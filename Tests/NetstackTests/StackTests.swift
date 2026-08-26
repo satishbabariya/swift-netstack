@@ -48,65 +48,77 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     // fixed, dropping `stack` immediately deallocates the NIC and trips
     // `RecordingEndpoint`'s "dispatcher deallocated while still attached"
     // assertion on the very next `inject`.
+    //
+    // `_ = stack` used to "fix" this, but that only works because it
+    // happens to be the LAST use of `stack` in the function, and ARC only
+    // extends a local's lifetime to the end of scope under `-Onone` — under
+    // `swift test -c release`, nothing guarantees `stack` (and therefore
+    // the NIC) outlives this point at all, so `link.inject` below could be
+    // racing the NIC's deinit. `withExtendedLifetime` is what actually
+    // guarantees what the comment above claims, in every build
+    // configuration, not just the one this happens to be run under today.
     let (stack, link, _) = makeStack()
-    _ = stack
-    link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
+    withExtendedLifetime(stack) {
+        link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
 
-    let frames = link.drainTransmitted()
-    #expect(frames.count == 1)
-    var reply = PacketBuffer(received: frames[0])
-    #expect(EthernetHeader.parse(&reply)?.etherType == .arp)
-    let arp = ARPPacket.parse(&reply)
-    #expect(arp?.operation == .reply)
-    #expect(arp?.senderIP == IPv4Address("192.168.127.1"))
+        let frames = link.drainTransmitted()
+        #expect(frames.count == 1)
+        var reply = PacketBuffer(received: frames[0])
+        #expect(EthernetHeader.parse(&reply)?.etherType == .arp)
+        let arp = ARPPacket.parse(&reply)
+        #expect(arp?.operation == .reply)
+        #expect(arp?.senderIP == IPv4Address("192.168.127.1"))
+    }
 }
 
 @Test func aGuestCanPingTheGateway() {
-    // See the comment in `aFreshStackAnswersARPForItsGatewayAddress`: `stack`
-    // must be kept alive here too, now that it is no longer implicitly kept
-    // alive by the retain cycle `start()` used to create.
+    // See the comment in `aFreshStackAnswersARPForItsGatewayAddress`:
+    // `stack` must be kept alive here too, and `withExtendedLifetime` is
+    // what actually guarantees that in every build configuration, not just
+    // the one `-Onone`'s "last use" ARC extension happens to cover.
     let (stack, link, _) = makeStack()
-    _ = stack
-    // ARP first, so the stack learns the guest's link address.
-    link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
-    _ = link.drainTransmitted()
+    withExtendedLifetime(stack) {
+        // ARP first, so the stack learns the guest's link address.
+        link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
+        _ = link.drainTransmitted()
 
-    var echo = ByteBuffer()
-    echo.writeInteger(UInt8(8))
-    echo.writeInteger(UInt8(0))
-    echo.writeInteger(UInt16(0), endianness: .big)
-    echo.writeInteger(UInt16(0x1111), endianness: .big)
-    echo.writeInteger(UInt16(42), endianness: .big)
-    echo.writeBytes(Array(repeating: UInt8(0x5a), count: 56))  // ping's default payload size
-    let checksum = echo.withUnsafeReadableBytes { Checksum.compute($0) }
-    echo.setInteger(checksum, at: 2, endianness: .big)
+        var echo = ByteBuffer()
+        echo.writeInteger(UInt8(8))
+        echo.writeInteger(UInt8(0))
+        echo.writeInteger(UInt16(0), endianness: .big)
+        echo.writeInteger(UInt16(0x1111), endianness: .big)
+        echo.writeInteger(UInt16(42), endianness: .big)
+        echo.writeBytes(Array(repeating: UInt8(0x5a), count: 56))  // ping's default payload size
+        let checksum = echo.withUnsafeReadableBytes { Checksum.compute($0) }
+        echo.setInteger(checksum, at: 2, endianness: .big)
 
-    var ipPacket = PacketBuffer(allocator: ByteBufferAllocator(), payload: echo)
-    let header = IPv4Header(
-        source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
-        protocolNumber: .icmp, payloadLength: echo.readableBytes)
-    var mutableHeader = header
-    mutableHeader.prepend(to: &ipPacket)
+        var ipPacket = PacketBuffer(allocator: ByteBufferAllocator(), payload: echo)
+        let header = IPv4Header(
+            source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+            protocolNumber: .icmp, payloadLength: echo.readableBytes)
+        var mutableHeader = header
+        mutableHeader.prepend(to: &ipPacket)
 
-    var frame = ByteBuffer()
-    frame.writeBytes(MACAddress("5a:94:ef:e4:0c:ee")!.bytes)
-    frame.writeBytes(MACAddress("0a:0b:0c:0d:0e:0f")!.bytes)
-    frame.writeInteger(UInt16(0x0800), endianness: .big)
-    var body = ipPacket.frame
-    frame.writeBuffer(&body)
-    link.inject(frame)
+        var frame = ByteBuffer()
+        frame.writeBytes(MACAddress("5a:94:ef:e4:0c:ee")!.bytes)
+        frame.writeBytes(MACAddress("0a:0b:0c:0d:0e:0f")!.bytes)
+        frame.writeInteger(UInt16(0x0800), endianness: .big)
+        var body = ipPacket.frame
+        frame.writeBuffer(&body)
+        link.inject(frame)
 
-    let frames = link.drainTransmitted()
-    #expect(frames.count == 1)
-    var reply = PacketBuffer(received: frames[0])
-    #expect(EthernetHeader.parse(&reply)?.destination == MACAddress("0a:0b:0c:0d:0e:0f"))
-    let replyHeader = IPv4Header.parse(&reply)
-    #expect(replyHeader?.source == IPv4Address("192.168.127.1"))
-    #expect(replyHeader?.destination == IPv4Address("192.168.127.2"))
-    let icmp = ICMPv4Header.parse(&reply)
-    #expect(icmp?.type == .echoReply)
-    #expect(icmp?.sequence == 42)
-    #expect(reply.readableBytes == 56)
+        let frames = link.drainTransmitted()
+        #expect(frames.count == 1)
+        var reply = PacketBuffer(received: frames[0])
+        #expect(EthernetHeader.parse(&reply)?.destination == MACAddress("0a:0b:0c:0d:0e:0f"))
+        let replyHeader = IPv4Header.parse(&reply)
+        #expect(replyHeader?.source == IPv4Address("192.168.127.1"))
+        #expect(replyHeader?.destination == IPv4Address("192.168.127.2"))
+        let icmp = ICMPv4Header.parse(&reply)
+        #expect(icmp?.type == .echoReply)
+        #expect(icmp?.sequence == 42)
+        #expect(reply.readableBytes == 56)
+    }
 }
 
 @Test func promiscuousAndSpoofingAreOnByDefault() {

@@ -85,6 +85,18 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     #expect(result == nil)
 }
 
+@Test func maximumPayloadLengthIsPinnedAgainstTheLiteral() {
+    // Every boundary test in this file is written in terms of
+    // `UDPHeader.maximumPayloadLength` itself (65535 - IPv4Header.minimumLength
+    // - UDPHeader.length), so a WRONG constant — in the property, or in
+    // either of the two subtractions it derives from — would still pass all
+    // of them: they would just be testing the wrong boundary consistently.
+    // Pin it against the literal RFC 768/791 actually implies: 65535 (the
+    // largest IPv4 total-length field) minus 20 (the minimum IPv4 header)
+    // minus 8 (the UDP header) = 65507.
+    #expect(UDPHeader.maximumPayloadLength == 65507)
+}
+
 @Test func serializeAcceptsTheLargestUDPPayload() {
     var largest = ByteBufferAllocator().buffer(capacity: UDPHeader.maximumPayloadLength)
     largest.writeRepeatingByte(0, count: UDPHeader.maximumPayloadLength)

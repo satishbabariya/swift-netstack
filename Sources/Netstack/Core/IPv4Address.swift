@@ -20,9 +20,11 @@ public struct IPv4Address: Hashable, Sendable, CustomStringConvertible {
         var octets: [UInt8] = []
         octets.reserveCapacity(4)
         for part in parts {
-            // Reject "01", "+1", and anything else Int would tolerate but a
-            // dotted quad does not.
+            // Leading-zero octets are an octal parser-differential hazard: glibc's inet_aton
+            // interprets them as octal, Go's net.ParseIP rejects them. Reject to prevent
+            // policy bypass. Single "0" is allowed; "01", "007" etc. are not.
             guard !part.isEmpty, part.count <= 3, part.allSatisfy(\.isASCII), part.allSatisfy(\.isNumber),
+                part.count == 1 || part.first != "0",
                 let value = UInt16(part), value <= 255
             else { return nil }
             octets.append(UInt8(value))

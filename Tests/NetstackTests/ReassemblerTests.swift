@@ -344,12 +344,32 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // enough that a correctly-bounded run's real growth (low single-digit MB
     // — cap plus noise) and a regressed run's real growth (tens of MB) are
     // both far outside the other's range, so `grown`'s threshold below has
-    // wide margin on both sides. `pendingCount`'s assertion just above is
-    // the tighter, deterministic half of this test — it does not depend on
-    // OS memory noise at all, and by itself already separates the fixed and
-    // reverted behaviour by two orders of magnitude (283 vs. 50,000
-    // surviving entries measured when the overhead charge below was
-    // reverted — see the report's falsification for COMMIT 1).
+    // wide margin on both sides.
+    //
+    // That margin does not make `grown`'s assertion reliable protection,
+    // though — it can only ever be too LENIENT, never too strict, and that
+    // asymmetry is exactly the problem. Because `ru_maxrss` is a high-water
+    // mark rather than a current-usage reading, `before` is not "memory used
+    // at the start of this test" — it is "the highest this process's RSS has
+    // ever been, including from any earlier test in this same process". If
+    // some earlier or concurrent test has already pushed the process peak
+    // above whatever this workload — regressed or not — would reach, `after
+    // - before` reads as ~0 and `grown < 30_000_000` passes regardless of
+    // whether this test's own allocations were actually bounded. It cannot
+    // merely flake occasionally; on a process whose peak is already high
+    // enough, it silently fails to fail on every run, indefinitely. There is
+    // no threshold that fixes this — the failure mode is in what `ru_maxrss`
+    // means, not in where the line is drawn.
+    //
+    // `pendingCount`'s assertion just above is the assertion actually doing
+    // the guarding here: it reads `Reassembler`'s own deterministic count,
+    // not a process-wide OS statistic, so it cannot be masked by unrelated
+    // allocations, and it already separates the fixed and reverted behaviour
+    // by two orders of magnitude (283 vs. 50,000 surviving entries measured
+    // when the overhead charge below was reverted — see the report's
+    // falsification of that fix). `grown` is kept only as an indicative,
+    // best-effort cross-check against the real allocator behaviour
+    // `pendingCount` cannot see directly — not as a guarantee.
     let memoryLimit = 200_000
     let reassembler = Reassembler(
         clock: ManualClock(), timeout: .seconds(3600), memoryLimit: memoryLimit,
@@ -390,6 +410,11 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // alone eventually reaches `memoryLimit`, so eviction still runs — just
     // ~177x too late, holding ~50,000 entries' worth of real memory instead
     // of ~283).
+    //
+    // Indicative only, NOT protection: see the doc comment above for why a
+    // process-wide high-water mark can read ~0 growth and pass here even on
+    // regressed code, silently, if some earlier test already pushed the
+    // peak higher. `pendingCount`'s assertion above is the real guard.
     #expect(grown < 30_000_000)
 }
 

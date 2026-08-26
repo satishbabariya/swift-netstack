@@ -57,10 +57,19 @@ public final class Reassembler {
         let isFragment = header.flags.contains(.moreFragments) || header.fragmentOffset > 0
         guard isFragment else { return (header, payload) }
 
+        // A fragment carrying no payload conveys nothing and cannot be part of a
+        // legitimate datagram, but it evades both the overlap test (a zero-width
+        // interval never intersects) and the memory cap (it adds zero bytes), so
+        // it is refused rather than tracked.
+        guard payload.readableBytes > 0 else { return nil }
+
         let offset = header.fragmentOffset
         let length = payload.readableBytes
         let end = offset + length
-        guard end <= Self.maximumDatagram else { return nil }
+        // RFC 791's 65535 is the limit on the WHOLE datagram, header included.
+        // Bounding only the payload lets a peer drive `headerLength + totalLength`
+        // past UInt16 at assembly, where the conversion is non-failable and traps.
+        guard header.headerLength + end <= Self.maximumDatagram else { return nil }
 
         let key = Key(
             source: header.source,
@@ -135,6 +144,10 @@ public final class Reassembler {
         var header = entry.header
         header.flags.remove(.moreFragments)
         header.fragmentOffset = 0
+        // Safe by construction: `process` admits a fragment only when
+        // `header.headerLength + end <= maximumDatagram` (65535), so this sum
+        // never exceeds UInt16.max. Do not relax that admission guard without
+        // reworking this conversion, which is non-failable and traps.
         header.totalLength = UInt16(header.headerLength + totalLength)
         return (header, assembled)
     }

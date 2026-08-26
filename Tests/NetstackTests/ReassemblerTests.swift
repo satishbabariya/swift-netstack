@@ -101,11 +101,18 @@ private func fragment(id: UInt16, offset: Int, more: Bool, bytes: [UInt8]) -> (I
 }
 
 @Test func rejectsAFragmentThatWouldOverrunTheMaximumDatagram() {
+    // The 65535 limit covers header + payload. A payload that fits the
+    // limit on its own but overruns it once the 20-byte header is added
+    // must be rejected at admission — at assembly the conversion to
+    // UInt16 is non-failable and would trap the process.
     let reassembler = Reassembler(clock: ManualClock())
-    // Offset 65528 plus 16 bytes exceeds the 65535-byte IPv4 maximum.
-    let bad = fragment(id: 3, offset: 65528, more: false, bytes: Array(repeating: UInt8(0), count: 16))
-    #expect(reassembler.process(header: bad.0, payload: bad.1) == nil)
-    #expect(reassembler.pendingCount == 0)
+    let head = fragment(id: 40, offset: 0, more: true, bytes: Array(repeating: UInt8(0xaa), count: 65512))
+    #expect(reassembler.process(header: head.0, payload: head.1) == nil)
+
+    // end = 65520; 65520 + 20 > 65535, so this must be refused.
+    let tail = fragment(id: 40, offset: 65512, more: false, bytes: Array(repeating: UInt8(0xbb), count: 8))
+    #expect(reassembler.process(header: tail.0, payload: tail.1) == nil)
+    #expect(reassembler.pendingCount == 1)   // still incomplete, not assembled
 }
 
 @Test func rejectsAnOverlappingFragment() {
@@ -174,4 +181,19 @@ private func fragment(id: UInt16, offset: Int, more: Bool, bytes: [UInt8]) -> (I
 
     // Completes at the length the FIRST terminator declared: 10 bytes.
     #expect(result?.1.readableBytes == 10)
+}
+
+@Test func rejectsEmptyFragments() {
+    // Zero-length fragments evade the overlap test and the memory cap, so
+    // a peer could repeat one indefinitely to grow the pending table.
+    let reassembler = Reassembler(clock: ManualClock())
+    for _ in 0..<100 {
+        let empty = fragment(id: 50, offset: 0, more: true, bytes: [])
+        #expect(reassembler.process(header: empty.0, payload: empty.1) == nil)
+    }
+    #expect(reassembler.pendingCount == 0)
+
+    // A non-fragmented packet with an empty payload is still delivered.
+    let bare = fragment(id: 51, offset: 0, more: false, bytes: [])
+    #expect(reassembler.process(header: bare.0, payload: bare.1) != nil)
 }

@@ -64,6 +64,49 @@ private func harness() -> (Stack, RecordingEndpoint, ManualClock, EmbeddedEventL
     }
 }
 
+@Test func theRunnerDetectsAFrameEmittedAtTheWrongTime() throws {
+    // Content-only comparison is invisible to a stack that emits the right
+    // bytes at the wrong logical time — exactly the failure mode a
+    // retransmission vector exists to catch (fired too early, or a stale
+    // duplicate sitting in the buffer). None of Plan 1's existing protocols
+    // (ARP/ICMP/UDP) reply on a delay, so there is no way to make correct
+    // production code emit early; this constructs the mismatch directly
+    // instead, by giving the `.expectedOutbound` line a DIFFERENT time than
+    // the `.inbound` line whose synchronous reply actually produces the
+    // frame. The reply is really emitted at 0.100s (it happens synchronously
+    // inside `link.inject`), but the script claims 0.200s — the runner must
+    // catch that disagreement even though the CONTENT matches exactly.
+    let script = try VectorScript.parse("""
+        0.100 < icmp echo_request id 1 seq 1
+        0.200 > icmp echo_reply id 1 seq 1
+        """)
+    let (stack, link, clock, loop) = harness()
+    withExtendedLifetime(stack) {
+        let runner = VectorRunner(script: script, codec: VectorFrames(
+            gateway: IPv4Address("192.168.127.1")!, gatewayMAC: MACAddress("5a:94:ef:e4:0c:ee")!,
+            guest: IPv4Address("192.168.127.2")!, guestMAC: MACAddress("0a:0b:0c:0d:0e:0f")!))
+        #expect(throws: VectorMismatch.self) { try runner.run(against: stack, link: link, clock: clock, loop: loop) }
+    }
+}
+
+@Test func theRunnerRejectsAScriptWhoseTimesGoBackwards() throws {
+    // A script whose second event claims an earlier time than its first is
+    // malformed — the runner must reject it outright rather than silently
+    // let its own `elapsed` bookkeeping drift backwards, which would
+    // desynchronise every delta computed after this point.
+    let script = try VectorScript.parse("""
+        0.200 < icmp echo_request id 1 seq 1
+        0.100 < icmp echo_request id 2 seq 2
+        """)
+    let (stack, link, clock, loop) = harness()
+    withExtendedLifetime(stack) {
+        let runner = VectorRunner(script: script, codec: VectorFrames(
+            gateway: IPv4Address("192.168.127.1")!, gatewayMAC: MACAddress("5a:94:ef:e4:0c:ee")!,
+            guest: IPv4Address("192.168.127.2")!, guestMAC: MACAddress("0a:0b:0c:0d:0e:0f")!))
+        #expect(throws: VectorScriptOutOfOrder.self) { try runner.run(against: stack, link: link, clock: clock, loop: loop) }
+    }
+}
+
 @Test func theRunnerDetectsAnUnexpectedExtraFrame() throws {
     // A stack that emits MORE than the script says is also wrong.
     let script = try VectorScript.parse("0.000 < icmp echo_request id 1 seq 1")

@@ -33,6 +33,14 @@ struct VectorEvent: Equatable {
     var time: TimeAmount
     var direction: VectorDirection
     var packet: VectorPacket
+    /// The 1-based line this event came from in the original script text,
+    /// counting comment and blank lines even though they produce no event —
+    /// so this is the number a reader would see in an editor, not the index
+    /// into `VectorScript.events`. Diagnostics (`VectorMismatch`) report
+    /// this rather than the event index for exactly that reason: the
+    /// validation vectors are deliberately comment-heavy, so "event 2" and
+    /// "line 2" can name entirely different statements.
+    var sourceLine: Int
 }
 
 enum VectorScriptError: Error, Equatable {
@@ -54,15 +62,22 @@ struct VectorScript {
 
     static func parse(_ text: String) throws -> VectorScript {
         var events: [VectorEvent] = []
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        // `enumerated()` here is what lets a diverging event be reported by
+        // its real position in the file — `split` with
+        // `omittingEmptySubsequences: false` keeps blank lines as empty
+        // subsequences, so this index (1-based below) lines up with what an
+        // editor shows, including comments and blanks that never become an
+        // event of their own.
+        for (offset, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            let sourceLine = offset + 1
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") { continue }
-            events.append(try parseLine(line))
+            events.append(try parseLine(line, sourceLine: sourceLine))
         }
         return VectorScript(events: events)
     }
 
-    private static func parseLine(_ line: String) throws -> VectorEvent {
+    private static func parseLine(_ line: String, sourceLine: Int) throws -> VectorEvent {
         var fields = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard fields.count >= 3 else { throw VectorScriptError.malformedLine(line) }
 
@@ -85,7 +100,8 @@ struct VectorScript {
         default: throw VectorScriptError.malformedLine(line)
         }
 
-        return VectorEvent(time: time, direction: direction, packet: try parsePacket(fields, line: line))
+        return VectorEvent(
+            time: time, direction: direction, packet: try parsePacket(fields, line: line), sourceLine: sourceLine)
     }
 
     private static func parsePacket(_ fields: [String], line: String) throws -> VectorPacket {

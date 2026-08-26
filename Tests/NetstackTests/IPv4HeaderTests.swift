@@ -70,6 +70,32 @@ private let sampleHeader: [UInt8] = [
     #expect(IPv4Header.parse(&packet) == nil)
 }
 
+@Test func rejectsTotalLengthShorterThanTheHeader() {
+    var bytes = sampleHeader
+    bytes[2] = 0x00  // total length 16, shorter than the 20-byte header itself
+    bytes[3] = 0x10
+    bytes[10] = 0
+    bytes[11] = 0
+    let checksum = bytes.withUnsafeBytes { Checksum.compute($0) }
+    bytes[10] = UInt8(checksum >> 8)
+    bytes[11] = UInt8(checksum & 0xff)
+    var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
+    #expect(IPv4Header.parse(&packet) == nil)
+}
+
+@Test func rejectsAnIHLThatOverrunsTheFrame() {
+    var bytes = sampleHeader
+    bytes[0] = 0x46  // IHL 6 — claims a 24-byte header
+    bytes[10] = 0
+    bytes[11] = 0
+    let checksum = bytes.withUnsafeBytes { Checksum.compute($0) }
+    bytes[10] = UInt8(checksum >> 8)
+    bytes[11] = UInt8(checksum & 0xff)
+    // Frame is only 20 bytes — shorter than the claimed 24-byte header.
+    var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
+    #expect(IPv4Header.parse(&packet) == nil)
+}
+
 @Test func skipsOptionsAndReportsTheirLength() {
     var bytes: [UInt8] = [
         0x46, 0x00, 0x00, 0x1c,  // IHL 6 — one 4-byte option word

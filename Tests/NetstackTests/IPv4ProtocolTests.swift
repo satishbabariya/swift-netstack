@@ -208,4 +208,33 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
             from: nil,
             protocolNumber: .udp)
     }
+
+    // Pin the exact edge: 65515 = 65535 - IPv4Header.minimumLength is the
+    // largest payload that still fits an IPv4 datagram, and 65516 is the
+    // smallest that does not. The 70000-byte case above is far past either
+    // and would not catch an off-by-one at the boundary itself.
+    var atTheLimit = ByteBufferAllocator().buffer(capacity: 65515)
+    atTheLimit.writeRepeatingByte(0xaa, count: 65515)
+    do {
+        try f.ip.send(
+            payload: atTheLimit,
+            to: IPv4Address("192.168.127.2")!,
+            from: nil,
+            protocolNumber: .udp)
+    } catch let error as StackError {
+        #expect(error != .messageTooLong)
+    } catch {
+        // Anything other than StackError is unexpected here, but only
+        // `.messageTooLong` is what this test is pinning against.
+    }
+
+    var oneOverTheLimit = ByteBufferAllocator().buffer(capacity: 65516)
+    oneOverTheLimit.writeRepeatingByte(0xaa, count: 65516)
+    #expect(throws: StackError.messageTooLong) {
+        try f.ip.send(
+            payload: oneOverTheLimit,
+            to: IPv4Address("192.168.127.2")!,
+            from: nil,
+            protocolNumber: .udp)
+    }
 }

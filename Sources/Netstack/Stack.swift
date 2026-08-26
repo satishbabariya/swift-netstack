@@ -220,6 +220,20 @@ public final class Stack {
     }
 
     private func shutdownOnLoop() -> EventLoopFuture<Void> {
+        // Enforce, rather than merely document, what `shutdown()`'s comment
+        // above claims. Every line below touches loop-confined state that
+        // the ingress path reads concurrently, and this package has no locks
+        // — so if `shutdown()` ever stops marshaling, that must be a loud,
+        // immediate failure on the first off-loop call rather than a data
+        // race that shows up as corruption somewhere else much later. It is
+        // also what lets a test detect the marshal's removal at all:
+        // clearing the handler tables off-loop produces exactly the same
+        // observable result as clearing them on-loop, so nothing about
+        // `shutdown()`'s return value can tell the two apart. The same
+        // `preconditionInEventLoop()` guards `LinkEndpoint`'s own
+        // loop-confined entry points for the same reason.
+        eventLoop.preconditionInEventLoop()
+
         // Defense in depth alongside the `[weak ipv4]` captures in `start()`:
         // those already keep `start()` from leaving a retain cycle, but
         // clearing the tables here also releases what the handler closures

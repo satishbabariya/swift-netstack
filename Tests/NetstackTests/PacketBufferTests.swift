@@ -70,3 +70,25 @@ import Testing
     #expect(packet.networkHeaderLength == 20)
     #expect(packet.linkHeaderLength == 14)
 }
+
+@Test func consumingRecordsEveryLayerLength() {
+    // Regression: prepend walks transport->network->link and consume walks
+    // link->network->transport. Sharing one stepper made consume step
+    // .link -> .done, so every header length after the first was silently
+    // dropped on the receive path — with no test asserting them, the suite
+    // stayed green. Assert all three.
+    var packet = PacketBuffer(received: ByteBuffer(bytes: [
+        0x07, 0x07,              // link header, 2 bytes
+        0x05, 0x06, 0x05, 0x06,  // network header, 4 bytes
+        0x01, 0x02, 0x03,        // transport header, 3 bytes
+        0xaa, 0xbb,              // payload
+    ]))
+    #expect(packet.consumeHeader(2) != nil)
+    #expect(packet.consumeHeader(4) != nil)
+    #expect(packet.consumeHeader(3) != nil)
+
+    #expect(packet.linkHeaderLength == 2)
+    #expect(packet.networkHeaderLength == 4)
+    #expect(packet.transportHeaderLength == 3)
+    #expect(Array(packet.payload.readableBytesView) == [0xaa, 0xbb])
+}

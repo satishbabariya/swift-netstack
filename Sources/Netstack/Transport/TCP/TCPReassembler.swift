@@ -270,9 +270,29 @@ public final class TCPReassembler {
     /// this. See the type's doc comment.
     public var finSequence: SequenceNumber? { fin }
 
-    /// Real storage retained by the queue, for tests that need to check the
-    /// copy-on-admission fix directly rather than through the accounting the
-    /// fix exists to make honest. Not `private`: `@testable import` reads it.
+    /// Diagnostic: the total `ByteBuffer.storageCapacity` of every queued
+    /// run's payload — the size of the allocations those payloads keep alive,
+    /// not the number of bytes they declare. Not `private`, because
+    /// `@testable import` elevates `internal` and not `private`.
+    ///
+    /// This exists to make copy-on-admission (see the type's doc comment)
+    /// falsifiable by a test without measuring anything. `storageCapacity`
+    /// reports the whole backing allocation a `ByteBuffer` references, so it
+    /// separates the two cases exactly and with no noise between them: a
+    /// fresh, exactly-sized 1-byte copy reports 1, while an uncopied 1-byte
+    /// slice of a 1500-byte MTU frame reports 2048 (NIO rounds capacity up to
+    /// a power of two). COW pinning is precisely what `storageCapacity` sees.
+    ///
+    /// It is deliberately NOT a substitute for `perSegmentOverhead`, and the
+    /// two failures must not be conflated. Real per-segment retention cost —
+    /// the array element, the backing storage object's own class header,
+    /// malloc's minimum bucket — is invisible here: with the overhead charge
+    /// set to zero, every queued entry still holds an exactly-sized 1-byte
+    /// copy and this number is still 1 per entry, while 200,000 of them are
+    /// retained instead of 778. `pendingSegments` is what bounds that. This
+    /// number bounds pinning, not footprint.
+    ///
+    /// O(queued runs); for tests and diagnostics only, never on a packet path.
     var pendingStorageCapacityForTesting: Int {
         queue.reduce(0) { $0 + $1.bytes.storageCapacity }
     }

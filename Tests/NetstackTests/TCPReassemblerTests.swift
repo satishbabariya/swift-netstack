@@ -1,18 +1,7 @@
-import Foundation
 import NIOCore
 import Testing
 
 @testable import Netstack
-
-/// Peak resident set size in bytes, as `getrusage` reports it on Darwin.
-/// Same technique as `ReassemblerTests.swift`'s `peakResidentBytes` — kept
-/// separate rather than shared so neither file's measurement can be changed
-/// out from under the other.
-private func tcpPeakResidentBytes() -> Int {
-    var info = rusage()
-    getrusage(RUSAGE_SELF, &info)
-    return info.ru_maxrss
-}
 
 private func tcpDeliveredBytes(_ buffers: [ByteBuffer]) -> [UInt8] {
     buffers.flatMap { Array($0.readableBytesView) }
@@ -378,6 +367,14 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     // A NIO slice is copy-on-write: it keeps a live reference to the ENTIRE
     // original allocation. Queued as received, one byte sliced off a 1500-byte
     // MTU frame pins all 1500 bytes while `pendingBytes` sees one.
+    //
+    // `storageCapacity` is the quantity COW pinning moves, and it separates
+    // the two cases with nothing in between: measured on this input, a queued
+    // exactly-sized 1-byte copy reports 1, and the same segment with
+    // copy-on-admission deleted reports 2048 — the slice's whole backing
+    // frame, since NIO rounds capacity up to a power of two. A 64x margin
+    // below the bound asserted here, and no process-wide reading is involved,
+    // so no concurrent test can move it either way.
     let reassembler = TCPReassembler(maximumBytes: 1 << 20, maximumSegments: 1024)
     var frame = ByteBufferAllocator().buffer(capacity: 1500)
     frame.writeRepeatingByte(0xaa, count: 1500)
@@ -386,46 +383,92 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
 
     _ = reassembler.insert(Segment(sequence: SequenceNumber(2000), flags: [], payload: oneByte), rcvNxt: SequenceNumber(1000))
 
+    // An upper bound on retained storage is satisfied perfectly by a queue
+    // holding nothing, so assert the segment is actually held before bounding
+    // what it holds.
     #expect(reassembler.pendingSegments == 1)
-    #expect(reassembler.pendingStorageCapacityForTesting < 1500)
+    #expect(reassembler.pendingStorageCapacityForTesting <= 32)
 }
 
-@Test func tcpReassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalSegments() {
+@Test func tcpReassemblyMemoryLimitBoundsRealRetentionUnderAFloodOfMinimalSegments() {
     // The attack shape: 1-byte out-of-order segments behind a gap that is
     // never filled. Nothing is ever delivered, so the caps are the only thing
     // keeping this bounded. The count cap is set far out of reach so this
-    // measures the BYTE cap specifically — i.e. whether `perSegmentOverhead`
-    // and copy-on-admission together make `maximumBytes` track real
-    // retention.
+    // exercises the BYTE cap specifically — i.e. whether `perSegmentOverhead`
+    // and copy-on-admission together make `maximumBytes` bound what is really
+    // retained rather than what the segments declared on the wire.
     //
     // Each segment is sliced off its OWN freshly allocated 1500-byte MTU
-    // frame, because that is how segments really arrive — one NIC read, one
-    // frame. Slicing them all off a single shared frame (which is what
-    // `ReassemblerTests`' equivalent does, and what this test did first)
-    // makes the test blind to exactly the defect it is here for: the shared
-    // frame is one allocation no matter how many slices reference it, so
-    // copy-on-admission can be deleted entirely and this measures 86 bytes
-    // per segment and passes. With distinct frames it measures 2207.
+    // frame. That is how segments really arrive — one NIC read, one frame —
+    // and it is also the only shape in which copy-on-write pinning is
+    // observable at all. Slicing a whole flood off ONE shared frame (which is
+    // what `ReassemblerTests`' equivalent does, and what this test did first)
+    // pins a single allocation however many slices point into it, so uncopied
+    // slices and fresh copies retain nearly the same amount and the shape is
+    // blind to precisely the defect it exists for.
     //
-    // Two assertions do the work, and neither may be phrased in terms of
-    // `perSegmentOverhead`: a bound that scales with the constant is vacuous
-    // the moment the constant is set to zero, which is precisely the
-    // regression to catch. `pendingSegments` is bounded by a flat number
-    // instead — ~778 entries fit at the current constant, 200,000 fit at
-    // zero, so the two are three orders of magnitude apart.
+    // NOTHING HERE IS MEASURED. An earlier version of this test read process
+    // RSS growth from `getrusage`'s `ru_maxrss` and asserted on the delta,
+    // which was wrong in both directions. `ru_maxrss` is a PROCESS-WIDE,
+    // monotonically non-decreasing high-water mark, and Swift Testing runs
+    // this suite concurrently in one process:
     //
-    // Read `ReassemblerTests.reassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalFragments`
-    // for why the `getrusage` half is indicative only and NOT protection:
-    // `ru_maxrss` is a process-wide high-water mark, so an unrelated
-    // concurrent test that has already pushed the peak up makes `grown` read
-    // ~0 and pass regardless. `pendingSegments` is the real guard — it reads
-    // this class's own deterministic count, which nothing else in the process
-    // can move.
+    //  * It fired on unrelated breakage. A change that broke a bound in the
+    //    IPv4 reassembler — a different type, a different file — failed this
+    //    TCP test, because the peak this reads is the whole process's.
+    //  * Far worse, it failed silently the other way. Once any earlier or
+    //    concurrent test has pushed the process peak above whatever this
+    //    workload would reach, `after - before` reads ~0 and the assertion
+    //    passes regardless of what this code actually retained. That is not
+    //    an occasional flake: on a process whose peak is already high it
+    //    fails to fail on every run, indefinitely. No threshold repairs it —
+    //    the defect is in what `ru_maxrss` means, not in where the line was
+    //    drawn.
+    //
+    // The claim is unchanged; only the instrument is. Every assertion below
+    // is a deterministic function of this reassembler's own state, and
+    // nothing else in the process can move any of them.
+    //
+    // They are not redundant with one another — each sees a failure the
+    // others cannot — and none may be phrased in terms of
+    // `perSegmentOverhead`, since a bound that scales with the constant is
+    // vacuous the moment the constant is set to zero, which is one of the two
+    // regressions to catch:
+    //
+    //  * `pendingSegments <= 2000` catches the overhead charge going away.
+    //    Measured on this exact input: 778 entries survive at the real
+    //    constant, 200,000 with it set to zero — the entire flood, more than
+    //    two orders of magnitude apart. `storageCapacity` cannot see this
+    //    one: with the overhead zeroed each of those 200,000 entries still
+    //    holds an exactly-sized 1-byte copy, so per-entry storage is
+    //    unchanged at 1. The real per-entry cost (array element, backing
+    //    storage object, malloc's minimum bucket) is invisible to
+    //    `storageCapacity` by construction; the count is what bounds it.
+    //  * `pendingStorageCapacityForTesting` catches copy-on-admission going
+    //    away, which the count cannot see, because the number of entries is
+    //    identical either way. Measured on this flood: 778 bytes of backing
+    //    allocation held with the copy in place, 1,593,344 with it deleted —
+    //    every entry pinning its whole 2048-byte frame instead of the 1 byte
+    //    it declares — against the 778 * 32 = 24,896 asserted here. A 64x
+    //    margin, with no noise in it.
+    //  * `pendingSegments > 100` is the positive control. Both bounds above
+    //    are upper bounds, and an upper bound is satisfied perfectly by a
+    //    reassembler that queued nothing whatsoever.
+    //
+    // One thing genuinely does not survive the change of instrument, and is
+    // recorded here rather than dropped quietly: no test re-measures the
+    // ABSOLUTE per-segment cost in resident bytes (167.5 with the copy and no
+    // overhead charge, 2207 with neither fix) that calibrates
+    // `perSegmentOverhead` at 256. That figure needs a real allocator
+    // reading, and a process-wide high-water mark cannot supply one
+    // trustworthily under concurrency. It stays a one-off measurement
+    // documented on the constant itself. What is guarded here is that both
+    // fixes are still in force — which is what a regression would remove —
+    // not that 256 is still the numerically right charge.
     let maximumBytes = 200_000
     let reassembler = TCPReassembler(maximumBytes: maximumBytes, maximumSegments: 1_000_000)
     let rcvNxt = SequenceNumber(1000)
 
-    let before = tcpPeakResidentBytes()
     for index in 0..<200_000 {
         var frame = ByteBufferAllocator().buffer(capacity: 1500)
         frame.writeRepeatingByte(0xaa, count: 1500)
@@ -433,11 +476,10 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
         _ = reassembler.insert(
             Segment(sequence: SequenceNumber(2000 + UInt32(index * 2)), flags: [], payload: slice), rcvNxt: rcvNxt)
     }
-    let grown = tcpPeakResidentBytes() - before
 
     #expect(reassembler.pendingBytes <= maximumBytes)
     #expect(reassembler.pendingSegments <= 2000)
     // Upper bounds alone pass against a reassembler that queues nothing.
     #expect(reassembler.pendingSegments > 100)
-    #expect(grown < 30_000_000)
+    #expect(reassembler.pendingStorageCapacityForTesting <= reassembler.pendingSegments * 32)
 }

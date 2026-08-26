@@ -17,11 +17,24 @@ import (
 // gVisor at bare IP would make the two stacks structurally incomparable and
 // every diff would be noise unrelated to TCP.
 //
-// It has no goroutines and no queue: WritePackets appends captured frames to
-// a slice under a mutex, and Inject (called by the driver in main.go, not
-// part of stack.LinkEndpoint) delivers an inbound frame synchronously on the
-// calling goroutine. That keeps the harness's notion of "what did the stack
-// emit in response to this frame" exact rather than racing a worker.
+// It has no goroutines and no queue of its own: WritePackets appends
+// captured frames to a slice under a mutex, and Inject (called by the
+// driver in main.go, not part of stack.LinkEndpoint) delivers an inbound
+// frame synchronously on the calling goroutine.
+//
+// That makes delivery itself exact for every path that gVisor also handles
+// synchronously on the calling goroutine — ARP resolution and replies, and
+// IP/TCP header validation up to the point a segment is handed to an
+// existing, already-established endpoint. It does NOT make delivery exact
+// for the one path this harness exists to test: a TCP SYN. gVisor's
+// tcp.Forwarder dispatches its handler — where CreateEndpoint runs and the
+// SYN-ACK is written — on its own goroutine (`go f.handler(...)`), not
+// through anything the injecting goroutine or the manual clock can see
+// complete. main.go's per-frame loop deals with that explicitly: the
+// forwarder handler it installs signals a channel when it returns, and the
+// loop waits on that signal (bounded, not a sleep or a poll) before
+// draining TakeEmitted for that frame. See main.go's handshakeSignalTimeout
+// doc comment for why that wait is necessary and how its bound was chosen.
 type harnessLink struct {
 	mu         sync.Mutex
 	dispatcher stack.NetworkDispatcher

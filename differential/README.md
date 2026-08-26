@@ -95,6 +95,19 @@ stack under comparison speaks ethernet; driving gVisor at bare IP would
 make the two stacks structurally incomparable, not just differently
 configured.
 
+## CI must build this harness
+
+CI **must** build `differential/harness` as part of every run, not just
+when someone remembers to. The Swift-side differential tests locate the
+built binary and, if it is absent, skip silently rather than failing — a
+skip that runs in about a millisecond and still reports the suite as green.
+That means a broken build here, or a CI job that simply forgets to build
+this directory, makes the entire differential comparison vanish from CI
+with nothing in the output saying so. There is no green checkmark that
+distinguishes "the differential suite ran and passed" from "the differential
+suite did not run at all." Wire the build into CI explicitly and do not
+rely on the Swift tests' skip behavior to catch its absence.
+
 ## Verified working
 
 Feeding the harness a single ARP request — constructed with the Swift

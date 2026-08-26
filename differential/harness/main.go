@@ -47,6 +47,23 @@ const (
 	// ever drives one scripted connection at a time; 10 leaves headroom
 	// without being unbounded.
 	tcpForwarderMaxInFlight = 10
+
+	// handshakeSignalTimeout bounds how long the per-frame loop will wait,
+	// in real wall-clock time, for the forwarder's handshake goroutine to
+	// signal completion before moving on. gVisor's tcp.Forwarder dispatches
+	// its handler with a bare `go f.handler(...)` — not a clock.AfterFunc
+	// timer — so ManualClock.Advance has no visibility into it at all; no
+	// amount of simulated time will make the goroutine run. This wait is
+	// therefore real time standing in for goroutine scheduling latency
+	// only (the handler is typically already most of the way done — SYN
+	// processing and CreateEndpoint have already run — by the time the
+	// main goroutine reaches this wait), not for any simulated protocol
+	// delay. 200ms is generous for that under a loaded or sandboxed CI
+	// runner while still keeping a script of a realistic size (tens of
+	// frames) well under a second of added wall time; every frame pays it
+	// when no handshake is pending, since the harness cannot know in
+	// advance which frames are SYNs.
+	handshakeSignalTimeout = 200 * time.Millisecond
 )
 
 // request is the harness's stdin contract: a list of base64-encoded
@@ -131,12 +148,32 @@ func run(stdin *os.File, stdout *os.File) error {
 	}
 	s.SetRouteTable([]tcpip.Route{{Destination: subnet, NIC: nicID}})
 
-	// tcp.NewForwarder(s, 0, 10, handler) matching upstream's
+	// gVisor's tcp.Forwarder dispatches this handler on its own goroutine
+	// (a bare `go f.handler(...)`, not anything ManualClock tracks) as soon
+	// as a SYN arrives, and the SYN-ACK is written — synchronously, inside
+	// this goroutine — by the time r.CreateEndpoint returns. handshakeDone
+	// is how the per-frame loop below finds out that has happened, since
+	// clock.Advance cannot: it only waits on clock.AfterFunc-scheduled
+	// work, and this goroutine is not that.
+	//
+	// tcp.NewForwarder(s, 0, 10, handler) matches upstream's
 	// pkg/services/forwarder/tcp.go: a handler that completes the endpoint
 	// and immediately closes it, rather than proxying it anywhere. The
 	// point of this harness is what gVisor's TCP emits on the wire around
 	// connection setup and teardown, not any application behavior on top.
+	handshakeDone := make(chan struct{}, tcpForwarderMaxInFlight)
 	forwarder := tcp.NewForwarder(s, 0, tcpForwarderMaxInFlight, func(r *tcp.ForwarderRequest) {
+		defer func() {
+			select {
+			case handshakeDone <- struct{}{}:
+			default:
+				// The channel is sized to tcpForwarderMaxInFlight, the same
+				// bound the forwarder itself enforces on concurrent
+				// in-flight connections, so this default case is a
+				// safety net rather than something a normal run can hit.
+			}
+		}()
+
 		var wq waiter.Queue
 		ep, err := r.CreateEndpoint(&wq)
 		r.Complete(err != nil)
@@ -155,12 +192,39 @@ func run(stdin *os.File, stdout *os.File) error {
 		}
 		link.Inject(frame)
 		clock.Advance(time.Duration(req.AdvanceMs[i]) * time.Millisecond)
+		waitForHandshake(handshakeDone, handshakeSignalTimeout)
 		emitted = append(emitted, link.TakeEmitted()...)
 	}
+	// A handshake goroutine triggered by the very last input frame has had
+	// no later frame's wait to be caught by; give it the same bounded
+	// window here so its SYN-ACK (or close) is not silently dropped from
+	// the response.
+	waitForHandshake(handshakeDone, handshakeSignalTimeout)
+	emitted = append(emitted, link.TakeEmitted()...)
 
 	resp := response{Emitted: make([]string, len(emitted))}
 	for i, frame := range emitted {
 		resp.Emitted[i] = base64.StdEncoding.EncodeToString(frame)
 	}
 	return json.NewEncoder(stdout).Encode(resp)
+}
+
+// waitForHandshake blocks for up to timeout waiting for a single signal on
+// done, then drains any further signals that are already available without
+// waiting any further. It is not a poll loop and it does not sleep: a
+// signal that arrives promptly is consumed promptly, and a frame that
+// provokes no handshake costs exactly one bounded wait rather than hanging.
+func waitForHandshake(done <-chan struct{}, timeout time.Duration) {
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		return
+	}
+	for {
+		select {
+		case <-done:
+		default:
+			return
+		}
+	}
 }

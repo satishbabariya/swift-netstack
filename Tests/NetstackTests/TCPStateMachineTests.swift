@@ -9,7 +9,7 @@ import Testing
 /// byte count only (its content is never inspected by the state machine
 /// except for its length and, when delivered, its identity), so it is
 /// filled with zero bytes.
-private func segment(sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], payload: Int = 0) -> TCPSegment {
+private func segment(sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], payload: Int = 0, window: UInt16 = 4096) -> TCPSegment {
     let header = TCPHeader(
         sourcePort: 55000,
         destinationPort: 80,
@@ -17,7 +17,7 @@ private func segment(sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], pa
         acknowledgement: SequenceNumber(ack),
         dataOffset: 5,
         flags: flags,
-        window: 4096,
+        window: window,
         checksum: 0,
         urgentPointer: 0,
         options: [])
@@ -348,6 +348,143 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     var tcb = establishedTCB(sndUna: 100, sndNxt: 200)
     _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 5000, flags: [.ack]), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(100))
+}
+
+@Test func aHalfSpaceAckIsRejectedWhenNothingIsInFlight() {
+    // The negated-ordering hole, at the one site where it was live. With
+    // nothing in flight (SND.UNA == SND.NXT, the ordinary state of an idle
+    // connection) the acceptable-ACK window is empty, so every ACK but
+    // SND.UNA itself must be refused. The old shape tested the two bounds as
+    // a pair of negated `lessThan`s, and `lessThan` answers `false` at
+    // exactly 2^31 apart -- so both negations answered `true` and the guest's
+    // chosen value was the one value waved through, dragging SND.UNA half the
+    // sequence space forward, past data that was never sent. That is the
+    // property `anAckForDataNeverSentIsRejected` above exists to hold, and it
+    // held everywhere except at the value a hostile peer can compute directly.
+    var tcb = establishedTCB(sndUna: 100, sndNxt: 100, rcvNxt: 1000, rcvWnd: 100)
+    let hostile = SequenceNumber(100 &+ 0x8000_0000)
+    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: hostile.value, flags: [.ack]), on: &tcb)
+    #expect(tcb.sndUna == SequenceNumber(100), "SND.UNA must not advance to a guest-chosen half-space ACK")
+    #expect(tcb.sndWl2 == SequenceNumber(100), "nor may the rejected ACK be recorded as a window update")
+    #expect(actions == [.sendAck], "an ACK beyond SND.NXT is answered with an ACK and dropped")
+}
+
+@Test func anInvertedSendWindowRejectsEveryAckRatherThanAdmittingABand() {
+    // The degenerate case: a TCB whose SND.NXT precedes SND.UNA describes a
+    // range that cannot contain anything -- more acknowledged than was ever
+    // sent. No correct path builds one, but an earlier bug advancing one
+    // variable without the other would, and the shape being replaced did not
+    // fail closed there: it admitted a whole 100-value band (verified by
+    // sweeping all 2^32 acknowledgements against both shapes), because its
+    // upper bound was a negated `lessThan` whose undefined point sits inside
+    // the inverted range. Accepting turns one upstream bug into an
+    // accept-anything hole exactly when the state is already known bad, so
+    // the predicate rejects instead.
+    //
+    // At this site -- unlike the ESTABLISHED one above -- the half-space
+    // value alone is NOT admitted, because the positive lower bound
+    // (SND.UNA < SEG.ACK) already excludes it. The inverted span is what
+    // separates the two shapes here.
+    var tcb = TCB(
+        state: .synReceived,
+        sndUna: SequenceNumber(3000),
+        sndNxt: SequenceNumber(2900),  // precedes sndUna: an impossible TCB
+        sndWnd: 4096,
+        sndWl1: SequenceNumber(8000),
+        sndWl2: SequenceNumber(3000),
+        iss: SequenceNumber(3000),
+        rcvNxt: SequenceNumber(8001),
+        rcvWnd: 4096,
+        irs: SequenceNumber(8000))
+    let hostile = SequenceNumber(2900 &+ 0x8000_0000)  // inside the band the old shape admitted
+    let actions = TCPStateMachine.receive(segment: segment(sequence: 8001, ack: hostile.value, flags: [.ack]), on: &tcb)
+    #expect(tcb.state == .synReceived, "an impossible TCB must not be talked into ESTABLISHED")
+    #expect(tcb.sndUna == SequenceNumber(3000))
+    #expect(actions == [.sendRst(sequence: hostile, ack: nil)])
+}
+
+@Test func aSynSentTcbWhoseSynConsumedNoSequenceNumberAcceptsNoAck() {
+    // A fourth site with the same defect, which a grep for `!` does not
+    // find: SYN-SENT spelled its negation structurally, computing
+    // `ackTooOld`/`ackTooNew` from positive `lessThan`s and accepting when
+    // neither held. That is the same negated accept guard in disguise, and
+    // it has the same hole -- verified by sweeping all 2^32 acknowledgements
+    // against both shapes.
+    //
+    // Here the acceptable window is ISS < SEG.ACK =< SND.NXT, so a TCB whose
+    // SND.NXT was never advanced past ISS (the SYN's own sequence number
+    // never reserved) describes an empty window and must accept nothing. The
+    // old shape accepted ISS + 2^31 and adopted it as SND.UNA.
+    var tcb = TCB(
+        state: .synSent,
+        sndUna: SequenceNumber(2000),
+        sndNxt: SequenceNumber(2000),  // never advanced past iss
+        sndWnd: 0,
+        sndWl1: SequenceNumber(0),
+        sndWl2: SequenceNumber(0),
+        iss: SequenceNumber(2000),
+        rcvNxt: SequenceNumber(0),
+        rcvWnd: 4096,
+        irs: SequenceNumber(0))
+    let hostile = SequenceNumber(2000 &+ 0x8000_0000)
+    let actions = TCPStateMachine.receive(segment: segment(sequence: 9000, ack: hostile.value, flags: [.syn, .ack]), on: &tcb)
+    #expect(tcb.state == .synSent, "an empty acceptable-ACK window must accept nothing")
+    #expect(tcb.sndUna == SequenceNumber(2000), "and must not adopt the guest's number as SND.UNA")
+    #expect(actions == [.sendRst(sequence: hostile, ack: nil)])
+}
+
+@Test func aHalfSpaceAckIsNotAcceptedAsAWindowUpdate() {
+    // RFC 9293 §3.10.7.4's window-update test is "SND.WL1 < SEG.SEQ, or
+    // SND.WL1 == SEG.SEQ and SND.WL2 =< SEG.ACK". Written as
+    // `!ack.lessThan(sndWl2)` its second half admitted SND.WL2 + 2^31, so an
+    // acknowledgement that is not in fact at or after SND.WL2 could install
+    // a window. Least severe of the three -- a stale window update rather
+    // than corrupted send state -- and, once the ESTABLISHED hole above is
+    // closed, only reachable by a TCB whose SND.WL2 sits 2^31 from an
+    // otherwise-valid ACK, which a live connection would take 2 GiB to
+    // reach. It is fixed anyway: it is the same defect, and leaving one
+    // behind teaches the next reader the wrong pattern.
+    var tcb = establishedTCB(sndUna: 100, sndNxt: 200, rcvNxt: 1000, rcvWnd: 100)
+    tcb.sndWnd = 1
+    tcb.sndWl1 = SequenceNumber(1000)
+    tcb.sndWl2 = SequenceNumber(150 &+ 0x8000_0000)
+    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 150, flags: [.ack], window: 65535), on: &tcb)
+    #expect(tcb.sndUna == SequenceNumber(150), "the ACK itself is perfectly acceptable and does advance SND.UNA")
+    #expect(tcb.sndWnd == 1, "but it is not at or after SND.WL2, so it must not install a window")
+    #expect(tcb.sndWl2 == SequenceNumber(150 &+ 0x8000_0000), "and must not be recorded as the last window update")
+}
+
+@Test func anOrdinaryWindowUpdateIsStillAccepted() {
+    // The other half of every range test: too strict breaks the connection
+    // just as thoroughly as too loose, and nothing else in this suite
+    // exercises the window-update path at all. Without this, the three
+    // rejection tests above would all be satisfied by a predicate that
+    // simply never accepts anything.
+    var tcb = establishedTCB(sndUna: 100, sndNxt: 200, rcvNxt: 1000, rcvWnd: 100)
+    tcb.sndWnd = 1
+    tcb.sndWl1 = SequenceNumber(1000)
+    tcb.sndWl2 = SequenceNumber(100)
+    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 150, flags: [.ack], window: 65535), on: &tcb)
+    #expect(tcb.sndUna == SequenceNumber(150))
+    #expect(tcb.sndWnd == 65535)
+    #expect(tcb.sndWl1 == SequenceNumber(1000))
+    #expect(tcb.sndWl2 == SequenceNumber(150))
+}
+
+@Test func aDuplicateAckOfExactlySndUnaStillCarriesAWindowUpdate() {
+    // SEG.ACK == SND.UNA is inside RFC 9293's acceptable-ACK window even
+    // though it advances nothing: it is how a sender learns the peer has
+    // reopened a window it had closed. The ESTABLISHED range test is
+    // therefore inclusive at the low end, and this is what says so -- an
+    // exclusive bound would leave a sender stuck against a zero window
+    // forever, which no other test in this suite would notice.
+    var tcb = establishedTCB(sndUna: 100, sndNxt: 200, rcvNxt: 1000, rcvWnd: 100)
+    tcb.sndWnd = 0
+    tcb.sndWl1 = SequenceNumber(1000)
+    tcb.sndWl2 = SequenceNumber(100)
+    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 100, flags: [.ack], window: 65535), on: &tcb)
+    #expect(tcb.sndUna == SequenceNumber(100))
+    #expect(tcb.sndWnd == 65535, "a zero window must be reopenable by a duplicate ACK")
 }
 
 @Test func aSynToAClosedPortIsRefusedWithARstCarryingAnAck() {

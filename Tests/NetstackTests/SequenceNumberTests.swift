@@ -47,6 +47,73 @@ import Testing
     #expect(!SequenceNumber.halfSpaceOrdering())
 }
 
+@Test func theRangePredicatesRejectTheUndefinedPointThatNegatedOrderingAdmits() {
+    // The whole reason these predicates exist. `!a.lessThan(b)` answers
+    // `true` at exactly 2^31 apart, because `lessThan` answers `false`
+    // there -- so a guard written as a negated ordering admits precisely the
+    // value whose ordering is undefined, which is precisely the value a peer
+    // holding one of our sequence numbers can compute. These are built on
+    // `-`, which is total and yields a negative distance there, so the same
+    // value is rejected with no special case.
+    let low = SequenceNumber(100)
+    let high = SequenceNumber(200)
+    let halfSpace = SequenceNumber(100 &+ 0x8000_0000)
+    #expect(!halfSpace.isInRange(after: low, throughAndIncluding: high))
+    #expect(!halfSpace.isInRange(from: low, throughAndIncluding: high))
+    #expect(!halfSpace.isAtOrAfter(low))
+    // ...and in the other direction too: `-` saturates to Int32.min from
+    // both sides, so neither is "at or after" the other.
+    #expect(!low.isAtOrAfter(halfSpace))
+    // The negated ordering these replace would have said yes to all four.
+    #expect(!low.lessThan(halfSpace) && !halfSpace.lessThan(low))
+}
+
+@Test func theRangePredicatesAgreeWithTheirWrittenBounds() {
+    let low = SequenceNumber(100)
+    let high = SequenceNumber(200)
+    #expect(!SequenceNumber(99).isInRange(after: low, throughAndIncluding: high))
+    #expect(!SequenceNumber(100).isInRange(after: low, throughAndIncluding: high), "the low bound is exclusive here")
+    #expect(SequenceNumber(101).isInRange(after: low, throughAndIncluding: high))
+    #expect(SequenceNumber(200).isInRange(after: low, throughAndIncluding: high), "the high bound is inclusive")
+    #expect(!SequenceNumber(201).isInRange(after: low, throughAndIncluding: high))
+
+    #expect(!SequenceNumber(99).isInRange(from: low, throughAndIncluding: high))
+    #expect(SequenceNumber(100).isInRange(from: low, throughAndIncluding: high), "the low bound is inclusive here")
+    #expect(SequenceNumber(200).isInRange(from: low, throughAndIncluding: high))
+    #expect(!SequenceNumber(201).isInRange(from: low, throughAndIncluding: high))
+
+    #expect(SequenceNumber(100).isAtOrAfter(low))
+    #expect(SequenceNumber(101).isAtOrAfter(low))
+    #expect(!SequenceNumber(99).isAtOrAfter(low))
+}
+
+@Test func theRangePredicatesWorkAcrossTheWrap() {
+    let low = SequenceNumber(0xFFFF_FFC0)   // 64 below the wrap
+    let high = SequenceNumber(0x0000_0040)  // 64 above it
+    #expect(SequenceNumber(0xFFFF_FFFF).isInRange(after: low, throughAndIncluding: high))
+    #expect(SequenceNumber(0x0000_0000).isInRange(after: low, throughAndIncluding: high))
+    #expect(SequenceNumber(0x0000_0040).isInRange(after: low, throughAndIncluding: high))
+    #expect(!SequenceNumber(0x0000_0041).isInRange(after: low, throughAndIncluding: high))
+    #expect(!SequenceNumber(0xFFFF_FFBF).isInRange(after: low, throughAndIncluding: high))
+    #expect(SequenceNumber(0x0000_0000).isAtOrAfter(low))
+    #expect(!low.isAtOrAfter(SequenceNumber(0x0000_0000)))
+}
+
+@Test func anInvertedRangeContainsNothingRatherThanEverything() {
+    // A range whose high bound precedes its low bound is self-contradictory:
+    // no correct caller builds one, but an upstream bug that advanced one
+    // TCB variable without the other would. It must fail closed -- admitting
+    // there would convert one bug into an accept-anything hole exactly when
+    // the state is already known to be corrupt. The negated-ordering shape
+    // these replace did admit a band of values in this case.
+    let low = SequenceNumber(200)
+    let high = SequenceNumber(100)
+    #expect(!SequenceNumber(150).isInRange(after: low, throughAndIncluding: high))
+    #expect(!SequenceNumber(150).isInRange(from: low, throughAndIncluding: high))
+    #expect(!SequenceNumber(200).isInRange(from: low, throughAndIncluding: high), "not even the low bound itself")
+    #expect(!SequenceNumber(100 &+ 0x8000_0000).isInRange(after: low, throughAndIncluding: high))
+}
+
 @Test func addsAndSubtractsAcrossTheWrap() {
     #expect((SequenceNumber(0xFFFF_FFFF) + 1).value == 0)
     #expect((SequenceNumber(0xFFFF_FF00) + 512).value == 0x100)

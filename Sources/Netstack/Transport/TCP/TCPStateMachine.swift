@@ -121,11 +121,17 @@ public struct TCPStateMachine {
         // First check the ACK bit: acceptable iff ISS < SEG.ACK =< SND.NXT
         // (nothing beyond the not-yet-acked SYN could possibly be ACKed
         // from here).
+        //
+        // A forward-distance range test, never a negated `lessThan` -- see
+        // the acceptance-test section of `SequenceNumber`. This site used to
+        // spell the negation structurally rather than with a `!` operator:
+        // it computed `ackTooOld`/`ackTooNew` from positive `lessThan`s and
+        // accepted when neither held, which is the same `!lessThan` accept
+        // guard wearing a disguise, with the same hole and invisible to a
+        // grep for `!`. Worth remembering when auditing for the next one.
         if header.flags.contains(.ack) {
             let ack = header.acknowledgement
-            let ackTooOld = ack.lessThan(tcb.iss) || ack == tcb.iss
-            let ackTooNew = tcb.sndNxt.lessThan(ack)
-            if ackTooOld || ackTooNew {
+            guard ack.isInRange(after: tcb.iss, throughAndIncluding: tcb.sndNxt) else {
                 if header.flags.contains(.rst) {
                     return [.none]
                 }
@@ -253,7 +259,9 @@ public struct TCPStateMachine {
         switch tcb.state {
         case .synReceived:
             // SND.UNA < SEG.ACK =< SND.NXT: our SYN|ACK is acknowledged.
-            if tcb.sndUna.lessThan(header.acknowledgement) && !tcb.sndNxt.lessThan(header.acknowledgement) {
+            // A forward-distance range test, never a negated `lessThan` --
+            // see the acceptance-test section of `SequenceNumber`.
+            if header.acknowledgement.isInRange(after: tcb.sndUna, throughAndIncluding: tcb.sndNxt) {
                 tcb.sndUna = header.acknowledgement
                 tcb.state = .established
             } else if header.acknowledgement.lessThan(tcb.sndUna) {
@@ -263,19 +271,33 @@ public struct TCPStateMachine {
             }
 
         case .established, .finWait1, .finWait2, .closeWait, .closing, .lastAck, .timeWait:
-            // An ACK beyond SND.NXT acknowledges data that was never sent;
-            // honouring it would advance SND.UNA past unsent data. Reject
-            // it (ACK, drop) rather than accept it.
-            if header.acknowledgement.lessThan(tcb.sndUna) {
-                break  // duplicate ACK of already-acknowledged data; ignore.
-            }
-            guard !tcb.sndNxt.lessThan(header.acknowledgement) else {
+            // SND.UNA =< SEG.ACK =< SND.NXT is the acceptable-ACK window
+            // (RFC 9293 §3.10.7.4). SEG.ACK == SND.UNA is inside it on
+            // purpose: it advances nothing, but it still carries a window
+            // update, which is how a sender escapes a zero window.
+            //
+            // A forward-distance range test, never a negated `lessThan`
+            // (see the acceptance-test section of `SequenceNumber`). The
+            // pair of negated bounds this replaces admitted SND.UNA + 2^31
+            // whenever nothing was in flight -- the ordinary state of an
+            // idle connection -- letting a guest drag SND.UNA half the
+            // sequence space forward, past data never sent, which is exactly
+            // what the bound below the guard exists to prevent.
+            guard header.acknowledgement.isInRange(from: tcb.sndUna, throughAndIncluding: tcb.sndNxt) else {
+                // Outside it in one of two directions. Behind SND.UNA it is
+                // a duplicate ACK of data already acknowledged: ignore it
+                // and carry on to steps 5-6, which may still have work to
+                // do. Ahead of SND.NXT it acknowledges data that was never
+                // sent: ACK (so the peer can resynchronize) and drop.
+                if header.acknowledgement.lessThan(tcb.sndUna) {
+                    break
+                }
                 return [.sendAck]
             }
 
             tcb.sndUna = header.acknowledgement
             if tcb.sndWl1.lessThan(header.sequence)
-                || (tcb.sndWl1 == header.sequence && !header.acknowledgement.lessThan(tcb.sndWl2)) {
+                || (tcb.sndWl1 == header.sequence && header.acknowledgement.isAtOrAfter(tcb.sndWl2)) {
                 tcb.sndWnd = Int(header.window)
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement

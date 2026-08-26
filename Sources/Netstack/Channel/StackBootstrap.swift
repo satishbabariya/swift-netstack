@@ -63,7 +63,16 @@ public struct StackBootstrap {
 
         let initializer = self.initializer
         let bindOnLoop: @Sendable () -> EventLoopFuture<Channel> = {
+            // Enforce the confinement this method's doc comment claims,
+            // rather than only describing it. `register0`/`bind0` and the
+            // channel initializer all mutate loop-confined state with no lock
+            // behind it, and an off-loop bind produces exactly the same
+            // `Channel` as an on-loop one — so without this, deleting the
+            // marshal below changes nothing any assertion about the returned
+            // channel can see, which is precisely how it went unguarded.
+            eventLoop.preconditionInEventLoop()
             let setup = initializer?(channel) ?? eventLoop.makeSucceededVoidFuture()
+
             return setup.flatMap {
                 let promise = eventLoop.makePromise(of: Void.self)
                 channel.register0(promise: nil)

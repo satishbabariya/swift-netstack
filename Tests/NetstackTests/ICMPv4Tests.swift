@@ -87,6 +87,7 @@ private func echoRequest(identifier: UInt16, sequence: UInt16, payload: [UInt8])
     // raw wire bytes instead of round-tripping it through `parse`.
     let quotedBytes = Array(parsed.payload.readableBytesView)
     #expect(quotedBytes[0] == 0x45)  // IHL 5, options dropped
+    #expect(UInt16(quotedBytes[2]) << 8 | UInt16(quotedBytes[3]) == offending.totalLength)  // original packet's declared length
     #expect(UInt16(quotedBytes[4]) << 8 | UInt16(quotedBytes[5]) == 0x55aa)  // identification
     #expect(Array(quotedBytes[16..<20]) == IPv4Address("8.8.8.8")!.bytes)  // destination
     #expect(Array(quotedBytes[20...]) == [0, 1, 2, 3, 4, 5, 6, 7])

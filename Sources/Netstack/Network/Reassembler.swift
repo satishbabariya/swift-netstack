@@ -2,10 +2,27 @@ import NIOCore
 
 /// Reassembles IPv4 fragments into whole datagrams.
 ///
-/// Bounded on two axes, because an incomplete datagram is otherwise an
+/// Bounded on three axes, because an incomplete datagram is otherwise an
 /// unbounded allocation a peer controls: each pending datagram expires after
-/// `timeout`, and the total held across all of them is capped at
-/// `memoryLimit`, evicting oldest-first.
+/// `timeout`; the memory actually retained across all of them is capped at
+/// `memoryLimit`; and the number of concurrently pending datagrams is capped
+/// at `maximumPendingDatagrams` — independently of `memoryLimit`, because a
+/// flood of minimal fragments (as little as 1 byte each) spread across many
+/// different datagram IDs barely moves the byte total while still costing one
+/// full entry — a header, an array, and a dictionary slot — per datagram. Both
+/// caps evict oldest-first, in the order entries were created.
+///
+/// Each admitted fragment's payload is copied into freshly allocated,
+/// exactly-sized storage rather than kept as the `ByteBuffer` slice it
+/// arrived in. NIO's `getSlice` (and everything built on it, including how a
+/// fragment reaches here from `PacketBuffer`) is copy-on-write: a slice keeps
+/// a live reference to the ENTIRE original allocation until something writes
+/// into it, so an uncopied 1-byte fragment sliced from a 1500-byte MTU frame
+/// pins all 1500 bytes, not 1. `holdingBytes`/`heldBytes`/`memoryLimit` count
+/// payload length either way, but only the copy makes that count track real
+/// retained memory — without it, `memoryLimit` bounds the accounting, not the
+/// actual allocation behind it, and the two can diverge by orders of
+/// magnitude.
 ///
 /// A correctly fragmenting sender never produces two fragments that claim
 /// the same byte, so any incoming fragment whose byte range overlaps a
@@ -20,6 +37,16 @@ import NIOCore
 public final class Reassembler {
     /// RFC 791: total length is a 16-bit field.
     private static let maximumDatagram = 65535
+
+    /// A fragmenting sender's job is to keep the receiver's job small: real
+    /// IP fragmentation is rare in the first place, and a legitimate flow
+    /// through one gateway to one guest is never fragmenting more than a
+    /// handful of datagrams at once. This is generous headroom over that —
+    /// enough to absorb a burst of ordinary reordering across many flows —
+    /// while still bounding worst-case per-entry overhead (a header, an
+    /// array, and a dictionary slot each) to a small, constant amount
+    /// regardless of how minimal an attacker makes each fragment.
+    public static let defaultMaximumPendingDatagrams = 1024
 
     private struct Key: Hashable {
         let source: IPv4Address
@@ -40,16 +67,45 @@ public final class Reassembler {
     private let clock: NetstackClock
     private let timeout: TimeAmount
     private let memoryLimit: Int
+    private let maximumPendingDatagrams: Int
     private var pending: [Key: Pending] = [:]
     private var heldBytes = 0
+    /// Every live key, oldest first — the order entries were created in, not
+    /// the order they were last touched in (a fragment for an existing
+    /// datagram never moves its position). Backs both eviction caps with an
+    /// amortized O(1) "next oldest" instead of the O(n) table scan
+    /// `pending.min(by: startedAt)` used to require on every admission while
+    /// at the memory cap. `admissionOrderHead` is the index of the oldest
+    /// entry that might still be live; entries at or before it may already
+    /// be gone (completed, expired, or evicted) and are skipped lazily
+    /// rather than removed from the middle of the array.
+    private var admissionOrder: [Key] = []
+    private var admissionOrderHead = 0
 
-    public init(clock: NetstackClock, timeout: TimeAmount = .seconds(30), memoryLimit: Int = 4 * 1024 * 1024) {
+    public init(
+        clock: NetstackClock, timeout: TimeAmount = .seconds(30), memoryLimit: Int = 4 * 1024 * 1024,
+        maximumPendingDatagrams: Int = Reassembler.defaultMaximumPendingDatagrams
+    ) {
         self.clock = clock
         self.timeout = timeout
         self.memoryLimit = memoryLimit
+        self.maximumPendingDatagrams = max(1, maximumPendingDatagrams)
     }
 
     public var pendingCount: Int { pending.count }
+
+    /// Diagnostic only: the total storage capacity retained by every byte
+    /// buffer currently held across every pending fragment — as opposed to
+    /// `heldBytes` (private) and the `memoryLimit` it is checked against,
+    /// which count RFC-declared payload bytes. Before fragments were copied
+    /// into fresh, exactly-sized storage on admission, this number could be
+    /// orders of magnitude larger than the payload-byte accounting, because
+    /// an uncopied slice pins the entire frame it was carved out of.
+    public var heldStorageBytes: Int {
+        pending.values.reduce(0) { total, entry in
+            total + entry.received.reduce(0) { $0 + $1.bytes.storageCapacity }
+        }
+    }
 
     /// Feed one fragment in. Returns the whole datagram once it is complete,
     /// nil while it is still missing pieces or the fragment was rejected.
@@ -74,6 +130,7 @@ public final class Reassembler {
             protocolNumber: header.protocolNumber.rawValue
         )
 
+        let isNewEntry = pending[key] == nil
         var entry = pending[key] ?? Pending(header: header, startedAt: clock.now())
 
         // Bound the datagram as it will be ASSEMBLED, not as this fragment
@@ -96,11 +153,32 @@ public final class Reassembler {
             return nil
         }
 
-        entry.received.append((offset: offset, bytes: payload))
+        // Copy into fresh, exactly-sized storage rather than keep `payload`
+        // as received. `payload` reached here through a chain of NIO
+        // `getSlice`/`readSlice` calls (see `PacketBuffer`), which are
+        // copy-on-write: the slice shares the ENTIRE original frame's
+        // storage until something writes into it. Stored as-is, a 1-byte
+        // fragment sliced from a 1500-byte MTU frame would pin all 1500
+        // bytes for as long as this entry stays pending, not 1 — silently
+        // defeating `memoryLimit`, which only ever sees the 1-byte count.
+        var copy = ByteBufferAllocator().buffer(capacity: length)
+        copy.writeBytes(payload.readableBytesView)
+        entry.received.append((offset: offset, bytes: copy))
         entry.holdingBytes += length
         heldBytes += length
         if !header.flags.contains(.moreFragments) {
             entry.totalLength = end
+        }
+
+        if isNewEntry {
+            // A flood of minimal fragments across many different datagram
+            // IDs can hold `heldBytes` far under `memoryLimit` while still
+            // creating one entry per datagram — this cap is independent of
+            // that one for exactly that reason.
+            if pending.count >= maximumPendingDatagrams {
+                evictOldest()
+            }
+            admissionOrder.append(key)
         }
         pending[key] = entry
 
@@ -108,6 +186,7 @@ public final class Reassembler {
             return complete
         }
         enforceMemoryLimit()
+        pruneStaleOrderHead()
         return nil
     }
 
@@ -119,6 +198,7 @@ public final class Reassembler {
             heldBytes -= entry.holdingBytes
             pending.removeValue(forKey: key)
         }
+        pruneStaleOrderHead()
     }
 
     private func assemble(key: Key) -> (IPv4Header, ByteBuffer)? {
@@ -172,9 +252,40 @@ public final class Reassembler {
 
     private func enforceMemoryLimit() {
         while heldBytes > memoryLimit, !pending.isEmpty {
-            guard let oldest = pending.min(by: { $0.value.startedAt < $1.value.startedAt }) else { return }
-            heldBytes -= oldest.value.holdingBytes
-            pending.removeValue(forKey: oldest.key)
+            guard evictOldest() else { return }
         }
+    }
+
+    /// Remove every already-gone entry from the front of `admissionOrder` —
+    /// one that finished (assembled, or dropped for overrunning the
+    /// datagram bound) or expired since it was appended. Safe, and cheap, to
+    /// call whenever `pending` may have shrunk: each stale key is skipped
+    /// exactly once over the table's lifetime, so the amortized cost is
+    /// O(1) per fragment processed, not O(pendingCount) — unlike the table
+    /// scan (`pending.min(by: startedAt)`) this replaces.
+    private func pruneStaleOrderHead() {
+        while admissionOrderHead < admissionOrder.count, pending[admissionOrder[admissionOrderHead]] == nil {
+            admissionOrderHead += 1
+        }
+        // Once at least half of `admissionOrder` is a consumed stale prefix,
+        // drop it, so the array does not grow without bound purely from
+        // entries that left `pending` some other way than through here.
+        if admissionOrderHead > 64, admissionOrderHead * 2 > admissionOrder.count {
+            admissionOrder.removeFirst(admissionOrderHead)
+            admissionOrderHead = 0
+        }
+    }
+
+    /// Evict the single oldest still-pending entry, if any. Backs both
+    /// `maximumPendingDatagrams` and `memoryLimit`.
+    @discardableResult
+    private func evictOldest() -> Bool {
+        pruneStaleOrderHead()
+        guard admissionOrderHead < admissionOrder.count else { return false }
+        let key = admissionOrder[admissionOrderHead]
+        admissionOrderHead += 1
+        guard let entry = pending.removeValue(forKey: key) else { return false }
+        heldBytes -= entry.holdingBytes
+        return true
     }
 }

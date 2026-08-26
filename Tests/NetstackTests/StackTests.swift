@@ -208,6 +208,44 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     #expect(weakLink == nil)
 }
 
+@Test func arpResponderOutlivesTheStackItCameFrom() {
+    // `stack.arpResponder` is public, so nothing stops a caller from
+    // holding it past the `Stack` — and therefore the `NIC` — it came from
+    // going away. Before the retain-cycle fix elsewhere in this package,
+    // that scenario was unreachable in practice: nothing in this graph
+    // ever actually deallocated, so a dangling reference here never came
+    // up. Now that dropping a `Stack` really does deallocate its `NIC`,
+    // `ARPResponder.nic` being `unowned` (mirroring `IPv4Protocol.nic`,
+    // which is safe only because `RouteTable` backstops it) was a
+    // reachable dangling reference with no such backstop of its own —
+    // `request`/`handle` would trap.
+    weak var weakStack: Stack?
+    weak var weakNIC: NIC?
+
+    func makeOrphanedResponder() -> ARPResponder {
+        let (stack, _, _) = makeStack()
+        weakStack = stack
+        weakNIC = stack.nic
+        return stack.arpResponder
+        // `stack` — and, with it, `nic`, `routes`, and `ipv4` — becomes
+        // unreachable here except through the `ARPResponder` returned.
+    }
+
+    let responder = makeOrphanedResponder()
+
+    // The `Stack` itself is gone...
+    #expect(weakStack == nil)
+    // ...but the `NIC` is deliberately NOT: `ARPResponder.nic` is now a
+    // strong reference, so holding `responder` keeps `nic` alive on its
+    // own, independent of `Stack`. This is what closes the dangle — under
+    // the old `unowned` field, `weakNIC` would be nil here too, and the
+    // `request` call below would trap.
+    #expect(weakNIC != nil)
+
+    // Must not trap.
+    responder.request(IPv4Address("192.168.127.99")!, from: IPv4Address("192.168.127.1")!)
+}
+
 @Test func shutdownStopsMaintenance() {
     // `.wait()` cannot be used here: RepeatedTask.cancel schedules its
     // promise onto the loop, and an EmbeddedEventLoop only advances when

@@ -102,8 +102,16 @@ public final class Stack {
 
     /// Wire the protocol handlers to the NIC and start the maintenance timer.
     public func start() {
-        nic.setHandler(for: .arp) { [arpResponder] packet, ethernet in
-            arpResponder.handle(packet, ethernet)
+        // `[weak arpResponder]`, not `[arpResponder]`: `ARPResponder` now
+        // holds `nic` strongly (see its own doc comment), so a strong
+        // capture here would close NIC -> handlers -> closure ->
+        // ARPResponder -> NIC, a self-contained retain cycle independent of
+        // anything else in this graph. `arpResponder` is kept alive for as
+        // long as this `Stack` is by the `public let arpResponder` field
+        // regardless, so `weak` costs nothing here and matches the `[weak
+        // ipv4]` pattern just below for the same reason.
+        nic.setHandler(for: .arp) { [weak arpResponder] packet, ethernet in
+            arpResponder?.handle(packet, ethernet)
         }
         // `[weak ipv4]`, not `[ipv4]`: `nic.handlers` would otherwise hold a
         // strong closure back to `ipv4`, which holds `routes` strongly,

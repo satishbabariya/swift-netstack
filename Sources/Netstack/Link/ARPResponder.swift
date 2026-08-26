@@ -3,12 +3,21 @@ import NIOCore
 /// Answers ARP requests for addresses this NIC owns, and learns bindings from
 /// everything it sees.
 public final class ARPResponder {
-    // `unowned`, not `let`. Stack owns the NIC, the responder, and the protocol
-    // handlers; the NIC holds handler closures that capture this type, so a
-    // strong reference back to the NIC closes a retain cycle when Stack wires
-    // them together. This can never outlive the NIC that Stack owns alongside
-    // it, so unowned is safe and encodes that invariant.
-    private unowned let nic: NIC
+    // Strong, unlike `IPv4Protocol.nic`. That similarity is only skin deep:
+    // `IPv4Protocol` is backstopped even though its own field is `unowned`
+    // — `ipv4 -> routes -> nics -> nic` keeps the NIC alive regardless — so
+    // its `unowned` never actually risks dangling. `ARPResponder` had no
+    // such backstop: `stack.arpResponder` is public, so `let r =
+    // stack.arpResponder` outliving `stack` was a reachable, un-backstopped
+    // dangling `unowned` — trapping on the next `handle` or `request` once
+    // the retain-cycle fix elsewhere in this package started actually
+    // deallocating things that used to leak forever. A strong reference
+    // here is safe from creating a NEW cycle only because `Stack.start()`
+    // captures `self` (`arpResponder`) WEAKLY in the NIC's `.arp` handler
+    // closure — see the comment there. Without that, `nic.handlers ->
+    // closure -> ARPResponder -> nic` would be a self-contained cycle
+    // neither Stack nor anything else in this graph sits outside of.
+    private let nic: NIC
     private let cache: ARPCache
     private let allocator: ByteBufferAllocator
 

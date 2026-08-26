@@ -20,6 +20,16 @@ public struct ResolvedRoute {
     /// otherwise the gateway.
     public let nextHop: IPv4Address
     public let isLocal: Bool
+    /// Whether `source` is the `preferredSource` that was actually asked
+    /// for. `false` means `lookup` fell back to the NIC's primary address
+    /// because the caller asked for one it neither owns nor is allowed to
+    /// spoof — a real request that could not be honoured, not the absence
+    /// of a preference. A caller that cares which one happened (`send` does:
+    /// answering from the wrong address is worse than not answering at all)
+    /// must check this rather than infer it from `source` alone, since a
+    /// fallback that happens to equal the primary address is otherwise
+    /// indistinguishable from a caller that never asked for anything else.
+    public let sourceWasHonoured: Bool
 }
 
 /// Longest-prefix route lookup with spoof-aware source selection.
@@ -65,10 +75,13 @@ public final class RouteTable {
             guard route.destination.contains(destination), let nic = nics[route.nicID] else { continue }
 
             let source: IPv4Address
+            let sourceWasHonoured: Bool
             if let preferred = preferredSource, nic.hasAddress(preferred) || nic.allowsAnySource {
                 source = preferred
+                sourceWasHonoured = true
             } else if let primary = nic.primaryAddress {
                 source = primary
+                sourceWasHonoured = preferredSource == nil
             } else {
                 continue
             }
@@ -77,7 +90,8 @@ public final class RouteTable {
                 nic: nic,
                 source: source,
                 nextHop: route.gateway ?? destination,
-                isLocal: route.gateway == nil
+                isLocal: route.gateway == nil,
+                sourceWasHonoured: sourceWasHonoured
             )
         }
         return nil

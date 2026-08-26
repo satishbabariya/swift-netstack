@@ -22,6 +22,8 @@ private func makeNIC(spoofing: Bool) -> NIC {
     #expect(route?.source == IPv4Address("192.168.127.1"))
     #expect(route?.nextHop == IPv4Address("192.168.127.2"))
     #expect(route?.isLocal == true)
+    // No source was requested, so there is nothing to have refused.
+    #expect(route?.sourceWasHonoured == true)
 }
 
 @Test func prefersTheLongestMatchingPrefix() {
@@ -57,6 +59,7 @@ private func makeNIC(spoofing: Bool) -> NIC {
     // Answering the guest as though we were a host on the internet.
     let route = table.lookup(destination: IPv4Address("192.168.127.2")!, preferredSource: IPv4Address("93.184.216.34"))
     #expect(route?.source == IPv4Address("93.184.216.34"))
+    #expect(route?.sourceWasHonoured == true)
 }
 
 @Test func withoutSpoofingAnUnownedSourceIsIgnored() {
@@ -67,6 +70,11 @@ private func makeNIC(spoofing: Bool) -> NIC {
 
     let route = table.lookup(destination: IPv4Address("192.168.127.2")!, preferredSource: IPv4Address("93.184.216.34"))
     #expect(route?.source == IPv4Address("192.168.127.1"))
+    // A real preference was requested and could not be granted — a caller
+    // that cares (`IPv4Protocol.send` does) must be able to tell this apart
+    // from "no preference was expressed", even though `source` alone looks
+    // identical to that case.
+    #expect(route?.sourceWasHonoured == false)
 }
 
 @Test func anOwnedPreferredSourceIsAlwaysHonoured() {
@@ -78,6 +86,7 @@ private func makeNIC(spoofing: Bool) -> NIC {
 
     let route = table.lookup(destination: IPv4Address("192.168.127.2")!, preferredSource: IPv4Address("192.168.127.5"))
     #expect(route?.source == IPv4Address("192.168.127.5"))
+    #expect(route?.sourceWasHonoured == true)
 }
 
 @Test func aRouteToAnUnregisteredNICResolvesToNothing() {

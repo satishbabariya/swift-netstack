@@ -152,6 +152,51 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
     #expect(IPv4Header.parse(&packet)?.source == IPv4Address("93.184.216.34"))
 }
 
+@Test func sendThrowsRatherThanSubstitutingARefusedSource() throws {
+    // Without spoofing, a `from:` address the NIC does not own cannot be
+    // honoured. `RouteTable.lookup` still resolves the route — the
+    // destination itself is perfectly reachable — but `send` must refuse to
+    // transmit from the wrong address rather than silently answering as the
+    // NIC's own primary address instead.
+    let f = makeFixture(spoofing: false)
+    #expect(throws: StackError.noRoute) {
+        try f.ip.send(
+            payload: ByteBuffer(bytes: [0x01]),
+            to: IPv4Address("192.168.127.2")!,
+            from: IPv4Address("93.184.216.34"),
+            protocolNumber: .tcp)
+    }
+    #expect(f.link.drainTransmitted().isEmpty)
+}
+
+@Test func promiscuousWithoutSpoofingDoesNotAnswerAnEchoToAForeignAddressFromTheWrongSource() {
+    // The real scenario the fix targets: promiscuous ON (the gateway
+    // accepts frames addressed to hosts it does not own, so it can
+    // terminate a guest's connection to an arbitrary destination) but
+    // spoofing OFF (it may not transmit FROM an address it does not own).
+    // An echo request arrives addressed to a foreign IP that is not the
+    // NIC's own. Before this fix, `handleICMP`'s `try? send(... from:
+    // header.destination ...)` silently substituted the NIC's own primary
+    // address as the reply's source instead of the address that was
+    // actually pinged — answering from the WRONG source. It must now not
+    // answer at all.
+    let f = makeFixture(promiscuous: true, spoofing: false)
+    var echo = ByteBuffer()
+    echo.writeInteger(UInt8(8))
+    echo.writeInteger(UInt8(0))
+    echo.writeInteger(UInt16(0), endianness: .big)
+    echo.writeInteger(UInt16(0xabcd), endianness: .big)
+    echo.writeInteger(UInt16(1), endianness: .big)
+    echo.writeBytes([0xde, 0xad])
+    let checksum = echo.withUnsafeReadableBytes { Checksum.compute($0) }
+    echo.setInteger(checksum, at: 2, endianness: .big)
+
+    // 203.0.113.9 is not an address this NIC owns.
+    f.link.inject(ipFrame(to: "203.0.113.9", protocolNumber: 1, payload: Array(echo.readableBytesView)))
+
+    #expect(f.link.drainTransmitted().isEmpty)
+}
+
 @Test func sendFragmentsAnOversizedPayload() throws {
     let f = makeFixture()
     try f.ip.send(

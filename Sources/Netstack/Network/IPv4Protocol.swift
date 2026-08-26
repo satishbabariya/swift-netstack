@@ -115,17 +115,23 @@ public final class IPv4Protocol {
 
     // MARK: Egress
 
-    /// Transmit a payload. Throws `.noRoute` when there is no route, or when
-    /// the next hop's link address is not yet known — in the latter case an
-    /// ARP request goes out, so a retry shortly after will succeed. Throws
-    /// `.messageTooLong` when `payload` cannot fit in a single IPv4 datagram
-    /// at all, regardless of fragmentation.
+    /// Transmit a payload. Throws `.noRoute` when there is no route, when the
+    /// next hop's link address is not yet known — in the latter case an ARP
+    /// request goes out, so a retry shortly after will succeed — or when
+    /// `source` was given and the route could not send from it (the NIC
+    /// neither owns that address nor is allowed to spoof it). That last case
+    /// matters: silently substituting the NIC's own address there would
+    /// answer from the WRONG source rather than not answer at all, which for
+    /// something like a promiscuous-but-not-spoofing echo reply is worse
+    /// than a dropped packet. Throws `.messageTooLong` when `payload` cannot
+    /// fit in a single IPv4 datagram at all, regardless of fragmentation.
     public func send(payload: ByteBuffer, to destination: IPv4Address, from source: IPv4Address?, protocolNumber: IPProtocol) throws {
         guard payload.readableBytes <= Self.maximumPayload else { throw StackError.messageTooLong }
 
         guard let route = routes.lookup(destination: destination, preferredSource: source) else {
             throw StackError.noRoute
         }
+        guard route.sourceWasHonoured else { throw StackError.noRoute }
         guard let nextHopMAC = arpCache.lookup(route.nextHop) else {
             arpResponder.request(route.nextHop, from: route.source)
             throw StackError.noRoute

@@ -35,14 +35,22 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// would report `true` in both directions, which breaks asymmetry and
     /// can cycle a `sort()`. This deliberately uses `halfSpaceOrdering()`
     /// instead — `false` in both directions, neither precedes the other —
-    /// which is defined and non-contradictory. Two live sequence numbers
-    /// landing exactly 2^31 apart means something has already gone wrong
-    /// upstream; the `assertionFailure` surfaces that during development
-    /// without trapping a release build that is meant to stay up.
+    /// which is defined, asymmetric and safe for a sort.
+    ///
+    /// The half-space case is **not** a symptom of an internal bug, and must
+    /// never trap. Every operand this stack compares against a TCB value is a
+    /// sequence or acknowledgement number lifted straight off the wire, and
+    /// we echo our own ISS to the peer in the SYN-ACK — so a hostile peer can
+    /// compute `iss + 2^31` and send it back on any connection it likes, at
+    /// will, on the first try. An `assertionFailure` here would therefore be
+    /// asserting on *peer behaviour*, which is a category error: it hands any
+    /// guest a one-segment abort of the stack that is supposed to sandbox it.
+    /// RFC 1982 leaves this point undefined precisely because the number is
+    /// chosen remotely; the only correct response is to define an answer and
+    /// return it.
     public func lessThan(_ other: SequenceNumber) -> Bool {
         let diff = value &- other.value
         if diff == 0x8000_0000 {
-            assertionFailure("SequenceNumber \(value) and \(other.value) are exactly 2^31 apart; ordering between them is undefined")
             return SequenceNumber.halfSpaceOrdering()
         }
         return Int32(bitPattern: diff) < 0
@@ -54,12 +62,11 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// both directions (the literal translation of the bit-pattern trick in
     /// `lessThan`) would break asymmetry and let a `sort()` cycle.
     ///
-    /// Separated from `lessThan` deliberately so the *decision* is testable
-    /// in any build configuration. `assertionFailure` aborts a debug build
-    /// the instant it is reached, so a test calling `lessThan` directly can
-    /// never observe what it returns afterward — only this helper, which
-    /// contains no assert, can be checked directly by a test regardless of
-    /// build configuration.
+    /// Kept as a named function rather than a bare `return false` so the
+    /// *decision* has somewhere to be documented and somewhere to be tested
+    /// on its own — flipping it to `true` would silently restore the
+    /// asymmetry bug, and `theHalfSpaceOrderingHelperReturnsFalse` exists to
+    /// catch exactly that edit.
     static func halfSpaceOrdering() -> Bool { false }
 
     /// Half-open: `[start, start + size)`. A zero size contains nothing.

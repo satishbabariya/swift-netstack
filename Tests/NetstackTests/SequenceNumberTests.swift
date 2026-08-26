@@ -15,47 +15,35 @@ import Testing
     // lessThan — it does not test SequenceNumber's behavior.
 }
 
-@Test func exactlyHalfTheSpaceApartNeitherPrecedes() async {
+@Test func neitherValuePrecedesTheOtherAtExactlyHalfTheSpace() {
     // RFC 1982 leaves ordering undefined at exactly 2^31 apart. The naive
     // translation of the bit-pattern trick would report both directions as
-    // "less than", which breaks asymmetry and can cycle a sort. The chosen
-    // behavior instead traps in debug builds (via assertionFailure) and then
-    // returns false in both directions -- neither precedes the other.
+    // "less than", which breaks asymmetry and can cycle a sort. The choice
+    // made here is `false` in both directions -- neither precedes the other.
     //
-    // assertionFailure aborts the process the instant it is reached in a
-    // debug build; control never returns to execute anything after it, so no
-    // in-process #expect can observe the eventual `false` return value
-    // without also crashing this entire test binary (confirmed empirically:
-    // a plain #expect(!a.lessThan(b)) here took down the whole suite). An
-    // exit test is the correct tool for this: it runs each call in its own
-    // subprocess and checks that the subprocess terminates abnormally, which
-    // is exactly what "surfaces during development" means and is a genuine,
-    // falsifiable regression check -- if the special case is ever removed,
-    // neither call traps and both expectations below fail. This proves the
-    // trap fires; it does not and cannot prove what the function would
-    // return once the trap is compiled out (a release build). See
-    // `theHalfSpaceOrderingHelperReturnsFalse` below for that half: it calls
-    // the assert-free decision helper directly, so it is checkable -- and
-    // falsifiable -- in any build configuration, including this one.
-    await #expect(processExitsWith: .failure) {
-        _ = SequenceNumber(0).lessThan(SequenceNumber(0x8000_0000))
-    }
-    await #expect(processExitsWith: .failure) {
-        _ = SequenceNumber(0x8000_0000).lessThan(SequenceNumber(0))
-    }
+    // This used to be an exit test asserting that lessThan *trapped* here.
+    // It must not: both operands of every comparison in TCPStateMachine come
+    // off the wire, and we hand the peer our ISS in the SYN-ACK, so a guest
+    // can pick `iss + 2^31` and hit this branch deliberately (see
+    // `aHalfSpaceAcknowledgementFromTheGuestIsHandledNotTrapped`). Calling
+    // lessThan directly here is itself part of the check: were the trap
+    // reintroduced, this test would abort the process rather than fail.
+    #expect(!SequenceNumber(0).lessThan(SequenceNumber(0x8000_0000)))
+    #expect(!SequenceNumber(0x8000_0000).lessThan(SequenceNumber(0)))
+    // And asymmetry holds either side of the boundary, so the special case
+    // is genuinely a point and not a region.
+    #expect(SequenceNumber(0).lessThan(SequenceNumber(0x7FFF_FFFF)))
+    #expect(!SequenceNumber(0x7FFF_FFFF).lessThan(SequenceNumber(0)))
+    #expect(!SequenceNumber(0).lessThan(SequenceNumber(0x8000_0001)))
+    #expect(SequenceNumber(0x8000_0001).lessThan(SequenceNumber(0)))
 }
 
 @Test func theHalfSpaceOrderingHelperReturnsFalse() {
-    // lessThan cannot be probed for its release-path return value directly:
-    // assertionFailure aborts a debug build the instant it is reached, so
-    // nothing after it is reachable in-process (see the exit test above).
-    // SequenceNumber.halfSpaceOrdering() is the assert-free decision that
-    // lessThan defers to once past the diagnostic, so it is what a future
-    // edit would actually have to change to alter the release-path outcome
-    // -- e.g. flipping this to `true` would silently restore the asymmetry
-    // bug that started this fix. Checking it directly here closes that gap:
-    // this test would catch that edit even though nothing else in the suite
-    // can.
+    // SequenceNumber.halfSpaceOrdering() is the decision that lessThan
+    // defers to at exactly 2^31 apart, so it is what a future edit would
+    // actually have to change to alter the outcome -- e.g. flipping it to
+    // `true` would silently restore the asymmetry bug that started this fix.
+    // Checking it directly here names the decision as a decision.
     #expect(!SequenceNumber.halfSpaceOrdering())
 }
 

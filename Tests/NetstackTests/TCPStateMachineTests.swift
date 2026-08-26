@@ -148,6 +148,24 @@ private func containsStartTimeWait(_ actions: [TCPAction]) -> Bool {
     actions.contains { if case .startTimeWait = $0 { return true }; return false }
 }
 
+private func containsSendFin(_ actions: [TCPAction]) -> Bool {
+    actions.contains { if case .sendFin = $0 { return true }; return false }
+}
+
+private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: Int = 100) -> TCB {
+    TCB(
+        state: .closeWait,
+        sndUna: SequenceNumber(sndUna),
+        sndNxt: SequenceNumber(sndUna),
+        sndWnd: 4096,
+        sndWl1: SequenceNumber(rcvNxt),
+        sndWl2: SequenceNumber(sndUna),
+        iss: SequenceNumber(sndUna),
+        rcvNxt: SequenceNumber(rcvNxt),
+        rcvWnd: rcvWnd,
+        irs: SequenceNumber(rcvNxt))
+}
+
 // MARK: - Happy path
 
 @Test func passiveOpenMovesListenToSynReceived() {
@@ -164,7 +182,49 @@ private func containsStartTimeWait(_ actions: [TCPAction]) -> Bool {
     let actions = TCPStateMachine.receive(segment: segment(sequence: 8001, ack: 3001, flags: [.ack]), on: &tcb)
     #expect(tcb.state == .established)
     #expect(tcb.sndUna == SequenceNumber(3001))
-    _ = actions
+    // The handshake-completing ACK carries no data and no FIN, so there is
+    // nothing left to answer: the connection is simply open. Asserting this
+    // pins down that the transition sends nothing -- a stray .sendAck here
+    // would be an unprovoked segment on every accepted connection, and a
+    // .sendRst would refuse a connection that just completed correctly.
+    #expect(actions == [.none])
+}
+
+@Test func localCloseFromSynReceivedSendsAFin() {
+    // A close() that only bumps sndNxt leaves the sender to infer "there is
+    // an unsent FIN" from state and sndNxt. Nothing else in this machine
+    // works that way, and a sender that inferred it wrongly would produce a
+    // connection that opens fine and then never closes.
+    var tcb = synReceivedTCB(iss: 3000, irs: 8000)
+    let actions = TCPStateMachine.close(on: &tcb)
+    #expect(tcb.state == .finWait1)
+    #expect(tcb.sndNxt == SequenceNumber(3002), "our FIN consumes a sequence number")
+    #expect(containsSendFin(actions))
+}
+
+@Test func localCloseFromCloseWaitSendsAFin() {
+    var tcb = closeWaitTCB(sndUna: 100)
+    let actions = TCPStateMachine.close(on: &tcb)
+    #expect(tcb.state == .lastAck)
+    #expect(tcb.sndNxt == SequenceNumber(101))
+    #expect(containsSendFin(actions))
+}
+
+@Test func aCloseInAStateThatHasAlreadyClosedSendsNoFin() {
+    // SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT are the only three states
+    // whose CLOSE queues a FIN (see the three tests around this one). A
+    // second CLOSE must not emit another one, or a half-closed connection
+    // would retransmit FINs the peer has already acknowledged. Without this,
+    // "returns .sendFin" could be satisfied by returning it unconditionally.
+    var finWait1 = finWait1TCB(sndUna: 100)
+    #expect(!containsSendFin(TCPStateMachine.close(on: &finWait1)))
+    var timeWait = establishedTCB(sndUna: 100)
+    timeWait.state = .timeWait
+    #expect(!containsSendFin(TCPStateMachine.close(on: &timeWait)))
+    var listening = listenTCB()
+    let listenActions = TCPStateMachine.close(on: &listening)
+    #expect(!containsSendFin(listenActions))
+    #expect(containsDeleteTCB(listenActions), "closing a LISTEN just discards the block")
 }
 
 @Test func activeOpenMovesSynSentToEstablished() {
@@ -184,9 +244,10 @@ private func containsStartTimeWait(_ actions: [TCPAction]) -> Bool {
 
 @Test func localCloseMovesEstablishedToFinWait1() {
     var tcb = establishedTCB(sndNxt: 500)
-    _ = TCPStateMachine.close(on: &tcb)
+    let actions = TCPStateMachine.close(on: &tcb)
     #expect(tcb.state == .finWait1)
     #expect(tcb.sndNxt == SequenceNumber(501), "our FIN consumes a sequence number")
+    #expect(containsSendFin(actions))
 }
 
 @Test func peerCloseMovesEstablishedToCloseWait() {
@@ -287,6 +348,58 @@ private func containsStartTimeWait(_ actions: [TCPAction]) -> Bool {
     var tcb = establishedTCB(sndUna: 100, sndNxt: 200)
     _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 5000, flags: [.ack]), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(100))
+}
+
+@Test func aSynToAClosedPortIsRefusedWithARstCarryingAnAck() {
+    // RFC 9293 §3.10.7.1: a segment arriving in CLOSED with the ACK bit off
+    // must be answered with <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>. The
+    // ACK bit and its value are load-bearing, not decoration: the peer has
+    // no other way to validate a reset carrying sequence zero, so a RST with
+    // the ACK bit clear -- or with an off-by-one acknowledgement -- is one
+    // the peer is required to discard, and a guest blocked in connect() then
+    // sees a hang where it should see "connection refused". Task 15's vector
+    // suite codifies this exact exchange as `0.100 > R. 0:0(0) ack 1`.
+    var tcb = establishedTCB()
+    tcb.state = .closed
+    let actions = TCPStateMachine.receive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
+    // SEG.LEN counts the SYN, so a bare SYN at 5000 is acknowledged with 5001.
+    #expect(actions == [.sendRst(sequence: SequenceNumber(0), ack: SequenceNumber(5001))])
+
+    // A bare SYN is the case that matters, but SEG.LEN is payload + SYN +
+    // FIN, and getting the payload term wrong is the same class of bug.
+    var withData = tcb
+    let dataActions = TCPStateMachine.receive(segment: segment(sequence: 5000, flags: [.syn], payload: 7), on: &withData)
+    #expect(dataActions == [.sendRst(sequence: SequenceNumber(0), ack: SequenceNumber(5008))])
+
+    // The ACK-on case is the other RFC form -- <SEQ=SEG.ACK><CTL=RST>, ACK
+    // bit clear -- and must NOT gain an acknowledgement. Without this, "the
+    // action can carry an ack" could be satisfied by always setting one.
+    var acked = tcb
+    let ackedActions = TCPStateMachine.receive(segment: segment(sequence: 5000, ack: 77, flags: [.ack]), on: &acked)
+    #expect(ackedActions == [.sendRst(sequence: SequenceNumber(77), ack: nil)])
+}
+
+@Test func aHalfSpaceAcknowledgementFromTheGuestIsHandledNotTrapped() {
+    // Every lessThan in TCPStateMachine compares an attacker-controlled wire
+    // field against a TCB value, and we hand the peer our ISS in the
+    // SYN-ACK. So a guest can compute iss + 2^31 and send it back as its
+    // ACK, landing both operands exactly half the sequence space apart --
+    // the one point RFC 1982 leaves undefined -- on any connection it
+    // chooses, first try. That path must be *handled*: an assert there is an
+    // assert on peer behaviour, and in a debug build (which is what `swift
+    // test` and most CI runs are) it hands a sandboxed guest a one-segment
+    // abort of the stack that sandboxes it.
+    //
+    // Random fuzzing would never find this: one exact value out of 2^32 is
+    // not reachable by chance.
+    var tcb = synReceivedTCB(iss: 3000, irs: 8000)
+    let hostile = SequenceNumber(3000 &+ 0x8000_0000)  // iss + 2^31, wrapping
+    let actions = TCPStateMachine.receive(segment: segment(sequence: 8001, ack: hostile.value, flags: [.ack]), on: &tcb)
+    // Reaching this line at all is most of the point -- a trap would have
+    // taken the process down before it.
+    #expect(tcb.sndUna == SequenceNumber(3000), "a half-space ACK must not retire our SYN")
+    #expect(tcb.state == .synReceived, "nor complete the handshake")
+    #expect(actions == [.sendRst(sequence: hostile, ack: nil)], "it is an unacceptable ACK, so it is reset")
 }
 
 @Test func ecnBitsOnASynAreTreatedAsAPlainSyn() {

@@ -32,8 +32,31 @@ public enum TCPAction: Equatable, Sendable {
     /// Covers both an ordinary "data received" ACK and an RFC 5961
     /// challenge ACK -- both are, on the wire, the same segment shape.
     case sendAck
-    /// Send a RST at the given sequence number.
-    case sendRst(sequence: SequenceNumber)
+    /// Send a RST at the given sequence number, optionally with the ACK bit
+    /// set and acknowledging `ack`.
+    ///
+    /// RFC 9293 §3.10.7.1 specifies two distinct refusal segments, and the
+    /// difference is on the wire, not cosmetic. When the offending segment
+    /// carried an ACK, the reset is `<SEQ=SEG.ACK><CTL=RST>` -- the ACK bit
+    /// is *clear*, because SEG.ACK already tells us the sequence number the
+    /// peer is expecting. When it did not, there is no such number to reuse,
+    /// so the reset is `<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>`: sequence
+    /// zero, and the ACK bit set so the peer can validate it against what it
+    /// actually sent. `ack` is `nil` for the first form and carries
+    /// `SEG.SEQ + SEG.LEN` for the second; a peer that receives the second
+    /// form with the ACK bit clear, or with the wrong acknowledgement, is
+    /// required to discard it -- which a guest waiting on `connect()`
+    /// experiences as a hang rather than "connection refused".
+    case sendRst(sequence: SequenceNumber, ack: SequenceNumber?)
+    /// Send a FIN (with the ACK bit set, as every segment past the handshake
+    /// carries) built from the TCB's current `sndNxt`/`rcvNxt`.
+    ///
+    /// `close(on:)` already bumps `sndNxt` to reserve the sequence number the
+    /// FIN consumes, so the FIN occupies `sndNxt - 1`. Returning this action
+    /// rather than leaving the sender to infer "there is an unsent FIN" from
+    /// `state` and `sndNxt` keeps the send decision where every other one in
+    /// this machine lives: in the returned action list.
+    case sendFin
     /// Deliver received, in-order data to the application.
     case deliver(ByteBuffer)
     /// Arm (or re-arm) the 2*MSL TIME-WAIT timer.

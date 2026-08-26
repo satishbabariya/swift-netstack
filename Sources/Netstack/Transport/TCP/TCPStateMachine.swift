@@ -68,9 +68,15 @@ public struct TCPStateMachine {
             return [.none]
         }
         if header.flags.contains(.ack) {
-            return [.sendRst(sequence: header.acknowledgement)]
+            // <SEQ=SEG.ACK><CTL=RST>, ACK bit clear.
+            return [.sendRst(sequence: header.acknowledgement, ack: nil)]
         }
-        return [.sendRst(sequence: SequenceNumber(0))]
+        // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>. SEG.LEN counts the SYN
+        // and FIN flags as well as the payload (see `TCPSegment.length`), so
+        // a bare SYN at sequence N is acknowledged with N+1 -- acknowledging
+        // N instead would be a refusal the peer discards, which the guest
+        // cannot tell apart from the port simply not answering.
+        return [.sendRst(sequence: SequenceNumber(0), ack: header.sequence + segment.length)]
     }
 
     // MARK: - LISTEN (RFC 9293 §3.10.7.2)
@@ -86,7 +92,7 @@ public struct TCPStateMachine {
         // Second check for an ACK: nothing has been sent, so any ACK here
         // is bogus. Reset it.
         if header.flags.contains(.ack) {
-            return [.sendRst(sequence: header.acknowledgement)]
+            return [.sendRst(sequence: header.acknowledgement, ack: nil)]
         }
 
         // Third check for a SYN: this is a passive open. Security/
@@ -123,7 +129,7 @@ public struct TCPStateMachine {
                 if header.flags.contains(.rst) {
                     return [.none]
                 }
-                return [.sendRst(sequence: ack)]
+                return [.sendRst(sequence: ack, ack: nil)]
             }
             ackAcceptable = true
         }
@@ -194,6 +200,20 @@ public struct TCPStateMachine {
         // reset; one that is merely somewhere in the window gets an RFC
         // 5961 challenge ACK instead, and one that is outside the window
         // entirely is silently discarded.
+        //
+        // An in-window RST deletes the TCB in every state handled here,
+        // SYN-RECEIVED included. RFC 9293 §3.10.7.4 distinguishes a
+        // SYN-RECEIVED reached by passive open (return to LISTEN) from one
+        // reached by an active or simultaneous open (delete), and this
+        // deliberately does not: the distinction presupposes a long-lived
+        // LISTEN TCB that a connection can fall back into. This stack
+        // follows gVisor's forwarder model -- one TCB per accepted
+        // connection, created on demand when a SYN arrives -- so there is no
+        // shared LISTEN TCB to return to, and "return to LISTEN" and "delete
+        // the TCB" name the same outcome: this connection's block goes away
+        // and the next SYN creates a fresh one. `TCB` therefore records no
+        // open-provenance flag, and needs none. This is a settled ruling,
+        // not an oversight.
         if header.flags.contains(.rst) {
             guard isInReceiveWindow(header.sequence, tcb: tcb) else {
                 return [.none]
@@ -239,7 +259,7 @@ public struct TCPStateMachine {
             } else if header.acknowledgement.lessThan(tcb.sndUna) {
                 break  // old duplicate ACK of the SYN itself; ignore, continue to steps 5-6.
             } else {
-                return [.sendRst(sequence: header.acknowledgement)]
+                return [.sendRst(sequence: header.acknowledgement, ack: nil)]
             }
 
         case .established, .finWait1, .finWait2, .closeWait, .closing, .lastAck, .timeWait:
@@ -382,6 +402,13 @@ extension TCPStateMachine {
     /// (established -> finWait1)" is one of the transitions the brief
     /// explicitly asks to be covered, and nothing reachable through
     /// `receive` can produce it.
+    ///
+    /// The three transitions that queue a FIN return `.sendFin` explicitly.
+    /// Bumping `sndNxt` to reserve the FIN's sequence number is not on its
+    /// own a signal to send anything: leaving the sender to infer "there is
+    /// an unsent FIN" from `state` and `sndNxt` would be an unwritten
+    /// contract between two files, and a sender that got it subtly wrong
+    /// would produce connections that open correctly and then never close.
     public static func close(on tcb: inout TCB) -> [TCPAction] {
         switch tcb.state {
         case .listen, .synSent:
@@ -390,11 +417,11 @@ extension TCPStateMachine {
         case .synReceived, .established:
             tcb.sndNxt = tcb.sndNxt + 1  // our FIN consumes a sequence number
             tcb.state = .finWait1
-            return []
+            return [.sendFin]
         case .closeWait:
             tcb.sndNxt = tcb.sndNxt + 1
             tcb.state = .lastAck
-            return []
+            return [.sendFin]
         case .finWait1, .finWait2, .closing, .lastAck, .timeWait, .closed:
             return []  // already closing or closed; a second CLOSE has no effect.
         }

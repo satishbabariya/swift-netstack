@@ -152,6 +152,27 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     #expect(endpoint.count == 1)
 }
 
+@Test func ephemeralPortAllocationIsScopedToTheLocalAddress() throws {
+    let demuxer = TransportDemuxer()
+    let addressA = IPv4Address("192.168.127.1")!
+    let addressB = IPv4Address("192.168.127.2")!
+
+    // Occupy the very first candidate port on a DIFFERENT local address.
+    // register() legitimately allows this: the same port is reusable on a
+    // different local address, since the full four-tuple (including
+    // localAddress) is the registration key.
+    let busy = Recorder()
+    try demuxer.register(
+        TransportEndpointID(localAddress: addressB, localPort: 49152, remoteAddress: .any, remotePort: 0),
+        protocolNumber: .udp, delegate: busy)
+
+    // The allocator must still hand out 49152 on addressA: a predicate that
+    // ignores localAddress (checking only protocolNumber and localPort)
+    // would see it as globally in-use and skip straight to 49153.
+    let port = try demuxer.allocateEphemeralPort(protocolNumber: .udp, localAddress: addressA)
+    #expect(port == 49152)
+}
+
 @Test func allocatesDistinctEphemeralPorts() throws {
     let demuxer = TransportDemuxer()
     var seen: Set<UInt16> = []

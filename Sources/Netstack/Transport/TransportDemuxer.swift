@@ -81,10 +81,18 @@ public final class TransportDemuxer {
             let candidate = nextEphemeral
             nextEphemeral = candidate == high ? low : candidate + 1
 
+            // A registration on `.any` occupies the port on every local
+            // address, so it conflicts regardless of `localAddress` here —
+            // and allocating for `.any` itself must in turn conflict with
+            // any address-specific registration, since that wildcard would
+            // occupy the port everywhere too. Otherwise the port is only
+            // taken for the exact local address it was registered on,
+            // matching what `register()` actually allows.
             let inUse = registrations.contains { key, registration in
                 key.protocolNumber == protocolNumber.rawValue
                     && key.id.localPort == candidate
                     && registration.delegate != nil
+                    && (key.id.localAddress == localAddress || key.id.localAddress == .any || localAddress == .any)
             }
             if !inUse { return candidate }
         }

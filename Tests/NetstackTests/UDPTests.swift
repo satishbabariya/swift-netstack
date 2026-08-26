@@ -220,6 +220,81 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     #expect(Array(packet.payload.readableBytesView) == [0xbe, 0xef])
 }
 
+@Test func aWildcardBoundEndpointSendsFromTheNICsAddressWhenSpoofingIsAllowed() throws {
+    // A wildcard bind (`.any`, 0.0.0.0) has no address of its own to prefer.
+    // `UDPEndpoint.send` used to pass it straight through to `ipv4.send`
+    // regardless: with spoofing allowed, `RouteTable.lookup` honours ANY
+    // preferred source, `.any` included, putting 0.0.0.0 in the emitted
+    // packet's IP source field — never a valid source address in practice.
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(
+            gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!,
+            allowsAnySource: true),
+        clock: ManualClock())
+    stack.start()
+    stack.arpCache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+
+    let endpoint = UDPEndpoint(stack: stack)
+    try endpoint.bind(address: .any, port: 53)
+    _ = link.drainTransmitted()
+
+    try endpoint.send(ByteBuffer(bytes: [0xbe, 0xef]), to: IPv4Address("192.168.127.2")!, port: 4000)
+
+    let frames = link.drainTransmitted()
+    #expect(frames.count == 1)
+    var packet = PacketBuffer(received: frames[0])
+    _ = EthernetHeader.parse(&packet)
+    let ipHeader = IPv4Header.parse(&packet)
+    // The NIC's own address, never 0.0.0.0.
+    #expect(ipHeader?.source == IPv4Address("192.168.127.1")!)
+    #expect(ipHeader?.source != .any)
+    // The checksum must have been computed against the address that was
+    // ACTUALLY put on the wire, not against `.any` — `UDPHeader.parse`
+    // verifies it against `ipHeader.source` and returns nil on a mismatch.
+    let udpHeader = UDPHeader.parse(&packet, header: ipHeader!)
+    #expect(udpHeader != nil)
+    #expect(udpHeader?.sourcePort == 53)
+}
+
+@Test func aWildcardBoundEndpointSendsSuccessfullyWhenSpoofingIsDisallowed() throws {
+    // The regression this closes: with `allowsAnySource == false`,
+    // `RouteTable.lookup` cannot honour `.any` as a preferred source (the
+    // NIC does not own it and is not allowed to spoof it), so it fell back
+    // to `primaryAddress` while reporting `sourceWasHonoured == false` —
+    // which `IPv4Protocol.send` treats as `.noRoute`, turning an ordinary
+    // wildcard-bound send into a total failure. A wildcard bind has no
+    // preference to fail to honour in the first place.
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(
+            gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!,
+            allowsAnySource: false),
+        clock: ManualClock())
+    stack.start()
+    stack.arpCache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+
+    let endpoint = UDPEndpoint(stack: stack)
+    try endpoint.bind(address: .any, port: 53)
+    _ = link.drainTransmitted()
+
+    // Must not throw.
+    try endpoint.send(ByteBuffer(bytes: [0xbe, 0xef]), to: IPv4Address("192.168.127.2")!, port: 4000)
+
+    let frames = link.drainTransmitted()
+    #expect(frames.count == 1)
+    var packet = PacketBuffer(received: frames[0])
+    _ = EthernetHeader.parse(&packet)
+    let ipHeader = IPv4Header.parse(&packet)
+    #expect(ipHeader?.source == IPv4Address("192.168.127.1")!)
+    let udpHeader = UDPHeader.parse(&packet, header: ipHeader!)
+    #expect(udpHeader != nil)
+}
+
 @Test func aClosedEndpointStopsReceiving() throws {
     let loop = EmbeddedEventLoop()
     let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)

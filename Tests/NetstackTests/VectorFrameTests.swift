@@ -74,6 +74,43 @@ private func codec() -> VectorFrames {
     #expect(codec().decode(ByteBuffer(bytes: [0x01, 0x02, 0x03])) == nil)
 }
 
+@Test func encodingATCPLineWithAnUnrecognizedFlagCharacterThrows() {
+    // Only "S.FRPU" are recognised wire flag bits (see `tcpFlagBits`); a
+    // `TCPLine` built directly (bypassing `VectorScript`'s own, separate
+    // flag-character check) must still be rejected by the codec itself.
+    let line = TCPLine(flags: "X", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: nil, window: nil, options: [])
+    #expect(throws: VectorFrameError.unrecognizedTCPFlag("X")) {
+        try codec().encode(.tcp(line), direction: .inbound)
+    }
+}
+
+@Test func encodingAMalformedTCPOptionThrows() {
+    // Neither a recognised keyword ("mss"/"wscale"/"sackOK"/"timestamp") nor
+    // parseable as one of them with the wrong number of parts.
+    let line = TCPLine(flags: "S", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: nil, window: nil, options: ["banana"])
+    #expect(throws: VectorFrameError.malformedTCPOption("banana")) {
+        try codec().encode(.tcp(line), direction: .inbound)
+    }
+}
+
+@Test func encodingAnOversizedUDPPayloadThrows() {
+    // One byte past `UDPHeader.maximumPayloadLength` (65507): the same
+    // boundary `UDPTests.serializeRejectsOneByteOverTheLargestUDPPayload`
+    // checks at `UDPHeader.serialize` itself, exercised here through the
+    // vector codec's own call site.
+    #expect(throws: VectorFrameError.udpPayloadTooLarge) {
+        try codec().encode(.udp(source: 4000, destination: 53, length: UDPHeader.maximumPayloadLength + 1), direction: .inbound)
+    }
+}
+
+@Test func encodingAnUnknownICMPUnreachableCodeThrows() {
+    // Only the five names in `unreachableCodeNames` ("network", "host",
+    // "protocol", "port", "frag-needed") are recognised.
+    #expect(throws: VectorFrameError.unknownICMPUnreachableCode("bogus")) {
+        try codec().encode(.icmpUnreachable(code: "bogus"), direction: .inbound)
+    }
+}
+
 @Test func outboundFramesReverseTheAddresses() throws {
     let line = TCPLine(flags: "S.", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 65535, options: [])
     let frame = try codec().encode(.tcp(line), direction: .expectedOutbound)

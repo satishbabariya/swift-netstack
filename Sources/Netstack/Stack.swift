@@ -1,4 +1,3 @@
-import Logging
 import NIOCore
 
 /// One virtual network stack, owning one event loop and one link.
@@ -54,19 +53,16 @@ public final class Stack {
     public let reassembler: Reassembler
     public let ipv4: IPv4Protocol
 
-    private let logger: Logger
     private var maintenanceTask: RepeatedTask?
 
     public init(
         link: LinkEndpoint,
         configuration: Configuration,
         clock: NetstackClock = RealClock(),
-        allocator: ByteBufferAllocator = ByteBufferAllocator(),
-        logger: Logger = Logger(label: "netstack")
+        allocator: ByteBufferAllocator = ByteBufferAllocator()
     ) {
         self.eventLoop = link.eventLoop
         self.configuration = configuration
-        self.logger = logger
 
         let nic = NIC(id: 1, link: link)
         nic.addAddress(configuration.gatewayAddress, prefixLength: configuration.subnet.prefixLength)
@@ -109,6 +105,12 @@ public final class Stack {
             ipv4.handleInbound(packet, ethernet)
         }
 
+        // A second start() would overwrite the reference to a task that keeps
+        // rescheduling itself, leaving it unreachable and unstoppable. Cancel
+        // first so it can never be orphaned.
+        assert(maintenanceTask == nil, "Stack.start() called more than once")
+        maintenanceTask?.cancel()
+
         maintenanceTask = eventLoop.scheduleRepeatedTask(
             initialDelay: configuration.maintenanceInterval,
             delay: configuration.maintenanceInterval
@@ -125,5 +127,14 @@ public final class Stack {
         let promise = eventLoop.makePromise(of: Void.self)
         task.cancel(promise: promise)
         return promise.futureResult
+    }
+
+    deinit {
+        // The maintenance timer reschedules itself through the event loop's own
+        // queue, so it outlives every external reference to this Stack. Only
+        // `cancel()` breaks that chain. A bare cancel is safe here: it does not
+        // require being on the event loop, captures no `self`, and takes no
+        // promise — so it cannot deadlock the way awaiting `shutdown()` would.
+        maintenanceTask?.cancel()
     }
 }

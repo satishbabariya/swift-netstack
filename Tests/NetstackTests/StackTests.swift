@@ -131,6 +131,39 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     #expect(stack.reassembler.pendingCount == 0)
 }
 
+@Test func startingTwiceDoesNotOrphanTheMaintenanceTimer() async {
+    // A second start() must not leave the first timer unreachable. Assert
+    // in debug would trip on a genuine double-start, so this exercises the
+    // release-path behaviour: the old timer is cancelled, not orphaned.
+    //
+    // `assert` is compiled in under `swift test`'s debug build, so calling
+    // `start()` twice in-process traps the whole test process rather than
+    // failing just this test. An exit test isolates that trap to a child
+    // process instead, which is what proves the guard is actually wired up:
+    // a genuine double-start is caught before anything can be orphaned. The
+    // no-guard, assertions-disabled release path — where the guard falls
+    // through to a bare `maintenanceTask?.cancel()` instead of trapping —
+    // was verified separately by building with `-Xswiftc -assert-config
+    // Release`, since NIO's `RepeatedTask` exposes no way to observe "did
+    // the old task stop rescheduling" from inside a normal, assertion-
+    // enabled test run.
+    await #expect(processExitsWith: .failure) {
+        let loop = EmbeddedEventLoop()
+        let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: IPv4Address("192.168.127.1")!,
+                subnet: IPv4Subnet(cidr: "192.168.127.0/24")!
+            ),
+            clock: ManualClock(),
+            allocator: ByteBufferAllocator()
+        )
+        stack.start()
+        stack.start()
+    }
+}
+
 @Test func shutdownStopsMaintenance() {
     // `.wait()` cannot be used here: RepeatedTask.cancel schedules its
     // promise onto the loop, and an EmbeddedEventLoop only advances when

@@ -5,19 +5,22 @@ public struct ICMPv4Header: Sendable, Equatable {
 
     public var type: ICMPv4Type
     public var code: UInt8
-    /// Meaningful for echo. On error messages this word is reused for other
-    /// purposes — always zero on a plain unreachable, but on
-    /// fragmentation-needed the low half (`sequence`) instead carries the
-    /// next-hop MTU. Callers must not interpret `identifier`/`sequence` on
-    /// anything but echo request/reply.
-    public var identifier: UInt16
-    public var sequence: UInt16
+    /// The four bytes after type/code/checksum are reused across message
+    /// types for unrelated purposes, so this is structural rather than a
+    /// single field callers must remember to gate on `type`: `identifier`
+    /// and `sequence` are set only for echo request/reply, and `nextHopMTU`
+    /// only for a fragmentation-needed error (destination unreachable, code 4).
+    public var identifier: UInt16?
+    public var sequence: UInt16?
+    /// Next-hop MTU, present only on a fragmentation-needed error.
+    public var nextHopMTU: UInt16?
 
-    public init(type: ICMPv4Type, code: UInt8, identifier: UInt16 = 0, sequence: UInt16 = 0) {
+    public init(type: ICMPv4Type, code: UInt8, identifier: UInt16? = nil, sequence: UInt16? = nil, nextHopMTU: UInt16? = nil) {
         self.type = type
         self.code = code
         self.identifier = identifier
         self.sequence = sequence
+        self.nextHopMTU = nextHopMTU
     }
 
     /// Consume and validate. ICMP checksums cover the whole message, header
@@ -32,11 +35,22 @@ public struct ICMPv4Header: Sendable, Equatable {
             let type = header.readInteger(as: UInt8.self),
             let code = header.readInteger(as: UInt8.self),
             header.readInteger(endianness: .big, as: UInt16.self) != nil,  // checksum, verified
-            let identifier = header.readInteger(endianness: .big, as: UInt16.self),
-            let sequence = header.readInteger(endianness: .big, as: UInt16.self)
+            let high = header.readInteger(endianness: .big, as: UInt16.self),
+            let low = header.readInteger(endianness: .big, as: UInt16.self)
         else { return nil }
 
-        return ICMPv4Header(type: ICMPv4Type(rawValue: type), code: code, identifier: identifier, sequence: sequence)
+        let icmpType = ICMPv4Type(rawValue: type)
+        var parsed = ICMPv4Header(type: icmpType, code: code)
+        switch (icmpType, code) {
+        case (.echoRequest, _), (.echoReply, _):
+            parsed.identifier = high
+            parsed.sequence = low
+        case (.destinationUnreachable, ICMPv4.UnreachableCode.fragmentationNeeded.rawValue):
+            parsed.nextHopMTU = low
+        default:
+            break
+        }
+        return parsed
     }
 }
 
@@ -56,8 +70,8 @@ public enum ICMPv4 {
         message.writeInteger(ICMPv4Type.echoReply.rawValue)
         message.writeInteger(UInt8(0))
         message.writeInteger(UInt16(0), endianness: .big)
-        message.writeInteger(request.identifier, endianness: .big)
-        message.writeInteger(request.sequence, endianness: .big)
+        message.writeInteger(request.identifier ?? 0, endianness: .big)
+        message.writeInteger(request.sequence ?? 0, endianness: .big)
         message.writeImmutableBuffer(payload)
         finalize(&message)
         return message
@@ -88,6 +102,14 @@ public enum ICMPv4 {
     /// the error to a socket — for TCP and UDP they hold both port numbers.
     /// If the offending payload is shorter than eight bytes, whatever there
     /// is gets quoted; there is nothing else to quote.
+    ///
+    /// The quoted header declares the ORIGINAL packet's length while carrying
+    /// only its first eight payload bytes. That is what RFC 792 requires, and
+    /// it means `IPv4Header.parse` will refuse to re-parse it — correctly, since
+    /// on live ingress a header claiming more bytes than are present is
+    /// truncated or hostile. A consumer that needs to read a quoted header
+    /// (path MTU discovery is the first) will need a parse path that trusts the
+    /// declared length instead of checking it against what is attached.
     private static func error(
         type: ICMPv4Type, code: UInt8, unusedWord: UInt32,
         quoting header: IPv4Header, quotedPayload: ByteBuffer, allocator: ByteBufferAllocator
@@ -98,9 +120,13 @@ public enum ICMPv4 {
         // Re-emit the offending header exactly as given, aside from the
         // options-stripping `prepend(to:)` always does now. The receiver
         // matches the quote on addresses and the transport ports that
-        // follow, so it must reflect what was actually on the wire.
+        // follow, so it must reflect what was actually on the wire. Only
+        // eight bytes of payload are quoted below, so `packet.readableBytes`
+        // at prepend time is not the original length — declare the real
+        // `totalLength` explicitly, since RFC 1191 path MTU discovery reads
+        // it to identify the packet that was too large.
         var reQuoted = PacketBuffer(allocator: allocator, payload: quotedBytes)
-        header.prepend(to: &reQuoted)
+        header.prepend(to: &reQuoted, declaringTotalLength: header.totalLength)
 
         var message = allocator.buffer(capacity: ICMPv4Header.length + reQuoted.readableBytes)
         message.writeInteger(type.rawValue)

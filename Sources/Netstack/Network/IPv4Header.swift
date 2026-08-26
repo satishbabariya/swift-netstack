@@ -103,8 +103,15 @@ public struct IPv4Header: Sendable, Equatable {
         return parsed
     }
 
-    public func prepend(to packet: inout PacketBuffer) {
-        let payloadLength = packet.readableBytes
+    /// Prepend this header to `packet`.
+    ///
+    /// The wire `totalLength` is normally derived from what is in `packet`,
+    /// which is correct whenever the full payload is loaded before prepending.
+    /// Pass `declaringTotalLength` when it is not — an ICMP error quotes only
+    /// the first eight bytes of the offending packet, but its quoted header
+    /// must still report the ORIGINAL length or path MTU discovery cannot
+    /// identify the packet that was too large.
+    public func prepend(to packet: inout PacketBuffer, declaringTotalLength override: UInt16? = nil) {
         // Always exactly 20 bytes. A header returned by `parse` may report a longer
         // `headerLength` because the packet carried IPv4 options, but this stack
         // never emits options, and the checksum arithmetic below is only valid for
@@ -114,10 +121,11 @@ public struct IPv4Header: Sendable, Equatable {
         // unchecksummed. Receivers match a quoted header on its addresses and the
         // transport ports that follow it, not on its IHL.
         let length = Self.minimumLength
+        let totalLength = override ?? UInt16(length + packet.readableBytes)
         packet.prepend(count: length) { buffer, index in
             buffer.setInteger(UInt8(0x40 | (length / 4)), at: index)
             buffer.setInteger(dscp, at: index + 1)
-            buffer.setInteger(UInt16(length + payloadLength), at: index + 2, endianness: .big)
+            buffer.setInteger(totalLength, at: index + 2, endianness: .big)
             buffer.setInteger(identification, at: index + 4, endianness: .big)
             let flagsAndOffset = UInt16(flags.rawValue) << 13 | UInt16(fragmentOffset / 8)
             buffer.setInteger(flagsAndOffset, at: index + 6, endianness: .big)
@@ -134,10 +142,12 @@ public struct IPv4Header: Sendable, Equatable {
             // checksum word itself contributes zero. This arithmetic is only
             // valid because `headerLength` is guaranteed to be exactly 20 —
             // `headerLength`'s setter is private, so nothing outside this
-            // type can grow it to include options.
+            // type can grow it to include options. `totalLength` here must be
+            // the exact same value written above, or the header fails its own
+            // checksum.
             var sum: UInt32 = 0
             sum += UInt32(UInt16(0x4000 | (length / 4) << 8) | UInt16(dscp))
-            sum += UInt32(UInt16(length + payloadLength))
+            sum += UInt32(totalLength)
             sum += UInt32(identification)
             sum += UInt32(flagsAndOffset)
             sum += UInt32(UInt16(ttl) << 8 | UInt16(protocolNumber.rawValue))

@@ -80,12 +80,17 @@ private func echoRequest(identifier: UInt16, sequence: UInt16, payload: [UInt8])
     #expect(header?.type == .destinationUnreachable)
     #expect(header?.code == 3)
 
-    // The quoted header must be a valid IPv4 header in its own right.
-    var quoted = PacketBuffer(received: parsed.payload)
-    let quotedHeader = IPv4Header.parse(&quoted)
-    #expect(quotedHeader?.identification == 0x55aa)
-    #expect(quotedHeader?.destination == IPv4Address("8.8.8.8"))
-    #expect(Array(quoted.payload.readableBytesView) == [0, 1, 2, 3, 4, 5, 6, 7])
+    // The quoted header declares the ORIGINAL packet's length (60), which
+    // IPv4Header.parse would refuse to accept given only 28 bytes are
+    // actually attached — correctly, since that guard exists to reject
+    // truncated or hostile live ingress. So this reads the quoted header's
+    // raw wire bytes instead of round-tripping it through `parse`.
+    let quotedBytes = Array(parsed.payload.readableBytesView)
+    #expect(quotedBytes[0] == 0x45)  // IHL 5, options dropped
+    #expect(UInt16(quotedBytes[4]) << 8 | UInt16(quotedBytes[5]) == 0x55aa)  // identification
+    #expect(Array(quotedBytes[16..<20]) == IPv4Address("8.8.8.8")!.bytes)  // destination
+    #expect(Array(quotedBytes[20...]) == [0, 1, 2, 3, 4, 5, 6, 7])
+    #expect(quotedBytes.prefix(20).withUnsafeBytes { Checksum.compute($0) } == 0)
 }
 
 @Test func fragmentationNeededCarriesTheNextHopMTU() {
@@ -104,6 +109,42 @@ private func echoRequest(identifier: UInt16, sequence: UInt16, payload: [UInt8])
     #expect(message.getInteger(at: 6, endianness: .big, as: UInt16.self) == 1400)
     #expect(message.getInteger(at: 0, as: UInt8.self) == 3)
     #expect(message.getInteger(at: 1, as: UInt8.self) == 4)
+
+    var parsed = PacketBuffer(received: message)
+    let header = ICMPv4Header.parse(&parsed)
+    #expect(header?.nextHopMTU == 1400)
+    #expect(header?.identifier == nil)
+    #expect(header?.sequence == nil)
+}
+
+@Test func theQuotedHeaderReportsTheOriginalPacketLength() {
+    // An ICMP error quotes only the first eight payload bytes, but its
+    // quoted header must still describe the packet that provoked it —
+    // RFC 1191 path MTU discovery matches on that length.
+    //
+    // Asserted against the raw wire bytes on purpose. Re-parsing through
+    // IPv4Header.parse cannot work here and should not: a quoted header
+    // legitimately declares more bytes than are attached, which is exactly
+    // what parse's length guard exists to reject on live ingress.
+    var offending = IPv4Header(
+        source: IPv4Address("192.168.127.2")!, destination: IPv4Address("8.8.8.8")!,
+        protocolNumber: .udp, payloadLength: 40)
+    offending.identification = 0x55aa
+
+    let message = ICMPv4.destinationUnreachable(
+        code: .port, quoting: offending,
+        quotedPayload: ByteBuffer(bytes: Array(0..<40).map(UInt8.init)),
+        allocator: ByteBufferAllocator())
+
+    let bytes = Array(message.readableBytesView)
+    #expect(bytes.count == 36)                          // 8 ICMP + 20 IP + 8 payload
+    let quoted = Array(bytes[8...])
+    #expect(quoted[0] == 0x45)                          // IHL 5, options dropped
+    #expect(UInt16(quoted[2]) << 8 | UInt16(quoted[3]) == 60)      // ORIGINAL total length
+    #expect(UInt16(quoted[4]) << 8 | UInt16(quoted[5]) == 0x55aa)  // identification
+    #expect(Array(quoted[20...]) == [0, 1, 2, 3, 4, 5, 6, 7])      // first 8 payload bytes
+    // The quoted header still carries a valid checksum of its own.
+    #expect(quoted.prefix(20).withUnsafeBytes { Checksum.compute($0) } == 0)
 }
 
 @Test func timeExceededQuotesTheHeader() {

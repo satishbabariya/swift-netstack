@@ -38,7 +38,17 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
 }
 
 @Test func aFreshStackAnswersARPForItsGatewayAddress() {
-    let (_, link, _) = makeStack()
+    // `stack` must stay alive for the test's duration: `link` only holds a
+    // *weak* reference to the NIC it is attached to (see
+    // `RecordingEndpoint.dispatcher`), and the NIC is owned by `stack`, not
+    // by `link`. Discarding `stack` here used to work only because of the
+    // retain cycle `start()` created — every previously-leaked object kept
+    // itself, and therefore the NIC, alive regardless. Now that the cycle is
+    // fixed, dropping `stack` immediately deallocates the NIC and trips
+    // `RecordingEndpoint`'s "dispatcher deallocated while still attached"
+    // assertion on the very next `inject`.
+    let (stack, link, _) = makeStack()
+    _ = stack
     link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
 
     let frames = link.drainTransmitted()
@@ -51,7 +61,11 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
 }
 
 @Test func aGuestCanPingTheGateway() {
-    let (_, link, _) = makeStack()
+    // See the comment in `aFreshStackAnswersARPForItsGatewayAddress`: `stack`
+    // must be kept alive here too, now that it is no longer implicitly kept
+    // alive by the retain cycle `start()` used to create.
+    let (stack, link, _) = makeStack()
+    _ = stack
     // ARP first, so the stack learns the guest's link address.
     link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
     _ = link.drainTransmitted()
@@ -162,6 +176,36 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         stack.start()
         stack.start()
     }
+}
+
+@Test func aStartedStackIsReleasedWhenDropped() {
+    // start() stores closures that capture the protocol handlers, which
+    // reach back to the NIC through RouteTable. Without breaking those
+    // edges the entire graph — NIC, RouteTable, IPv4Protocol, ARPCache,
+    // Reassembler, TransportDemuxer and the LinkEndpoint — leaks for the
+    // life of the host process, once per sandbox.
+    //
+    // `.wait()` on `shutdown()`'s future deadlocks on an `EmbeddedEventLoop`
+    // — see `shutdownStopsMaintenance` above — so the loop is driven instead.
+    weak var weakNIC: NIC?
+    weak var weakRoutes: RouteTable?
+    weak var weakIPv4: IPv4Protocol?
+    weak var weakLink: RecordingEndpoint?
+    do {
+        let (stack, link, loop) = makeStack()
+        weakNIC = stack.nic
+        weakRoutes = stack.routes
+        weakIPv4 = stack.ipv4
+        weakLink = link
+        var completed = false
+        stack.shutdown().whenSuccess { completed = true }
+        loop.run()
+        #expect(completed)
+    }
+    #expect(weakNIC == nil)
+    #expect(weakRoutes == nil)
+    #expect(weakIPv4 == nil)
+    #expect(weakLink == nil)
 }
 
 @Test func shutdownStopsMaintenance() {

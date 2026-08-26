@@ -28,6 +28,18 @@ public struct ResolvedRoute {
 /// entries — that a linear scan beats any structure with an index to maintain.
 public final class RouteTable {
     private var routes: [Route] = []
+    // Deliberately strong. `Stack` owns both this table and every `NIC`
+    // registered into it, so their lifetimes already coincide — nothing
+    // requires `RouteTable` to outlive a `NIC` it looks up, so there is no
+    // ownership reason to weaken this. It used to be the other half of a
+    // retain cycle (`NIC.handlers` -> `IPv4Protocol` -> `RouteTable.nics` ->
+    // `NIC`), but that cycle is closed by making `IPv4Protocol`'s handler
+    // closures capture `ipv4` weakly in `Stack.start()` instead — the
+    // correct edge to cut, since it is the one closure-captured reference
+    // that does not already reflect real ownership. Weakening this
+    // dictionary too would be redundant and would let a route resolve to a
+    // `nil` NIC the moment nothing else happened to be holding it, which is
+    // not a state this table should ever need to represent.
     private var nics: [Int: NIC] = [:]
 
     public init() {}

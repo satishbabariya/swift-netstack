@@ -104,11 +104,25 @@ public final class Stack {
         nic.setHandler(for: .arp) { [arpResponder] packet, ethernet in
             arpResponder.handle(packet, ethernet)
         }
-        nic.setHandler(for: .ipv4) { [ipv4] packet, ethernet in
-            ipv4.handleInbound(packet, ethernet)
+        // `[weak ipv4]`, not `[ipv4]`: `nic.handlers` would otherwise hold a
+        // strong closure back to `ipv4`, which holds `routes` strongly,
+        // whose `RouteTable.nics` holds this same `nic` strongly — NIC ->
+        // closure -> IPv4Protocol -> RouteTable -> NIC, a cycle Stack itself
+        // sits outside of, so the whole graph leaks for the life of the
+        // process once `start()` is called. `nic`'s own `unowned` field on
+        // `IPv4Protocol` does not touch this edge; it runs through
+        // `RouteTable`, not through `IPv4Protocol.nic`. `weak` (rather than
+        // `unowned`) means a handler that somehow fires after `ipv4` is gone
+        // is a silent no-op instead of a trap.
+        nic.setHandler(for: .ipv4) { [weak ipv4] packet, ethernet in
+            ipv4?.handleInbound(packet, ethernet)
         }
 
-        ipv4.setHandler(for: .udp) { [transportDemuxer, ipv4, allocator] header, payload in
+        // `[weak ipv4]` here too: this closure is stored in `ipv4.handlers`
+        // itself, so capturing `ipv4` strongly makes `IPv4Protocol` retain
+        // itself directly — a second, independent cycle from the one above.
+        ipv4.setHandler(for: .udp) { [weak ipv4, transportDemuxer, allocator] header, payload in
+            guard let ipv4 else { return }
             var packet = PacketBuffer(received: payload)
             guard let udp = UDPHeader.parse(&packet, header: header) else { return }
             let delivered = transportDemuxer.deliver(
@@ -145,6 +159,17 @@ public final class Stack {
     }
 
     public func shutdown() -> EventLoopFuture<Void> {
+        // Defense in depth alongside the `[weak ipv4]` captures in `start()`:
+        // those already keep `start()` from leaving a retain cycle, but
+        // clearing the tables here also releases what the handler closures
+        // captured — `arpResponder`, `transportDemuxer`, `allocator` — as
+        // soon as the stack is deliberately shut down, rather than only when
+        // every external reference to `nic` and `ipv4` themselves also goes
+        // away, and it means a handler cannot fire at all once shutdown has
+        // begun.
+        nic.removeAllHandlers()
+        ipv4.removeAllHandlers()
+
         guard let task = maintenanceTask else {
             return eventLoop.makeSucceededVoidFuture()
         }

@@ -52,6 +52,14 @@ public final class IPv4Protocol {
         handlers[protocolNumber] = handler
     }
 
+    /// Detach every registered handler. `Stack.shutdown()` calls this
+    /// alongside `NIC.removeAllHandlers()` for the same reason: a handler
+    /// closure stored here can capture `self`, which otherwise keeps this
+    /// type alive purely through its own handler table.
+    public func removeAllHandlers() {
+        handlers.removeAll()
+    }
+
     // MARK: Ingress
 
     public func handleInbound(_ packet: PacketBuffer, _ ethernet: EthernetHeader) {

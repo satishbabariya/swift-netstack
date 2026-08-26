@@ -51,6 +51,15 @@ public final class NIC: LinkDispatcher {
         handlers[etherType] = handler
     }
 
+    /// Detach every registered handler. `Stack.shutdown()` calls this so a
+    /// shut-down stack releases whatever its handler closures captured —
+    /// historically including a strong reference back to this NIC itself —
+    /// promptly, rather than only when every external reference to the
+    /// `Stack` also happens to go away.
+    public func removeAllHandlers() {
+        handlers.removeAll()
+    }
+
     // MARK: LinkDispatcher
 
     public func deliverInbound(_ frame: PacketBuffer) {

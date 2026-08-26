@@ -33,20 +33,34 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// At exactly half the space (2^31 apart), RFC 1982 leaves the ordering
     /// undefined. The literal translation of the bit-pattern trick below
     /// would report `true` in both directions, which breaks asymmetry and
-    /// can cycle a `sort()`. This deliberately returns `false` in both
-    /// directions instead — neither precedes the other — which is defined
-    /// and non-contradictory. Two live sequence numbers landing exactly 2^31
-    /// apart means something has already gone wrong upstream; the
-    /// `assertionFailure` surfaces that during development without trapping
-    /// a release build that is meant to stay up.
+    /// can cycle a `sort()`. This deliberately uses `halfSpaceOrdering()`
+    /// instead — `false` in both directions, neither precedes the other —
+    /// which is defined and non-contradictory. Two live sequence numbers
+    /// landing exactly 2^31 apart means something has already gone wrong
+    /// upstream; the `assertionFailure` surfaces that during development
+    /// without trapping a release build that is meant to stay up.
     public func lessThan(_ other: SequenceNumber) -> Bool {
         let diff = value &- other.value
         if diff == 0x8000_0000 {
             assertionFailure("SequenceNumber \(value) and \(other.value) are exactly 2^31 apart; ordering between them is undefined")
-            return false
+            return SequenceNumber.halfSpaceOrdering()
         }
         return Int32(bitPattern: diff) < 0
     }
+
+    /// The ordering to use at exactly half the space (2^31) apart, where RFC
+    /// 1982 leaves "precedes" undefined: neither value precedes the other.
+    /// That is defined and non-contradictory, whereas returning `true` in
+    /// both directions (the literal translation of the bit-pattern trick in
+    /// `lessThan`) would break asymmetry and let a `sort()` cycle.
+    ///
+    /// Separated from `lessThan` deliberately so the *decision* is testable
+    /// in any build configuration. `assertionFailure` aborts a debug build
+    /// the instant it is reached, so a test calling `lessThan` directly can
+    /// never observe what it returns afterward — only this helper, which
+    /// contains no assert, can be checked directly by a test regardless of
+    /// build configuration.
+    static func halfSpaceOrdering() -> Bool { false }
 
     /// Half-open: `[start, start + size)`. A zero size contains nothing.
     ///

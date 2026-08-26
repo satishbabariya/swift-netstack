@@ -688,3 +688,64 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     let bare = fragment(id: 51, offset: 0, more: false, bytes: [])
     #expect(reassembler.process(header: bare.0, payload: bare.1) != nil)
 }
+
+@Test func admissionOrderStaysBoundedWhenOneKeyIsReadmittedUnderAPinnedHead() {
+    // The narrower half of the pinned-head fix, and the half
+    // `admissionOrderStaysBoundedWhenOneDatagramPinsTheHead` cannot see.
+    //
+    // That test floods DISTINCT identifications, so every completed
+    // datagram's key really has left `pending` by the time compaction runs —
+    // which a staleness test as weak as `pending[key] != nil` gets right by
+    // accident. It stays green with `Pending.admissionSequence` deleted and
+    // `isLive` reduced to bare key membership.
+    //
+    // The attack that separates them reuses ONE key. `process` returns early
+    // when a datagram completes, so the compaction pass only ever runs on the
+    // non-completing path — i.e. immediately after the first fragment of the
+    // next cycle has re-admitted that same key. At that instant
+    // `pending[key] != nil` is true, so a membership-only check reads EVERY
+    // earlier appearance of the key as live, keeps them all, and the bound it
+    // is supposed to enforce never fires. Comparing each appearance against
+    // the `admissionSequence` its own `Pending` was stamped with is what tells
+    // one admission of a key apart from the next.
+    let maximumPendingDatagrams = 8
+    let reassembler = Reassembler(
+        clock: ManualClock(), timeout: .seconds(3600), memoryLimit: 1_000_000,
+        maximumPendingDatagrams: maximumPendingDatagrams)
+
+    // Pin the head with a datagram that never terminates, so the head-only
+    // scan can never advance and the full pass is the only thing that can
+    // reclaim anything.
+    var pin = IPv4Header(
+        source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+        protocolNumber: .udp, payloadLength: 1)
+    pin.identification = 0
+    pin.flags = [.moreFragments]
+    _ = reassembler.process(header: pin, payload: ByteBuffer(bytes: [0xaa]))
+    #expect(reassembler.pendingCount == 1)
+
+    // One identification, re-admitted and completed over and over. Every
+    // cycle appends a fresh appearance for the identical key.
+    let cycles = 20_000
+    for _ in 0..<cycles {
+        var head = IPv4Header(
+            source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+            protocolNumber: .udp, payloadLength: 1)
+        head.identification = 1
+        head.flags = [.moreFragments]
+        _ = reassembler.process(header: head, payload: ByteBuffer(bytes: [0xbb]))
+
+        var tail = head
+        tail.fragmentOffset = 1
+        tail.flags = []
+        #expect(reassembler.process(header: tail, payload: ByteBuffer(bytes: [0xcc]))?.1.readableBytes == 2)
+    }
+
+    // Positive control: the flood really did run through this reassembler and
+    // really did leave only the pin behind, so the bound below is not
+    // satisfied by an empty structure.
+    #expect(reassembler.pendingCount == 1)
+    #expect(reassembler.admissionOrderCountForTesting >= 1)
+    // Falsifies to ~20,001 with `isLive` weakened to `pending[key] != nil`.
+    #expect(reassembler.admissionOrderCountForTesting <= 4 * maximumPendingDatagrams + 1)
+}

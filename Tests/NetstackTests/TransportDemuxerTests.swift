@@ -111,9 +111,15 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
 @Test func unregisterFreesTheTuple() throws {
     let demuxer = TransportDemuxer()
     let target = id("192.168.127.1", 53, "0.0.0.0", 0)
-    try demuxer.register(target, protocolNumber: .udp, delegate: Recorder())
+    // Both delegates must stay alive for the whole test, or the weak slot
+    // goes nil on its own and register()'s dead-slot check — not
+    // unregister() — is what lets the third call through. See
+    // registeringTheSameTupleTwiceThrows for the same reasoning.
+    let first = Recorder()
+    let second = Recorder()
+    try demuxer.register(target, protocolNumber: .udp, delegate: first)
     demuxer.unregister(target, protocolNumber: .udp)
-    try demuxer.register(target, protocolNumber: .udp, delegate: Recorder())
+    try demuxer.register(target, protocolNumber: .udp, delegate: second)
 }
 
 @Test func aProtocolHandlerOverridesEndpointMatching() throws {
@@ -149,13 +155,19 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
 @Test func allocatesDistinctEphemeralPorts() throws {
     let demuxer = TransportDemuxer()
     var seen: Set<UInt16> = []
+    // Recorders must stay alive for the whole test, or every registration's
+    // weak slot goes nil immediately and allocateEphemeralPort's in-use
+    // predicate never sees a live registration to avoid.
+    var recorders: [Recorder] = []
     for _ in 0..<50 {
         let port = try demuxer.allocateEphemeralPort(protocolNumber: .udp, localAddress: IPv4Address("192.168.127.1")!)
         #expect(port >= 49152)
         #expect(!seen.contains(port))
         seen.insert(port)
+        let recorder = Recorder()
+        recorders.append(recorder)
         try demuxer.register(
             TransportEndpointID(localAddress: IPv4Address("192.168.127.1")!, localPort: port, remoteAddress: .any, remotePort: 0),
-            protocolNumber: .udp, delegate: Recorder())
+            protocolNumber: .udp, delegate: recorder)
     }
 }

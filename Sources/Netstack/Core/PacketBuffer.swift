@@ -83,6 +83,14 @@ public struct PacketBuffer: Sendable {
         return header
     }
 
+    /// Discard everything after the first `length` bytes of the remaining
+    /// payload. Ethernet pads frames below 60 bytes, so a short IP packet
+    /// arrives with trailing garbage that must not reach the transport layer.
+    public mutating func trimPayload(to length: Int) {
+        guard length < storage.readableBytes else { return }
+        storage = storage.getSlice(at: storage.readerIndex, length: length) ?? storage
+    }
+
     /// An independent copy. `ByteBuffer` is copy-on-write, so this is cheap
     /// until one of the two is written to.
     public func clone() -> PacketBuffer {

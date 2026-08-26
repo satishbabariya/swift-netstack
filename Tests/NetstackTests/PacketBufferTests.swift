@@ -92,3 +92,11 @@ import Testing
     #expect(packet.transportHeaderLength == 3)
     #expect(Array(packet.payload.readableBytesView) == [0xaa, 0xbb])
 }
+
+@Test func trimPayloadDiscardsPadding() {
+    var packet = PacketBuffer(received: ByteBuffer(bytes: [0x01, 0x02, 0x03, 0x04, 0x00, 0x00]))
+    packet.trimPayload(to: 4)
+    #expect(Array(packet.payload.readableBytesView) == [0x01, 0x02, 0x03, 0x04])
+    packet.trimPayload(to: 10)  // longer than present: no-op
+    #expect(packet.readableBytes == 4)
+}

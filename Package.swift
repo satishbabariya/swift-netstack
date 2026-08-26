@@ -27,6 +27,7 @@ let package = Package(
                 "Netstack",
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
             ]
         ),
     ]

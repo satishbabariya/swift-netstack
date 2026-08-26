@@ -1,16 +1,29 @@
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
 import Testing
 
 @testable import Netstack
 
-private final class EnvelopeCollector: ChannelInboundHandler {
+/// `StackBootstrap.channelInitializer` is `@Sendable`, matching how real NIO
+/// bootstraps work: the initializer runs on the channel's event loop, not
+/// necessarily the caller's thread, so it cannot capture handler state built
+/// on the caller's side. The handler is built *inside* the initializer
+/// instead (as real NIO usage does), and observation from the test happens
+/// through a `NIOLockedValueBox` the handler is handed at construction —
+/// this is the "Sendable box" the no-locks-in-Sources rule explicitly
+/// exempts test support code from needing to avoid.
+private final class EnvelopeCollector: ChannelInboundHandler, Sendable {
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
-    var received: [(bytes: [UInt8], remote: SocketAddress)] = []
+    let received: NIOLockedValueBox<[(bytes: [UInt8], remote: SocketAddress)]>
+
+    init(received: NIOLockedValueBox<[(bytes: [UInt8], remote: SocketAddress)]>) {
+        self.received = received
+    }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let envelope = unwrapInboundIn(data)
-        received.append((Array(envelope.data.readableBytesView), envelope.remoteAddress))
+        received.withLockedValue { $0.append((Array(envelope.data.readableBytesView), envelope.remoteAddress)) }
     }
 }
 
@@ -44,19 +57,22 @@ private func makeStack(_ link: RecordingEndpoint) -> Stack {
     let loop = EmbeddedEventLoop()
     let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
     let stack = makeStack(link)
-    let collector = EnvelopeCollector()
+    let received = NIOLockedValueBox<[(bytes: [UInt8], remote: SocketAddress)]>([])
 
     let channel = try StackBootstrap(stack: stack)
-        .channelInitializer { $0.pipeline.addHandler(collector) }
+        .channelInitializer { channel in
+            channel.pipeline.addHandler(EnvelopeCollector(received: received))
+        }
         .bind(host: IPv4Address("192.168.127.1")!, port: 53)
         .wait()
     _ = channel
 
     injectUDP(into: link, from: "192.168.127.2", to: "192.168.127.1", sourcePort: 4000, destinationPort: 53, payload: [0xde, 0xad])
 
-    #expect(collector.received.count == 1)
-    #expect(collector.received[0].bytes == [0xde, 0xad])
-    #expect(collector.received[0].remote.port == 4000)
+    let collected = received.withLockedValue { $0 }
+    #expect(collected.count == 1)
+    #expect(collected[0].bytes == [0xde, 0xad])
+    #expect(collected[0].remote.port == 4000)
 }
 
 @Test func writingAnEnvelopeEmitsADatagram() throws {
@@ -91,7 +107,7 @@ private func makeStack(_ link: RecordingEndpoint) -> Stack {
     let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
     let stack = makeStack(link)
 
-    final class Echoer: ChannelInboundHandler {
+    final class Echoer: ChannelInboundHandler, Sendable {
         typealias InboundIn = AddressedEnvelope<ByteBuffer>
         typealias OutboundOut = AddressedEnvelope<ByteBuffer>
         func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -133,6 +149,29 @@ private func makeStack(_ link: RecordingEndpoint) -> Stack {
 
     // Rebinding proves the demuxer entry is gone.
     _ = try StackBootstrap(stack: stack).bind(host: IPv4Address("192.168.127.1")!, port: 53).wait()
+}
+
+@Test func closingTheChannelReleasesIt() throws {
+    // `ChannelPipeline.init(channel:)` creates a strong channel<->pipeline
+    // cycle. Only `removeHandlers` breaks it. Without that, every closed
+    // channel leaks along with its UDPEndpoint and the Stack they capture —
+    // and nothing else in this suite would notice.
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = makeStack(link)
+
+    weak var weakChannel: Channel?
+    do {
+        let channel = try StackBootstrap(stack: stack)
+            .bind(host: IPv4Address("192.168.127.1")!, port: 53)
+            .wait()
+        weakChannel = channel
+        #expect(weakChannel != nil)
+        try channel.close().wait()
+    }
+    loop.run()
+
+    #expect(weakChannel == nil, "closed channel was not released — the pipeline cycle is still live")
 }
 
 @Test func bindingAnOccupiedPortFailsTheFuture() throws {

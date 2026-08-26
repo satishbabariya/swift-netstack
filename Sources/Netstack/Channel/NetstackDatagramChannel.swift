@@ -65,10 +65,13 @@ public final class NetstackDatagramChannel: Channel, ChannelCore, @unchecked Sen
 
     public func register0(promise: EventLoopPromise<Void>?) {
         promise?.succeed(())
+        pipeline.fireChannelRegistered()
     }
 
     public func registerAlreadyConfigured0(promise: EventLoopPromise<Void>?) {
-        promise?.succeed(())
+        state = .active
+        register0(promise: promise)
+        pipeline.fireChannelActive()
     }
 
     public func bind0(to address: SocketAddress, promise: EventLoopPromise<Void>?) {
@@ -159,6 +162,15 @@ public final class NetstackDatagramChannel: Channel, ChannelCore, @unchecked Sen
         pipeline.fireChannelInactive()
         pipeline.fireChannelUnregistered()
         eventLoop.execute {
+            // Deferred, as real NIO channels do (see `BaseSocketChannel.close0`
+            // and `EmbeddedChannel.close0`), so any pipeline traversal still
+            // in flight from the callouts above completes first. This is
+            // also what breaks the channel<->pipeline retain cycle:
+            // `ChannelPipeline.init(channel:)` holds `self` strongly, and
+            // `removeHandlers(pipeline:)` is what nils `_channel` on the
+            // pipeline. Without this call, a closed channel — and the
+            // `Stack`/`UDPEndpoint` it captures — is retained forever.
+            self.removeHandlers(pipeline: self.pipeline)
             self.closePromise.succeed(())
         }
     }

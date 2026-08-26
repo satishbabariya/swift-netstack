@@ -85,3 +85,18 @@ private func makeNIC(spoofing: Bool) -> NIC {
     table.add(Route(destination: IPv4Subnet(cidr: "0.0.0.0/0")!, gateway: nil, nicID: 99))
     #expect(table.lookup(destination: IPv4Address("8.8.8.8")!, preferredSource: nil) == nil)
 }
+
+@Test func fallsThroughToTheNextRouteWhenTheBestMatchsNICIsUnregistered() {
+    let nic = makeNIC(spoofing: false)
+    let table = RouteTable()
+    table.register(nic)
+    // Best (longest-prefix) match points at a NIC that was never registered.
+    table.add(Route(destination: IPv4Subnet(cidr: "192.168.127.0/24")!, gateway: nil, nicID: 99))
+    // Less-specific default route to the NIC that IS registered.
+    table.add(Route(destination: IPv4Subnet(cidr: "0.0.0.0/0")!, gateway: IPv4Address("192.168.127.254"), nicID: 1))
+
+    let route = table.lookup(destination: IPv4Address("192.168.127.2")!, preferredSource: nil)
+    #expect(route?.nic.id == 1)
+    #expect(route?.nextHop == IPv4Address("192.168.127.254"))
+    #expect(route?.isLocal == false)
+}

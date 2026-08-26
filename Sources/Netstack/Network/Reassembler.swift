@@ -66,10 +66,6 @@ public final class Reassembler {
         let offset = header.fragmentOffset
         let length = payload.readableBytes
         let end = offset + length
-        // RFC 791's 65535 is the limit on the WHOLE datagram, header included.
-        // Bounding only the payload lets a peer drive `headerLength + totalLength`
-        // past UInt16 at assembly, where the conversion is non-failable and traps.
-        guard header.headerLength + end <= Self.maximumDatagram else { return nil }
 
         let key = Key(
             source: header.source,
@@ -79,6 +75,14 @@ public final class Reassembler {
         )
 
         var entry = pending[key] ?? Pending(header: header, startedAt: clock.now())
+
+        // Bound the datagram as it will be ASSEMBLED, not as this fragment
+        // arrives. `entry.header` is fixed by whichever fragment created the
+        // entry and may carry options, while `totalLength` comes from whichever
+        // fragment terminates it — checking the incoming fragment's own header
+        // ties none of them together and lets three individually-admissible
+        // fragments overflow the conversion at assembly.
+        guard entry.header.headerLength + end <= Self.maximumDatagram else { return nil }
 
         // Reject any fragment that overlaps a byte range already accepted
         // for this datagram (including an exact duplicate), and reject a
@@ -129,6 +133,18 @@ public final class Reassembler {
         }
         guard covered >= totalLength else { return nil }
 
+        // The admission guard should make this unreachable. It is checked anyway
+        // because the consequence of being wrong is a non-failable conversion that
+        // traps the process, and this invariant has been got wrong once already.
+        // Placed here — before `assembled` is allocated and before the accounting
+        // below runs — so the drop-path decrement/removal fires exactly once,
+        // not on top of the success path's own bookkeeping further down.
+        guard entry.header.headerLength + totalLength <= Self.maximumDatagram else {
+            heldBytes -= entry.holdingBytes
+            pending.removeValue(forKey: key)
+            return nil
+        }
+
         var assembled = ByteBufferAllocator().buffer(capacity: totalLength)
         assembled.writeRepeatingByte(0, count: totalLength)
         for piece in entry.received {
@@ -145,8 +161,10 @@ public final class Reassembler {
         header.flags.remove(.moreFragments)
         header.fragmentOffset = 0
         // Safe by construction: `process` admits a fragment only when
-        // `header.headerLength + end <= maximumDatagram` (65535), so this sum
-        // never exceeds UInt16.max. Do not relax that admission guard without
+        // `entry.header.headerLength + end <= maximumDatagram` (65535), and the
+        // guard just above re-checks the same bound against the final
+        // `totalLength` using the header that is actually used here, so this
+        // sum never exceeds UInt16.max. Do not relax either guard without
         // reworking this conversion, which is non-failable and traps.
         header.totalLength = UInt16(header.headerLength + totalLength)
         return (header, assembled)

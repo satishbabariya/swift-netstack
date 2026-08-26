@@ -3,7 +3,12 @@ import NIOCore
 /// Answers ARP requests for addresses this NIC owns, and learns bindings from
 /// everything it sees.
 public final class ARPResponder {
-    private let nic: NIC
+    // `unowned`, not `let`. Stack owns the NIC, the responder, and the protocol
+    // handlers; the NIC holds handler closures that capture this type, so a
+    // strong reference back to the NIC closes a retain cycle when Stack wires
+    // them together. This can never outlive the NIC that Stack owns alongside
+    // it, so unowned is safe and encodes that invariant.
+    private unowned let nic: NIC
     private let cache: ARPCache
     private let allocator: ByteBufferAllocator
 

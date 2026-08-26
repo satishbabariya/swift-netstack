@@ -293,11 +293,24 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // A fragment's payload reaches `process` as a NIO `getSlice`/`readSlice`
     // off the frame it arrived in — copy-on-write, so an uncopied slice
     // keeps the ENTIRE original allocation alive until something writes into
-    // it. Confirms the slice really is COW-backed by the whole frame, and
-    // that a single admission does not itself blow past a generous ceiling.
-    // (The tight, real-footprint bound lives in
-    // `reassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalFragments`
-    // below, which exercises this at scale.)
+    // it. Confirms the slice really is COW-backed by the whole frame, and then
+    // asserts on what the reassembler actually RETAINED: the pending payload's
+    // `storageCapacity`, which is exactly the quantity COW pinning moves.
+    //
+    // `storageCapacity` reports the size of the whole allocation a `ByteBuffer`
+    // references, so the two cases separate by three orders of magnitude with
+    // no measurement noise in between: a fresh, exactly-sized 1-byte copy
+    // reports 1, an uncopied 1-byte slice of the 1500-byte frame reports the
+    // frame's full allocation (2048, measured with the copy deleted — NIO
+    // rounds capacity to a power of two). Nothing about a process-wide RSS
+    // reading is involved, so nothing here can be masked by a concurrent test.
+    //
+    // This is NOT redundant with `perFragmentOverhead`'s guard, and the two
+    // must not be conflated: real per-fragment retention cost (the array
+    // element, the backing storage object, malloc's minimum bucket) is
+    // genuinely invisible to `storageCapacity`, which is why the old
+    // `heldStorageBytes` diagnostic could not catch the missing overhead
+    // charge. COW pinning is the one failure `storageCapacity` sees perfectly.
     let reassembler = Reassembler(clock: ManualClock())
     var frame = ByteBufferAllocator().buffer(capacity: 1500)
     frame.writeRepeatingByte(0xaa, count: 1500)
@@ -312,6 +325,58 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     _ = reassembler.process(header: header, payload: onebyte)
 
     #expect(reassembler.pendingCount == 1)
+    // An upper bound alone is satisfied by having retained nothing at all, so
+    // assert the fragment is actually being held before bounding what it holds.
+    #expect(reassembler.pendingFragmentCount == 1)
+    #expect(reassembler.pendingPayloadStorageBytes <= 32)
+}
+
+@Test func admittedFragmentsDoNotPinTheirFramesUnderAFloodOfMinimalFragments() {
+    // The same guarantee as `admittedFragmentsDoNotPinTheirOriginalFrameStorage`
+    // above, at the scale where it matters — the flood shape that
+    // `reassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalFragments` uses,
+    // where eviction is running and hundreds of fragments are held at once.
+    //
+    // Every datagram gets its OWN 1500-byte frame here, which is the whole
+    // point of this test existing separately. Slicing a flood off ONE shared
+    // frame — as the RSS test does — cannot see COW pinning at all: however
+    // many slices point into a single frame, they pin that one allocation
+    // between them, so uncopied slices and copies retain nearly the same
+    // amount. Distinct frames are what make the difference observable, and
+    // `storageCapacity` is what observes it: 1 byte per fragment when
+    // copy-on-admission runs, the frame's whole allocation when it does not
+    // (2048 for a 1500-byte frame, since NIO rounds capacity to a power of
+    // two). Measured with the copy deleted: 2,310,144 bytes pinned against a
+    // 36,096-byte bound, a 64x separation.
+    let memoryLimit = 200_000
+    let fragmentsPerDatagram = 4
+    let datagrams = 5_000
+    let reassembler = Reassembler(
+        clock: ManualClock(), timeout: .seconds(3600), memoryLimit: memoryLimit,
+        maximumPendingDatagrams: 1_000_000)
+
+    for d in 0..<datagrams {
+        var frame = ByteBufferAllocator().buffer(capacity: 1500)
+        frame.writeRepeatingByte(0xaa, count: 1500)
+        for i in 0..<fragmentsPerDatagram {
+            let slice = frame.getSlice(at: i * 8, length: 1)!
+            var header = IPv4Header(
+                source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+                protocolNumber: .udp, payloadLength: 1)
+            header.identification = UInt16(d % 65536)
+            header.fragmentOffset = i * 8
+            header.flags = [.moreFragments]
+            _ = reassembler.process(header: header, payload: slice)
+        }
+    }
+
+    // Eviction must actually have left fragments pending — an upper bound on
+    // retained storage is trivially satisfied by an empty reassembler.
+    #expect(reassembler.pendingFragmentCount >= fragmentsPerDatagram)
+    // 32 bytes of allocation per 1-byte payload is generous headroom over the
+    // 1 an exactly-sized copy really costs, and 64x below the 2048 an
+    // uncopied slice of its frame would pin.
+    #expect(reassembler.pendingPayloadStorageBytes <= reassembler.pendingFragmentCount * 32)
 }
 
 @Test func reassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalFragments() {
@@ -320,10 +385,21 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // `assemble()` never runs — nothing is ever released by completing, so
     // the memory cap's eviction is the only thing keeping this bounded.
     // Fragments are sliced off a shared 1500-byte MTU-sized frame, the way
-    // `PacketBuffer` really delivers them, so a regression of the
-    // copy-on-admission fix (an uncopied slice pinning the whole frame)
-    // would also blow this bound, not just a regression of the per-fragment
-    // overhead charge below.
+    // `PacketBuffer` really delivers them.
+    //
+    // This test does NOT guard the copy-on-admission fix, and an earlier
+    // version of this comment claiming it did was wrong — verified by
+    // deleting the copy, at which point all 20 tests in this file still
+    // passed. Sharing one frame across every fragment is precisely what
+    // makes the shape blind to COW pinning: however many slices point into a
+    // single allocation, they pin that one allocation between them, so
+    // uncopied slices cost essentially the same as copies here. "Slices
+    // behave the way real delivery does" is not "many distinct frames are
+    // retained". Copy-on-admission is guarded by
+    // `admittedFragmentsDoNotPinTheirFramesUnderAFloodOfMinimalFragments`
+    // above, which uses a distinct frame per datagram and asserts on
+    // `storageCapacity` rather than RSS. What this test guards is the
+    // per-fragment overhead charge.
     //
     // Before `perFragmentOverhead` was charged, the reviewer measured 147.7
     // bytes of REAL retention per accounted byte on this exact shape — a

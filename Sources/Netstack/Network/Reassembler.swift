@@ -166,6 +166,41 @@ public final class Reassembler {
 
     public var pendingCount: Int { pending.count }
 
+    /// Diagnostic: the total `ByteBuffer.storageCapacity` of every pending
+    /// fragment payload — the size of the allocations those payloads keep
+    /// alive, not the number of bytes they declare.
+    ///
+    /// This exists to make copy-on-admission (see the type-level doc comment)
+    /// falsifiable by a test. `storageCapacity` reports the whole backing
+    /// allocation a `ByteBuffer` references, so it separates the two cases
+    /// exactly: a fresh, exactly-sized 1-byte copy reports 1, while an
+    /// uncopied 1-byte `getSlice` of a 1500-byte MTU frame reports 1500 —
+    /// COW pinning is precisely what `storageCapacity` can see.
+    ///
+    /// It is deliberately NOT a substitute for `perFragmentOverhead`, and the
+    /// two failures must not be conflated. Real per-fragment retention cost —
+    /// the array element, the backing storage object's own class header,
+    /// malloc's minimum bucket — is invisible to `storageCapacity` (which is
+    /// why an earlier `heldStorageBytes` diagnostic could not catch the
+    /// missing overhead charge, and why `perFragmentOverhead` exists). This
+    /// number bounds pinning, not footprint.
+    ///
+    /// O(pending fragments); for tests and diagnostics only, never on a
+    /// packet path.
+    var pendingPayloadStorageBytes: Int {
+        pending.values.reduce(0) { total, entry in
+            total + entry.received.reduce(0) { $0 + $1.bytes.storageCapacity }
+        }
+    }
+
+    /// Diagnostic: the number of fragment payloads currently pending, across
+    /// every pending datagram. Pairs with `pendingPayloadStorageBytes` so a
+    /// test can state the per-fragment pinning bound rather than a total that
+    /// silently depends on how many entries eviction happened to leave.
+    var pendingFragmentCount: Int {
+        pending.values.reduce(0) { $0 + $1.received.count }
+    }
+
     /// Feed one fragment in. Returns the whole datagram once it is complete,
     /// nil while it is still missing pieces or the fragment was rejected.
     public func process(header: IPv4Header, payload: ByteBuffer) -> (IPv4Header, ByteBuffer)? {

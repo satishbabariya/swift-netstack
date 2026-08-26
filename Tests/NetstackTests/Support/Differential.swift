@@ -79,18 +79,25 @@ struct DifferentialDivergence: CustomStringConvertible {
 /// `Stack`, and reports every point where what the two stacks emitted
 /// disagrees.
 ///
-/// PERMITTED DIVERGENCES (spec §8.2), excluded from the diff: initial
-/// sequence numbers, timestamp option values, and ACK coalescing
-/// decisions. Everything else is a defect. Two independently-implemented
-/// stacks never choose the same ISN, so raw TCP sequence/ack numbers are
-/// masked to a fixed, comparable form before comparison — see
-/// `normalized(_:)`. ACK-coalescing decisions (whether a stack piggybacks
-/// an ACK on data or sends it separately) can change how many frames a
-/// stack emits, not just one frame's content, and nothing in this task's
-/// vectors exercises that path (Task 5 is validated only against ARP and
-/// ICMP, which carry no TCP fields at all) — so it is left unhandled here,
-/// documented rather than guessed at, for whichever TCP task first needs
-/// it and can falsify an implementation against a real example.
+/// PERMITTED DIVERGENCES (spec §8.2): initial sequence numbers and
+/// timestamp option values. Everything else is a defect. Two
+/// independently-implemented stacks never choose the same ISN, so raw TCP
+/// sequence/ack numbers, and timestamp option values, are masked to a
+/// fixed, comparable form before comparison — see `normalized(_:)`. Those
+/// two are the only things actually excluded from the diff.
+///
+/// ACK-coalescing decisions (whether a stack piggybacks an ACK on data or
+/// sends it separately) are ALSO a permitted divergence per spec §8.2, but
+/// this type does NOT mask them: nothing in this task's vectors exercises
+/// that path (Task 5 is validated only against ARP and ICMP, which carry no
+/// TCP fields at all), so a frame-count difference caused purely by
+/// ACK-coalescing will currently be reported as a divergence rather than
+/// silently permitted. This is the safe failure direction — a permitted
+/// divergence surfacing as a false-positive defect is noisy but harmless,
+/// whereas masking a real defect would be dangerous — but it is still
+/// wrong, and it is documented here rather than guessed at. Whichever TCP
+/// task first produces such a frame-count difference must implement the
+/// masking then, against a real example it can falsify.
 ///
 /// THE BUG THIS TYPE EXISTS TO NOT HAVE: comparing `zip(swiftFrames,
 /// goFrames)` and silently ignoring whichever list has a longer tail. If

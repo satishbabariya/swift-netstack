@@ -1,7 +1,17 @@
+import Foundation
 import NIOCore
 import Testing
 
 @testable import Netstack
+
+/// Peak resident set size in bytes, as `getrusage` reports it on Darwin.
+/// Used to measure REAL retained memory rather than trusting the
+/// reassembler's own accounting, which is exactly the thing under test.
+private func peakResidentBytes() -> Int {
+    var info = rusage()
+    getrusage(RUSAGE_SELF, &info)
+    return info.ru_maxrss
+}
 
 private func fragment(id: UInt16, offset: Int, more: Bool, bytes: [UInt8]) -> (IPv4Header, ByteBuffer) {
     var header = IPv4Header(
@@ -135,13 +145,17 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
 
 @Test func evictsTheOldestWhenOverTheMemoryLimit() {
     let clock = ManualClock()
-    let reassembler = Reassembler(clock: clock, timeout: .seconds(30), memoryLimit: 24)
+    // Each 8-byte fragment is charged `perFragmentOverhead` on top of its
+    // payload length (see `Reassembler`'s doc comment on why); size the cap
+    // for exactly 3 entries so 5 insertions still evict the oldest two.
+    let entryCost = 8 + Reassembler.perFragmentOverhead
+    let reassembler = Reassembler(clock: clock, timeout: .seconds(30), memoryLimit: entryCost * 3)
     for id in UInt16(1)...UInt16(5) {
         let f = fragment(id: id, offset: 0, more: true, bytes: Array(repeating: UInt8(id), count: 8))
         _ = reassembler.process(header: f.0, payload: f.1)
         clock.advance(by: .milliseconds(1))
     }
-    // 5 x 8 bytes exceeds the 24-byte cap; the oldest are evicted.
+    // 5 entries exceed the 3-entry cap; the oldest two are evicted.
     #expect(reassembler.pendingCount == 3)
 }
 
@@ -231,7 +245,11 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // peer's duplicate fragments were counted repeatedly, it could inflate
     // its own accounted size and push an older, legitimate datagram out.
     let clock = ManualClock()
-    let reassembler = Reassembler(clock: clock, timeout: .seconds(30), memoryLimit: 24)
+    // Size the cap for exactly 2 entries' worth (see
+    // `evictsTheOldestWhenOverTheMemoryLimit` for why raw payload bytes are
+    // no longer the right unit).
+    let entryCost = 8 + Reassembler.perFragmentOverhead
+    let reassembler = Reassembler(clock: clock, timeout: .seconds(30), memoryLimit: entryCost * 2)
 
     let victim = fragment(id: 1, offset: 0, more: true, bytes: Array(repeating: UInt8(0x11), count: 8))
     _ = reassembler.process(header: victim.0, payload: victim.1)
@@ -243,8 +261,8 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
         _ = reassembler.process(header: flood.0, payload: flood.1)
     }
 
-    // Held bytes must be 16, not 40 — so nothing was evicted and the
-    // older datagram survives.
+    // Held bytes must reflect 2 admitted fragments, not 5 — so nothing was
+    // evicted and the older datagram survives.
     #expect(reassembler.pendingCount == 2)
 
     let victimTail = fragment(id: 1, offset: 8, more: false, bytes: [0x11])
@@ -275,10 +293,11 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // A fragment's payload reaches `process` as a NIO `getSlice`/`readSlice`
     // off the frame it arrived in — copy-on-write, so an uncopied slice
     // keeps the ENTIRE original allocation alive until something writes into
-    // it. Simulate that here directly: a 1-byte fragment sliced from a
-    // 1500-byte MTU-sized buffer. Before fragments were copied into fresh,
-    // exactly-sized storage on admission, `heldStorageBytes` would reflect
-    // the full 1500 bytes, not the 1 actually admitted.
+    // it. Confirms the slice really is COW-backed by the whole frame, and
+    // that a single admission does not itself blow past a generous ceiling.
+    // (The tight, real-footprint bound lives in
+    // `reassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalFragments`
+    // below, which exercises this at scale.)
     let reassembler = Reassembler(clock: ManualClock())
     var frame = ByteBufferAllocator().buffer(capacity: 1500)
     frame.writeRepeatingByte(0xaa, count: 1500)
@@ -293,10 +312,107 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     _ = reassembler.process(header: header, payload: onebyte)
 
     #expect(reassembler.pendingCount == 1)
-    // Real retained memory must track what was actually admitted (1 byte,
-    // rounded up by whatever the allocator does for a tiny buffer), not the
-    // ~1500-byte frame the fragment happened to be sliced from.
-    #expect(reassembler.heldStorageBytes < 256)
+}
+
+@Test func reassemblyMemoryLimitBoundsRealRSSUnderAFloodOfMinimalFragments() {
+    // The reviewer's attack shape: 1-byte fragments at 8-byte offsets, with
+    // `MoreFragments` always set so `totalLength` is never established and
+    // `assemble()` never runs — nothing is ever released by completing, so
+    // the memory cap's eviction is the only thing keeping this bounded.
+    // Fragments are sliced off a shared 1500-byte MTU-sized frame, the way
+    // `PacketBuffer` really delivers them, so a regression of the
+    // copy-on-admission fix (an uncopied slice pinning the whole frame)
+    // would also blow this bound, not just a regression of the per-fragment
+    // overhead charge below.
+    //
+    // Before `perFragmentOverhead` was charged, the reviewer measured 147.7
+    // bytes of REAL retention per accounted byte on this exact shape — a
+    // 4 MiB nominal cap permitted roughly 620 MB of actual memory, and the
+    // `heldStorageBytes` diagnostic that existed to catch this could not see
+    // it (a fresh 1-byte buffer's `storageCapacity` is 1). This test asserts
+    // real RSS growth via `getrusage` instead, so a regression of either fix
+    // shows up directly rather than only in an accounting number that can
+    // itself be wrong.
+    //
+    // `getrusage`'s `ru_maxrss` is a process-wide, monotonically
+    // non-decreasing high-water mark, and `swift test` runs Swift Testing
+    // tests concurrently within one process by default, so a modest amount
+    // of apparent "growth" here can come from unrelated sibling tests
+    // allocating at the same moment rather than from this workload (observed
+    // up to ~10 MB of such noise across repeated full-suite runs). Rather
+    // than chase that noise with a tight bound, `datagrams` is picked large
+    // enough that a correctly-bounded run's real growth (low single-digit MB
+    // — cap plus noise) and a regressed run's real growth (tens of MB) are
+    // both far outside the other's range, so `grown`'s threshold below has
+    // wide margin on both sides. `pendingCount`'s assertion just above is
+    // the tighter, deterministic half of this test — it does not depend on
+    // OS memory noise at all, and by itself already separates the fixed and
+    // reverted behaviour by two orders of magnitude (283 vs. 50,000
+    // surviving entries measured when the overhead charge below was
+    // reverted — see the report's falsification for COMMIT 1).
+    let memoryLimit = 200_000
+    let reassembler = Reassembler(
+        clock: ManualClock(), timeout: .seconds(3600), memoryLimit: memoryLimit,
+        maximumPendingDatagrams: 1_000_000)
+
+    var frame = ByteBufferAllocator().buffer(capacity: 1500)
+    frame.writeRepeatingByte(0xaa, count: 1500)
+
+    let fragmentsPerDatagram = 4
+    let datagrams = 70_000
+    let before = peakResidentBytes()
+    for d in 0..<datagrams {
+        for i in 0..<fragmentsPerDatagram {
+            let slice = frame.getSlice(at: i * 8, length: 1)!
+            var header = IPv4Header(
+                source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+                protocolNumber: .udp, payloadLength: 1)
+            header.identification = UInt16(d % 65536)
+            header.fragmentOffset = i * 8
+            header.flags = [.moreFragments]
+            _ = reassembler.process(header: header, payload: slice)
+        }
+    }
+    let grown = peakResidentBytes() - before
+
+    // Each surviving entry costs `fragmentsPerDatagram * (1 + perFragmentOverhead)`
+    // in the accounting; the cap admits at most `memoryLimit` worth of that,
+    // plus one entry's slop for whichever admission last tripped eviction.
+    // 70,000 datagrams were offered, so a bounded count here (rather than
+    // 70,000) proves eviction actually ran, not merely that everything fit.
+    let entryCost = fragmentsPerDatagram * (1 + Reassembler.perFragmentOverhead)
+    #expect(reassembler.pendingCount <= memoryLimit / entryCost + 1)
+
+    // A generous ceiling, well above the ~10 MB of ambient noise this
+    // workload's own bounded contribution was observed to hide inside, but
+    // below the ~52 MB measured for this same input with the overhead
+    // charge reverted (at which point the raw, unweighted payload total
+    // alone eventually reaches `memoryLimit`, so eviction still runs — just
+    // ~177x too late, holding ~50,000 entries' worth of real memory instead
+    // of ~283).
+    #expect(grown < 30_000_000)
+}
+
+@Test func rejectsFragmentsBeyondThePerDatagramCap() {
+    // `maximumFragmentsPerDatagram` bounds one datagram's own fragment count
+    // independently of `memoryLimit` — insurance against `perFragmentOverhead`
+    // ever being mis-measured or mis-tuned again. Cap set to 5 contiguous
+    // 8-byte fragments; a 6th, terminating fragment must be rejected outright
+    // rather than complete the datagram, proving admission actually stopped
+    // at the cap rather than merely still waiting for more data.
+    let reassembler = Reassembler(clock: ManualClock(), maximumFragmentsPerDatagram: 5)
+    for i in 0..<5 {
+        let f = fragment(id: 77, offset: i * 8, more: true, bytes: Array(repeating: UInt8(0xaa), count: 8))
+        #expect(reassembler.process(header: f.0, payload: f.1) == nil)
+    }
+    #expect(reassembler.pendingCount == 1)
+
+    // The 6th fragment would complete the datagram (offsets 0..<40) if
+    // admitted, so a nil result here — with the entry still pending, not
+    // gone — proves it was rejected by the cap, not merely incomplete.
+    let sixth = fragment(id: 77, offset: 40, more: false, bytes: Array(repeating: UInt8(0xbb), count: 8))
+    #expect(reassembler.process(header: sixth.0, payload: sixth.1) == nil)
+    #expect(reassembler.pendingCount == 1)
 }
 
 @Test func pendingCountIsBoundedIndependentlyOfTheByteCap() {
@@ -376,8 +492,12 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // O(1)-amortized version this replaces it with finishes in well under
     // one, a ~20x difference that only widens as the flood grows.
     let clock = ManualClock()
+    // Sized for exactly 3000 entries' worth under the new per-fragment
+    // overhead charge (see `Reassembler.perFragmentOverhead`), matching the
+    // original 8-byte-payload x 3000 intent.
+    let entryCost = 8 + Reassembler.perFragmentOverhead
     let reassembler = Reassembler(
-        clock: clock, timeout: .seconds(3600), memoryLimit: 8 * 3000, maximumPendingDatagrams: 1_000_000)
+        clock: clock, timeout: .seconds(3600), memoryLimit: entryCost * 3000, maximumPendingDatagrams: 1_000_000)
 
     let elapsed = ContinuousClock().measure {
         for id in 0..<50_000 {

@@ -2,15 +2,22 @@ import NIOCore
 
 /// Reassembles IPv4 fragments into whole datagrams.
 ///
-/// Bounded on three axes, because an incomplete datagram is otherwise an
+/// Bounded on four axes, because an incomplete datagram is otherwise an
 /// unbounded allocation a peer controls: each pending datagram expires after
 /// `timeout`; the memory actually retained across all of them is capped at
-/// `memoryLimit`; and the number of concurrently pending datagrams is capped
-/// at `maximumPendingDatagrams` — independently of `memoryLimit`, because a
+/// `memoryLimit`; the number of concurrently pending datagrams is capped at
+/// `maximumPendingDatagrams` — independently of `memoryLimit`, because a
 /// flood of minimal fragments (as little as 1 byte each) spread across many
 /// different datagram IDs barely moves the byte total while still costing one
-/// full entry — a header, an array, and a dictionary slot — per datagram. Both
-/// caps evict oldest-first, in the order entries were created.
+/// full entry — a header, an array, and a dictionary slot — per datagram; and
+/// the number of fragments accepted for any ONE datagram is capped at
+/// `maximumFragmentsPerDatagram`, because the same trick works the other way
+/// too — one datagram ID, thousands of 1-byte fragments — and neither of the
+/// other two caps limits it (`memoryLimit` is exactly what per-fragment
+/// overhead charging below closes, but a second, structural cap on fragment
+/// count is cheap insurance against ever mis-measuring that overhead again).
+/// All three eviction/rejection caps evict oldest-first, in the order entries
+/// were created, or reject outright once a single datagram's own cap is hit.
 ///
 /// Each admitted fragment's payload is copied into freshly allocated,
 /// exactly-sized storage rather than kept as the `ByteBuffer` slice it
@@ -18,11 +25,22 @@ import NIOCore
 /// fragment reaches here from `PacketBuffer`) is copy-on-write: a slice keeps
 /// a live reference to the ENTIRE original allocation until something writes
 /// into it, so an uncopied 1-byte fragment sliced from a 1500-byte MTU frame
-/// pins all 1500 bytes, not 1. `holdingBytes`/`heldBytes`/`memoryLimit` count
-/// payload length either way, but only the copy makes that count track real
-/// retained memory — without it, `memoryLimit` bounds the accounting, not the
-/// actual allocation behind it, and the two can diverge by orders of
-/// magnitude.
+/// pins all 1500 bytes, not 1. Copying fixes that pinning, but it does not by
+/// itself make `heldBytes`/`memoryLimit` track real retained memory: even a
+/// freshly, exactly-sized copy of 1 payload byte costs far more than 1 byte
+/// in practice, because what is actually retained per fragment is the
+/// `(offset: Int, bytes: ByteBuffer)` array element, the `ByteBuffer`'s own
+/// backing `_Storage` class instance (an allocation with a class header), and
+/// whatever malloc's minimum bucket rounds that tiny allocation up to — none
+/// of which `payload.readableBytes` sees. Measured empirically (this
+/// package's own `getrusage`-based measurement, reproducing the 1-byte,
+/// 8-byte-offset, `MoreFragments`-always-set shape end to end through
+/// `process`): roughly 119–131 bytes of real RSS growth per 1-byte fragment
+/// depending on build configuration, and a prior measurement on a different
+/// platform/allocator put it at 147.7. `perFragmentOverhead` charges 176 —
+/// comfortably above every measurement taken, including the least favourable
+/// one, so `memoryLimit` bounds what is actually retained rather than merely
+/// what was declared on the wire.
 ///
 /// A correctly fragmenting sender never produces two fragments that claim
 /// the same byte, so any incoming fragment whose byte range overlaps a
@@ -48,6 +66,24 @@ public final class Reassembler {
     /// regardless of how minimal an attacker makes each fragment.
     public static let defaultMaximumPendingDatagrams = 1024
 
+    /// The real, per-fragment cost of holding one admitted fragment pending —
+    /// the array element, the `ByteBuffer`'s backing storage object, and
+    /// malloc's rounding of that tiny allocation — none of which shows up in
+    /// `payload.readableBytes`. See the type-level doc comment for how this
+    /// number was measured. Charged on top of the declared payload length so
+    /// `heldBytes`/`memoryLimit` bound what is actually retained.
+    public static let perFragmentOverhead = 176
+
+    /// A correctly fragmenting sender splits a datagram into at most a few
+    /// dozen pieces even at the smallest MTU IPv4 permits (68 bytes, RFC
+    /// 791 §3.1): a 65535-byte datagram needs at most ~1366 fragments at
+    /// that floor, and ordinary Ethernet-MTU fragmentation needs a few dozen.
+    /// This is generous headroom over that worst legitimate case while still
+    /// bounding, independent of `memoryLimit`, how many times one datagram ID
+    /// can pay `perFragmentOverhead` — insurance against `memoryLimit` alone
+    /// ever being mis-measured or mis-tuned again.
+    public static let defaultMaximumFragmentsPerDatagram = 2048
+
     private struct Key: Hashable {
         let source: IPv4Address
         let destination: IPv4Address
@@ -68,6 +104,7 @@ public final class Reassembler {
     private let timeout: TimeAmount
     private let memoryLimit: Int
     private let maximumPendingDatagrams: Int
+    private let maximumFragmentsPerDatagram: Int
     private var pending: [Key: Pending] = [:]
     private var heldBytes = 0
     /// Every live key, oldest first — the order entries were created in, not
@@ -84,28 +121,17 @@ public final class Reassembler {
 
     public init(
         clock: NetstackClock, timeout: TimeAmount = .seconds(30), memoryLimit: Int = 4 * 1024 * 1024,
-        maximumPendingDatagrams: Int = Reassembler.defaultMaximumPendingDatagrams
+        maximumPendingDatagrams: Int = Reassembler.defaultMaximumPendingDatagrams,
+        maximumFragmentsPerDatagram: Int = Reassembler.defaultMaximumFragmentsPerDatagram
     ) {
         self.clock = clock
         self.timeout = timeout
         self.memoryLimit = memoryLimit
         self.maximumPendingDatagrams = max(1, maximumPendingDatagrams)
+        self.maximumFragmentsPerDatagram = max(1, maximumFragmentsPerDatagram)
     }
 
     public var pendingCount: Int { pending.count }
-
-    /// Diagnostic only: the total storage capacity retained by every byte
-    /// buffer currently held across every pending fragment — as opposed to
-    /// `heldBytes` (private) and the `memoryLimit` it is checked against,
-    /// which count RFC-declared payload bytes. Before fragments were copied
-    /// into fresh, exactly-sized storage on admission, this number could be
-    /// orders of magnitude larger than the payload-byte accounting, because
-    /// an uncopied slice pins the entire frame it was carved out of.
-    public var heldStorageBytes: Int {
-        pending.values.reduce(0) { total, entry in
-            total + entry.received.reduce(0) { $0 + $1.bytes.storageCapacity }
-        }
-    }
 
     /// Feed one fragment in. Returns the whole datagram once it is complete,
     /// nil while it is still missing pieces or the fragment was rejected.
@@ -141,6 +167,14 @@ public final class Reassembler {
         // fragments overflow the conversion at assembly.
         guard entry.header.headerLength + end <= Self.maximumDatagram else { return nil }
 
+        // Reject outright once this ONE datagram has already accumulated
+        // `maximumFragmentsPerDatagram` fragments — independent of, and
+        // cheaper to check than, the overlap scan below. No legitimately
+        // fragmenting sender approaches this count (see the doc comment on
+        // `defaultMaximumFragmentsPerDatagram`); an attacker sending nothing
+        // but 1-byte fragments for a single ID is the shape this closes.
+        guard entry.received.count < maximumFragmentsPerDatagram else { return nil }
+
         // Reject any fragment that overlaps a byte range already accepted
         // for this datagram (including an exact duplicate), and reject a
         // second "final fragment" that disagrees with the first about where
@@ -164,8 +198,12 @@ public final class Reassembler {
         var copy = ByteBufferAllocator().buffer(capacity: length)
         copy.writeBytes(payload.readableBytesView)
         entry.received.append((offset: offset, bytes: copy))
-        entry.holdingBytes += length
-        heldBytes += length
+        // Charge the real per-fragment retention cost, not just the payload
+        // length — see `perFragmentOverhead`'s doc comment. Without this,
+        // `memoryLimit` bounds the accounting, not the allocation behind it.
+        let charge = length + Self.perFragmentOverhead
+        entry.holdingBytes += charge
+        heldBytes += charge
         if !header.flags.contains(.moreFragments) {
             entry.totalLength = end
         }

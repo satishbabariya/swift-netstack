@@ -55,14 +55,19 @@ private func frame(to destination: String, etherType: UInt16, payload: [UInt8]) 
 
 @Test func dropsFramesWithNoHandlerForTheirEtherType() {
     let (nic, link) = makeNIC()
-    // No handler registered for IPv6; must not trap.
+    // A handler exists for IPv4. An IPv6 frame must not reach it, and must
+    // not trap. Asserting "nothing was transmitted" would prove nothing:
+    // the receive path never transmits, so that is true either way.
+    var ipv4Deliveries = 0
+    nic.setHandler(for: .ipv4) { _, _ in ipv4Deliveries += 1 }
+
     link.inject(frame(to: "5a:94:ef:e4:0c:ee", etherType: 0x86dd, payload: [0xaa]))
-    #expect(link.drainTransmitted().isEmpty)
-    // `nic` is otherwise unused here, but it must stay bound: NIC's dispatcher
-    // link is weak (see LinkEndpoint), so an unretained NIC deallocates and the
-    // link silently drops every frame — the test would then pass for the wrong
-    // reason (dropped because gone, not dropped because unhandled).
-    _ = nic
+    #expect(ipv4Deliveries == 0)
+
+    // And the NIC still works afterwards, so the drop was selective rather
+    // than the handler table being broken outright.
+    link.inject(frame(to: "5a:94:ef:e4:0c:ee", etherType: 0x0800, payload: [0xbb]))
+    #expect(ipv4Deliveries == 1)
 }
 
 @Test func dropsRuntFrames() {

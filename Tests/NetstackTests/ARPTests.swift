@@ -136,6 +136,45 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.count == capacity)
 }
 
+@Test func orderStaysBoundedWhenOneAddressPinsTheHead() {
+    // `order`'s head-only compaction (`compactOrderIfNeeded`'s lazy scan) can
+    // be pinned indefinitely by a single address that is recorded once and
+    // never touched again: its one appearance sits at `order[0]` forever,
+    // always live, so the lazy scan never advances `orderHead` past it and
+    // the prefix-drop never fires — no matter how many times some OTHER
+    // address is re-touched behind it. The existing
+    // `refreshingAnExistingEntryDoesNotScanTheWholeCache` test cycles
+    // round-robin through every key, which keeps the head moving and stays
+    // bounded — precisely the shape that misses this. This test uses the
+    // actual attack shape instead: one address to pin the head, then a
+    // DIFFERENT single address hammered many times.
+    //
+    // Reviewer's measurement of this exact shape against the unfixed code,
+    // capacity 512: 4,000,000 touches, `cache.count == 2`, ~165 MB of real
+    // RSS growth — `order` had grown to roughly one element per touch.
+    let clock = ManualClock()
+    let capacity = 64
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: capacity)
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, 0, UInt8($0)) }
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, 0, UInt8($0)])! }
+
+    // Pin the head: recorded once, never touched again.
+    cache.record(ip(1), mac(1))
+
+    // Hammer a single, different address many times.
+    let touches = 200_000
+    for _ in 0..<touches {
+        cache.record(ip(2), mac(2))
+    }
+
+    #expect(cache.count == 2)
+    // The periodic full-pass compaction bounds `order` to a small constant
+    // multiple of `capacity` regardless of the touch pattern — not merely
+    // when the head happens to keep moving. Falsifies to ~200,000 (one
+    // element per touch, unbounded) against the pre-fix, head-only scan.
+    #expect(cache.orderCountForTesting <= 4 * capacity + 1)
+}
+
 @Test func cacheEvictsOldestButKeepsARecentlyTouchedEntry() {
     let clock = ManualClock()
     let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: 4)

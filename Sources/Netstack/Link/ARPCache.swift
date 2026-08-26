@@ -123,6 +123,15 @@ public final class ARPCache {
     /// is the index of the oldest appearance that might still be live;
     /// appearances at or before it may already be stale and are skipped
     /// lazily rather than removed from the middle of the array.
+    ///
+    /// Bounded to `4 * capacity + 1` elements by `compactOrderIfNeeded`'s
+    /// periodic full pass — see that function's doc comment. Without it, one
+    /// address that is recorded once and never touched again pins
+    /// `orderHead` at its own appearance forever, and every touch of every
+    /// OTHER address grows this array with nothing to reclaim it: an
+    /// attacker pins with one packet, then floods from a second address to
+    /// drive unbounded growth using only ordinary, individually-legitimate
+    /// traffic.
     private var order: [(ip: IPv4Address, sequence: Int)] = []
     private var orderHead = 0
     private var nextSequence = 0
@@ -153,6 +162,12 @@ public final class ARPCache {
     /// perturbed unrelated tests' own memory measurements (see
     /// `ReassemblerTests`). This counter sidesteps both problems.
     var orderScanStepsForTesting = 0
+
+    /// Test-only instrumentation, not `private`, for the same reason as
+    /// `orderScanStepsForTesting`: `order.count` itself, to assert directly
+    /// that it stays bounded under a pinned-head attack rather than
+    /// inferring it indirectly from scan-step counts.
+    var orderCountForTesting: Int { order.count }
 
     public init(clock: NetstackClock, ttl: TimeAmount = .seconds(60), capacity: Int = ARPCache.defaultCapacity) {
         self.clock = clock
@@ -237,6 +252,31 @@ public final class ARPCache {
     /// number rather than relying on array position to imply one, so
     /// `removeFirst` shifting every surviving element's position here does
     /// not invalidate the comparison on the next call.
+    ///
+    /// The head-only scan above has a gap: it can be pinned indefinitely by
+    /// a single address that is never re-touched while every OTHER address
+    /// is repeatedly re-touched behind it. Each re-touch appends a fresh
+    /// appearance without ever making the pinning entry's own appearance
+    /// stale, so `orderHead` simply stops advancing and the prefix-drop
+    /// above never fires again — `order` then grows by one element per
+    /// touch, forever, entirely independent of `capacity`. (Measured: 4M
+    /// touches against one pinned address and one hammered address grew
+    /// `order` to ~4M elements and real RSS by ~165 MB at `capacity == 512`
+    /// before this fix.)
+    ///
+    /// Close that with a periodic FULL pass, not just the consumed prefix:
+    /// once `order` has grown past a multiple of `capacity` it could never
+    /// legitimately reach through live entries alone (at most `capacity`
+    /// entries can be live at once, so live appearances account for at most
+    /// `capacity` elements), rebuild `order` keeping only the appearances
+    /// that are still each entry's live one. This bounds `order.count` to a
+    /// small constant multiple of `capacity` (`4 * capacity + 1`, since this
+    /// is checked after every single append) regardless of the touch
+    /// pattern, not merely as long as the head happens to keep moving.
+    /// Amortized O(1): each appearance is visited by at most one full pass
+    /// before it is either dropped or survives as the sole live one for its
+    /// key, and the threshold guarantees a full pass runs at most once per
+    /// `capacity` further touches.
     private func compactOrderIfNeeded() {
         while orderHead < order.count {
             orderScanStepsForTesting += 1
@@ -244,8 +284,22 @@ public final class ARPCache {
             if let entry = entries[appearance.ip], entry.sequence == appearance.sequence { break }
             orderHead += 1
         }
-        guard orderHead > 64, orderHead * 2 > order.count else { return }
-        order.removeFirst(orderHead)
+        if orderHead > 64, orderHead * 2 > order.count {
+            order.removeFirst(orderHead)
+            orderHead = 0
+            return
+        }
+        guard order.count > 4 * capacity else { return }
+        var compacted: [(ip: IPv4Address, sequence: Int)] = []
+        compacted.reserveCapacity(entries.count)
+        for index in orderHead..<order.count {
+            orderScanStepsForTesting += 1
+            let appearance = order[index]
+            if let entry = entries[appearance.ip], entry.sequence == appearance.sequence {
+                compacted.append(appearance)
+            }
+        }
+        order = compacted
         orderHead = 0
     }
 

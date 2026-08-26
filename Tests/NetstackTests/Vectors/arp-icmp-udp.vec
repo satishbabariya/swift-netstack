@@ -1,0 +1,14 @@
+# Every line here describes behaviour Plan 1 already implements and verified
+# by other means. If the runner disagrees with any of it, the runner is wrong.
+
+# The guest resolves the gateway.
+0.000 < arp who-has 192.168.127.1 tell 192.168.127.2
+0.000 > arp reply 192.168.127.1 is-at 5a:94:ef:e4:0c:ee
+
+# The guest pings the gateway; the payload comes back verbatim.
+0.010 < icmp echo_request id 4660 seq 42
+0.010 > icmp echo_reply id 4660 seq 42
+
+# Nothing is listening on port 53, so the gateway refuses.
+0.020 < udp 4000 > 53 (12)
+0.020 > icmp unreachable port

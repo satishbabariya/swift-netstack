@@ -38,8 +38,20 @@ private final class CollectingDispatcher: LinkDispatcher {
 @Test func injectingWithNoDispatcherIsDropped() {
     let loop = EmbeddedEventLoop()
     let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
-    link.inject(ByteBuffer(bytes: [0xaa]))  // must not trap
-    #expect(link.drainTransmitted().isEmpty)
+
+    // No dispatcher attached: the frame must be dropped outright, as a real
+    // wire drops what nothing is listening for. It must not trap, and it
+    // must not be queued for a dispatcher that attaches later.
+    link.inject(ByteBuffer(bytes: [0xaa]))
+
+    let dispatcher = CollectingDispatcher()
+    link.attach(dispatcher)
+    #expect(dispatcher.received.isEmpty)
+
+    // The endpoint is still usable afterwards.
+    link.inject(ByteBuffer(bytes: [0xbb]))
+    #expect(dispatcher.received.count == 1)
+    #expect(Array(dispatcher.received[0].readableBytesView) == [0xbb])
 }
 
 @Test func loopbackDeliversWritesBackInbound() {

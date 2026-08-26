@@ -8,7 +8,7 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     public let capabilities: LinkCapabilities
     public let eventLoop: EventLoop
 
-    private var dispatcher: LinkDispatcher?
+    private weak var dispatcher: (any LinkDispatcher)?
     private var captured: [ByteBuffer] = []
 
     public init(
@@ -24,10 +24,12 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     }
 
     public func attach(_ dispatcher: LinkDispatcher) {
+        eventLoop.preconditionInEventLoop()
         self.dispatcher = dispatcher
     }
 
     public func write(_ packets: [PacketBuffer]) {
+        eventLoop.preconditionInEventLoop()
         captured.append(contentsOf: packets.map(\.frame))
     }
 
@@ -35,6 +37,7 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     public var transmitted: [ByteBuffer] { captured }
 
     public func drainTransmitted() -> [ByteBuffer] {
+        eventLoop.preconditionInEventLoop()
         defer { captured.removeAll(keepingCapacity: true) }
         return captured
     }
@@ -42,6 +45,7 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     /// Deliver a frame as though it arrived off the wire. A frame injected
     /// before anything is attached is dropped, exactly as a real wire would.
     public func inject(_ frame: ByteBuffer) {
+        eventLoop.preconditionInEventLoop()
         dispatcher?.deliverInbound(PacketBuffer(received: frame))
     }
 }

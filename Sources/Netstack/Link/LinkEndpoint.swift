@@ -18,9 +18,15 @@ public protocol LinkDispatcher: AnyObject {
 
 /// One wire.
 ///
-/// Deals only in whole frames. Header parsing belongs to the layer above, so
-/// a wire carrying something other than ethernet can conform without
-/// inventing link addresses it does not have.
+/// Deals only in whole frames: header parsing belongs to the layer above,
+/// so the link layer never needs to know what it is carrying.
+///
+/// The wire is assumed to carry ethernet frames, which is why
+/// `linkAddress` is non-optional. That holds for every transport this
+/// package targets — a datagram on the wire IS one ethernet frame. A wire
+/// carrying bare IP would need a different abstraction; change this
+/// protocol then, rather than weakening it now for a case that does not
+/// arise.
 public protocol LinkEndpoint: AnyObject {
     var mtu: UInt32 { get }
     var linkAddress: MACAddress { get }

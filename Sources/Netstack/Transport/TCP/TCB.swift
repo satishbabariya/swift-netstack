@@ -1,0 +1,99 @@
+import NIOCore
+
+/// The eleven TCP connection states from RFC 9293 §3.3.2, Figure 5.
+///
+/// `.closed` is a real, representable state here (not "no TCB exists") so
+/// that transitions into it (e.g. LAST-ACK + ACK -> CLOSED) are ordinary
+/// switch cases in `TCPStateMachine` rather than a special-cased teardown
+/// path.
+public enum TCPState: Equatable, Sendable {
+    case closed
+    case listen
+    case synSent
+    case synReceived
+    case established
+    case finWait1
+    case finWait2
+    case closeWait
+    case closing
+    case lastAck
+    case timeWait
+}
+
+/// What `TCPStateMachine` wants the caller to do, having already mutated
+/// the `TCB` it was given. The state machine performs no I/O itself --
+/// every RFC 9293 transition that would "send a segment" instead returns
+/// one of these, which is what keeps the machine a pure, directly testable
+/// function of `(segment, TCB) -> (TCB, [TCPAction])`.
+public enum TCPAction: Equatable, Sendable {
+    /// Send a SYN|ACK built from the TCB's current `iss`/`rcvNxt`.
+    case sendSynAck
+    /// Send a bare ACK built from the TCB's current `sndNxt`/`rcvNxt`.
+    /// Covers both an ordinary "data received" ACK and an RFC 5961
+    /// challenge ACK -- both are, on the wire, the same segment shape.
+    case sendAck
+    /// Send a RST at the given sequence number.
+    case sendRst(sequence: SequenceNumber)
+    /// Deliver received, in-order data to the application.
+    case deliver(ByteBuffer)
+    /// Arm (or re-arm) the 2*MSL TIME-WAIT timer.
+    case startTimeWait
+    /// The connection is finished; the caller should discard the TCB.
+    case deleteTCB
+    /// Nothing to do.
+    case none
+}
+
+/// The TCP Control Block (RFC 9293 §3.3.1): the send and receive sequence
+/// variables plus the current state. This struct holds no I/O handles and
+/// no data buffers of its own -- it is exactly the state RFC 9293's state
+/// machine reads and mutates, and nothing else.
+public struct TCB: Equatable, Sendable {
+    public var state: TCPState
+
+    // Send Sequence Variables (RFC 9293 §3.3.1).
+    /// SND.UNA: oldest unacknowledged sequence number.
+    public var sndUna: SequenceNumber
+    /// SND.NXT: next sequence number to be sent.
+    public var sndNxt: SequenceNumber
+    /// SND.WND: send window, as last advertised by the peer.
+    public var sndWnd: Int
+    /// SND.WL1: segment sequence number used for the last window update.
+    public var sndWl1: SequenceNumber
+    /// SND.WL2: segment acknowledgment number used for the last window update.
+    public var sndWl2: SequenceNumber
+    /// ISS: initial send sequence number.
+    public var iss: SequenceNumber
+
+    // Receive Sequence Variables (RFC 9293 §3.3.1).
+    /// RCV.NXT: next sequence number expected on an incoming segment.
+    public var rcvNxt: SequenceNumber
+    /// RCV.WND: receive window we have advertised to the peer.
+    public var rcvWnd: Int
+    /// IRS: initial receive sequence number.
+    public var irs: SequenceNumber
+
+    public init(
+        state: TCPState,
+        sndUna: SequenceNumber,
+        sndNxt: SequenceNumber,
+        sndWnd: Int,
+        sndWl1: SequenceNumber,
+        sndWl2: SequenceNumber,
+        iss: SequenceNumber,
+        rcvNxt: SequenceNumber,
+        rcvWnd: Int,
+        irs: SequenceNumber
+    ) {
+        self.state = state
+        self.sndUna = sndUna
+        self.sndNxt = sndNxt
+        self.sndWnd = sndWnd
+        self.sndWl1 = sndWl1
+        self.sndWl2 = sndWl2
+        self.iss = iss
+        self.rcvNxt = rcvNxt
+        self.rcvWnd = rcvWnd
+        self.irs = irs
+    }
+}

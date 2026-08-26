@@ -8,6 +8,11 @@ public final class LoopbackEndpoint: LinkEndpoint, @unchecked Sendable {
     public let eventLoop: EventLoop
 
     private weak var dispatcher: (any LinkDispatcher)?
+    /// Whether `attach` was ever called. Distinguishes "nothing is listening"
+    /// — a legitimate state a real wire is also in — from "the dispatcher was
+    /// deallocated while still attached", which is a bug that would otherwise
+    /// present as packets silently vanishing.
+    private var hasAttached = false
 
     public init(eventLoop: EventLoop, mtu: UInt32 = 65536) {
         self.eventLoop = eventLoop
@@ -20,10 +25,12 @@ public final class LoopbackEndpoint: LinkEndpoint, @unchecked Sendable {
     public func attach(_ dispatcher: LinkDispatcher) {
         eventLoop.preconditionInEventLoop()
         self.dispatcher = dispatcher
+        hasAttached = true
     }
 
     public func write(_ packets: [PacketBuffer]) {
         eventLoop.preconditionInEventLoop()
+        assert(dispatcher != nil || !hasAttached, "dispatcher was deallocated while still attached to this link")
         guard let dispatcher else { return }
         for packet in packets {
             dispatcher.deliverInbound(PacketBuffer(received: packet.frame))

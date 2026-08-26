@@ -65,6 +65,17 @@ private final class CollectingDispatcher: LinkDispatcher {
     #expect(Array(dispatcher.received[0].readableBytesView) == [0x42])
 }
 
+@Test func injectingWithNothingEverAttachedIsLegal() {
+    // The never-attached case is a real state a wire can be in and must
+    // stay silent. Only "attached, then deallocated" is a bug, and that is
+    // what the assert distinguishes.
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    link.inject(ByteBuffer(bytes: [0xaa]))
+    link.write([PacketBuffer(received: ByteBuffer(bytes: [0xbb]))])
+    #expect(link.drainTransmitted().count == 1)
+}
+
 @Test func defaultMTUIsEthernetSized() {
     let loop = EmbeddedEventLoop()
     let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)

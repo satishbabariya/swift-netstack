@@ -9,6 +9,11 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     public let eventLoop: EventLoop
 
     private weak var dispatcher: (any LinkDispatcher)?
+    /// Whether `attach` was ever called. Distinguishes "nothing is listening"
+    /// — a legitimate state a real wire is also in — from "the dispatcher was
+    /// deallocated while still attached", which is a bug that would otherwise
+    /// present as packets silently vanishing.
+    private var hasAttached = false
     private var captured: [ByteBuffer] = []
 
     public init(
@@ -26,10 +31,12 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     public func attach(_ dispatcher: LinkDispatcher) {
         eventLoop.preconditionInEventLoop()
         self.dispatcher = dispatcher
+        hasAttached = true
     }
 
     public func write(_ packets: [PacketBuffer]) {
         eventLoop.preconditionInEventLoop()
+        assert(dispatcher != nil || !hasAttached, "dispatcher was deallocated while still attached to this link")
         captured.append(contentsOf: packets.map(\.frame))
     }
 
@@ -46,6 +53,7 @@ public final class RecordingEndpoint: LinkEndpoint, @unchecked Sendable {
     /// before anything is attached is dropped, exactly as a real wire would.
     public func inject(_ frame: ByteBuffer) {
         eventLoop.preconditionInEventLoop()
+        assert(dispatcher != nil || !hasAttached, "dispatcher was deallocated while still attached to this link")
         dispatcher?.deliverInbound(PacketBuffer(received: frame))
     }
 }

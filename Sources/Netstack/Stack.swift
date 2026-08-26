@@ -52,7 +52,9 @@ public final class Stack {
     public let arpResponder: ARPResponder
     public let reassembler: Reassembler
     public let ipv4: IPv4Protocol
+    public let transportDemuxer = TransportDemuxer()
 
+    private let allocator: ByteBufferAllocator
     private var maintenanceTask: RepeatedTask?
 
     public init(
@@ -63,6 +65,7 @@ public final class Stack {
     ) {
         self.eventLoop = link.eventLoop
         self.configuration = configuration
+        self.allocator = allocator
 
         let nic = NIC(id: 1, link: link)
         nic.addAddress(configuration.gatewayAddress, prefixLength: configuration.subnet.prefixLength)
@@ -103,6 +106,28 @@ public final class Stack {
         }
         nic.setHandler(for: .ipv4) { [ipv4] packet, ethernet in
             ipv4.handleInbound(packet, ethernet)
+        }
+
+        ipv4.setHandler(for: .udp) { [transportDemuxer, ipv4, allocator] header, payload in
+            var packet = PacketBuffer(received: payload)
+            guard let udp = UDPHeader.parse(&packet, header: header) else { return }
+            let delivered = transportDemuxer.deliver(
+                protocolNumber: .udp, header: header, payload: packet.payload,
+                localPort: udp.destinationPort, remotePort: udp.sourcePort)
+            guard !delivered else { return }
+
+            // Nothing is listening. Tell the sender, so it fails fast instead
+            // of retrying into a void.
+            var quoted = ByteBuffer()
+            quoted.writeInteger(udp.sourcePort, endianness: .big)
+            quoted.writeInteger(udp.destinationPort, endianness: .big)
+            // `udp.length` is already the full wire field (header plus
+            // payload) — see UDPHeader.parse — so it is quoted as-is.
+            quoted.writeInteger(udp.length, endianness: .big)
+            quoted.writeInteger(udp.checksum, endianness: .big)
+            let message = ICMPv4.destinationUnreachable(
+                code: .port, quoting: header, quotedPayload: quoted, allocator: allocator)
+            try? ipv4.send(payload: message, to: header.source, from: header.destination, protocolNumber: .icmp)
         }
 
         // A second start() would overwrite the reference to a task that keeps

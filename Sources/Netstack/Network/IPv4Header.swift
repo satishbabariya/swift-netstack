@@ -105,7 +105,15 @@ public struct IPv4Header: Sendable, Equatable {
 
     public func prepend(to packet: inout PacketBuffer) {
         let payloadLength = packet.readableBytes
-        let length = max(headerLength, Self.minimumLength)
+        // Always exactly 20 bytes. A header returned by `parse` may report a longer
+        // `headerLength` because the packet carried IPv4 options, but this stack
+        // never emits options, and the checksum arithmetic below is only valid for
+        // the ten fixed-field words. Re-emitting such a header — which the ICMP
+        // error path does when it quotes an offending packet — therefore drops the
+        // options rather than reserving space it would leave uninitialised and
+        // unchecksummed. Receivers match a quoted header on its addresses and the
+        // transport ports that follow it, not on its IHL.
+        let length = Self.minimumLength
         packet.prepend(count: length) { buffer, index in
             buffer.setInteger(UInt8(0x40 | (length / 4)), at: index)
             buffer.setInteger(dscp, at: index + 1)

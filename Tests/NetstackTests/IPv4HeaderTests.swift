@@ -90,6 +90,36 @@ private let sampleHeader: [UInt8] = [
     #expect(Array(packet.payload.readableBytesView) == [0xaa, 0xbb, 0xcc, 0xdd])
 }
 
+@Test func reEmittingAParsedOptionsHeaderProducesAValidTwentyByteHeader() {
+    // The ICMP error path re-prepends a header it got from `parse`. If that
+    // header carried options, `prepend` must still emit a well-formed
+    // 20-byte header with a correct checksum, not reserve 24 bytes and
+    // leave four of them uninitialised and unchecksummed.
+    var bytes: [UInt8] = [
+        0x46, 0x00, 0x00, 0x1c,  // IHL 6 — one 4-byte option word
+        0x00, 0x00, 0x00, 0x00,
+        0x40, 0x11, 0x00, 0x00,
+        0xc0, 0xa8, 0x7f, 0x01,
+        0xc0, 0xa8, 0x7f, 0x02,
+        0x01, 0x01, 0x01, 0x00,  // NOP NOP NOP EOL
+    ]
+    let checksum = bytes.withUnsafeBytes { Checksum.compute($0) }
+    bytes[10] = UInt8(checksum >> 8)
+    bytes[11] = UInt8(checksum & 0xff)
+
+    var incoming = PacketBuffer(received: ByteBuffer(bytes: bytes + [0xaa, 0xbb, 0xcc, 0xdd]))
+    let parsed = IPv4Header.parse(&incoming)
+    #expect(parsed?.headerLength == 24)
+
+    var outgoing = PacketBuffer(allocator: ByteBufferAllocator(), payload: ByteBuffer(bytes: [0xaa, 0xbb, 0xcc, 0xdd]))
+    parsed?.prepend(to: &outgoing)
+
+    let emitted = Array(outgoing.frame.readableBytesView)
+    #expect(emitted.count == 24)                 // 20-byte header + 4-byte payload
+    #expect(emitted[0] == 0x45)                  // IHL back down to 5
+    #expect(emitted.prefix(20).withUnsafeBytes { Checksum.compute($0) } == 0)
+}
+
 @Test func prependComputesTheChecksum() {
     var packet = PacketBuffer(allocator: ByteBufferAllocator(), payload: ByteBuffer(bytes: [0x01, 0x02, 0x03, 0x04]))
     var header = IPv4Header(

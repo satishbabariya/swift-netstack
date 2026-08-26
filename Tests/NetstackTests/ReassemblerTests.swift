@@ -107,3 +107,71 @@ private func fragment(id: UInt16, offset: Int, more: Bool, bytes: [UInt8]) -> (I
     #expect(reassembler.process(header: bad.0, payload: bad.1) == nil)
     #expect(reassembler.pendingCount == 0)
 }
+
+@Test func rejectsAnOverlappingFragment() {
+    // Legitimate fragmentation never overlaps. An overlapping fragment is
+    // an attempt to rewrite bytes already accepted (the teardrop family),
+    // so it is dropped rather than merged — and the datagram still
+    // completes from the fragments that were accepted.
+    let reassembler = Reassembler(clock: ManualClock())
+    let first = fragment(id: 20, offset: 0, more: true, bytes: Array(repeating: UInt8(0xaa), count: 8))
+    #expect(reassembler.process(header: first.0, payload: first.1) == nil)
+
+    // Overlaps bytes 4..<8, which are already accepted. Must be dropped.
+    let overlapping = fragment(id: 20, offset: 4, more: true, bytes: Array(repeating: UInt8(0xff), count: 8))
+    #expect(reassembler.process(header: overlapping.0, payload: overlapping.1) == nil)
+
+    let last = fragment(id: 20, offset: 8, more: false, bytes: [0xbb, 0xbb])
+    let result = reassembler.process(header: last.0, payload: last.1)
+
+    #expect(result != nil)
+    let bytes = Array(result!.1.readableBytesView)
+    #expect(bytes.count == 10)
+    #expect(bytes.prefix(8).allSatisfy { $0 == 0xaa })   // 0xff never landed
+    #expect(Array(bytes.suffix(2)) == [0xbb, 0xbb])
+}
+
+@Test func duplicateFragmentsCannotEvictOtherDatagrams() {
+    // The eviction policy is oldest-first when over the memory cap. If a
+    // peer's duplicate fragments were counted repeatedly, it could inflate
+    // its own accounted size and push an older, legitimate datagram out.
+    let clock = ManualClock()
+    let reassembler = Reassembler(clock: clock, timeout: .seconds(30), memoryLimit: 24)
+
+    let victim = fragment(id: 1, offset: 0, more: true, bytes: Array(repeating: UInt8(0x11), count: 8))
+    _ = reassembler.process(header: victim.0, payload: victim.1)
+    clock.advance(by: .milliseconds(1))
+
+    // The same fragment of a second datagram, sent four times.
+    for _ in 0..<4 {
+        let flood = fragment(id: 2, offset: 0, more: true, bytes: Array(repeating: UInt8(0x22), count: 8))
+        _ = reassembler.process(header: flood.0, payload: flood.1)
+    }
+
+    // Held bytes must be 16, not 40 — so nothing was evicted and the
+    // older datagram survives.
+    #expect(reassembler.pendingCount == 2)
+
+    let victimTail = fragment(id: 1, offset: 8, more: false, bytes: [0x11])
+    #expect(reassembler.process(header: victimTail.0, payload: victimTail.1)?.1.readableBytes == 9)
+}
+
+@Test func rejectsASecondFinalFragmentThatDisagrees() {
+    // The fragment with moreFragments clear defines where the datagram
+    // ends. A second one claiming a different end must not overwrite it,
+    // or a peer could truncate or extend someone else's datagram.
+    let reassembler = Reassembler(clock: ManualClock())
+    let terminator = fragment(id: 30, offset: 8, more: false, bytes: [0xbb, 0xbb])
+    #expect(reassembler.process(header: terminator.0, payload: terminator.1) == nil)
+
+    // Different end (18, not 10), and deliberately non-overlapping so the
+    // overlap check cannot be what rejects it.
+    let conflicting = fragment(id: 30, offset: 16, more: false, bytes: [0xcc, 0xcc])
+    #expect(reassembler.process(header: conflicting.0, payload: conflicting.1) == nil)
+
+    let head = fragment(id: 30, offset: 0, more: true, bytes: Array(repeating: UInt8(0xaa), count: 8))
+    let result = reassembler.process(header: head.0, payload: head.1)
+
+    // Completes at the length the FIRST terminator declared: 10 bytes.
+    #expect(result?.1.readableBytes == 10)
+}

@@ -1,3 +1,4 @@
 .build/
 .swiftpm/
 .superpowers/
+differential/harness/harness

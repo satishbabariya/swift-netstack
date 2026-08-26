@@ -274,3 +274,60 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.lookup(IPv4Address("192.168.127.2")!) == MACAddress("0a:0b:0c:0d:0e:0f"))
     #expect(link.drainTransmitted().isEmpty)  // a reply is not answered
 }
+
+@Test func touchingAnExistingEntryAppendsToTheOrderLogRatherThanRewritingIt() {
+    // `refreshingAnExistingEntryDoesNotScanTheWholeCache` counts scan steps
+    // inside `compactOrderIfNeeded`, which is the wrong place to look for a
+    // reintroduced linear scan: a `touch` that goes back to
+    // `order.firstIndex(of:)` + `order.remove(at:)` does its scanning in
+    // `nextTouchSequence`, where nothing counts it. Restoring exactly that
+    // pre-fix shape — same eviction semantics, O(order.count) per touch —
+    // leaves the whole suite green, which is what this test exists to stop.
+    //
+    // What separates the two implementations without any measurement at all
+    // is structural, and it is the very thing that makes the touch O(1):
+    // the fixed path only ever APPENDS. A superseded appearance is left
+    // where it lies and recognised later by comparing its sequence number
+    // against `Entry.sequence`; it is never searched for and never removed
+    // from the middle. So one refresh of an already-present address grows
+    // `order` by exactly one element. Remove-and-reappend grows it by zero —
+    // it removes one and appends one — and that is a one-element,
+    // deterministic difference, at any scale, with nothing timed.
+    //
+    // Kept far below both compaction thresholds (`orderHead > 64` for the
+    // prefix drop, `order.count > 4 * capacity` for the full pass) so
+    // nothing but the touch itself can move the count.
+    let clock = ManualClock()
+    let capacity = 64
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: capacity)
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, 0, UInt8($0)) }
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, 0, UInt8($0)])! }
+
+    for i in 0..<8 {
+        cache.record(ip(i), mac(i))
+    }
+    // Positive control: eight distinct addresses really are recorded, and
+    // each contributed exactly one appearance, so the deltas below are
+    // measured against a log that is genuinely populated.
+    #expect(cache.count == 8)
+    #expect(cache.orderCountForTesting == 8)
+
+    // One refresh of an address already in the table. The entry count must
+    // not move — this is a refresh, not an insertion — while the touch log
+    // must grow by exactly one.
+    cache.record(ip(3), mac(3))
+    #expect(cache.count == 8)
+    #expect(cache.orderCountForTesting == 9)
+
+    // And it keeps holding as refreshes accumulate: ten more touches of
+    // addresses already present add ten more appearances and no entries.
+    for i in 0..<10 {
+        cache.record(ip(i % 8), mac(i % 8))
+    }
+    #expect(cache.count == 8)
+    #expect(cache.orderCountForTesting == 19)
+
+    // A successful `lookup` touches too, by the same append-only route.
+    #expect(cache.lookup(ip(3)) == mac(3))
+    #expect(cache.orderCountForTesting == 20)
+}

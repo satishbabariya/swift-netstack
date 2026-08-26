@@ -80,6 +80,62 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.count == 512)
 }
 
+@Test func refreshingAnExistingEntryDoesNotScanTheWholeCache() {
+    // `touch` used to do `order.firstIndex(of:)` + `order.remove(at:)` on
+    // every refresh -- an O(capacity) scan replacing what should be a
+    // single dictionary store -- on the hottest path in the stack:
+    // `IPv4Protocol.handleInbound` calls `record` on EVERY accepted IPv4
+    // packet, and `lookup` touches too. The reviewer measured 100,000
+    // refreshes at capacity 512 taking 1.611s versus 0.075s at capacity 8,
+    // a ~21x cost that scales with capacity rather than staying constant.
+    //
+    // A wall-clock ceiling (the same style used for the reassembler's own
+    // analogous O(n)-scan fix, `evictionUnderTheByteCapDoesNotScanEveryPendingEntry`)
+    // was tried here first and dropped: reliably separating the O(1) and
+    // O(capacity) implementations on this hardware needed a cache large
+    // enough (tens of thousands of live entries) that holding them for the
+    // duration measurably perturbed OTHER tests' own real-memory
+    // measurements running concurrently in the same process (see
+    // `ReassemblerTests`). `orderScanStepsForTesting` sidesteps that: it is
+    // a direct, timing-independent count of how much scanning
+    // `compactOrderIfNeeded` actually does, and the invariant under test —
+    // that touching an entry does constant, not capacity-proportional, work
+    // — holds at any scale, including one small enough to be memory-cheap.
+    let clock = ManualClock()
+    let capacity = 64
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: capacity)
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, 0, UInt8($0)) }
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, 0, UInt8($0)])! }
+
+    for i in 0..<capacity {
+        cache.record(ip(i), mac(i))
+    }
+    #expect(cache.count == capacity)
+
+    let touches = 100_000
+    for i in 0..<touches {
+        // Refreshes an EXISTING entry every time -- this is the
+        // `entries[ip] != nil` path in `record`, i.e. exactly the touch
+        // this test is regression-guarding. Cycling through all 64 keys
+        // (rather than hammering one) exercises `compactOrderIfNeeded`
+        // against a full, constantly-churning table, not a degenerate
+        // single-key case.
+        cache.record(ip(i % capacity), mac(i % capacity))
+    }
+
+    // Each of the `touches` calls to `record` triggers exactly one call to
+    // `compactOrderIfNeeded`. Over the table's lifetime, an appearance in
+    // `order` is scanned past as "stale" at most once ever, and a call
+    // scans at most one further "live" appearance before breaking -- so
+    // total scan steps across every call is bounded by roughly twice the
+    // number of touches, not by touches times capacity (which for this
+    // input would be 6,400,000, two orders of magnitude more). `+ capacity`
+    // covers the initial fill's own appends.
+    #expect(cache.orderScanStepsForTesting <= 2 * touches + capacity)
+    // Refreshing must never evict: every key touched was already present.
+    #expect(cache.count == capacity)
+}
+
 @Test func cacheEvictsOldestButKeepsARecentlyTouchedEntry() {
     let clock = ManualClock()
     let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: 4)

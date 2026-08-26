@@ -82,6 +82,9 @@ public final class ARPCache {
     private struct Entry {
         let mac: MACAddress
         var expiresAt: NIODeadline
+        /// The `order` position that currently represents this entry's most
+        /// recent touch. See `order`'s doc comment for why this is needed.
+        var sequence: Int
     }
 
     /// A single guest behind one gateway resolves only a handful of on-link
@@ -97,13 +100,59 @@ public final class ARPCache {
     private let ttl: TimeAmount
     private let capacity: Int
     private var entries: [IPv4Address: Entry] = [:]
-    /// Least-recently-used order for the entries currently in `entries`: the
-    /// front is the next eviction candidate, the back is the most recently
-    /// touched. Touched by both a new-or-refreshed `record` and a successful
-    /// `lookup`, so an address the stack is actively talking to survives an
-    /// eviction sweep even while a flood of unrelated, single-use spoofed
-    /// sources is cycling through the rest of the table.
-    private var order: [IPv4Address] = []
+    /// A log of touches, oldest first: the front is the next eviction
+    /// candidate, the back is the most recent touch. Appended to by both a
+    /// new-or-refreshed `record` and a successful `lookup`, so an address
+    /// the stack is actively talking to survives an eviction sweep even
+    /// while a flood of unrelated, single-use spoofed sources is cycling
+    /// through the rest of the table.
+    ///
+    /// Unlike the reassembler's `admissionOrder` (one entry per KEY, never
+    /// re-touched), this is one entry per TOUCH — a re-touched key appears
+    /// here more than once, with only its most recent appearance still
+    /// live. Each appearance carries the sequence number it was assigned
+    /// when appended (a monotonic counter, distinct from — and not implied
+    /// by — the appearance's position, since `compactOrderIfNeeded` shifts
+    /// positions but must not need to renumber every surviving element to
+    /// keep them meaningful). `Entry.sequence` records which appearance is
+    /// the live one, so a stale, superseded appearance is distinguished by
+    /// an O(1) comparison instead of an O(n) search for the key: this is
+    /// what makes touching an entry — done on every `record` and every
+    /// `lookup`, i.e. on every accepted IPv4 packet — O(1) instead of the
+    /// O(capacity) `firstIndex(of:)` + `remove(at:)` it replaces. `orderHead`
+    /// is the index of the oldest appearance that might still be live;
+    /// appearances at or before it may already be stale and are skipped
+    /// lazily rather than removed from the middle of the array.
+    private var order: [(ip: IPv4Address, sequence: Int)] = []
+    private var orderHead = 0
+    private var nextSequence = 0
+
+    /// Test-only instrumentation, not `private`: `@testable import` needs to
+    /// read it, but nothing outside this file writes it. Counts every
+    /// iteration of `compactOrderIfNeeded`'s loop, whether it ends up
+    /// advancing `orderHead` past a stale appearance or breaking on a live
+    /// one. Over the table's lifetime, the "advance past a stale one" case
+    /// can happen at most once per appearance ever appended to `order`
+    /// (once skipped, `orderHead` never revisits it), and the "break on a
+    /// live one" case happens at most once per CALL — so the running total
+    /// staying within a small constant multiple of the number of touches
+    /// performed, rather than growing with `capacity`, is a direct,
+    /// timing-independent witness that touching an entry is amortized O(1).
+    /// Counting every iteration (not just the skips) also catches a future
+    /// regression that keeps this general shape but drops the early
+    /// `break`, which would scan needlessly far without ever registering as
+    /// a "skip".
+    ///
+    /// A wall-clock regression guard for this same property was tried
+    /// first; at capacities small enough not to also inflate memory for
+    /// every OTHER test running concurrently in the same process, the
+    /// difference between the O(1) and O(capacity) implementations was too
+    /// fast on this hardware (sub-millisecond either way) to separate
+    /// reliably, and at capacities large enough to separate reliably, the
+    /// live entries the test had to hold for the duration measurably
+    /// perturbed unrelated tests' own memory measurements (see
+    /// `ReassemblerTests`). This counter sidesteps both problems.
+    var orderScanStepsForTesting = 0
 
     public init(clock: NetstackClock, ttl: TimeAmount = .seconds(60), capacity: Int = ARPCache.defaultCapacity) {
         self.clock = clock
@@ -114,25 +163,26 @@ public final class ARPCache {
     public func record(_ ip: IPv4Address, _ mac: MACAddress) {
         let expiresAt = clock.now() + ttl
         if entries[ip] != nil {
-            entries[ip] = Entry(mac: mac, expiresAt: expiresAt)
-            touch(ip)
+            entries[ip] = Entry(mac: mac, expiresAt: expiresAt, sequence: nextTouchSequence(for: ip))
+            compactOrderIfNeeded()
             return
         }
         if entries.count >= capacity {
             evictLeastRecentlyUsed()
         }
-        entries[ip] = Entry(mac: mac, expiresAt: expiresAt)
-        order.append(ip)
+        entries[ip] = Entry(mac: mac, expiresAt: expiresAt, sequence: nextTouchSequence(for: ip))
+        compactOrderIfNeeded()
     }
 
     public func lookup(_ ip: IPv4Address) -> MACAddress? {
         guard let entry = entries[ip] else { return nil }
         guard entry.expiresAt > clock.now() else {
             entries.removeValue(forKey: ip)
-            removeFromOrder(ip)
             return nil
         }
-        touch(ip)
+        let sequence = nextTouchSequence(for: ip)
+        entries[ip]?.sequence = sequence
+        compactOrderIfNeeded()
         return entry.mac
     }
 
@@ -146,25 +196,64 @@ public final class ARPCache {
         for ip in expired {
             entries.removeValue(forKey: ip)
         }
-        let expiredSet = Set(expired)
-        order.removeAll { expiredSet.contains($0) }
+        // A removed entry's appearances in `order` are already stale by
+        // `entries[ip] == nil` alone; this just lets that be noticed —
+        // and `order`'s storage reclaimed — without waiting for enough
+        // further touches to cross `compactOrderIfNeeded`'s own threshold.
+        compactOrderIfNeeded()
     }
 
     public var count: Int { entries.count }
 
-    private func touch(_ ip: IPv4Address) {
-        removeFromOrder(ip)
-        order.append(ip)
+    /// Record one more touch for `ip` and return the sequence number that
+    /// makes THIS appearance in `order` the live one. O(1): just an append
+    /// and a counter increment.
+    ///
+    /// Deliberately does NOT also run `compactOrderIfNeeded` — every caller
+    /// must call it separately, and only AFTER `entries[ip]` itself has been
+    /// updated to carry the returned sequence number. Compaction checks a
+    /// candidate appearance for staleness by comparing it against
+    /// `entries[appearance.ip]?.sequence`; calling it before that dictionary
+    /// write lands would find no matching (or no) entry for the appearance
+    /// this very call just appended, misread it as already-stale, and skip
+    /// `orderHead` straight past a genuinely live entry — silently
+    /// disabling eviction entirely once `orderHead` runs past the whole
+    /// live prefix, which is exactly what happened here before this was
+    /// split into two steps.
+    private func nextTouchSequence(for ip: IPv4Address) -> Int {
+        nextSequence += 1
+        order.append((ip: ip, sequence: nextSequence))
+        return nextSequence
     }
 
-    private func removeFromOrder(_ ip: IPv4Address) {
-        guard let index = order.firstIndex(of: ip) else { return }
-        order.remove(at: index)
+    /// Advance `orderHead` past every already-stale appearance at the front
+    /// of `order` (superseded by a later touch of the same address, or its
+    /// entry is gone), then drop that consumed prefix once it is worth the
+    /// copy, so `order` does not grow without bound purely from re-touches
+    /// of the same few hot addresses. Safe to call at any time: an
+    /// appearance before `orderHead` is never live, since `orderHead` is
+    /// only ever advanced past ones this loop (or `evictLeastRecentlyUsed`)
+    /// has already found stale. Each appearance carries its own sequence
+    /// number rather than relying on array position to imply one, so
+    /// `removeFirst` shifting every surviving element's position here does
+    /// not invalidate the comparison on the next call.
+    private func compactOrderIfNeeded() {
+        while orderHead < order.count {
+            orderScanStepsForTesting += 1
+            let appearance = order[orderHead]
+            if let entry = entries[appearance.ip], entry.sequence == appearance.sequence { break }
+            orderHead += 1
+        }
+        guard orderHead > 64, orderHead * 2 > order.count else { return }
+        order.removeFirst(orderHead)
+        orderHead = 0
     }
 
     private func evictLeastRecentlyUsed() {
-        guard !order.isEmpty else { return }
-        let oldest = order.removeFirst()
-        entries.removeValue(forKey: oldest)
+        compactOrderIfNeeded()
+        guard orderHead < order.count else { return }
+        let oldest = order[orderHead]
+        orderHead += 1
+        entries.removeValue(forKey: oldest.ip)
     }
 }

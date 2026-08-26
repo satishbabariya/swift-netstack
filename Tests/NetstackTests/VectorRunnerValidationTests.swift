@@ -107,6 +107,59 @@ private func harness() -> (Stack, RecordingEndpoint, ManualClock, EmbeddedEventL
     }
 }
 
+@Test func theRunnerDistinguishesTwoFramesEmittedAtGenuinelyDifferentTimes() throws {
+    // `Stack`'s only timer (maintenance) never writes to the link, so
+    // production code cannot produce two timer-driven emissions to test
+    // this against. This constructs the shape directly, as a deliberately
+    // scheduled write on the `EmbeddedEventLoop` — a test double standing
+    // in for what a retransmission timer would do: two frames, written
+    // straight onto the link (bypassing the stack entirely), five and
+    // fifteen milliseconds after time zero. The script checkpoints each at
+    // its true time with its own `.expectedOutbound` line; both must match.
+    let (stack, link, clock, loop) = harness()
+    withExtendedLifetime(stack) {
+        let codec = VectorFrames(
+            gateway: IPv4Address("192.168.127.1")!, gatewayMAC: MACAddress("5a:94:ef:e4:0c:ee")!,
+            guest: IPv4Address("192.168.127.2")!, guestMAC: MACAddress("0a:0b:0c:0d:0e:0f")!)
+        let first = try! codec.encode(.icmpEcho(request: false, identifier: 1, sequence: 1), direction: .expectedOutbound)
+        let second = try! codec.encode(.icmpEcho(request: false, identifier: 2, sequence: 2), direction: .expectedOutbound)
+        _ = loop.scheduleTask(in: .milliseconds(5)) { link.write([PacketBuffer(received: first)]) }
+        _ = loop.scheduleTask(in: .milliseconds(15)) { link.write([PacketBuffer(received: second)]) }
+
+        let script = try! VectorScript.parse("""
+            0.005 > icmp echo_reply id 1 seq 1
+            0.015 > icmp echo_reply id 2 seq 2
+            """)
+        let runner = VectorRunner(script: script, codec: codec)
+        #expect(throws: Never.self) { try runner.run(against: stack, link: link, clock: clock, loop: loop) }
+    }
+}
+
+@Test func theRunnerRejectsAFrameEmittedEarlyInsideASingleAdvance() throws {
+    // The shape fix round 2 exists to close: ONE frame, genuinely emitted
+    // at 5ms (a deliberately scheduled write, same test-double technique as
+    // above — `Stack` has nothing that would do this on its own), but the
+    // script's only checkpoint for it claims 15ms, with NO intermediate
+    // `.expectedOutbound` line at 5ms to catch it there instead. Advancing
+    // straight to 15ms in one jump (the pre-fix behaviour) would stamp this
+    // frame with the jump's destination (15ms) rather than when it actually
+    // fired, matching the script by accident and passing silently. Advancing
+    // in sub-steps stamps it with the sub-step boundary nearest 5ms instead,
+    // which disagrees with the declared 15ms and must be rejected.
+    let (stack, link, clock, loop) = harness()
+    withExtendedLifetime(stack) {
+        let codec = VectorFrames(
+            gateway: IPv4Address("192.168.127.1")!, gatewayMAC: MACAddress("5a:94:ef:e4:0c:ee")!,
+            guest: IPv4Address("192.168.127.2")!, guestMAC: MACAddress("0a:0b:0c:0d:0e:0f")!)
+        let early = try! codec.encode(.icmpEcho(request: false, identifier: 1, sequence: 1), direction: .expectedOutbound)
+        _ = loop.scheduleTask(in: .milliseconds(5)) { link.write([PacketBuffer(received: early)]) }
+
+        let script = try! VectorScript.parse("0.015 > icmp echo_reply id 1 seq 1")
+        let runner = VectorRunner(script: script, codec: codec)
+        #expect(throws: VectorMismatch.self) { try runner.run(against: stack, link: link, clock: clock, loop: loop) }
+    }
+}
+
 @Test func theRunnerDetectsAnUnexpectedExtraFrame() throws {
     // A stack that emits MORE than the script says is also wrong.
     let script = try VectorScript.parse("0.000 < icmp echo_request id 1 seq 1")

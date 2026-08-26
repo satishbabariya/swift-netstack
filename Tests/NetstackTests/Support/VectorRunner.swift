@@ -91,13 +91,49 @@ private struct TimedFrame {
 /// the stack about when something should happen, which is precisely what
 /// this instrument exists to surface. A tolerance window would only ever
 /// serve to hide that disagreement instead of reporting it.
+///
+/// STAMPING GRANULARITY: a frame's timestamp is made true BY CONSTRUCTION,
+/// not by convention. Advancing straight to an event's declared time in one
+/// jump and draining once afterward would stamp every frame found with that
+/// jump's DESTINATION, regardless of when inside the jump it actually
+/// appeared — invisible as long as a vector only ever crosses one timer
+/// deadline per step, but a silent false-positive the moment it crosses
+/// two (exactly what an RTO vector does: a stack that retransmits too
+/// early would get its early frame stamped with the *correct*, later,
+/// destination time, matching the script by accident). So `run` never
+/// jumps straight to an event's time: it advances in `subStep`-sized
+/// increments and drains after each one, so a frame's stamp is always the
+/// increment boundary nearest its true emission time — never a distant
+/// jump's endpoint it merely happened to be swept up in. Deliberately not
+/// solved by documentation ("checkpoint a script at every emission time")
+/// or a stricter assertion ("at most one frame per step", which would
+/// wrongly reject a stack that legitimately emits two frames from one
+/// inbound packet): both rely on someone remembering or guessing correctly,
+/// where this makes the property structural instead.
 struct VectorRunner {
     var script: VectorScript
     var codec: VectorFrames
 
+    /// The granularity `run` advances the clock and loop in, rather than
+    /// jumping straight to each event's declared time. 1 ms: fine enough
+    /// that no vector in this plan (RTO deadlines are on the order of
+    /// hundreds of milliseconds to tens of seconds) can hide two distinct
+    /// emissions behind one stamp, coarse enough that even a 60 s gap costs
+    /// only 60,000 loop iterations of an integer add plus a `loop.run()`
+    /// with nothing scheduled — measured at a few milliseconds of wall time
+    /// for the existing suite, immaterial next to the run times already
+    /// logged for this package's cache/reassembler stress tests.
+    private static let subStep = TimeAmount.milliseconds(1)
+
     func run(against stack: Stack, link: RecordingEndpoint, clock: ManualClock, loop: EmbeddedEventLoop) throws {
         var elapsed = TimeAmount.zero
         var pending: [TimedFrame] = []
+
+        func drainAndStamp(sourceLine: Int) {
+            for frame in link.drainTransmitted() {
+                pending.append(TimedFrame(frame: frame, emittedAt: elapsed, sourceLine: sourceLine))
+            }
+        }
 
         for event in script.events {
             // A script whose events go backwards in time is malformed —
@@ -111,31 +147,28 @@ struct VectorRunner {
             // Advance BOTH the clock and the loop to this event's time, or
             // scheduled work (the maintenance timer, a retransmission
             // timer) and timer deadlines disagree about what time it
-            // currently is.
-            let delta = event.time - elapsed
-            if delta > .zero {
-                clock.advance(by: delta)
-                loop.advanceTime(by: delta)
+            // currently is — in `subStep` increments, draining (and
+            // stamping with the increment's own time, not the eventual
+            // destination) after each one. See the STAMPING GRANULARITY
+            // note on this type for why a single jump is not enough.
+            while elapsed < event.time {
+                let step = min(Self.subStep, event.time - elapsed)
+                clock.advance(by: step)
+                loop.advanceTime(by: step)
+                elapsed += step
+                drainAndStamp(sourceLine: event.sourceLine)
             }
-            elapsed = event.time
 
             if event.direction == .inbound {
                 let frame = try codec.encode(event.packet, direction: .inbound)
                 link.inject(frame)
             }
 
-            // Drain and stamp EVERY iteration, regardless of direction —
-            // not only when an `.expectedOutbound` line needs a frame. This
-            // is what gives frames their timestamp: `RecordingEndpoint`
-            // itself carries no timing, so `elapsed` (the time this
-            // iteration just advanced to) is the only granularity available
-            // to attribute "when" a frame was actually emitted, whether it
-            // came from the `.inbound` injection just above or from a timer
-            // that fired as a side effect of advancing the clock/loop to
-            // reach this event's time.
-            for frame in link.drainTransmitted() {
-                pending.append(TimedFrame(frame: frame, emittedAt: elapsed, sourceLine: event.sourceLine))
-            }
+            // Drain and stamp again after the event's own action — this is
+            // what captures a frame emitted synchronously by an `.inbound`
+            // injection (the sub-step loop above only covers time ADVANCE;
+            // an injection at unchanged time needs its own drain).
+            drainAndStamp(sourceLine: event.sourceLine)
 
             if event.direction == .expectedOutbound {
                 guard !pending.isEmpty else {
@@ -164,11 +197,18 @@ struct VectorRunner {
 
         // A stack that emits MORE than the script accounts for is also
         // wrong: drain once more after the last event and fail if anything
-        // — buffered-but-unconsumed, or freshly transmitted — remains.
+        // — buffered-but-unconsumed, or freshly transmitted — remains. This
+        // final drain is defensive: every event iteration above already
+        // drains after both its sub-step advances and its own action, so
+        // nothing should genuinely surface here with no line of its own —
+        // but if it does, it is attributed to the last event actually
+        // processed, the closest thing available to provenance.
+        let final = link.drainTransmitted().map {
+            TimedFrame(frame: $0, emittedAt: elapsed, sourceLine: script.events.last?.sourceLine ?? 0)
+        }
         // Each leftover frame reports the source line whose processing
         // actually produced it (see `TimedFrame.sourceLine`), not the last
         // line of the script regardless of where the extra frame came from.
-        let final = link.drainTransmitted().map { TimedFrame(frame: $0, emittedAt: elapsed, sourceLine: event(at: elapsed)) }
         let leftover = pending + final
         guard leftover.isEmpty else {
             let rendered = leftover.map { timed -> String in
@@ -180,13 +220,5 @@ struct VectorRunner {
                 expected: "no further frames",
                 actual: "\(leftover.count) extra frame(s): \(rendered.joined(separator: "; "))")
         }
-    }
-
-    /// The source line of the last event at or before `time` — used only to
-    /// attribute a frame drained in the FINAL post-loop drain (which has no
-    /// event of its own) to the closest thing it has to provenance: the
-    /// last event actually processed.
-    private func event(at time: TimeAmount) -> Int {
-        script.events.last(where: { $0.time <= time })?.sourceLine ?? script.events.last?.sourceLine ?? 0
     }
 }

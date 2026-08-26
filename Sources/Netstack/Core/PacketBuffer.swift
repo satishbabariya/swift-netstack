@@ -8,9 +8,14 @@ import NIOCore
 /// no reallocation and no copy. Parsing an ingress frame walks the reader
 /// index forward and records how long each header was; it never slices.
 public struct PacketBuffer: Sendable {
-    /// Enough for ethernet (14) + IPv4 with options (60) rounded up, so the
-    /// common path never has to grow the buffer.
-    public static let defaultHeadroom = 64
+    /// Sized for the worst case this stack actually emits:
+    ///   ethernet 14 + IPv4 20 + TCP 60 (full options: MSS, window scale,
+    ///   SACK-permitted, timestamps, and SACK blocks) = 94 bytes.
+    /// Rounded up to 128 for slack. `prepend` enforces this with a
+    /// `precondition`, which is live in release builds — undersizing it is a
+    /// crash, not a slow path, and UDP-only tests would never reveal it.
+    /// This stack never emits IPv4 options; headers are built at minimum length.
+    public static let defaultHeadroom = 128
 
     private var storage: ByteBuffer
 
@@ -66,7 +71,7 @@ public struct PacketBuffer: Sendable {
         writer(&storage, start)
         storage.moveReaderIndex(to: start)
         record(count, at: prependLayer)
-        prependLayer = next(after: prependLayer)
+        prependLayer = next(afterPrepend: prependLayer)
     }
 
     /// Take `count` bytes off the front as this layer's header.
@@ -74,7 +79,7 @@ public struct PacketBuffer: Sendable {
     public mutating func consumeHeader(_ count: Int) -> ByteBuffer? {
         guard let header = storage.readSlice(length: count) else { return nil }
         record(count, at: consumeLayer)
-        consumeLayer = next(after: consumeLayer)
+        consumeLayer = next(afterConsume: consumeLayer)
         return header
     }
 
@@ -89,15 +94,30 @@ public struct PacketBuffer: Sendable {
         case .transport: transportHeaderLength = count
         case .network: networkHeaderLength = count
         case .link: linkHeaderLength = count
-        case .done: break
+        case .done:
+            // Four headers on one packet is a programmer error in this stack:
+            // link, network, and transport are all there are. Trap in debug
+            // rather than silently dropping the length.
+            assertionFailure("PacketBuffer: more than three header layers recorded")
         }
     }
 
-    private func next(after layer: Layer) -> Layer {
+    /// Prepend visits layers in build order: transport, then network, then link.
+    private func next(afterPrepend layer: Layer) -> Layer {
         switch layer {
         case .transport: return .network
         case .network: return .link
         case .link: return .done
+        case .done: return .done
+        }
+    }
+
+    /// Consume visits layers in wire order: link, then network, then transport.
+    private func next(afterConsume layer: Layer) -> Layer {
+        switch layer {
+        case .link: return .network
+        case .network: return .transport
+        case .transport: return .done
         case .done: return .done
         }
     }

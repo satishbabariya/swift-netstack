@@ -87,6 +87,15 @@ import Testing
     #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 0:0 win 65535") }
 }
 
+@Test func rejectsATimeFieldThatCannotBeRepresentedAsNanoseconds() {
+    // `Double("1e19")` parses cleanly, and the naive `Int64(Double)` conversion traps once the
+    // scaled value no longer fits in an Int64 — a typo in a vector file must fail one test, not
+    // kill the whole test process. `inf`/`nan` are equally fatal to that naive conversion.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("1e19 < S 0:0(0)") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("inf < S 0:0(0)") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("nan < S 0:0(0)") }
+}
+
 @Test func rejectsAnUnterminatedTCPOptionList() {
     // The option-rejoining loop in parseTCP walks fields looking for a
     // closing ">". If the input never supplies one, the loop must not spin
@@ -94,4 +103,58 @@ import Testing
     // truncated/garbled option list either. Malformed input like this must
     // be rejected loudly, not parsed into a wrong-but-plausible result.
     #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 0:0(0) win 65535 <mss 1460") }
+}
+
+@Test func rejectsANegativeTimeField() {
+    // A negative time makes no sense against a logical clock that only ever
+    // advances forward, and `Double("-1.000")` parses cleanly enough to slip
+    // past a naive check.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("-1.000 < S 0:0(0)") }
+}
+
+@Test func rejectsUnparseableAckAndWindowValues() {
+    // `UInt32("banana")`, `UInt32("4294967296")`, and `UInt16("70000")` are
+    // all nil — which, unless the parser checks explicitly, is
+    // indistinguishable from "the field was never present". A
+    // present-but-unparseable value must throw, not silently become "no
+    // ack/window expected".
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S. 0:0(0) ack banana") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S. 0:0(0) ack 4294967296") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S. 0:0(0) win 70000") }
+}
+
+@Test func rejectsADuplicateAckOrWindowKey() {
+    // A repeated key must not silently overwrite the earlier value — that
+    // hides a real authoring mistake (or a merge conflict) behind a
+    // plausible-looking vector.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S. 0:0(0) ack 1 ack 2") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S. 0:0(0) win 100 win 200") }
+}
+
+@Test func rejectsASequenceRangeThatDisagreesWithTheDeclaredLength() {
+    // `5:3(0)` puts the end before the start, and `1:100(0)` implies 99
+    // bytes of payload while declaring 0 — both must be rejected rather than
+    // silently parsed. Sequence numbers wrap at 2^32, so this must be
+    // checked with wrapping arithmetic rather than trusting the fields
+    // independently.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 5:3(0)") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 1:100(0)") }
+}
+
+@Test func rejectsANegativePayloadLength() {
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 0:0(-5)") }
+}
+
+@Test func rejectsInvalidTCPFlagCharacters() {
+    // An unrecognised first token (e.g. a typo'd protocol keyword) must not
+    // silently fall through to being parsed as a "valid" TCP packet with a
+    // garbage flags string.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < banana 1:2(1)") }
+}
+
+@Test func rejectsEmptyTCPOptionListElements() {
+    // `split` defaults to dropping empty subsequences, so
+    // "<mss 1460,,sackOK>" would otherwise silently lose the empty element
+    // between the two commas instead of failing.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 0:0(0) <mss 1460,,sackOK>") }
 }

@@ -39,6 +39,7 @@ enum VectorScriptError: Error, Equatable {
     case malformedLine(String)
     case malformedTime(String)
     case malformedSequence(String)
+    case malformedField(String)
     case unknownPacketForm(String)
 }
 
@@ -66,8 +67,16 @@ struct VectorScript {
         guard fields.count >= 3 else { throw VectorScriptError.malformedLine(line) }
 
         let timeField = fields.removeFirst()
-        guard let seconds = Double(timeField) else { throw VectorScriptError.malformedTime(line) }
-        let time = TimeAmount.nanoseconds(Int64((seconds * 1_000_000_000).rounded()))
+        guard let seconds = Double(timeField), seconds.isFinite, seconds >= 0 else {
+            throw VectorScriptError.malformedTime(line)
+        }
+        // `Int64(Double)` traps rather than returning nil once the value no longer fits, so a
+        // malformed vector must never reach it. `Int64(exactly:)` never traps: it returns nil for
+        // non-finite, non-integral, or out-of-range values, which is exactly what we want here.
+        guard let nanoseconds = Int64(exactly: (seconds * 1_000_000_000).rounded()) else {
+            throw VectorScriptError.malformedTime(line)
+        }
+        let time = TimeAmount.nanoseconds(nanoseconds)
 
         let direction: VectorDirection
         switch fields.removeFirst() {
@@ -132,6 +141,13 @@ struct VectorScript {
         var fields = fields
         guard fields.count >= 2 else { throw VectorScriptError.malformedLine(line) }
         let flags = fields.removeFirst()
+        // Known flag characters only: S SYN, . ACK, F FIN, R RST, P PSH, U URG. This is also what
+        // stops an unrecognised first token (e.g. a typo'd protocol keyword) from falling through
+        // `parsePacket`'s default case and being accepted as a "valid" TCP packet with a garbage
+        // flags string.
+        guard !flags.isEmpty, flags.allSatisfy({ "S.FRPU".contains($0) }) else {
+            throw VectorScriptError.unknownPacketForm(line)
+        }
 
         let sequence = fields.removeFirst()
         guard let colon = sequence.firstIndex(of: ":"),
@@ -140,6 +156,13 @@ struct VectorScript {
             let end = UInt32(sequence[sequence.index(after: colon)..<openParen]),
             let length = Int(sequence[sequence.index(after: openParen)..<sequence.index(before: sequence.endIndex)])
         else { throw VectorScriptError.malformedSequence(line) }
+        // The declared length must agree with the range it claims to describe. Sequence numbers
+        // wrap at 2^32, so the difference must be computed with wrapping arithmetic rather than
+        // signed comparison — and `UInt32(exactly:)` rejects a negative or oversized length in the
+        // same step, since neither could ever equal a valid wrapping difference.
+        guard let declaredLength = UInt32(exactly: length), end &- start == declaredLength else {
+            throw VectorScriptError.malformedSequence(line)
+        }
 
         var ack: UInt32?
         var window: UInt16?
@@ -148,9 +171,16 @@ struct VectorScript {
         while index < fields.count {
             let field = fields[index]
             if field == "ack", index + 1 < fields.count {
-                ack = UInt32(fields[index + 1]); index += 2
+                // `nil` from a failed parse must mean "absent", and nothing else — so a
+                // present-but-unparseable value, or a key repeated with a second value, has to
+                // throw rather than silently leave the field looking unset (or overwrite it).
+                guard ack == nil else { throw VectorScriptError.malformedField(line) }
+                guard let value = UInt32(fields[index + 1]) else { throw VectorScriptError.malformedField(line) }
+                ack = value; index += 2
             } else if field == "win", index + 1 < fields.count {
-                window = UInt16(fields[index + 1]); index += 2
+                guard window == nil else { throw VectorScriptError.malformedField(line) }
+                guard let value = UInt16(fields[index + 1]) else { throw VectorScriptError.malformedField(line) }
+                window = value; index += 2
             } else if field.hasPrefix("<") {
                 // Options may contain spaces ("mss 1460"), so rejoin to the ">".
                 // This loop is bounded by `fields.count` on every iteration, so it
@@ -167,8 +197,16 @@ struct VectorScript {
                 guard joined.hasSuffix(">") else {
                     throw VectorScriptError.malformedLine(line)
                 }
-                options = joined.dropFirst().dropLast()
-                    .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                // Keep empty elements here (rather than the default omittingEmptySubsequences:
+                // true) so "<mss 1460,,sackOK>" is caught below instead of silently losing the
+                // element between the two commas.
+                let rawOptions = joined.dropFirst().dropLast()
+                    .split(separator: ",", omittingEmptySubsequences: false)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                guard rawOptions.allSatisfy({ !$0.isEmpty }) else {
+                    throw VectorScriptError.unknownPacketForm(line)
+                }
+                options = rawOptions
                 index += 1
             } else {
                 throw VectorScriptError.unknownPacketForm(line)

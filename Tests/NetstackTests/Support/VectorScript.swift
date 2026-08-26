@@ -128,12 +128,15 @@ struct VectorScript {
 
     private static func parseUDP(_ fields: [String], line: String) throws -> VectorPacket {
         // udp <sport> > <dport> (<payloadLength>)
+        // `Int(...)` alone accepts a negative literal like "(-12)" cleanly; `UInt32(exactly:)`
+        // is the same guard the TCP path uses to reject a length that cannot be a real payload
+        // size, without giving up the wider `Int` the field is stored as.
         guard fields.count == 5, fields[2] == ">",
             let source = UInt16(fields[1]), let destination = UInt16(fields[3]),
             fields[4].hasPrefix("("), fields[4].hasSuffix(")"),
-            let length = Int(fields[4].dropFirst().dropLast())
+            let length = Int(fields[4].dropFirst().dropLast()), let declaredLength = UInt32(exactly: length)
         else { throw VectorScriptError.unknownPacketForm(line) }
-        return .udp(source: source, destination: destination, length: length)
+        return .udp(source: source, destination: destination, length: Int(declaredLength))
     }
 
     private static func parseTCP(_ fields: [String], line: String) throws -> TCPLine {

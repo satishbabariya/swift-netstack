@@ -152,6 +152,14 @@ import Testing
     #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < banana 1:2(1)") }
 }
 
+@Test func rejectsANegativeUDPPayloadLength() {
+    // `Int("-12")` parses cleanly, so without an explicit range check
+    // "udp 4000 > 53 (-12)" would parse to `.udp(length: -12)` — a payload
+    // length that can never exist on the wire. Mirrors the TCP path's
+    // `UInt32(exactly:)` guard on its declared length.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.020 < udp 4000 > 53 (-12)") }
+}
+
 @Test func rejectsEmptyTCPOptionListElements() {
     // `split` defaults to dropping empty subsequences, so
     // "<mss 1460,,sackOK>" would otherwise silently lose the empty element

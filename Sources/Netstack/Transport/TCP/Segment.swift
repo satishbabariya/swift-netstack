@@ -10,11 +10,12 @@ import NIOCore
 /// are not rivals: `TCPSegment.reassemblySegment` projects one into the
 /// other, so the seam between them is written down once.
 ///
-/// `TCPSegment.length` computes SEG.LEN independently of `length` below.
-/// That duplication is deliberate only in the sense that it was left alone:
-/// `TCPStateMachine.swift` is owned by another change in flight this round,
-/// so collapsing the two definitions into one is a follow-up, not part of
-/// this task. Two copies of SEG.LEN in one module can drift.
+/// `length` below is the module's only definition of SEG.LEN.
+/// `TCPSegment.length` used to compute it independently; the two have since
+/// been collapsed, and that property is now a projection onto this one. Two
+/// copies could drift, and a drift between them would mean the acceptability
+/// test and the reassembler's gap arithmetic disagreeing about how much
+/// sequence space a segment occupies.
 public struct Segment: Sendable {
     public let sequence: SequenceNumber
     public let flags: TCPFlags

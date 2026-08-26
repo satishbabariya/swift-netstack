@@ -250,6 +250,21 @@ public final class TCPReassembler {
     /// than one run when it straddles a gap between runs already queued.
     public var pendingSegments: Int { queue.count }
 
+    /// How much of `maximumBytes` is still free, in the same (overhead-charged)
+    /// units `pendingBytes` reports.
+    ///
+    /// Exists so that `Receiver` can derive the window it advertises from the
+    /// one place that knows the cap, rather than being handed `maximumBytes` a
+    /// second time and subtracting for itself. A second copy of the cap is a
+    /// second thing to keep in step with this one.
+    ///
+    /// Conservative on purpose: because `pendingBytes` charges
+    /// `perSegmentOverhead` per queued run, this is smaller than the payload
+    /// room actually left, so a window derived from it under-promises. That is
+    /// the right direction — the alternative advertises space the queue would
+    /// then refuse.
+    public var availableBytes: Int { max(0, maximumBytes - accountedBytes) }
+
     /// The sequence number a FIN occupies, once one has been seen at or ahead
     /// of RCV.NXT. The caller's FIN is in order when its own RCV.NXT equals
     /// this. See the type's doc comment.

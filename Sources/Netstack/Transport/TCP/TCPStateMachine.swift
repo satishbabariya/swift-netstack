@@ -8,7 +8,7 @@ import NIOCore
 /// machine needs both for the acceptability test (RFC 9293 §3.10.7.4) and
 /// to build `.deliver` actions. This is the one addition beyond what the
 /// brief's interface list named; it is unavoidable plumbing, not a design
-/// choice, since `receive(segment:on:)` takes a single `segment` argument.
+/// choice, since `receive(segment:on:receiver:)` takes a single `segment` argument.
 public struct TCPSegment: Sendable {
     public var header: TCPHeader
     public var payload: ByteBuffer
@@ -20,12 +20,19 @@ public struct TCPSegment: Sendable {
 
     /// SEG.LEN (RFC 9293 §3.10.7.4): payload bytes, plus one each for SYN
     /// and FIN, since both consume a sequence number of their own.
-    var length: Int {
-        payload.readableBytes + (header.flags.contains(.syn) ? 1 : 0) + (header.flags.contains(.fin) ? 1 : 0)
-    }
+    ///
+    /// Deliberately *not* computed here. This used to be a second, independent
+    /// implementation of the same formula alongside `Segment.length`, and two
+    /// copies of SEG.LEN in one module can drift: the acceptability test below
+    /// and the reassembler's gap arithmetic would then disagree about how much
+    /// sequence space a segment occupies, which is precisely the kind of
+    /// disagreement that lets a segment be accepted by one and mis-placed by
+    /// the other. There is now one definition, in `Segment`, and this is a
+    /// projection onto it.
+    var length: Int { reassemblySegment.length }
 }
 
-/// RFC 9293's TCP state machine. `receive(segment:on:)` is the "SEGMENT
+/// RFC 9293's TCP state machine. `receive(segment:on:receiver:)` is the "SEGMENT
 /// ARRIVES" event (§3.10.7): given a segment and the connection's control
 /// block, it mutates the block in place and returns what the caller should
 /// do about it. `close(on:)` is the other half of the state diagram, the
@@ -41,8 +48,41 @@ public struct TCPSegment: Sendable {
 /// fail a `flags == [.syn]` comparison even though it is an ordinary SYN.
 /// `.contains(.syn)` ignores those unnamed bits entirely, which is exactly
 /// what's needed here: this state machine has no ECN behavior to give them.
+///
+/// ## What this machine does *not* own
+///
+/// Everything about *bytes*: which received bytes are in order, when RCV.NXT
+/// advances over them, what is handed to the application, and what receive
+/// window is advertised back. All of that belongs to `Receiver`, which is
+/// passed in and called at step 5 below.
+///
+/// That split is deliberate and load-bearing rather than tidiness. This file
+/// once advanced RCV.NXT and emitted `.deliver` itself, for in-order data
+/// only, while `TCPReassembler` did the same job with out-of-order handling on
+/// top. Two components each individually correct, both believing they own
+/// RCV.NXT, is the shape behind every serious defect this stack has produced:
+/// the connection's idea of what it has received would depend on which path a
+/// segment happened to take, and no test of either component alone can see it.
+/// So there is exactly one writer of `tcb.rcvNxt` and `tcb.rcvWnd`, and it is
+/// not this file. Do not reintroduce a sequence comparison here that `Receiver`
+/// already makes — if the same comparison appears in both files, the defect is
+/// back.
 public struct TCPStateMachine {
-    public static func receive(segment: TCPSegment, on tcb: inout TCB) -> [TCPAction] {
+    /// `receiver` owns RCV.NXT, delivery and the advertised window, and is
+    /// `inout` because it carries per-connection state.
+    ///
+    /// It is driven here rather than by the caller, and only after the segment
+    /// has passed the RST, acceptability, SYN and ACK checks, so that nothing
+    /// unacceptable ever reaches the reassembly queue. That ordering is a
+    /// security property, not an optimisation: the acceptability test is what
+    /// confines a peer's data to the window it was offered, and a receiver
+    /// driven ahead of it would queue — and eventually deliver — bytes the
+    /// connection said it would not accept. Reversing the two, so that a caller
+    /// reassembled first and then asked the state machine what to do, would
+    /// also need a way to re-enter this function for a FIN whose gap has since
+    /// filled; no such re-drive exists, and the comment that used to assume one
+    /// is what left an out-of-order FIN unhandled forever.
+    public static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
         switch tcb.state {
         case .closed:
             return closedStateSegmentArrives(segment: segment)
@@ -51,7 +91,7 @@ public struct TCPStateMachine {
         case .synSent:
             return synSentStateSegmentArrives(segment: segment, tcb: &tcb)
         case .synReceived, .established, .finWait1, .finWait2, .closeWait, .closing, .lastAck, .timeWait:
-            return generalSegmentArrives(segment: segment, tcb: &tcb)
+            return generalSegmentArrives(segment: segment, tcb: &tcb, receiver: &receiver)
         }
     }
 
@@ -191,7 +231,7 @@ public struct TCPStateMachine {
     /// depend on earlier ones having already run (in particular, the RST
     /// and SYN checks assume the segment has already passed the sequence
     /// acceptability test).
-    private static func generalSegmentArrives(segment: TCPSegment, tcb: inout TCB) -> [TCPAction] {
+    private static func generalSegmentArrives(segment: TCPSegment, tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
         let header = segment.header
         var actions: [TCPAction] = []
 
@@ -297,7 +337,8 @@ public struct TCPStateMachine {
 
             tcb.sndUna = header.acknowledgement
             if tcb.sndWl1.lessThan(header.sequence)
-                || (tcb.sndWl1 == header.sequence && header.acknowledgement.isAtOrAfter(tcb.sndWl2)) {
+                || (tcb.sndWl1 == header.sequence && header.acknowledgement.isAtOrAfter(tcb.sndWl2))
+            {
                 tcb.sndWnd = Int(header.window)
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
@@ -337,32 +378,65 @@ public struct TCPStateMachine {
         // and FIN-WAIT-2 accept new data -- in every other state reachable
         // here, the peer has already sent its FIN, so trailing data is
         // ignored rather than delivered.
-        if segment.payload.readableBytes > 0 {
-            switch tcb.state {
-            case .established, .finWait1, .finWait2:
-                if header.sequence == tcb.rcvNxt {
-                    tcb.rcvNxt = tcb.rcvNxt + segment.payload.readableBytes
-                    actions.append(.deliver(segment.payload))
-                    actions.append(.sendAck)
-                }
-            // An out-of-order segment that is merely in-window (its start
-            // is ahead of RCV.NXT) is accepted by step 2 above but not
-            // delivered here -- reassembly of out-of-order data is out of
-            // this task's scope (see `Reassembler`).
-            default:
-                break
+        //
+        // Which states accept data is a question about *state*, so it is
+        // answered here. Everything after that -- whether these particular
+        // bytes are in order, what that unblocks, how far RCV.NXT moves and
+        // what window is left to advertise -- is a question about *bytes*,
+        // so it is answered by the receiver and simply reported back. Note
+        // that the switch reads `tcb.state` after step 4 may have moved
+        // SYN-RECEIVED to ESTABLISHED, which is what lets a handshake-
+        // completing segment carry data.
+        var outcome: ReceiveOutcome?
+        switch tcb.state {
+        case .established, .finWait1, .finWait2:
+            outcome = receiver.accept(segment.reassemblySegment, tcb: &tcb)
+        case .synReceived:
+            // Only reachable through the "old duplicate ACK of our SYN|ACK"
+            // break above, since an acceptable ACK has already moved the
+            // state to ESTABLISHED. There is no established connection to
+            // deliver to yet, so the segment is dropped exactly as the
+            // previous in-order-only implementation dropped it. The peer
+            // retransmits.
+            break
+        case .closeWait, .closing, .lastAck, .timeWait:
+            break  // the peer's FIN is already past; trailing data is ignored.
+        case .closed, .listen, .synSent:
+            break  // unreachable: generalSegmentArrives is never entered in these states.
+        }
+
+        if let outcome {
+            for buffer in outcome.delivered {
+                actions.append(.deliver(buffer))
+            }
+            // `finReached` is currently implied by `shouldAck` -- a segment
+            // that occupies no sequence space cannot advance RCV.NXT and so
+            // cannot be the one that reaches the FIN. Kept as an explicit
+            // disjunct anyway: RFC 9293 requires a FIN to be acknowledged,
+            // and that requirement must not become contingent on how
+            // `shouldAck` is defined tomorrow.
+            if outcome.shouldAck || outcome.finReached {
+                actions.append(.sendAck)
             }
         }
 
-        // Step 6: the FIN bit. Only recognised once it is the next
-        // in-order byte -- an out-of-order FIN is left for a later segment
-        // to complete the sequence up to it.
-        if header.flags.contains(.fin), header.sequence + segment.payload.readableBytes == tcb.rcvNxt {
-            tcb.rcvNxt = tcb.rcvNxt + 1
-            actions.append(.sendAck)
-
+        // Step 6: the FIN bit. The *transition* is a state change and stays
+        // here; deciding *when* the FIN's sequence has been reached is byte
+        // arithmetic and belongs to the receiver, which reports it exactly
+        // once, on whichever segment finally makes the FIN in-order. That
+        // segment need not be the one that carried the FIN -- a FIN behind a
+        // gap is acted on when the gap fills, which the previous
+        // implementation could not do at all: it tested the arriving
+        // segment's own sequence against RCV.NXT and left an out-of-order FIN
+        // "for a later segment to complete the sequence up to it", a re-drive
+        // that nothing ever performed, so the connection simply never reached
+        // CLOSE-WAIT.
+        if outcome?.finReached == true {
             switch tcb.state {
             case .synReceived, .established:
+                // SYN-RECEIVED is unreachable here (see step 5's switch) but
+                // is kept as RFC 9293 §3.10.7.4 writes it, so that widening
+                // step 5 to that state does not silently lose the transition.
                 tcb.state = .closeWait
             case .finWait1:
                 if tcb.sndUna == tcb.sndNxt {
@@ -416,7 +490,7 @@ public struct TCPStateMachine {
 
 extension TCPStateMachine {
     /// RFC 9293 §3.10.4's "CLOSE Call": an application-initiated close, not
-    /// a segment arrival. `receive(segment:on:)` above is the only entry
+    /// a segment arrival. `receive(segment:on:receiver:)` above is the only entry
     /// point RFC 9293's "SEGMENT ARRIVES" event maps onto; this is the
     /// other half of the state diagram's edges, driven by the local
     /// application rather than the network, and is not one of the

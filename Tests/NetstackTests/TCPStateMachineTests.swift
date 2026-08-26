@@ -28,6 +28,24 @@ private func segment(sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], pa
     return TCPSegment(header: header, payload: buffer)
 }
 
+/// `TCPStateMachine.receive` takes a `Receiver`, which owns RCV.NXT, delivery
+/// and the advertised window. Every call site in this file goes through here so
+/// the plumbing is written once.
+///
+/// **A fresh receiver per call, deliberately.** No test in this file may depend
+/// on reassembly state surviving between two `receive` calls -- an out-of-order
+/// segment offered here is forgotten before the next one arrives. That is not
+/// an oversight to be fixed by hoisting the receiver: the tests that exercise
+/// the receiver's memory, and the seam between it and this machine, live in
+/// `TCPReceiverTests.swift` and hold a receiver across calls on purpose. Making
+/// this one persistent would quietly turn every test below into an integration
+/// test of two components at once, which is how the seam stopped being covered
+/// by anything the first time.
+private func stateMachineReceive(segment: TCPSegment, on tcb: inout TCB) -> [TCPAction] {
+    var receiver = Receiver(reassembler: TCPReassembler())
+    return TCPStateMachine.receive(segment: segment, on: &tcb, receiver: &receiver)
+}
+
 private func listenTCB(iss: UInt32 = 1000) -> TCB {
     TCB(
         state: .listen,
@@ -170,7 +188,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 
 @Test func passiveOpenMovesListenToSynReceived() {
     var tcb = listenTCB(iss: 1000)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
     #expect(tcb.state == .synReceived)
     #expect(containsSendSynAck(actions))
     #expect(tcb.irs == SequenceNumber(5000))
@@ -179,7 +197,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 
 @Test func handshakeCompletionMovesSynReceivedToEstablished() {
     var tcb = synReceivedTCB(iss: 3000, irs: 8000)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 8001, ack: 3001, flags: [.ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 8001, ack: 3001, flags: [.ack]), on: &tcb)
     #expect(tcb.state == .established)
     #expect(tcb.sndUna == SequenceNumber(3001))
     // The handshake-completing ACK carries no data and no FIN, so there is
@@ -229,7 +247,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 
 @Test func activeOpenMovesSynSentToEstablished() {
     var tcb = synSentTCB(iss: 2000)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 9000, ack: 2001, flags: [.syn, .ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 9000, ack: 2001, flags: [.syn, .ack]), on: &tcb)
     #expect(tcb.state == .established)
     #expect(containsSendAck(actions))
     #expect(tcb.irs == SequenceNumber(9000))
@@ -237,7 +255,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 
 @Test func simultaneousOpenMovesSynSentToSynReceived() {
     var tcb = synSentTCB(iss: 2000)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 9000, flags: [.syn]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 9000, flags: [.syn]), on: &tcb)
     #expect(tcb.state == .synReceived)
     #expect(containsSendSynAck(actions))
 }
@@ -252,7 +270,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 
 @Test func peerCloseMovesEstablishedToCloseWait() {
     var tcb = establishedTCB(sndUna: 100, sndNxt: 100, rcvNxt: 1000, rcvWnd: 100)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 100, flags: [.fin, .ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: 100, flags: [.fin, .ack]), on: &tcb)
     #expect(tcb.state == .closeWait)
     #expect(containsSendAck(actions))
     #expect(tcb.rcvNxt == SequenceNumber(1001))
@@ -262,7 +280,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     var tcb = finWait1TCB(sndUna: 100, rcvNxt: 1000, rcvWnd: 100)
     // The peer's FIN acks only what we'd already sent (sndUna), not the
     // FIN we just sent ourselves -- both sides closing at once.
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 100, flags: [.fin, .ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: 100, flags: [.fin, .ack]), on: &tcb)
     #expect(tcb.state == .closing)
     #expect(containsSendAck(actions))
 }
@@ -270,14 +288,14 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 @Test func finWait1PlusAckMovesToFinWait2() {
     var tcb = finWait1TCB(sndUna: 100, rcvNxt: 1000, rcvWnd: 100)
     // sndNxt is sndUna+1 (our unacked FIN); acking it exactly retires it.
-    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 101, flags: [.ack]), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 1000, ack: 101, flags: [.ack]), on: &tcb)
     #expect(tcb.state == .finWait2)
     #expect(tcb.sndUna == SequenceNumber(101))
 }
 
 @Test func finWait2PlusFinMovesToTimeWait() {
     var tcb = finWait2TCB(sndUna: 100, rcvNxt: 1000, rcvWnd: 100)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 100, flags: [.fin, .ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: 100, flags: [.fin, .ack]), on: &tcb)
     #expect(tcb.state == .timeWait)
     #expect(containsStartTimeWait(actions))
     #expect(tcb.rcvNxt == SequenceNumber(1001))
@@ -286,14 +304,14 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 @Test func lastAckPlusAckMovesToClosed() {
     var tcb = lastAckTCB(sndUna: 100, rcvNxt: 1000, rcvWnd: 100)
     // sndNxt is sndUna+1 (our unacked FIN); acking it exactly retires it.
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 101, flags: [.ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: 101, flags: [.ack]), on: &tcb)
     #expect(tcb.state == .closed)
     #expect(containsDeleteTCB(actions))
 }
 
 @Test func inOrderDataInEstablishedIsDeliveredAndAcked() {
     var tcb = establishedTCB(sndUna: 100, sndNxt: 100, rcvNxt: 1000, rcvWnd: 100)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 100, flags: [.ack], payload: 10), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: 100, flags: [.ack], payload: 10), on: &tcb)
     #expect(tcb.rcvNxt == SequenceNumber(1010))
     #expect(containsDeliver(actions))
     #expect(containsSendAck(actions))
@@ -306,7 +324,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // expected next sequence, and is otherwise dropped. Accepting it would let
     // a peer inject data anywhere in the stream.
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 5000, payload: 4), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 5000, payload: 4), on: &tcb)
     #expect(actions.contains { if case .sendAck = $0 { return true }; return false })
     #expect(!actions.contains { if case .deliver = $0 { return true }; return false })
     #expect(tcb.rcvNxt == SequenceNumber(1000), "rcvNxt must not move for a rejected segment")
@@ -316,7 +334,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // RFC 5961: a blind off-window RST must not tear down the connection, or
     // any peer that can guess the four-tuple can kill it.
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
-    let offWindowActions = TCPStateMachine.receive(segment: segment(sequence: 50_000, flags: [.rst]), on: &tcb)
+    let offWindowActions = stateMachineReceive(segment: segment(sequence: 50_000, flags: [.rst]), on: &tcb)
     #expect(tcb.state == .established, "an off-window RST must not close the connection")
     // The state-only assertion above cannot by itself distinguish "silently
     // discarded" from "in window but not an exact RCV.NXT match, so
@@ -330,14 +348,14 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // the wrong reason.
     #expect(offWindowActions == [.none], "an off-window RST must be silently discarded, not challenged")
 
-    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, flags: [.rst]), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 1000, flags: [.rst]), on: &tcb)
     #expect(tcb.state == .closed)
 }
 
 @Test func aSynInAnEstablishedConnectionDoesNotResetIt() {
     // A challenge ACK is sent instead -- RFC 5961 §4.
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, flags: [.syn]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, flags: [.syn]), on: &tcb)
     #expect(tcb.state == .established)
     #expect(actions.contains { if case .sendAck = $0 { return true }; return false })
 }
@@ -346,7 +364,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // RFC 9293 §3.10.7.4: ACK beyond SND.NXT is unacceptable. Honouring it
     // would advance sndUna past data that was never transmitted.
     var tcb = establishedTCB(sndUna: 100, sndNxt: 200)
-    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 5000, flags: [.ack]), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 1000, ack: 5000, flags: [.ack]), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(100))
 }
 
@@ -363,7 +381,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // held everywhere except at the value a hostile peer can compute directly.
     var tcb = establishedTCB(sndUna: 100, sndNxt: 100, rcvNxt: 1000, rcvWnd: 100)
     let hostile = SequenceNumber(100 &+ 0x8000_0000)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: hostile.value, flags: [.ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: hostile.value, flags: [.ack]), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(100), "SND.UNA must not advance to a guest-chosen half-space ACK")
     #expect(tcb.sndWl2 == SequenceNumber(100), "nor may the rejected ACK be recorded as a window update")
     #expect(actions == [.sendAck], "an ACK beyond SND.NXT is answered with an ACK and dropped")
@@ -397,7 +415,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
         rcvWnd: 4096,
         irs: SequenceNumber(8000))
     let hostile = SequenceNumber(2900 &+ 0x8000_0000)  // inside the band the old shape admitted
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 8001, ack: hostile.value, flags: [.ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 8001, ack: hostile.value, flags: [.ack]), on: &tcb)
     #expect(tcb.state == .synReceived, "an impossible TCB must not be talked into ESTABLISHED")
     #expect(tcb.sndUna == SequenceNumber(3000))
     #expect(actions == [.sendRst(sequence: hostile, ack: nil)])
@@ -427,7 +445,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
         rcvWnd: 4096,
         irs: SequenceNumber(0))
     let hostile = SequenceNumber(2000 &+ 0x8000_0000)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 9000, ack: hostile.value, flags: [.syn, .ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 9000, ack: hostile.value, flags: [.syn, .ack]), on: &tcb)
     #expect(tcb.state == .synSent, "an empty acceptable-ACK window must accept nothing")
     #expect(tcb.sndUna == SequenceNumber(2000), "and must not adopt the guest's number as SND.UNA")
     #expect(actions == [.sendRst(sequence: hostile, ack: nil)])
@@ -448,7 +466,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     tcb.sndWnd = 1
     tcb.sndWl1 = SequenceNumber(1000)
     tcb.sndWl2 = SequenceNumber(150 &+ 0x8000_0000)
-    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 150, flags: [.ack], window: 65535), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 1000, ack: 150, flags: [.ack], window: 65535), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(150), "the ACK itself is perfectly acceptable and does advance SND.UNA")
     #expect(tcb.sndWnd == 1, "but it is not at or after SND.WL2, so it must not install a window")
     #expect(tcb.sndWl2 == SequenceNumber(150 &+ 0x8000_0000), "and must not be recorded as the last window update")
@@ -464,7 +482,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     tcb.sndWnd = 1
     tcb.sndWl1 = SequenceNumber(1000)
     tcb.sndWl2 = SequenceNumber(100)
-    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 150, flags: [.ack], window: 65535), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 1000, ack: 150, flags: [.ack], window: 65535), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(150))
     #expect(tcb.sndWnd == 65535)
     #expect(tcb.sndWl1 == SequenceNumber(1000))
@@ -482,7 +500,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     tcb.sndWnd = 0
     tcb.sndWl1 = SequenceNumber(1000)
     tcb.sndWl2 = SequenceNumber(100)
-    _ = TCPStateMachine.receive(segment: segment(sequence: 1000, ack: 100, flags: [.ack], window: 65535), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 1000, ack: 100, flags: [.ack], window: 65535), on: &tcb)
     #expect(tcb.sndUna == SequenceNumber(100))
     #expect(tcb.sndWnd == 65535, "a zero window must be reopenable by a duplicate ACK")
 }
@@ -498,21 +516,21 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // suite codifies this exact exchange as `0.100 > R. 0:0(0) ack 1`.
     var tcb = establishedTCB()
     tcb.state = .closed
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
     // SEG.LEN counts the SYN, so a bare SYN at 5000 is acknowledged with 5001.
     #expect(actions == [.sendRst(sequence: SequenceNumber(0), ack: SequenceNumber(5001))])
 
     // A bare SYN is the case that matters, but SEG.LEN is payload + SYN +
     // FIN, and getting the payload term wrong is the same class of bug.
     var withData = tcb
-    let dataActions = TCPStateMachine.receive(segment: segment(sequence: 5000, flags: [.syn], payload: 7), on: &withData)
+    let dataActions = stateMachineReceive(segment: segment(sequence: 5000, flags: [.syn], payload: 7), on: &withData)
     #expect(dataActions == [.sendRst(sequence: SequenceNumber(0), ack: SequenceNumber(5008))])
 
     // The ACK-on case is the other RFC form -- <SEQ=SEG.ACK><CTL=RST>, ACK
     // bit clear -- and must NOT gain an acknowledgement. Without this, "the
     // action can carry an ack" could be satisfied by always setting one.
     var acked = tcb
-    let ackedActions = TCPStateMachine.receive(segment: segment(sequence: 5000, ack: 77, flags: [.ack]), on: &acked)
+    let ackedActions = stateMachineReceive(segment: segment(sequence: 5000, ack: 77, flags: [.ack]), on: &acked)
     #expect(ackedActions == [.sendRst(sequence: SequenceNumber(77), ack: nil)])
 }
 
@@ -531,7 +549,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // not reachable by chance.
     var tcb = synReceivedTCB(iss: 3000, irs: 8000)
     let hostile = SequenceNumber(3000 &+ 0x8000_0000)  // iss + 2^31, wrapping
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 8001, ack: hostile.value, flags: [.ack]), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 8001, ack: hostile.value, flags: [.ack]), on: &tcb)
     // Reaching this line at all is most of the point -- a trap would have
     // taken the process down before it.
     #expect(tcb.sndUna == SequenceNumber(3000), "a half-space ACK must not retire our SYN")
@@ -551,7 +569,7 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     let ece: UInt8 = 1 << 6
     let cwr: UInt8 = 1 << 7
     let ecnSetupSyn = TCPFlags(rawValue: TCPFlags.syn.rawValue | ece | cwr)
-    let actions = TCPStateMachine.receive(segment: segment(sequence: 5000, flags: ecnSetupSyn), on: &tcb)
+    let actions = stateMachineReceive(segment: segment(sequence: 5000, flags: ecnSetupSyn), on: &tcb)
     #expect(tcb.state == .synReceived)
     #expect(containsSendSynAck(actions))
 }

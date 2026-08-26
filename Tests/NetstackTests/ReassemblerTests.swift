@@ -393,6 +393,64 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     #expect(grown < 30_000_000)
 }
 
+@Test func admissionOrderStaysBoundedWhenOneDatagramPinsTheHead() {
+    // `pruneStaleOrderHead`'s head-only scan can be pinned indefinitely by a
+    // single never-completing datagram sitting at the front of
+    // `admissionOrder`: every OTHER datagram that completes leaves `pending`
+    // from the middle, so its own `admissionOrder` appearance goes stale
+    // where the head-only scan can never reach it, and the array grows by
+    // one `Key` per admission forever — entirely unaccounted by
+    // `heldBytes`/`memoryLimit`. Uses the actual attack shape: one
+    // never-completing fragment to pin the head, then a flood of ordinary
+    // two-fragment datagrams that each complete and are freed.
+    //
+    // Reviewer's measurement of this exact shape against the unfixed code,
+    // `memoryLimit: 4 MiB`: 2,000,000 admission cycles, `pendingCount == 1`,
+    // ~58 MB of real RSS growth — `admissionOrder` had grown to roughly one
+    // `Key` per completed datagram, none of it ever reclaimed.
+    let maximumPendingDatagrams = 8
+    let reassembler = Reassembler(
+        clock: ManualClock(), timeout: .seconds(3600), memoryLimit: 1_000_000,
+        maximumPendingDatagrams: maximumPendingDatagrams)
+
+    // Pin the head: one fragment that never gets a terminator.
+    var pin = IPv4Header(
+        source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+        protocolNumber: .udp, payloadLength: 1)
+    pin.identification = 0
+    pin.flags = [.moreFragments]
+    _ = reassembler.process(header: pin, payload: ByteBuffer(bytes: [0xaa]))
+    #expect(reassembler.pendingCount == 1)
+
+    // Flood ordinary two-fragment datagrams, each with a distinct
+    // identification (so they never collide with the pin or each other),
+    // that complete and leave `pending` immediately.
+    let cycles = 50_000
+    for i in 0..<cycles {
+        let id = UInt16(1 + (i % 65535))
+        var head = IPv4Header(
+            source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+            protocolNumber: .udp, payloadLength: 1)
+        head.identification = id
+        head.flags = [.moreFragments]
+        _ = reassembler.process(header: head, payload: ByteBuffer(bytes: [0xbb]))
+
+        var tail = head
+        tail.fragmentOffset = 1
+        tail.flags = []
+        #expect(reassembler.process(header: tail, payload: ByteBuffer(bytes: [0xcc]))?.1.readableBytes == 2)
+    }
+
+    // Only the pinning datagram is still pending; everything else completed
+    // and was freed.
+    #expect(reassembler.pendingCount == 1)
+    // The periodic full-pass compaction bounds `admissionOrder` to a small
+    // constant multiple of `maximumPendingDatagrams` regardless of how the
+    // head is pinned. Falsifies to ~50,001 (one `Key` per admission,
+    // unbounded) against the pre-fix, head-only scan.
+    #expect(reassembler.admissionOrderCountForTesting <= 4 * maximumPendingDatagrams + 1)
+}
+
 @Test func rejectsFragmentsBeyondThePerDatagramCap() {
     // `maximumFragmentsPerDatagram` bounds one datagram's own fragment count
     // independently of `memoryLimit` — insurance against `perFragmentOverhead`

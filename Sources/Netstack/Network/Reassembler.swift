@@ -98,6 +98,15 @@ public final class Reassembler {
         /// Set when the fragment carrying the end of the datagram arrives.
         var totalLength: Int?
         let startedAt: NIODeadline
+        /// The `admissionOrder` sequence number assigned when this entry was
+        /// created. See `admissionOrder`'s doc comment for why this is
+        /// needed: it lets a stale `admissionOrder` appearance for a KEY
+        /// that has since been re-admitted (completed or evicted, then a
+        /// fresh datagram with the identical source/destination/id/protocol
+        /// arrived later) be told apart from the appearance that actually
+        /// represents THIS live entry, by an O(1) comparison instead of
+        /// conflating every appearance of the same key as equally live.
+        let admissionSequence: Int
     }
 
     private let clock: NetstackClock
@@ -116,8 +125,32 @@ public final class Reassembler {
     /// entry that might still be live; entries at or before it may already
     /// be gone (completed, expired, or evicted) and are skipped lazily
     /// rather than removed from the middle of the array.
-    private var admissionOrder: [Key] = []
+    ///
+    /// One entry per ADMISSION (i.e. per `isNewEntry` in `process`), not one
+    /// per key — the same key can be admitted more than once over this
+    /// object's lifetime if an earlier entry under it completes or is
+    /// evicted and a later fragment starts a fresh one. Each appearance
+    /// carries the `admissionSequence` its `Pending` was stamped with when
+    /// created, so a stale appearance from an earlier admission of the same
+    /// key can be told apart from the one that represents the CURRENT entry
+    /// by an O(1) comparison against `Pending.admissionSequence`, rather
+    /// than by key membership in `pending` alone (which cannot distinguish
+    /// "this key has never been re-admitted" from "this key was re-admitted
+    /// after this appearance went stale").
+    ///
+    /// `pruneStaleOrderHead`'s head-only scan alone is not enough to bound
+    /// this: a single never-completing entry sitting at the front pins
+    /// `admissionOrderHead`, and every OTHER datagram that completes leaves
+    /// `pending` from the middle, going stale where the head-only scan can
+    /// never reach it. See `pruneStaleOrderHead`'s doc comment for the fix.
+    private var admissionOrder: [(key: Key, sequence: Int)] = []
     private var admissionOrderHead = 0
+    private var nextAdmissionSequence = 0
+
+    /// Test-only instrumentation, not `private`: `@testable import` needs to
+    /// read it to assert directly that `admissionOrder` stays bounded under
+    /// a pinned-head attack.
+    var admissionOrderCountForTesting: Int { admissionOrder.count }
 
     public init(
         clock: NetstackClock, timeout: TimeAmount = .seconds(30), memoryLimit: Int = 4 * 1024 * 1024,
@@ -157,7 +190,7 @@ public final class Reassembler {
         )
 
         let isNewEntry = pending[key] == nil
-        var entry = pending[key] ?? Pending(header: header, startedAt: clock.now())
+        var entry = pending[key] ?? Pending(header: header, startedAt: clock.now(), admissionSequence: allocateAdmissionSequence())
 
         // Bound the datagram as it will be ASSEMBLED, not as this fragment
         // arrives. `entry.header` is fixed by whichever fragment created the
@@ -216,7 +249,7 @@ public final class Reassembler {
             if pending.count >= maximumPendingDatagrams {
                 evictOldest()
             }
-            admissionOrder.append(key)
+            admissionOrder.append((key: key, sequence: entry.admissionSequence))
         }
         pending[key] = entry
 
@@ -294,15 +327,54 @@ public final class Reassembler {
         }
     }
 
+    /// An `admissionOrder` appearance is live only if `pending[key]` still
+    /// exists AND is the same admission this appearance recorded — a key
+    /// membership check alone cannot tell "this key was never re-admitted"
+    /// from "this key went stale here but was re-admitted later", and would
+    /// misidentify the latter as live forever.
+    private func isLive(_ appearance: (key: Key, sequence: Int)) -> Bool {
+        pending[appearance.key]?.admissionSequence == appearance.sequence
+    }
+
     /// Remove every already-gone entry from the front of `admissionOrder` —
     /// one that finished (assembled, or dropped for overrunning the
-    /// datagram bound) or expired since it was appended. Safe, and cheap, to
-    /// call whenever `pending` may have shrunk: each stale key is skipped
+    /// datagram bound), expired, or was superseded by a later re-admission
+    /// of the same key, since it was appended. Safe, and cheap, to call
+    /// whenever `pending` may have shrunk: each stale appearance is skipped
     /// exactly once over the table's lifetime, so the amortized cost is
     /// O(1) per fragment processed, not O(pendingCount) — unlike the table
     /// scan (`pending.min(by: startedAt)`) this replaces.
+    ///
+    /// The head-only scan above has a gap: it can be pinned indefinitely by
+    /// a single never-completing entry sitting at the front — e.g. one
+    /// 1-byte `MoreFragments` fragment with no terminator ever admitted.
+    /// Every OTHER datagram that completes leaves `pending` from the
+    /// middle, so its `admissionOrder` appearance goes stale where this
+    /// scan can never reach it: `admissionOrderHead` stops advancing, the
+    /// prefix-drop above never fires, and `admissionOrder` grows by one
+    /// `Key` per admission, forever — entirely unaccounted by
+    /// `heldBytes`/`memoryLimit`. (Measured: 2M admission cycles against one
+    /// pinned datagram grew real RSS by ~58 MB with `pendingCount == 1` and
+    /// `heldBytes` in the low hundreds of bytes, against a 4 MiB cap.)
+    ///
+    /// Close that with a periodic FULL pass, not just the consumed prefix:
+    /// once `admissionOrder` has grown past a multiple of
+    /// `maximumPendingDatagrams` it could never legitimately reach through
+    /// live entries alone (at most `maximumPendingDatagrams` entries can be
+    /// live at once), rebuild it keeping only the appearances that are each
+    /// currently live. This bounds `admissionOrder.count` to
+    /// `4 * maximumPendingDatagrams + 1` elements (checked after every
+    /// single append) — a small, constant memory footprint for this
+    /// structure alone, independent of `memoryLimit` and of how the head is
+    /// pinned, establishing that total retention here is bounded to within
+    /// a stated constant factor rather than merely that the accounted
+    /// number (`heldBytes`) stays small. Amortized O(1): each appearance is
+    /// visited by at most one full pass before it is either dropped or
+    /// survives as the sole live one for its key, and the threshold
+    /// guarantees a full pass runs at most once per `maximumPendingDatagrams`
+    /// further admissions.
     private func pruneStaleOrderHead() {
-        while admissionOrderHead < admissionOrder.count, pending[admissionOrder[admissionOrderHead]] == nil {
+        while admissionOrderHead < admissionOrder.count, !isLive(admissionOrder[admissionOrderHead]) {
             admissionOrderHead += 1
         }
         // Once at least half of `admissionOrder` is a consumed stale prefix,
@@ -311,7 +383,19 @@ public final class Reassembler {
         if admissionOrderHead > 64, admissionOrderHead * 2 > admissionOrder.count {
             admissionOrder.removeFirst(admissionOrderHead)
             admissionOrderHead = 0
+            return
         }
+        guard admissionOrder.count > 4 * maximumPendingDatagrams else { return }
+        var compacted: [(key: Key, sequence: Int)] = []
+        compacted.reserveCapacity(pending.count)
+        for index in admissionOrderHead..<admissionOrder.count {
+            let appearance = admissionOrder[index]
+            if isLive(appearance) {
+                compacted.append(appearance)
+            }
+        }
+        admissionOrder = compacted
+        admissionOrderHead = 0
     }
 
     /// Evict the single oldest still-pending entry, if any. Backs both
@@ -320,10 +404,18 @@ public final class Reassembler {
     private func evictOldest() -> Bool {
         pruneStaleOrderHead()
         guard admissionOrderHead < admissionOrder.count else { return false }
-        let key = admissionOrder[admissionOrderHead]
+        let key = admissionOrder[admissionOrderHead].key
         admissionOrderHead += 1
         guard let entry = pending.removeValue(forKey: key) else { return false }
         heldBytes -= entry.holdingBytes
         return true
+    }
+
+    /// Allocate the sequence number that marks a newly created `Pending` as
+    /// the live admission for its key. See `Pending.admissionSequence` and
+    /// `admissionOrder`'s doc comments.
+    private func allocateAdmissionSequence() -> Int {
+        nextAdmissionSequence += 1
+        return nextAdmissionSequence
     }
 }

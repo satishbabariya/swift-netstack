@@ -67,36 +67,104 @@ public struct ARPPacket: Sendable, Equatable {
 
 /// IP-to-MAC bindings with a time-to-live.
 ///
-/// Loop-confined, so no lock. Expiry is lazy: an entry is checked on lookup
-/// rather than swept, which costs nothing on a table this small and avoids a
-/// timer that would fire forever on an idle stack.
+/// Loop-confined, so no lock. Expiry is lazy on `lookup` — a key is checked
+/// only when it is asked for — but that is not enough on its own: nothing
+/// fed by an attacker's own choices, rather than the stack's, may be allowed
+/// to grow without bound. `record` is called from `IPv4Protocol.handleInbound`
+/// on EVERY accepted IPv4 packet and from `ARPResponder.handle` on every ARP
+/// seen — a guest (or, under promiscuous mode, anything it forwards for) can
+/// grow this table just by varying the claimed source address, no valid ARP
+/// exchange or checksum required. Bounded capacity with eviction closes that;
+/// `reapExpired`, called from `Stack`'s maintenance timer, then lets an idle
+/// cache actually shrink back down between floods instead of merely stopping
+/// its growth at the cap.
 public final class ARPCache {
     private struct Entry {
         let mac: MACAddress
-        let expiresAt: NIODeadline
+        var expiresAt: NIODeadline
     }
+
+    /// A single guest behind one gateway resolves only a handful of on-link
+    /// peers in practice — the gateway itself and perhaps a few local
+    /// services — so this is two to three orders of magnitude more headroom
+    /// than legitimate traffic ever needs. It still caps worst-case memory
+    /// to a small, constant amount (each entry is a MAC, a deadline, and a
+    /// dictionary/array slot — on the order of tens of bytes) regardless of
+    /// how many distinct source addresses a guest sends, spoofed or not.
+    public static let defaultCapacity = 512
 
     private let clock: NetstackClock
     private let ttl: TimeAmount
+    private let capacity: Int
     private var entries: [IPv4Address: Entry] = [:]
+    /// Least-recently-used order for the entries currently in `entries`: the
+    /// front is the next eviction candidate, the back is the most recently
+    /// touched. Touched by both a new-or-refreshed `record` and a successful
+    /// `lookup`, so an address the stack is actively talking to survives an
+    /// eviction sweep even while a flood of unrelated, single-use spoofed
+    /// sources is cycling through the rest of the table.
+    private var order: [IPv4Address] = []
 
-    public init(clock: NetstackClock, ttl: TimeAmount = .seconds(60)) {
+    public init(clock: NetstackClock, ttl: TimeAmount = .seconds(60), capacity: Int = ARPCache.defaultCapacity) {
         self.clock = clock
         self.ttl = ttl
+        self.capacity = max(1, capacity)
     }
 
     public func record(_ ip: IPv4Address, _ mac: MACAddress) {
-        entries[ip] = Entry(mac: mac, expiresAt: clock.now() + ttl)
+        let expiresAt = clock.now() + ttl
+        if entries[ip] != nil {
+            entries[ip] = Entry(mac: mac, expiresAt: expiresAt)
+            touch(ip)
+            return
+        }
+        if entries.count >= capacity {
+            evictLeastRecentlyUsed()
+        }
+        entries[ip] = Entry(mac: mac, expiresAt: expiresAt)
+        order.append(ip)
     }
 
     public func lookup(_ ip: IPv4Address) -> MACAddress? {
         guard let entry = entries[ip] else { return nil }
         guard entry.expiresAt > clock.now() else {
             entries.removeValue(forKey: ip)
+            removeFromOrder(ip)
             return nil
         }
+        touch(ip)
         return entry.mac
     }
 
+    /// Evict every entry whose TTL has elapsed. Called from `Stack`'s
+    /// periodic maintenance timer, alongside the reassembler's own sweep.
+    public func reapExpired() {
+        let now = clock.now()
+        guard !entries.isEmpty else { return }
+        let expired = entries.filter { $0.value.expiresAt <= now }.map(\.key)
+        guard !expired.isEmpty else { return }
+        for ip in expired {
+            entries.removeValue(forKey: ip)
+        }
+        let expiredSet = Set(expired)
+        order.removeAll { expiredSet.contains($0) }
+    }
+
     public var count: Int { entries.count }
+
+    private func touch(_ ip: IPv4Address) {
+        removeFromOrder(ip)
+        order.append(ip)
+    }
+
+    private func removeFromOrder(_ ip: IPv4Address) {
+        guard let index = order.firstIndex(of: ip) else { return }
+        order.remove(at: index)
+    }
+
+    private func evictLeastRecentlyUsed() {
+        guard !order.isEmpty else { return }
+        let oldest = order.removeFirst()
+        entries.removeValue(forKey: oldest)
+    }
 }

@@ -65,6 +65,59 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.lookup(IPv4Address("10.0.0.1")!) != nil)
 }
 
+@Test func cacheIsBoundedUnderAFloodOfSpoofedSources() {
+    // `IPv4Protocol.handleInbound` calls `arpCache.record` on EVERY accepted
+    // IPv4 packet, so a guest — or anything it forwards for, under
+    // promiscuous mode — can grow this table by simply varying the claimed
+    // source address, no valid ARP or checksum required. Unbounded, that is
+    // an OOM of the host process. 50,000 distinct sources, capped table.
+    let clock = ManualClock()
+    let cache = ARPCache(clock: clock, ttl: .seconds(60), capacity: 512)
+    for i in 0..<50_000 {
+        let ip = IPv4Address(UInt8((i >> 24) & 0xff), UInt8((i >> 16) & 0xff), UInt8((i >> 8) & 0xff), UInt8(i & 0xff))
+        cache.record(ip, MACAddress(bytes: [0x02, 0, 0, 0, UInt8((i >> 8) & 0xff), UInt8(i & 0xff)])!)
+    }
+    #expect(cache.count == 512)
+}
+
+@Test func cacheEvictsOldestButKeepsARecentlyTouchedEntry() {
+    let clock = ManualClock()
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: 4)
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, 0, UInt8($0)])! }
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, 0, UInt8($0)) }
+
+    cache.record(ip(1), mac(1))
+    cache.record(ip(2), mac(2))
+    cache.record(ip(3), mac(3))
+    cache.record(ip(4), mac(4))
+    // Touch the oldest entry so it is no longer the least-recently-used one.
+    #expect(cache.lookup(ip(1)) == mac(1))
+
+    // A fifth distinct source must evict the actual least-recently-used
+    // entry (2), not the one that was merely inserted first (1).
+    cache.record(ip(5), mac(5))
+
+    #expect(cache.count == 4)
+    #expect(cache.lookup(ip(1)) == mac(1))   // recently touched: survives
+    #expect(cache.lookup(ip(2)) == nil)      // least-recently-used: evicted
+    #expect(cache.lookup(ip(3)) == mac(3))
+    #expect(cache.lookup(ip(4)) == mac(4))
+    #expect(cache.lookup(ip(5)) == mac(5))
+}
+
+@Test func cacheReapsExpiredEntriesOnMaintenance() {
+    let clock = ManualClock()
+    let cache = ARPCache(clock: clock, ttl: .seconds(60))
+    cache.record(IPv4Address("10.0.0.1")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+    cache.record(IPv4Address("10.0.0.2")!, MACAddress("0a:0b:0c:0d:0e:10")!)
+    #expect(cache.count == 2)
+
+    clock.advance(by: .seconds(61))
+    cache.reapExpired()
+    #expect(cache.count == 0)
+    #expect(cache.lookup(IPv4Address("10.0.0.1")!) == nil)
+}
+
 @Test func respondsToARequestForOurAddress() {
     let link = RecordingEndpoint(eventLoop: EmbeddedEventLoop(), linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
     let nic = NIC(id: 1, link: link)

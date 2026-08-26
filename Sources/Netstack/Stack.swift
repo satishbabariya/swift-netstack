@@ -12,8 +12,9 @@ import NIOCore
 /// Dropping every reference to this `Stack` — including this `Stack` itself
 /// — does not stop it; only `cancel()`, which `shutdown()` calls, does. Skip
 /// `shutdown()` and the timer keeps firing forever, holding the
-/// `Reassembler` alive with it, even after the rest of the stack (`nic`,
-/// `arpResponder`, `ipv4`, `routes`, `arpCache`) has been deallocated.
+/// `Reassembler` and the `ARPCache` alive with it — both of which it sweeps
+/// on every firing — even after the rest of the stack (`nic`, `arpResponder`,
+/// `ipv4`, `routes`) has been deallocated.
 public final class Stack {
     public struct Configuration: Sendable {
         /// The address the stack answers for — the guest's default gateway.
@@ -153,8 +154,9 @@ public final class Stack {
         maintenanceTask = eventLoop.scheduleRepeatedTask(
             initialDelay: configuration.maintenanceInterval,
             delay: configuration.maintenanceInterval
-        ) { [reassembler] _ in
+        ) { [reassembler, arpCache] _ in
             reassembler.reapExpired()
+            arpCache.reapExpired()
         }
     }
 

@@ -15,15 +15,19 @@ import NIOCore
 /// `Reassembler` and the `ARPCache` alive with it — both of which it sweeps
 /// on every firing — even after the rest of the stack (`nic`, `arpResponder`,
 /// `ipv4`, `routes`) has been deallocated.
-// `@unchecked Sendable`, not derived: every stored property here is
-// loop-confined, mutated only on `eventLoop`, exactly like
-// `NetstackDatagramChannel` elsewhere in this package. `shutdown()` is the
-// one method documented as safe to call from any thread, and it earns that
-// by marshaling onto `eventLoop` before touching anything -- see its own
-// comment -- rather than by this type actually being safe to touch
-// concurrently. This annotation exists only so `shutdown()` can capture
-// `self` in the `@Sendable` closure `EventLoop.flatSubmit` requires.
-public final class Stack: @unchecked Sendable {
+// Deliberately NOT `Sendable`, checked or otherwise. Every stored property
+// here is loop-confined, mutated only on `eventLoop`, and this type publicly
+// exposes the entire graph (`nic`/`ipv4`/`routes`/`arpCache`/`reassembler`/
+// `transportDemuxer`) that confinement is the only thing protecting -- no
+// locks exist anywhere in this package. Making `Stack` itself `Sendable`
+// would let that whole graph cross an isolation boundary through `Stack`
+// alone, after which the compiler stops objecting to touching any part of it
+// off-loop from anywhere a `Stack` reference reaches, not just from
+// `shutdown()`. `shutdown()` still needs to capture stack-owned state inside
+// a `@Sendable` closure for `EventLoop.flatSubmit`; see `ShutdownBox` just
+// below, which earns exactly that one narrow crossing without extending
+// `Sendable` to the public type itself.
+public final class Stack {
     public struct Configuration: Sendable {
         /// The address the stack answers for — the guest's default gateway.
         public var gatewayAddress: IPv4Address
@@ -196,7 +200,22 @@ public final class Stack: @unchecked Sendable {
         if eventLoop.inEventLoop {
             return shutdownOnLoop()
         } else {
-            return eventLoop.flatSubmit { self.shutdownOnLoop() }
+            // `EventLoop.flatSubmit` requires an `@Sendable` closure — that
+            // closure crosses to `eventLoop`'s thread, so the compiler must
+            // see everything it captures as safe for that crossing. Capturing
+            // `self` directly would need `Stack` itself to be `Sendable`,
+            // which is deliberately not true (see the type's own doc
+            // comment) — that conformance would extend past this one
+            // marshal to every public, loop-confined property `Stack`
+            // exposes. `ShutdownBox` captures `self` instead, behind an
+            // `@unchecked Sendable` conformance scoped to this one `private`
+            // type: it is safe for exactly the same reason `shutdownOnLoop`
+            // itself is — the closure's body runs only once, only after
+            // `flatSubmit` has actually handed control to `eventLoop`'s own
+            // thread, matching the confinement guarantee every other
+            // loop-confined access in this package already relies on.
+            let box = ShutdownBox(stack: self)
+            return eventLoop.flatSubmit { box.stack.shutdownOnLoop() }
         }
     }
 
@@ -232,4 +251,20 @@ public final class Stack: @unchecked Sendable {
         // promise — so it cannot deadlock the way awaiting `shutdown()` would.
         maintenanceTask?.cancel()
     }
+}
+
+/// A one-shot, `Sendable` carrier for a `Stack` reference, used only to get
+/// `shutdown()`'s marshaled closure past `EventLoop.flatSubmit`'s `@Sendable`
+/// requirement without making the public `Stack` type itself `Sendable`.
+///
+/// `@unchecked`, not derived — `Stack` is not `Sendable` and never will be
+/// (see its own doc comment) — but safe here specifically because this type
+/// is `private` (so nothing outside `shutdown()` can construct one or treat
+/// a `Stack` as `Sendable` through it), holds the reference only long enough
+/// to hand it across a single `flatSubmit` call, and the closure that reads
+/// `stack` back out only ever runs after `flatSubmit` has scheduled it onto
+/// `eventLoop`'s own thread — the same confinement guarantee every other
+/// loop-confined access in this package already relies on instead of a lock.
+private struct ShutdownBox: @unchecked Sendable {
+    let stack: Stack
 }

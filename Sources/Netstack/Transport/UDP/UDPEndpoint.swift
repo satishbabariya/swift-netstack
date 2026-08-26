@@ -49,11 +49,13 @@ public final class UDPEndpoint: TransportEndpointDelegate {
             let destinationPort = port ?? connectedPeer?.port
         else { throw StackError.notConnected }
 
-        let datagram = UDPHeader.serialize(
-            payload: payload,
-            source: boundID.localAddress, destination: destination,
-            sourcePort: boundID.localPort, destinationPort: destinationPort,
-            allocator: ByteBufferAllocator())
+        guard
+            let datagram = UDPHeader.serialize(
+                payload: payload,
+                source: boundID.localAddress, destination: destination,
+                sourcePort: boundID.localPort, destinationPort: destinationPort,
+                allocator: ByteBufferAllocator())
+        else { throw StackError.messageTooLong }
         try stack.ipv4.send(payload: datagram, to: destination, from: boundID.localAddress, protocolNumber: .udp)
     }
 

@@ -54,11 +54,24 @@ public struct UDPHeader: Sendable, Equatable {
         return UDPHeader(sourcePort: sourcePort, destinationPort: destinationPort, length: declaredLength, checksum: onWireChecksum)
     }
 
+    /// The largest payload one UDP datagram can carry: 65535 (the largest
+    /// value the IPv4 total-length field can hold) minus the minimum IPv4
+    /// header (20) minus this header (8) — 65507. `length + payload` below
+    /// is a non-failable `UInt16` conversion that TRAPS the process once the
+    /// sum exceeds 65535, and `IPv4Protocol.send`'s own guard against
+    /// exactly that never runs: it lives one layer up and this serializer is
+    /// called before it, so the trap fires first. A real UDP socket returns
+    /// EMSGSIZE instead of crashing; this bound exists so this call can too.
+    public static let maximumPayloadLength = 65535 - IPv4Header.minimumLength - length
+
     /// Build a complete datagram: header plus payload, checksum filled in.
+    /// Returns `nil` when `payload` cannot fit in one UDP datagram — see
+    /// `maximumPayloadLength` — rather than trapping.
     public static func serialize(
         payload: ByteBuffer, source: IPv4Address, destination: IPv4Address,
         sourcePort: UInt16, destinationPort: UInt16, allocator: ByteBufferAllocator
-    ) -> ByteBuffer {
+    ) -> ByteBuffer? {
+        guard payload.readableBytes <= maximumPayloadLength else { return nil }
         let total = UInt16(length + payload.readableBytes)
         var datagram = allocator.buffer(capacity: Int(total))
         datagram.writeInteger(sourcePort, endianness: .big)

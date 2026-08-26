@@ -191,7 +191,7 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
         payload: ByteBuffer(bytes: payload),
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,
         sourcePort: sourcePort, destinationPort: destinationPort,
-        allocator: ByteBufferAllocator())
+        allocator: ByteBufferAllocator())!
     var ipPacket = PacketBuffer(allocator: ByteBufferAllocator(), payload: datagram)
     var header = IPv4Header(
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,

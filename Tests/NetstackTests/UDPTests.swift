@@ -9,7 +9,7 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
         payload: ByteBuffer(bytes: payload),
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,
         sourcePort: sourcePort, destinationPort: destinationPort,
-        allocator: ByteBufferAllocator())
+        allocator: ByteBufferAllocator())!
 }
 
 @Test func serializedDatagramHasAValidChecksum() {
@@ -64,6 +64,89 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
         source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
     #expect(UDPHeader.parse(&packet, header: ipHeader)?.sourcePort == 4000)
+}
+
+// `UDPHeader.serialize`'s `let total = UInt16(length + payload.readableBytes)`
+// used to be a non-failable conversion: any payload over 65527 bytes made it
+// TRAP the whole process (`Fatal error: Not enough bits to represent the
+// passed value`), reachable from `UDPEndpoint.send` and, through it, from a
+// NIO handler calling `writeAndFlush` on `NetstackDatagramChannel` with an
+// oversized `ByteBuffer`. `IPv4Protocol.send` has its own guard against an
+// oversized payload, but it runs one layer up, after this serializer has
+// already trapped — so it never got a chance to fire. These three pin the
+// real bound (65535 − 20-byte IPv4 header − 8-byte UDP header = 65507, not
+// the 65527 the naive conversion alone would have allowed) at the boundary.
+@Test func serializeRejectsAnOversizedPayloadInsteadOfTrapping() {
+    var oversized = ByteBufferAllocator().buffer(capacity: 70000)
+    oversized.writeRepeatingByte(0, count: 70000)
+    let result = UDPHeader.serialize(
+        payload: oversized, source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+        sourcePort: 4000, destinationPort: 53, allocator: ByteBufferAllocator())
+    #expect(result == nil)
+}
+
+@Test func serializeAcceptsTheLargestUDPPayload() {
+    var largest = ByteBufferAllocator().buffer(capacity: UDPHeader.maximumPayloadLength)
+    largest.writeRepeatingByte(0, count: UDPHeader.maximumPayloadLength)
+    let result = UDPHeader.serialize(
+        payload: largest, source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+        sourcePort: 4000, destinationPort: 53, allocator: ByteBufferAllocator())
+    #expect(result?.readableBytes == UDPHeader.length + UDPHeader.maximumPayloadLength)
+}
+
+@Test func serializeRejectsOneByteOverTheLargestUDPPayload() {
+    var overByOne = ByteBufferAllocator().buffer(capacity: UDPHeader.maximumPayloadLength + 1)
+    overByOne.writeRepeatingByte(0, count: UDPHeader.maximumPayloadLength + 1)
+    let result = UDPHeader.serialize(
+        payload: overByOne, source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+        sourcePort: 4000, destinationPort: 53, allocator: ByteBufferAllocator())
+    #expect(result == nil)
+}
+
+@Test func sendingAnOversizedPayloadThrowsMessageTooLongInsteadOfTrapping() throws {
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!),
+        clock: ManualClock())
+    stack.start()
+    stack.arpCache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+
+    let endpoint = UDPEndpoint(stack: stack)
+    try endpoint.bind(address: IPv4Address("192.168.127.1")!, port: 53)
+
+    var oversized = ByteBufferAllocator().buffer(capacity: 70000)
+    oversized.writeRepeatingByte(0, count: 70000)
+
+    #expect(throws: StackError.messageTooLong) {
+        try endpoint.send(oversized, to: IPv4Address("192.168.127.2")!, port: 4000)
+    }
+}
+
+@Test func sendAcceptsTheLargestUDPPayloadAndRejectsOneByteMore() throws {
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!),
+        clock: ManualClock())
+    stack.start()
+    stack.arpCache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+
+    let endpoint = UDPEndpoint(stack: stack)
+    try endpoint.bind(address: IPv4Address("192.168.127.1")!, port: 53)
+
+    var largest = ByteBufferAllocator().buffer(capacity: UDPHeader.maximumPayloadLength)
+    largest.writeRepeatingByte(0, count: UDPHeader.maximumPayloadLength)
+    // Must not throw at all — in particular not `.messageTooLong`.
+    try endpoint.send(largest, to: IPv4Address("192.168.127.2")!, port: 4000)
+
+    var overByOne = ByteBufferAllocator().buffer(capacity: UDPHeader.maximumPayloadLength + 1)
+    overByOne.writeRepeatingByte(0, count: UDPHeader.maximumPayloadLength + 1)
+    #expect(throws: StackError.messageTooLong) {
+        try endpoint.send(overByOne, to: IPv4Address("192.168.127.2")!, port: 4000)
+    }
 }
 
 @Test func rejectsARuntAndABadLengthField() {
@@ -198,7 +281,7 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
         payload: ByteBuffer(bytes: payload),
         source: source, destination: destination,
         sourcePort: sourcePort, destinationPort: destinationPort,
-        allocator: ByteBufferAllocator())
+        allocator: ByteBufferAllocator())!
 
     // Read the datagram's own wire header straight off the bytes about to
     // be injected: a plain `getInteger` peek, not a Netstack helper, so
@@ -265,7 +348,7 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
         payload: ByteBuffer(bytes: payload),
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,
         sourcePort: sourcePort, destinationPort: destinationPort,
-        allocator: ByteBufferAllocator())
+        allocator: ByteBufferAllocator())!
     injectRawUDPDatagram(datagram, into: link, from: source, to: destination)
 }
 

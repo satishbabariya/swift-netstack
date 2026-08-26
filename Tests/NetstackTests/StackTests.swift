@@ -1,5 +1,6 @@
 import NIOCore
 import NIOEmbedded
+import NIOPosix
 import Testing
 
 @testable import Netstack
@@ -258,4 +259,70 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
 
     // Advancing after shutdown must neither fire the cancelled task nor trap.
     loop.advanceTime(by: .seconds(60))
+}
+
+@Test func shutdownMarshalsOntoTheLoopWhenCalledOffLoop() async throws {
+    // `shutdown()` is documented as safe to call from any thread, unlike
+    // everything else in this package — it must earn that by marshaling
+    // onto `eventLoop` before clearing `nic`/`ipv4`'s handler tables, which
+    // the ingress path reads. `EmbeddedEventLoop` cannot exercise this: its
+    // own `inEventLoop` is hardcoded to always return `true`, and it traps
+    // outright if actually touched from a thread other than the one that
+    // created it — so a genuinely off-loop call needs a real, threaded
+    // event loop.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = group.next()
+
+    // `RecordingEndpoint.attach` (called from `NIC`'s init) preconditions
+    // that it is itself on `eventLoop`, so construction and `start()` have
+    // to happen there — off-loop is the scenario under test for `shutdown`
+    // specifically, not for building the stack in the first place.
+    let stack = try await eventLoop.submit {
+        let link = RecordingEndpoint(eventLoop: eventLoop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: IPv4Address("192.168.127.1")!,
+                subnet: IPv4Subnet(cidr: "192.168.127.0/24")!
+            ),
+            clock: ManualClock())
+        stack.start()
+        return stack
+    }.get()
+
+    // Resumed on Swift concurrency's own executor after the `await` above,
+    // not on `eventLoop`'s dedicated thread — a genuinely off-loop call.
+    // Completing at all (rather than hanging or racing the ingress path)
+    // is what this test is checking; awaiting it is itself the assertion.
+    try await stack.shutdown().get()
+
+    try await group.shutdownGracefully()
+}
+
+@Test func shutdownCompletesWithoutDrivingTheLoopWhenNothingIsLeftToCancel() throws {
+    // The deadlock shape `StackBootstrap.bind`'s own doc comment warns
+    // about, applied to `shutdown()`. A FIRST call still needs the loop
+    // driven regardless of how `shutdown()` itself routes onto the loop:
+    // `RepeatedTask.cancel`'s promise is fulfilled through the loop's own
+    // queue, which is why even the callback-based `shutdownStopsMaintenance`
+    // test above calls `loop.run()`. A SECOND call is different —
+    // `maintenanceTask` is already nil, so `shutdownOnLoop`'s fast path
+    // returns an already-succeeded future with no `RepeatedTask` involved
+    // at all — PROVIDED `shutdown()` actually calls it directly rather
+    // than routing it through `flatSubmit`. `EventLoop.submit`/
+    // `flatSubmit` always go through `execute` even when already on the
+    // loop — they never check `inEventLoop` themselves — and on an
+    // `EmbeddedEventLoop`, `execute` only enqueues; nothing runs until the
+    // loop is driven again. An unconditional `flatSubmit` would therefore
+    // make even this trivial second call deadlock under `.wait()`, with
+    // the loop never driven a second time below. The `inEventLoop` check
+    // must bypass `flatSubmit` entirely here and call straight through
+    // instead, completing synchronously.
+    let (stack, _, loop) = makeStack()
+    var firstCompleted = false
+    stack.shutdown().whenSuccess { firstCompleted = true }
+    loop.run()
+    #expect(firstCompleted)
+
+    try stack.shutdown().wait()
 }

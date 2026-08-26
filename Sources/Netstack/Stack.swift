@@ -15,7 +15,15 @@ import NIOCore
 /// `Reassembler` and the `ARPCache` alive with it — both of which it sweeps
 /// on every firing — even after the rest of the stack (`nic`, `arpResponder`,
 /// `ipv4`, `routes`) has been deallocated.
-public final class Stack {
+// `@unchecked Sendable`, not derived: every stored property here is
+// loop-confined, mutated only on `eventLoop`, exactly like
+// `NetstackDatagramChannel` elsewhere in this package. `shutdown()` is the
+// one method documented as safe to call from any thread, and it earns that
+// by marshaling onto `eventLoop` before touching anything -- see its own
+// comment -- rather than by this type actually being safe to touch
+// concurrently. This annotation exists only so `shutdown()` can capture
+// `self` in the `@Sendable` closure `EventLoop.flatSubmit` requires.
+public final class Stack: @unchecked Sendable {
     public struct Configuration: Sendable {
         /// The address the stack answers for — the guest's default gateway.
         public var gatewayAddress: IPv4Address
@@ -168,7 +176,31 @@ public final class Stack {
         }
     }
 
+    /// Tear down the stack: detach every handler and cancel the maintenance
+    /// timer.
+    ///
+    /// Unlike everything else in this package, which relies entirely on
+    /// loop confinement instead of locks and therefore must only ever be
+    /// called from `eventLoop`, this — like `StackBootstrap.bind` — is
+    /// documented as safe to call from any thread. It earns that by
+    /// marshaling onto `eventLoop` before touching anything loop-confined,
+    /// the same way `bind` does; see that method's own comment for why the
+    /// `inEventLoop` check below is load-bearing rather than an
+    /// optimisation. Skipping it — an unconditional `flatSubmit` — would
+    /// hang any test that calls `shutdown()` and then drives an
+    /// `EmbeddedEventLoop` itself without anything else pumping it, which
+    /// this project's own test suite already does (see `StackTests`), and
+    /// which has bitten this exact method once already: it used to clear
+    /// the handler tables unconditionally, off-loop, before this fix.
     public func shutdown() -> EventLoopFuture<Void> {
+        if eventLoop.inEventLoop {
+            return shutdownOnLoop()
+        } else {
+            return eventLoop.flatSubmit { self.shutdownOnLoop() }
+        }
+    }
+
+    private func shutdownOnLoop() -> EventLoopFuture<Void> {
         // Defense in depth alongside the `[weak ipv4]` captures in `start()`:
         // those already keep `start()` from leaving a retain cycle, but
         // clearing the tables here also releases what the handler closures
@@ -176,7 +208,10 @@ public final class Stack {
         // soon as the stack is deliberately shut down, rather than only when
         // every external reference to `nic` and `ipv4` themselves also goes
         // away, and it means a handler cannot fire at all once shutdown has
-        // begun.
+        // begun. The ingress path reads these same tables, so clearing them
+        // off-loop — which is what happened here before this method
+        // marshaled onto `eventLoop` — would be a data race, not just a
+        // logic bug.
         nic.removeAllHandlers()
         ipv4.removeAllHandlers()
 

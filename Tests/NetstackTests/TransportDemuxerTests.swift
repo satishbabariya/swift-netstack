@@ -152,6 +152,59 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     #expect(endpoint.count == 1)
 }
 
+@Test func removingAProtocolHandlerResumesEndpointMatching() throws {
+    let demuxer = TransportDemuxer()
+    let endpoint = Recorder()
+    try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: endpoint)
+
+    // While installed, the handler consumes everything and the endpoint
+    // sees nothing.
+    demuxer.setProtocolHandler(.udp) { _, _ in true }
+    #expect(demuxer.deliver(
+        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+    #expect(endpoint.count == 0)
+
+    // Passing nil must remove it, so endpoint matching resumes.
+    demuxer.setProtocolHandler(.udp, nil)
+    #expect(demuxer.deliver(
+        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+        payload: ByteBuffer(bytes: [0x02]), localPort: 53, remotePort: 4000))
+    #expect(endpoint.count == 1)
+    #expect(endpoint.lastPayload == [0x02])
+}
+
+@Test func deliverReportsFalseWhenTheDelegateHasDeallocated() throws {
+    let demuxer = TransportDemuxer()
+    let target = id("192.168.127.1", 53, "0.0.0.0", 0)
+    do {
+        let scoped = Recorder()
+        try demuxer.register(target, protocolNumber: .udp, delegate: scoped)
+    }
+    // `scoped` is gone now: the weak slot is nil even though the
+    // registration is still in the table. `deliver` must report false, not
+    // silently swallow the packet, so the caller can send ICMP
+    // port-unreachable.
+    #expect(!demuxer.deliver(
+        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+}
+
+@Test func aSpecificAddressListenerBeatsAWildcardListener() throws {
+    let demuxer = TransportDemuxer()
+    let specific = Recorder()
+    let wildcard = Recorder()
+    try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: specific)
+    try demuxer.register(id("0.0.0.0", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: wildcard)
+
+    _ = demuxer.deliver(
+        protocolNumber: .udp, header: header(from: "10.0.0.1", to: "192.168.127.1"),
+        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 9000)
+
+    #expect(specific.count == 1)
+    #expect(wildcard.count == 0)
+}
+
 @Test func ephemeralPortAllocationIsScopedToTheLocalAddress() throws {
     let demuxer = TransportDemuxer()
     let addressA = IPv4Address("192.168.127.1")!

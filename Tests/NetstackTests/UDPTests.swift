@@ -177,6 +177,88 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     }
 }
 
+@Test func anUnboundPortElicitsAnICMPPortUnreachableQuotingTheOriginalDatagram() throws {
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!),
+        clock: ManualClock())
+    stack.start()
+    // The reply needs to resolve the original sender's link address.
+    stack.arpCache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+
+    let source = IPv4Address("192.168.127.2")!
+    let destination = IPv4Address("192.168.127.1")!
+    let sourcePort: UInt16 = 4321
+    let destinationPort: UInt16 = 9999  // nothing is bound here
+    let payload: [UInt8] = [0xde, 0xad, 0xbe, 0xef]
+
+    let datagram = UDPHeader.serialize(
+        payload: ByteBuffer(bytes: payload),
+        source: source, destination: destination,
+        sourcePort: sourcePort, destinationPort: destinationPort,
+        allocator: ByteBufferAllocator())
+
+    // Read the datagram's own wire header straight off the bytes about to
+    // be injected: a plain `getInteger` peek, not a Netstack helper, so
+    // these expectations cannot be a self-consistency check against the
+    // code under test — that has hidden defects here before.
+    let expectedSourcePort = datagram.getInteger(at: datagram.readerIndex, endianness: .big, as: UInt16.self)!
+    let expectedDestinationPort = datagram.getInteger(at: datagram.readerIndex + 2, endianness: .big, as: UInt16.self)!
+    let expectedLength = datagram.getInteger(at: datagram.readerIndex + 4, endianness: .big, as: UInt16.self)!
+    let expectedChecksum = datagram.getInteger(at: datagram.readerIndex + 6, endianness: .big, as: UInt16.self)!
+    #expect(expectedSourcePort == sourcePort)
+    #expect(expectedDestinationPort == destinationPort)
+    #expect(expectedLength == UInt16(UDPHeader.length + payload.count))
+
+    injectRawUDPDatagram(datagram, into: link, from: "192.168.127.2", to: "192.168.127.1")
+
+    let frames = link.drainTransmitted()
+    #expect(frames.count == 1)
+
+    var packet = PacketBuffer(received: frames[0])
+    _ = EthernetHeader.parse(&packet)
+    let ipHeader = IPv4Header.parse(&packet)
+    #expect(ipHeader?.protocolNumber == .icmp)
+    // The reply comes from the address the original datagram was addressed
+    // to, back to whoever sent it.
+    #expect(ipHeader?.source == destination)
+    #expect(ipHeader?.destination == source)
+
+    let icmp = ICMPv4Header.parse(&packet)
+    #expect(icmp?.type == .destinationUnreachable)
+    #expect(icmp?.code == ICMPv4.UnreachableCode.port.rawValue)
+
+    // The quoted IP header. Read raw rather than through IPv4Header.parse:
+    // it legitimately declares the ORIGINAL datagram's length while only
+    // eight bytes of payload actually follow it here, which parse's length
+    // guard exists to reject on live ingress.
+    var quotedPayload = packet.payload
+    let quotedIPBytes = quotedPayload.readBytes(length: IPv4Header.minimumLength)!
+    #expect(quotedIPBytes[9] == IPProtocol.udp.rawValue)
+    #expect(Array(quotedIPBytes[12..<16]) == source.bytes)
+    #expect(Array(quotedIPBytes[16..<20]) == destination.bytes)
+
+    // The quoted eight bytes: the original datagram's own UDP wire header —
+    // source port, destination port, length (header + payload), checksum —
+    // reconstructed from the quoted bytes themselves, then cross-checked
+    // against the bytes that were actually injected above.
+    let quotedUDPBytes = quotedPayload.readBytes(length: UDPHeader.length)!
+    let quotedSourcePort = UInt16(quotedUDPBytes[0]) << 8 | UInt16(quotedUDPBytes[1])
+    let quotedDestinationPort = UInt16(quotedUDPBytes[2]) << 8 | UInt16(quotedUDPBytes[3])
+    let quotedLength = UInt16(quotedUDPBytes[4]) << 8 | UInt16(quotedUDPBytes[5])
+    let quotedChecksum = UInt16(quotedUDPBytes[6]) << 8 | UInt16(quotedUDPBytes[7])
+
+    #expect(quotedSourcePort == sourcePort)
+    #expect(quotedDestinationPort == destinationPort)
+    #expect(quotedLength == UInt16(UDPHeader.length + payload.count))
+    #expect(quotedSourcePort == expectedSourcePort)
+    #expect(quotedDestinationPort == expectedDestinationPort)
+    #expect(quotedLength == expectedLength)
+    #expect(quotedChecksum == expectedChecksum)
+}
+
 /// Build a full ethernet/IP/UDP frame and hand it to the link.
 private func injectUDP(into link: RecordingEndpoint, from source: String, to destination: String, sourcePort: UInt16, destinationPort: UInt16, payload: [UInt8]) {
     let datagram = UDPHeader.serialize(
@@ -184,9 +266,16 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,
         sourcePort: sourcePort, destinationPort: destinationPort,
         allocator: ByteBufferAllocator())
+    injectRawUDPDatagram(datagram, into: link, from: source, to: destination)
+}
 
+/// Wrap an already-built UDP datagram in ethernet/IP and hand it to the
+/// link. Factored out of `injectUDP` above so a caller can inject the exact
+/// buffer it also inspects for expected values, rather than building a
+/// second one from the same inputs.
+private func injectRawUDPDatagram(_ datagram: ByteBuffer, into link: RecordingEndpoint, from source: String, to destination: String) {
     var ipPacket = PacketBuffer(allocator: ByteBufferAllocator(), payload: datagram)
-    var header = IPv4Header(
+    let header = IPv4Header(
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
     header.prepend(to: &ipPacket)

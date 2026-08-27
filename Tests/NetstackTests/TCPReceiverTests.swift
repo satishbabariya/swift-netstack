@@ -73,11 +73,57 @@ private func hasDeliver(_ actions: [TCPAction]) -> Bool {
     }
 }
 
+/// An established TCB with a window scale genuinely negotiated, as RFC 7323
+/// §2.3 negotiates it.
+///
+/// `TCB.rcvWindScale` is `private(set)` and must stay that way: the shift is
+/// fixed once, by the handshake, and a test that reached past that would be
+/// exercising a state no connection can be in. `windowScaleToOffer` is the
+/// constructor parameter that exists for exactly this — it is `nil` on every
+/// connection this stack builds today, so this is currently the only way a
+/// non-zero shift is reachable at all.
+///
+/// The two shifts are deliberately *different* numbers. With `ourShift ==
+/// peerShift` nothing distinguishes `>> rcvWindScale` from `>> sndWindScale`,
+/// and the direction is the whole substance of RFC 7323 §2.3: `rcvWindScale`
+/// is ours and scales what we advertise, `sndWindScale` is the peer's and
+/// scales what it advertises.
+private func scaledTCB(rcvNxt: UInt32 = 1000, rcvWnd: Int, ourShift: UInt8, peerShift: UInt8 = 3) -> TCB {
+    var tcb = TCB(
+        state: .established,
+        sndUna: SequenceNumber(100),
+        sndNxt: SequenceNumber(100),
+        sndWnd: 4096,
+        sndWl1: SequenceNumber(rcvNxt),
+        sndWl2: SequenceNumber(100),
+        iss: SequenceNumber(100),
+        rcvNxt: SequenceNumber(rcvNxt),
+        rcvWnd: rcvWnd,
+        irs: SequenceNumber(rcvNxt),
+        windowScaleToOffer: ourShift)
+    tcb.negotiateWindowScale(fromSynOptions: [.windowScale(peerShift)])
+    return tcb
+}
+
 /// The right edge of the receive window: the highest sequence number the peer
 /// has been told it may send. Retracting this is what RFC 9293 §3.8.6.2.2
 /// forbids.
+///
+/// In **real bytes**, which is the only unit the rule is stated in. `window`
+/// is the 16-bit field as it goes on the wire, and the peer decodes it as
+/// `window << Rcv.Wind.Shift`; with no scale negotiated the shift is zero and
+/// this is the plain sum it has always been. Comparing wire values instead
+/// would be comparing two different units the moment a scale is negotiated,
+/// and would call a legitimate fall in the wire value a retraction.
 private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
-    tcb.rcvNxt + Int(window)
+    tcb.rcvNxt + (Int(window) << Int(tcb.rcvWindScale))
+}
+
+/// The wire field a real window would be advertised in at this connection's
+/// negotiated scale — the starting edge for a retraction sequence, expressed
+/// the way the handshake would have expressed it.
+private func onTheWire(_ window: Int, at scale: UInt8) -> UInt16 {
+    UInt16(min(window >> Int(scale), Int(UInt16.max)))
 }
 
 // MARK: - In-order delivery
@@ -259,6 +305,132 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
 
     #expect(outcome.advertisedWindow == 65535)
     #expect(tcb.rcvWnd == 65535, "and the TCB records what was advertised, since it is what the next acceptability test uses")
+}
+
+// MARK: - The negotiated receive window scale (RFC 7323 §2.3)
+
+@Test func theAdvertisedWindowIsTheRealWindowShiftedRightByTheNegotiatedScale() {
+    // The positive control first, and it is the half a degenerate receiver
+    // fails: with no scale negotiated the shift is zero and the advertisement
+    // is the real window untouched. A receiver that always emitted zero, or
+    // always emitted 65535, would satisfy one of the two halves below and not
+    // the other.
+    var unscaled = establishedTCB(rcvNxt: 1000, rcvWnd: 65535)
+    var unscaledReceiver = Receiver(reassembler: TCPReassembler())
+    #expect(unscaledReceiver.accept(segment(sequence: 1000, payload: 1), tcb: &unscaled).advertisedWindow == 65535, "`>> 0` is the identity")
+
+    // And with a scale, the shift is *lossy downwards*. 1,000,000 >> 7 is
+    // 7812.5; 7812 is what goes on the wire, promising 999,936 bytes. 7813
+    // would promise 1,000,064 against a queue that holds 1,000,000 — an
+    // advertisement rounded up claims space the receiver does not have, which
+    // is the one direction the error may not go.
+    var tcb = scaledTCB(rcvWnd: 1_000_000, ourShift: 7)
+    var receiver = Receiver(reassembler: TCPReassembler(maximumBytes: 1_000_000, maximumSegments: 64))
+
+    let outcome = receiver.accept(segment(sequence: 1000, payload: 1), tcb: &tcb)
+
+    #expect(outcome.advertisedWindow == 7812, "truncated, not rounded up to 7813")
+    #expect(Int(outcome.advertisedWindow) << 7 == 999_936)
+    #expect(
+        tcb.rcvWnd == 999_936,
+        "and the TCB records the window in *real bytes* — what the peer decodes — because that is the unit the acceptability test measures in")
+}
+
+@Test func theScaledAdvertisementStillFitsTheWireFieldHoweverSmallTheShift() {
+    // A shift of 1 against a 10 MB queue: the real window divided by two is
+    // still 5,000,000, which does not fit a 16-bit field. `UInt16(_:)` would
+    // trap on it and `UInt16(truncatingIfNeeded:)` would advertise 4928. The
+    // wire's own limit binds after the shift, not instead of it.
+    var tcb = scaledTCB(rcvWnd: 10_000_000, ourShift: 1)
+    var receiver = Receiver(reassembler: TCPReassembler(maximumBytes: 10_000_000, maximumSegments: 64))
+
+    let outcome = receiver.accept(segment(sequence: 1000, payload: 1), tcb: &tcb)
+
+    #expect(outcome.advertisedWindow == 65535)
+    #expect(tcb.rcvWnd == 131_070, "65535 << 1: the largest window this connection can express, and it is twice the unscaled ceiling")
+}
+
+@Test func theRightWindowEdgeNeverMovesBackwardsAtAScaleThatCannotExpressEveryWindow() {
+    // The point of the task. At a shift of 7 the smallest expressible step is
+    // 128 bytes, so the free-space figure almost never lands on a value the
+    // wire can carry, and the rounding has to go *up* on the never-retract
+    // floor while it goes *down* on the space we actually have.
+    //
+    // Concretely: the floor is the smallest wire value W with
+    // `RCV.NXT_new + (W << S) >= edge_old`, i.e. a **ceiling** division, and a
+    // floor on the *wire* value rather than on the real one. Clamping in real
+    // bytes and shifting afterwards — `(offered - consumed) >> S` — is a floor
+    // division, and gives up to `2^S - 1` bytes of the edge away at step two
+    // below.
+    //
+    // Asserted on the edge, in real bytes, across three steps. The wire value
+    // is not the thing under test and legitimately falls from 32 to 29 while
+    // the edge holds; a test that watched the wire value would call that a
+    // retraction and a truncating one a success, exactly backwards.
+    var tcb = scaledTCB(rcvWnd: 4096, ourShift: 7)
+    var receiver = Receiver(reassembler: TCPReassembler(maximumBytes: 4096, maximumSegments: 64))
+    var edge = rightEdge(tcb, window: onTheWire(tcb.rcvWnd, at: tcb.rcvWindScale))
+    #expect(edge == SequenceNumber(5096), "1000 + (32 << 7): the handshake could offer 4096 exactly, since 4096 is a whole number of 128s")
+
+    var wire: [UInt16] = []
+    for step in [(sequence: UInt32(2000), payload: 1000), (sequence: 1000, payload: 400), (sequence: 1400, payload: 600)] {
+        let outcome = receiver.accept(segment(sequence: step.sequence, payload: step.payload), tcb: &tcb)
+        let newEdge = rightEdge(tcb, window: outcome.advertisedWindow)
+        #expect(newEdge.isAtOrAfter(edge), "the right window edge moved backwards at sequence \(step.sequence)")
+        edge = newEdge
+        wire.append(outcome.advertisedWindow)
+    }
+
+    // The middle step is where a floor division retracts. 1000 out-of-order
+    // bytes plus one segment's overhead leave 2840 free, which is 22 whole
+    // 128s; RCV.NXT has moved 400, so the edge allows the window to fall to
+    // 3696 real bytes — but 3696 is 28.875 steps, and 28 of them is 3584,
+    // which is 112 bytes short of the edge already promised.
+    #expect(wire == [32, 29, 32])
+    #expect(wire[1] < wire[0], "the wire value does fall — the edge is what may not")
+    #expect(edge == SequenceNumber(7096), "and once the gap closes the queue is empty again")
+}
+
+@Test func theConfiguredReceiveWindowStillCapsTheAdvertisementOnceItIsScaled() {
+    // `TCB.rcvWndMax` is a cap on the *real* window, so it has to be applied
+    // before the shift; applied to the wire value it would cap at 12,800 wire
+    // units, which is 1.6 MB of real window from a connection configured for
+    // 12,800 bytes. The default 256 KiB queue is what makes the difference
+    // visible: uncapped, 262,144 >> 7 is 2048.
+    var tcb = scaledTCB(rcvWnd: 12_800, ourShift: 7)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    let outcome = receiver.accept(segment(sequence: 1000, payload: 1), tcb: &tcb)
+
+    #expect(outcome.advertisedWindow == 100, "12,800 configured bytes are 100 units of 128, not the 2048 the queue could have offered")
+    #expect(tcb.rcvWnd == 12_800)
+}
+
+@Test func theAcceptabilityWindowIsTheScaledWindowAndNotTheWireField() {
+    // What makes the unit of `tcb.rcvWnd` load-bearing rather than a matter of
+    // taste. `TCPStateMachine.isInReceiveWindow` and the §3.9 trim both measure
+    // an arriving segment against `rcvNxt + rcvWnd`, so recording the wire
+    // field there would narrow the connection's real window by a factor of
+    // 2^S — 128 here — and silently discard data the peer was told it could
+    // send. That is not a lost optimisation: it is a stall, since the peer
+    // retransmits into a window we keep refusing.
+    let queue = TCPReassembler()
+    var tcb = scaledTCB(rcvWnd: 12_800, ourShift: 7)
+    var receiver = Receiver(reassembler: queue)
+
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1000, payload: 10), on: &tcb, receiver: &receiver)
+    #expect(tcb.rcvNxt == SequenceNumber(1010))
+    #expect(tcb.rcvWnd == 12_800, "the real window, which is what the next acceptability test measures against")
+
+    // 5000 past RCV.NXT: well inside the 12,800 real bytes advertised, and 50x
+    // outside the 100 that went on the wire.
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 6010, payload: 10), on: &tcb, receiver: &receiver)
+    #expect(queue.pendingSegments == 1, "a segment inside the window the peer was actually offered must be accepted")
+
+    // The control, so this is not satisfied by a machine that accepts
+    // everything: 13,000 past RCV.NXT is outside the real window too.
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 14_010, payload: 10), on: &tcb, receiver: &receiver)
+    #expect(queue.pendingSegments == 1, "and one outside it is still refused")
 }
 
 // MARK: - FIN

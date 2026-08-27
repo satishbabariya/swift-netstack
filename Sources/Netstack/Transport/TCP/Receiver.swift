@@ -16,9 +16,14 @@ struct ReceiveOutcome: Sendable {
     /// Whether the peer is owed an acknowledgement for this segment.
     let shouldAck: Bool
 
-    /// RCV.WND to advertise, already written into the TCB. See
-    /// `Receiver.advertisedWindow` for why this is a `UInt16` and what Task 13
-    /// has to change here.
+    /// The window field to put on the wire, already written into the TCB.
+    ///
+    /// **A wire field, not RCV.WND.** With a window scale negotiated the two
+    /// differ: the peer decodes this as `advertisedWindow << Rcv.Wind.Shift`,
+    /// and it is that product — the real window — that `tcb.rcvWnd` records and
+    /// that every sequence-number comparison measures against. `UInt16` is the
+    /// header's own type and is deliberate; see `Receiver.advertisedWindow` for
+    /// which way each bound rounds on the way into it.
     let advertisedWindow: UInt16
 
     /// True on the one call where RCV.NXT first reaches the peer's FIN, and
@@ -113,40 +118,62 @@ struct ReceiveOutcome: Sendable {
 struct Receiver {
     /// The largest window expressible in the header's 16-bit field.
     ///
-    /// ## The window-scale seam
+    /// ## The window-scale seam, now closed
     ///
     /// `advertisedWindow` is the on-the-wire field, so it is what the peer will
     /// actually decode — not a "real" window this receiver would like to have.
-    /// `TCB.rcvWindScale` now records the shift *we* negotiated, but it is zero
-    /// on every connection — this stack sends no Window Scale option yet, and
-    /// RFC 7323 §2.2 scales nothing unless both sides did — so there is still no
-    /// scale factor to apply here and none is invented.
+    /// `TCB.rcvWindScale` records the shift *we* negotiated, and
+    /// `advertisedWindow(...)` below now applies it. It is still zero on every
+    /// connection this stack builds — `TCPEndpoint.windowScaleToOffer` is `nil`,
+    /// and RFC 7323 §2.2 scales nothing unless both sides sent the option — so
+    /// the shift is the identity in production and the arithmetic here is
+    /// exercised only where a `TCB` is constructed with an offer of its own.
+    /// That ordering is the point: **apply before advertising**, because
+    /// advertising a scale we do not apply claims a window we cannot honour.
     ///
-    /// When the shift is applied, the change to *this* side of the connection —
-    /// the window we advertise — belongs in `advertisedWindow(...)` below and
-    /// nowhere else. **That is not the whole of window scaling.** RFC 7323 §2.3
-    /// negotiates a scale in each direction independently, and the peer's
-    /// direction is decoded in `TCPStateMachine`, at the four sites marked
-    /// "Snd.Wind.Scale" there (`tcb.sndWnd = Int(header.window)`). Exactly **two**
-    /// of those four take `<< tcb.sndWindScale`: the SYN-RECEIVED and ESTABLISHED
-    /// window updates in `generalSegmentArrives`. The other two read the window
-    /// out of a SYN or SYN-ACK, and RFC 7323 §2.3 exempts `<SYN>` segments from
-    /// the shift — the peer chose that window before it knew scaling had been
+    /// **This is not the whole of window scaling.** RFC 7323 §2.3 negotiates a
+    /// scale in each direction independently, and the peer's direction is
+    /// decoded in `TCPStateMachine`, at the four sites marked "Snd.Wind.Scale"
+    /// there (`tcb.sndWnd = Int(header.window)`). Exactly **two** of those four
+    /// take `<< tcb.sndWindScale`: the SYN-RECEIVED and ESTABLISHED window
+    /// updates in `generalSegmentArrives`. The other two read the window out of
+    /// a SYN or SYN-ACK, and RFC 7323 §2.3 exempts `<SYN>` segments from the
+    /// shift — the peer chose that window before it knew scaling had been
     /// agreed, so shifting it would inflate the peer's opening window by up to
     /// 2^14. (An earlier revision of this paragraph said all of them needed the
-    /// shift. They do not.) That direction is **done**: the two shifts are
-    /// applied there, and only this side of the seam is still outstanding.
+    /// shift. They do not.) One site on *this* side of the seam is still
+    /// outstanding: `TCPEndpoint.advertisedWindow(of:)` builds the window field
+    /// for every segment this method does not — the SYN-ACK above all — and
+    /// still clamps `tcb.rcvWnd` to 65535 without shifting it. Correct while the
+    /// shift is zero, and the step that starts offering a scale must fix it in
+    /// the same change, or the handshake will advertise 2^S times the window the
+    /// connection has.
     ///
-    /// On this side, the value advertised becomes the real window
-    /// shifted right by the negotiated scale, and the shift is **lossy** — the
-    /// peer decodes `advertised << scale`, so rounding must go downwards or the
-    /// connection promises space it does not have. The clamp here becomes
-    /// `65535 << scale` rather than 65535. Note that this makes the granularity
-    /// of a retraction check coarser too: at scale 14 the smallest expressible
-    /// step is 16 KiB, so the "never move the right edge backwards" arithmetic
-    /// must be done in real bytes and only then shifted, not the other way
-    /// round. RFC 7323 caps the scale at 14 and nothing here may assume it can
-    /// exceed that.
+    /// ## The clamp is on the wire value, and so is the never-retract floor
+    ///
+    /// The shift is **lossy**, and which way each bound rounds is not a matter
+    /// of taste:
+    ///
+    /// - *Space we have* rounds **down**. The peer decodes `advertised <<
+    ///   scale`, so a wire value rounded up promises bytes the queue cannot
+    ///   hold.
+    /// - *Space we already promised* rounds **up**, and this is the half that
+    ///   is easy to get backwards. Plan 3 asked for the never-retract clamp to
+    ///   be applied in real bytes and shifted afterwards; that is a floor
+    ///   division applied to a floor already at the limit, and it hands back up
+    ///   to `2^S - 1` bytes of the right edge — 16 KiB at scale 14 — every time
+    ///   the floor binds. See `advertisedWindow(offered:consumed:maximum:scale:)`
+    ///   for the derivation.
+    ///
+    /// The `UInt16` clamp needs no scaling: it is a limit on the wire field
+    /// itself, and everything is already in wire units by the time it applies.
+    /// A real window above `65535 << scale` is simply not expressible, which is
+    /// what this constant says. RFC 7323 caps the scale at 14 — `TCPOptionCodec`
+    /// enforces that on the peer's shift before `TCB` records it — but note that
+    /// *our* shift reaches `TCB` as a constructor parameter that nothing bounds,
+    /// so the arithmetic below is written to stay total rather than to lean on
+    /// the cap: Swift's shifts on `Int` saturate to zero rather than trapping,
+    /// so an out-of-contract shift yields a closed window rather than a crash.
     private static let maximumUnscaledWindow = Int(UInt16.max)
 
     private let reassembler: TCPReassembler
@@ -176,6 +203,19 @@ struct Receiver {
     /// consistent depends on the never-retract rule below: a segment the peer
     /// put in flight for space it was offered is still inside `rcvNxt + rcvWnd`
     /// when it lands, because the right edge only ever moves forward.
+    ///
+    /// It is written back **shifted left again**, in real bytes, because that
+    /// is the unit every reader of the field works in: `isInReceiveWindow`,
+    /// RFC 5961's RST test and the §3.9 trim all measure sequence numbers
+    /// against `rcvNxt + rcvWnd`, and sequence numbers count bytes. Recording
+    /// the wire field instead would narrow the connection's real window by a
+    /// factor of `2^rcvWindScale` — 16384 at the maximum scale — and discard
+    /// data the peer had been told it could send, which is a stall rather than
+    /// a lost optimisation: the peer retransmits into a window we keep
+    /// refusing. `window << rcvWindScale` is exactly what the peer decodes, so
+    /// the two ends agree on the edge by construction; it is also, and not
+    /// coincidentally, what makes `offered` on the *next* call a window the
+    /// wire could express, which the never-retract floor below relies on.
     mutating func accept(_ segment: Segment, tcb: inout TCB) -> ReceiveOutcome {
         let offered = tcb.rcvWnd
         let delivered = reassembler.insert(segment, rcvNxt: tcb.rcvNxt)
@@ -201,8 +241,8 @@ struct Receiver {
             finReached = true
         }
 
-        let window = advertisedWindow(offered: offered, consumed: consumed, maximum: tcb.rcvWndMax)
-        tcb.rcvWnd = Int(window)
+        let window = advertisedWindow(offered: offered, consumed: consumed, maximum: tcb.rcvWndMax, scale: tcb.rcvWindScale)
+        tcb.rcvWnd = Int(window) << Int(tcb.rcvWindScale)
 
         // Every segment that occupies sequence space is acknowledged: in order,
         // to advance the peer's SND.UNA; out of order, as the duplicate ACK
@@ -223,7 +263,10 @@ struct Receiver {
     /// lands, and the connection stalls with each side waiting on the other.
     /// So the floor is the previously offered window less whatever RCV.NXT has
     /// just moved: shrinking by exactly what was consumed leaves the edge
-    /// where it was, and anything less than that is a retraction.
+    /// where it was, and anything less than that is a retraction. (That
+    /// subtraction is in real bytes; the section on the shift below is about
+    /// expressing its result in a wire field that may not be able to name it
+    /// exactly, and that is where the rounding has to be argued.)
     ///
     /// The consequence is that the window can only shrink while RCV.NXT is
     /// advancing. A peer that stalls the stream and then floods out-of-order
@@ -248,13 +291,59 @@ struct Receiver {
     /// Order matters where the two conflict. The never-retract floor wins over
     /// the cap — a promise already made to the peer cannot be withdrawn by
     /// lowering the configured window afterwards — and the `UInt16` clamp is
-    /// the wire's limit and wins over both, since a `rcvWnd` above 65535 was
-    /// never expressible with no window scale negotiated (see
+    /// the wire's limit and wins over both, since a window above `65535 <<
+    /// scale` is not expressible in the header at all (see
     /// `maximumUnscaledWindow`) and `UInt16(_:)` would trap on it.
-    private func advertisedWindow(offered: Int, consumed: Int, maximum: Int) -> UInt16 {
+    ///
+    /// ## Where the shift goes, and which way each bound rounds
+    ///
+    /// `scale` is `TCB.rcvWindScale`, the shift **we** negotiated; the peer
+    /// decodes `result << scale` (RFC 7323 §2.3). `sndWindScale` is the peer's
+    /// shift for the peer's own window and has no business here — the two are
+    /// negotiated independently and are not the same number.
+    ///
+    /// The two bounds are in different units before the shift and must not be
+    /// rounded the same way:
+    ///
+    /// - **The cap** — free queue space, and the configured `rcvWndMax` — is
+    ///   space we have, so it rounds **down**. `min(free, maximum) >> scale`
+    ///   discards up to `2^scale - 1` bytes we could have offered. Rounding up
+    ///   would advertise space that does not exist.
+    ///
+    /// - **The floor** — the right edge already promised — rounds **up**, and
+    ///   getting this backwards is a live bug rather than an inefficiency.
+    ///   Writing S for the scale, the rule is that
+    ///   `RCV.NXT_new + (result << S)` may not fall below the old edge
+    ///   `RCV.NXT_old + offered`, and `RCV.NXT_new` is `RCV.NXT_old +
+    ///   consumed`, so the constraint is `result << S >= offered - consumed`:
+    ///   a **ceiling** division, `result >= ceil((offered - consumed) / 2^S)`,
+    ///   and therefore a floor on the *wire* value, not on the real one.
+    ///
+    ///   Plan 3 asked for the opposite — clamp in real bytes, shift afterwards
+    ///   — and that is `(offered - consumed) >> S`, a floor division of a
+    ///   quantity that is already the minimum permitted. It retracts the edge
+    ///   by up to `2^S - 1` bytes, 16 KiB at scale 14, on every segment where
+    ///   the floor binds. The receiver tests' scaled retraction sequence — the
+    ///   one asserting on the edge in real bytes across three steps — is what
+    ///   separates the two; nothing that watches the wire value can, because
+    ///   the wire value falls legitimately while the edge holds.
+    ///
+    /// The ceiling division is written as `(offered >> scale) - (consumed >>
+    /// scale)`, which is the same value and cannot overflow. `offered` is a
+    /// window this connection previously advertised, so it is `wire << scale`
+    /// for some wire value and `offered >> scale` recovers that wire value
+    /// exactly; `ceil((q * 2^S - c) / 2^S)` is `q - floor(c / 2^S)`. The one
+    /// call where `offered` is *not* a previous advertisement is the first,
+    /// where it is the configured `rcvWnd` and may not be a whole number of
+    /// `2^scale`; `>> scale` there rounds it down to the largest window the
+    /// handshake could actually have put on the wire, which is the edge the
+    /// peer was really given. Rounding it up instead would let the first
+    /// advertisement exceed `rcvWndMax` and defeat that cap.
+    private func advertisedWindow(offered: Int, consumed: Int, maximum: Int, scale: UInt8) -> UInt16 {
+        let shift = Int(scale)
         let free = reassembler.availableBytes
-        let floor = max(0, offered - consumed)
-        let ceiling = max(0, min(maximum, Self.maximumUnscaledWindow))
-        return UInt16(min(max(floor, min(free, ceiling)), Self.maximumUnscaledWindow))
+        let floor = max(0, (offered >> shift) - (consumed >> shift))
+        let ceiling = max(0, min(free, maximum)) >> shift
+        return UInt16(min(max(floor, ceiling), Self.maximumUnscaledWindow))
     }
 }

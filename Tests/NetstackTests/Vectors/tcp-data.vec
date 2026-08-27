@@ -380,3 +380,82 @@
 0.020 > P.    1001:1101(100) ack 1 win 65535
 1.020 > P.    1001:1101(100) ack 1 win 65535
 1.030 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: window-updates-are-not-duplicate-acknowledgements
+#
+# FOUND BY THE DIFFERENTIAL (Task 17), seed 6840123409045651459, step 12. This
+# stack fast-retransmitted a segment nothing had been lost of, because it read
+# RFC 5681 section 3.2's condition (e) off the wrong variable.
+#
+# (e) is "the advertised window in the incoming acknowledgment equals the
+# advertised window in the LAST INCOMING ACKNOWLEDGMENT" -- a comparison
+# between two numbers that arrived on the wire. `Sender.acknowledged` compared
+# `tcb.sndWnd` before and after instead, which is the window AFTER RFC 9293
+# section 3.10.7.4's update rule has decided whether to take it. Those two are
+# not the same thing, and the gap between them is reachable by the peer:
+#
+#   the update rule refuses a window carried by a segment whose SND.WL1 is not
+#   newer, so once ONE out-of-order segment has pushed SND.WL1 forward, every
+#   later acknowledgement at a lower sequence number leaves SND.WND frozen --
+#   and a frozen SND.WND reads as "the window did not change" no matter what
+#   the peer actually advertised.
+#
+# So a guest that sends one segment out of order and then three bare
+# acknowledgements with three DIFFERENT windows makes this stack halve its
+# congestion window and retransmit. Nothing was lost. gVisor gets this right
+# (`snd.go`'s `isDupAck` compares `s.SndWnd` against `seg.window`, and stashes
+# `s.SndWnd = rcvdSeg.window` only afterwards, so its stored value is exactly
+# "the window in the last incoming acknowledgement").
+#
+# The out-of-order segment at 5001 is not decoration: it is what makes SND.WL1
+# unreachable and is the only reason the three window updates can be mistaken
+# for duplicates at all. The file ENDING after the last of them is what pins
+# the absence of the retransmission -- the runner fails on any frame a script
+# does not account for.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+0.020 > P.    1001:1101(100) ack 1 win 65535
+# Out of order: queued, not delivered, and acknowledged with a duplicate ACK
+# naming RCV.NXT. SND.WL1 is now 5001.
+0.030 < .     5001:5101(100) ack 1001 win 65535
+0.030 > .     1101:1101(0) ack 1 win 65535
+# Three window updates, three different windows, all naming SND.UNA. Not one
+# of them is a duplicate acknowledgement.
+0.040 < .     1:1(0) ack 1001 win 40000
+0.050 < .     1:1(0) ack 1001 win 30000
+0.060 < .     1:1(0) ack 1001 win 20000
+
+
+# scenario: three-identical-duplicate-acknowledgements-still-fast-retransmit
+#
+# The positive control for the scenario above, and the reason it is a separate
+# vector rather than a comment: a stack that fixed the window test by never
+# counting duplicates at all would pass `window-updates-are-not-duplicate-
+# acknowledgements` perfectly.
+#
+# Same shape, same out-of-order segment, same three bare acknowledgements --
+# but all four advertise the SAME window -- the out-of-order segment included,
+# because RFC 5681 section 3.2 condition (e) compares against "the last
+# incoming acknowledgment" and a data segment carrying an ACK is one. So all
+# three bare acknowledgements are duplicates, and the third is the loss signal
+# that retransmits the oldest unacknowledged segment (section 3.2 step 3). At
+# 0.060, on the third, not the second and not the fourth.
+#
+# Note what changing ONE number does: give the first bare acknowledgement a
+# different window from the out-of-order segment and the count restarts, so
+# only two duplicates accrue and nothing is retransmitted. That is the whole
+# difference between this scenario and the one above it.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+0.020 > P.    1001:1101(100) ack 1 win 65535
+0.030 < .     5001:5101(100) ack 1001 win 65535
+0.030 > .     1101:1101(0) ack 1 win 65535
+0.040 < .     1:1(0) ack 1001 win 65535
+0.050 < .     1:1(0) ack 1001 win 65535
+0.060 < .     1:1(0) ack 1001 win 65535
+0.060 > P.    1001:1101(100) ack 1 win 65535

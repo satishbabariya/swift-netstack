@@ -229,6 +229,8 @@ private let closeVectors = "tcp-close"
         "zero-window", "sequence-wrap", "rtt-sample-drives-the-rto",
         "push-on-the-last-segment-of-a-write", "write-under-a-small-window",
         "a-retransmission-keeps-the-push-bit",
+        "window-updates-are-not-duplicate-acknowledgements",
+        "three-identical-duplicate-acknowledgements-still-fast-retransmit",
     ]
     #expect(try transferScenarioNames(dataVectors) == run)
 }
@@ -348,6 +350,19 @@ private let closeVectors = "tcp-close"
 
 @Test func aRetransmissionReproducesThePushBitOfTheSegmentItLost() throws {
     let harness = try runTransferScenario(dataVectors, "a-retransmission-keeps-the-push-bit")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func windowUpdatesRepeatingTheAcknowledgementNumberDoNotFastRetransmit() throws {
+    let harness = try runTransferScenario(dataVectors, "window-updates-are-not-duplicate-acknowledgements")
+    // Nothing was lost, so nothing was declared lost: the congestion window is
+    // still where slow start left it. Without this the scenario would also
+    // pass on a stack that halved cwnd and then failed to act on it.
+    #expect(harness.endpoint.congestionWindowForTesting == 10 * 1460)
+}
+
+@Test func threeDuplicateAcknowledgementsWithAnUnchangedWindowStillFastRetransmit() throws {
+    let harness = try runTransferScenario(dataVectors, "three-identical-duplicate-acknowledgements-still-fast-retransmit")
     #expect(harness.endpoint.connectionCountForTesting == 1)
 }
 

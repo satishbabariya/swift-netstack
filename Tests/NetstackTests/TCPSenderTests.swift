@@ -17,7 +17,7 @@ import Testing
 // Every mutating call is also hoisted into a `let` before being asserted on.
 // `#expect` captures its operand expression so it can print it on failure, and
 // a `mutating` call inside that capture does not compile -- so the natural
-// spelling `#expect(sender.acknowledged(upTo: x, tcb: &tcb))`, which is both
+// spelling `#expect(sender.acknowledged(upTo: x, tcb: &tcb, advertisedWindow: 65535))`, which is both
 // the call under test and the assertion about it, is not available here. That
 // is a good thing: the call and the claim are separate lines, and it is
 // visible when a test forgets to make one.
@@ -123,7 +123,7 @@ private func establishedSender(
     #expect(sender.flightSize == 3000, "positive control: three segments are outstanding before the ACK")
     #expect(sender.unacknowledgedCount == 3)
 
-    let accepted = sender.acknowledged(upTo: SequenceNumber(2100), tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: SequenceNumber(2100), tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
 
     #expect(tcb.sndUna == SequenceNumber(2100))
@@ -140,7 +140,7 @@ private func establishedSender(
     #expect(sender.flightSize == 3000)
     #expect(sender.unacknowledgedCount == 3)
 
-    let accepted = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted, "an ACK of SND.UNA is acceptable, it just advances nothing")
 
     #expect(tcb.sndUna == SequenceNumber(100))
@@ -154,7 +154,7 @@ private func establishedSender(
     var sender = establishedSender(clock: ManualClock(start: senderStart), tcb: &tcb)
     #expect(tcb.sndNxt == SequenceNumber(3100))
 
-    let pastSendNext = sender.acknowledged(upTo: SequenceNumber(3101), tcb: &tcb)
+    let pastSendNext = sender.acknowledged(upTo: SequenceNumber(3101), tcb: &tcb, advertisedWindow: 65535)
     #expect(pastSendNext == false, "one byte past SND.NXT was never sent")
     #expect(tcb.sndUna == SequenceNumber(100), "a rejected ACK must not move SND.UNA")
     #expect(sender.flightSize == 3000)
@@ -162,7 +162,7 @@ private func establishedSender(
 
     // Positive control: the very next sequence number down, which WAS sent, is
     // accepted and does retire everything.
-    let atSendNext = sender.acknowledged(upTo: SequenceNumber(3100), tcb: &tcb)
+    let atSendNext = sender.acknowledged(upTo: SequenceNumber(3100), tcb: &tcb, advertisedWindow: 65535)
     #expect(atSendNext)
     #expect(tcb.sndUna == SequenceNumber(3100))
     #expect(sender.flightSize == 0)
@@ -170,7 +170,7 @@ private func establishedSender(
 
     // And an ACK that has fallen behind SND.UNA is refused rather than
     // rewinding it.
-    let stale = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    let stale = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(stale == false)
     #expect(tcb.sndUna == SequenceNumber(3100))
 }
@@ -186,19 +186,19 @@ private func establishedSender(
     #expect(sender.congestionControl.congestionWindow == 10000)
     #expect(sender.congestionControl.slowStartThreshold == .max)
 
-    let first = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    let first = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(first)
     #expect(sender.congestionControl.congestionWindow == 10000, "one duplicate is not a loss signal")
     let afterFirst = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
     #expect(afterFirst.isEmpty)
 
-    let second = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    let second = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(second)
     #expect(sender.congestionControl.congestionWindow == 10000, "two duplicates are not a loss signal either")
     let afterSecond = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
     #expect(afterSecond.isEmpty)
 
-    let third = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    let third = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(third)
     #expect(sender.duplicateAcknowledgements == 3)
     // RFC 5681 3.2 with FlightSize 3000 and SMSS 1000:
@@ -225,15 +225,23 @@ private func establishedSender(
     // each advertising a different window. RFC 5681 3.2 excludes those: on an
     // idle connection a peer's window updates repeat the last acknowledgement
     // number, and counting them retransmits segments nothing was ever lost of.
-    let baseline = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    //
+    // The three windows are passed as SEG.WND — the number on the wire —
+    // while `tcb.sndWnd` is deliberately left FROZEN at 65535 throughout. That
+    // combination is not artificial: RFC 9293 3.10.7.4's update rule refuses a
+    // window whose segment does not advance SND.WL1, so a peer that has pushed
+    // SND.WL1 forward once produces exactly it. A sender that read condition
+    // (e) off the TCB — as this one did until the Task 17 differential caught
+    // it — sees three unchanged windows here and fast-retransmits.
+    let baseline = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(baseline)
     #expect(sender.duplicateAcknowledgements == 1, "positive control: with the window held still, this one DID count")
 
     for window in [40000, 30000, 20000] {
-        tcb.sndWnd = window
-        let update = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+        let update = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: window)
         #expect(update)
     }
+    #expect(tcb.sndWnd == 65535, "the TCB's window is deliberately untouched: this test is about SEG.WND, not about it")
 
     #expect(sender.duplicateAcknowledgements == 0)
     #expect(sender.congestionControl.congestionWindow == 10000)
@@ -247,7 +255,7 @@ private func establishedSender(
     var controlTCB = senderTCB()
     var control = establishedSender(clock: clock, tcb: &controlTCB)
     for _ in 0..<4 {
-        let duplicate = control.acknowledged(upTo: SequenceNumber(100), tcb: &controlTCB)
+        let duplicate = control.acknowledged(upTo: SequenceNumber(100), tcb: &controlTCB, advertisedWindow: 65535)
         #expect(duplicate)
     }
     #expect(control.congestionControl.congestionWindow == 5000)
@@ -264,7 +272,7 @@ private func establishedSender(
     // flow piggybacks its acknowledgements on data segments, and every one of
     // those repeats SND.UNA while our own data is outstanding.
     for _ in 0..<3 {
-        let withData = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, segmentLength: 10)
+        let withData = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, segmentLength: 10, advertisedWindow: 65535)
         #expect(withData)
     }
 
@@ -278,7 +286,7 @@ private func establishedSender(
     var controlTCB = senderTCB()
     var control = establishedSender(clock: clock, tcb: &controlTCB)
     for _ in 0..<3 {
-        let bare = control.acknowledged(upTo: SequenceNumber(100), tcb: &controlTCB, segmentLength: 0)
+        let bare = control.acknowledged(upTo: SequenceNumber(100), tcb: &controlTCB, segmentLength: 0, advertisedWindow: 65535)
         #expect(bare)
     }
     #expect(control.congestionControl.congestionWindow == 5000)
@@ -344,7 +352,7 @@ private func establishedSender(
     #expect(sender.retransmitDeadline == senderStart + .seconds(1), "5.1: armed when the data went out, at the initial one-second RTO")
 
     clock.advance(by: .milliseconds(500))
-    let accepted = sender.acknowledged(upTo: SequenceNumber(1100), tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: SequenceNumber(1100), tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
 
     // The 500ms sample is unambiguous, so RFC 6298 2.2 gives SRTT = 500ms,
@@ -364,7 +372,7 @@ private func establishedSender(
     #expect(sender.retransmitDeadline == senderStart + .seconds(1))
 
     clock.advance(by: .milliseconds(500))
-    let duplicate = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb)
+    let duplicate = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
     #expect(duplicate)
 
     #expect(sender.retransmitDeadline == senderStart + .seconds(1), "unchanged, still measured from the original transmission")
@@ -377,7 +385,7 @@ private func establishedSender(
     var control = establishedSender(clock: controlClock, write: 2000, tcb: &controlTCB)
     #expect(control.retransmitDeadline == senderStart + .seconds(1))
     controlClock.advance(by: .milliseconds(500))
-    let newData = control.acknowledged(upTo: SequenceNumber(1100), tcb: &controlTCB)
+    let newData = control.acknowledged(upTo: SequenceNumber(1100), tcb: &controlTCB, advertisedWindow: 65535)
     #expect(newData)
     #expect(control.retransmitDeadline == senderStart + .milliseconds(2000))
 }
@@ -392,7 +400,7 @@ private func establishedSender(
     #expect(sender.flightSize == 2000)
 
     clock.advance(by: .milliseconds(500))
-    let accepted = sender.acknowledged(upTo: SequenceNumber(2100), tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: SequenceNumber(2100), tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
 
     #expect(sender.retransmitDeadline == nil)
@@ -415,7 +423,7 @@ private func establishedSender(
     #expect(sender.retransmissionTimeout == .seconds(2), "positive control: the backed-off RTO is the value that must survive")
 
     clock.advance(by: .milliseconds(10))
-    let accepted = sender.acknowledged(upTo: tcb.sndNxt, tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: tcb.sndNxt, tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
 
     // Sampling the ambiguous ACK would give R = 10ms, hence
@@ -435,7 +443,7 @@ private func establishedSender(
     #expect(sender.retransmissionTimeout == .seconds(1))
 
     clock.advance(by: .milliseconds(500))
-    let accepted = sender.acknowledged(upTo: tcb.sndNxt, tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: tcb.sndNxt, tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
 
     #expect(sender.retransmissionTimeout == .milliseconds(1500))
@@ -490,7 +498,7 @@ private func establishedSender(
     let refusedAgain = sender.write(senderPayload(1))
     #expect(refusedAgain == false, "transmitting does not free the queue -- the peer has not acknowledged it yet")
 
-    let accepted = sender.acknowledged(upTo: SequenceNumber(100 + 1024), tcb: &tcb)
+    let accepted = sender.acknowledged(upTo: SequenceNumber(100 + 1024), tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
     #expect(sender.bufferedBytes == 1024 + Sender.perChunkOverhead)
     let afterAck = sender.write(senderPayload(1024, from: 200))
@@ -586,7 +594,7 @@ private func establishedSender(
     let segments = sender.segmentsToTransmit(tcb: &tcb, mss: 512)
     #expect(segments.map(\.payload.readableBytes) == [512, 512])
 
-    let half = sender.acknowledged(upTo: SequenceNumber(612), tcb: &tcb)
+    let half = sender.acknowledged(upTo: SequenceNumber(612), tcb: &tcb, advertisedWindow: 65535)
     #expect(half)
     #expect(sender.flightSize == 512, "positive control: half the chunk really was acknowledged")
     #expect(sender.bufferedBytes == capacity, "half the chunk is acknowledged; none of its allocation is released")
@@ -595,7 +603,7 @@ private func establishedSender(
 
     // And the charge IS refunded once the whole chunk goes, so the accounting
     // is conservative rather than simply stuck.
-    let rest = sender.acknowledged(upTo: SequenceNumber(1124), tcb: &tcb)
+    let rest = sender.acknowledged(upTo: SequenceNumber(1124), tcb: &tcb, advertisedWindow: 65535)
     #expect(rest)
     #expect(sender.bufferedBytes == 0)
     let afterFullAck = sender.write(senderPayload(1))

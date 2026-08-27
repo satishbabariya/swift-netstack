@@ -408,6 +408,19 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// indistinguishable from "the segment was silently mis-parsed".
     var connectionCountForTesting: Int { connections.count }
 
+    /// The congestion window of the single connection this endpoint holds, or
+    /// nil if it holds none or more than one.
+    ///
+    /// Here so that "nothing was declared lost" can be asserted directly. A
+    /// vector that pins the ABSENCE of a retransmission is equally true of a
+    /// stack that halved its congestion window and then had nothing to
+    /// retransmit, and the difference between those two is invisible on the
+    /// wire until the next write.
+    var congestionWindowForTesting: Int? {
+        guard connections.count == 1, let connection = connections.values.first else { return nil }
+        return connection.sender.congestionControl.congestionWindow
+    }
+
     /// How many of them are in TIME-WAIT. The cap is on this number, and a cap
     /// asserted without it would be satisfied by an endpoint that holds nothing
     /// at all.

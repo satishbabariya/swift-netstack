@@ -518,7 +518,13 @@ struct TCPStateMachine {
             // passed. That guard is `acknowledged`'s own, for callers that
             // reach it without coming through here, and is not a second opinion
             // this file relies on.
-            _ = sender.acknowledged(upTo: header.acknowledgement, tcb: &tcb, segmentLength: segment.length)
+            // `header.window` and not `tcb.sndWnd`: RFC 5681 §3.2's
+            // duplicate-ACK test is about the window this segment ADVERTISED,
+            // and the update just above may deliberately have refused to take
+            // it. See `Sender.acknowledged`.
+            _ = sender.acknowledged(
+                upTo: header.acknowledgement, tcb: &tcb, segmentLength: segment.length,
+                advertisedWindow: Int(header.window))
 
             switch tcb.state {
             case .finWait1:

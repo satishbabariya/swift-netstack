@@ -165,8 +165,19 @@ struct Sender {
     private var duplicates = 0
     private var fastRetransmitPending = false
 
-    /// The peer's last advertised window, as this type last saw it. Used only
-    /// to tell a duplicate ACK from a window update -- see `acknowledged`.
+    /// SEG.WND from the last acknowledgement that reached `acknowledged` --
+    /// the number that was ON THE WIRE, not what the TCB made of it.
+    ///
+    /// RFC 5681 §3.2's condition (e) is a comparison between two advertised
+    /// windows, and reading it off `TCB.sndWnd` instead is a defect the Task 17
+    /// differential caught: RFC 9293 §3.10.7.4's update rule REFUSES a window
+    /// carried by a segment whose SND.WL1 is not newer, so a peer that pushes
+    /// SND.WL1 forward with one out-of-order segment freezes `sndWnd` and every
+    /// later window update then reads as "unchanged". Three of them in a row
+    /// were enough to halve the congestion window and retransmit a segment
+    /// nothing had been lost of. See
+    /// `tcp-data.vec`'s `window-updates-are-not-duplicate-acknowledgements`.
+    ///
     /// `nil` until the first acknowledgement, so the first one is never
     /// classified as a change against a window that was never advertised.
     private var lastAdvertisedWindow: Int?
@@ -344,16 +355,22 @@ struct Sender {
     /// acknowledgement rides on a data segment and repeats SND.UNA while our
     /// own data is outstanding -- would fast-retransmit continuously.
     ///
-    /// The window half of that test is read from `tcb.sndWnd` against the
-    /// value seen on the previous acknowledgement, which requires the caller
-    /// to have applied RFC 9293 §3.10.7.4's window update before calling. A
-    /// window update that happens to repeat the last ACK number is not a
+    /// `advertisedWindow` is SEG.WND, straight off the wire, and it is a
+    /// REQUIRED argument rather than a defaulted one on purpose. RFC 5681
+    /// §3.2's condition (e) compares it against the window in the previous
+    /// acknowledgement -- not against `tcb.sndWnd`, which is what RFC 9293
+    /// §3.10.7.4's update rule made of it and which a peer can freeze at will
+    /// by pushing SND.WL1 forward once. Reading it off the TCB was a real
+    /// defect (see `lastAdvertisedWindow`), and a caller that could omit this
+    /// argument is a caller that can reintroduce it.
+    ///
+    /// A window update that happens to repeat the last ACK number is not a
     /// duplicate ACK, and counting it as one retransmits segments nothing was
     /// ever lost of, on an idle connection, invisibly until throughput is
     /// measured.
-    mutating func acknowledged(upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0) -> Bool {
-        let windowChanged = lastAdvertisedWindow.map { $0 != tcb.sndWnd } ?? false
-        lastAdvertisedWindow = tcb.sndWnd
+    mutating func acknowledged(upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0, advertisedWindow: Int) -> Bool {
+        let windowChanged = lastAdvertisedWindow.map { $0 != advertisedWindow } ?? false
+        lastAdvertisedWindow = advertisedWindow
 
         // RFC 9293 §3.10.7.4's acceptable-ACK window, inclusive at the bottom
         // so a duplicate naming SND.UNA reaches the counting below. Written as

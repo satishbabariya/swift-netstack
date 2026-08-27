@@ -4,7 +4,8 @@
 # These lines are the SPECIFICATION. Where the implementation disagrees with a
 # line here, the implementation is what changes. A line is only edited if it
 # can be shown to be wrong, and then the reason is written down next to it --
-# there are three such edits in this file, all in `sequence-wrap`, all marked.
+# there are three such edits in `sequence-wrap` and six more (all PSH, all made
+# by Task 17 after the differential found a real defect), all marked.
 #
 # The conventions are `tcp-handshake.vec`'s and are not restated: scenarios
 # separated by `# scenario:` markers because `VectorFrames` pins every TCP
@@ -53,17 +54,22 @@
 # 2.220s), so no line here is quietly a statement about ARP. `tcp-close.vec`
 # does cross 60 seconds, and says there how it handles it.
 #
-# ## Our data segments carry no PSH, and our advertised window barely moves
+# ## PSH, and our advertised window barely moving
 #
-# Two facts read out of the implementation rather than out of an RFC, stated
-# here because several lines below depend on them and a reader should not have
-# to infer them from the numbers:
+# 1. Our data segments DO carry PSH, on the last segment of each write. This
+#    note used to say the opposite -- "`Sender` cuts segments with the ACK bit
+#    and nothing else... PSH is advisory, so this is legal" -- and it was
+#    wrong: RFC 1122 section 4.2.2.2 clause (2), carried forward by RFC 9293
+#    section 3.9.1, makes it a MUST for a stack whose send call has no push
+#    argument, and `TCPEndpoint.send` has none. The Task 17 differential found
+#    it; `push-on-the-last-segment-of-a-write`, `write-under-a-small-window`
+#    and `a-retransmission-keeps-the-push-bit` pin the rule; four `>` lines in
+#    the three scenarios above them were edited and are marked.
 #
-# 1. `Sender` cuts segments with the ACK bit and nothing else, so our data
-#    lines are `.` and never `P.`. PSH is advisory (RFC 9293 section 3.9.1) and
-#    a receiver may not infer anything from its absence, so this is legal; it
-#    is also a difference from every stack that sets PSH on the last segment of
-#    a write, and the differential will see it.
+#    Note what this cost: the note was written from the implementation, called
+#    a defect a design decision, and made every vector line that depended on it
+#    agree with the defect. That is exactly the failure mode a differential
+#    against a stack nobody here wrote exists to catch.
 # 2. Our advertised window is 65535 on essentially every line below. In-order
 #    bytes are handed to the application synchronously and never retained, and
 #    out-of-order bytes are held in a queue four times larger than the window,
@@ -143,8 +149,13 @@
 0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
 0.010 < .     1:1(0) ack 1001 win 65535
 0.020 < write 100
-0.020 > .     1001:1101(100) ack 1 win 65535
-1.020 > .     1001:1101(100) ack 1 win 65535
+# `P.`, not `.`. EDITED by Task 17 after the differential found this stack
+# setting no PSH at all; see `push-on-the-last-segment-of-a-write` below for
+# the RFC 1122 section 4.2.2.2 MUST and the rule. A hundred bytes is one
+# segment and it empties the write, so it pushes -- and so does the
+# retransmission, which reproduces the segment rather than re-deriving it.
+0.020 > P.    1001:1101(100) ack 1 win 65535
+1.020 > P.    1001:1101(100) ack 1 win 65535
 # Acknowledged at last: the retransmit timer is cancelled and the scenario ends
 # with nothing further on the wire. The runner reports any frame this file does
 # not account for, so a stack that retransmitted a third time -- or that failed
@@ -177,7 +188,9 @@
 0.010 < .     1:1(0) ack 1001 win 0
 0.020 < write 100
 0.100 < .     1:1(0) ack 1001 win 1000
-0.100 > .     1001:1101(100) ack 1 win 65535
+# `P.` for the same reason as `retransmission-after-rto` above: one segment,
+# and it empties the write. EDITED by Task 17.
+0.100 > P.    1001:1101(100) ack 1 win 65535
 0.110 < .     1:1(0) ack 1101 win 1000
 
 
@@ -269,12 +282,101 @@
 0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
 0.010 < .     1:1(0) ack 1001 win 100
 0.010 < write 300
-0.010 > .     1001:1101(100) ack 1 win 65535
+# `P.` on all three pieces, EDITED by Task 17. Three hundred bytes is less than
+# one MSS, so this write is split by the peer's hundred-byte WINDOW and not by
+# the MSS -- and a window split does not defer the push. This is the same rule
+# `write-under-a-small-window` below exists to pin, met here by accident, which
+# is why that scenario states it deliberately rather than relying on this one.
+0.010 > P.    1001:1101(100) ack 1 win 65535
 0.510 < .     1:1(0) ack 1101 win 100
-0.510 > .     1101:1201(100) ack 1 win 65535
+0.510 > P.    1101:1201(100) ack 1 win 65535
 0.610 < .     1:1(0) ack 1201 win 100
-0.610 > .     1201:1301(100) ack 1 win 65535
+0.610 > P.    1201:1301(100) ack 1 win 65535
 # 0.610 + 1.600. Not 0.610 + 1.000: the floor has been left behind, and a stack
 # that ignored its own measurements would retransmit at 1.610 instead.
-2.210 > .     1201:1301(100) ack 1 win 65535
+2.210 > P.    1201:1301(100) ack 1 win 65535
 2.220 < .     1:1(0) ack 1301 win 100
+
+
+# scenario: push-on-the-last-segment-of-a-write
+#
+# FOUND BY THE DIFFERENTIAL (Task 17), seed 6840123409045651459, step 4. This
+# stack cut every data segment with the ACK bit and nothing else; gVisor set
+# PSH on the last segment of each write. That is not a matter of taste:
+#
+#   RFC 1122 section 4.2.2.2, carried forward by RFC 9293 section 3.9.1 --
+#   "A TCP MAY implement PUSH flags on SEND calls. If PUSH flags are not
+#   implemented, then the sending TCP: (1) must not buffer data indefinitely,
+#   and (2) MUST set the PSH bit in the last buffered segment (i.e., when there
+#   is no more queued data to be sent)."
+#
+# `TCPEndpoint.send` has no push argument, so clause (2) applies unconditionally
+# and this stack was violating a MUST on every write it ever made. gVisor is
+# right and we were wrong; the header note that used to say "our data lines are
+# `.` and never `P.`" was recording a defect as a design decision.
+#
+# The rule implemented, which is Linux's and gVisor's: a segment carries PSH
+# exactly when the bytes remaining in the WRITE it is cut from, counted from
+# that segment's first byte, are no more than one MSS -- that is, when nothing
+# more of that write will follow it as a full segment. A write is split at the
+# MSS and at the peer's window, and the two splits behave differently on
+# purpose (gVisor `snd.go`'s `splitSeg`, Linux `tcp_write_xmit`).
+#
+# Three lines pin the three cases at once. The MSS here is 1460 (the guest
+# offered `mss 1460` and the link carries 1500), and the write is 2941 bytes:
+# 1460 + 1460 + 21. The first two segments have more than an MSS of their write
+# still to come, so they carry no PSH; the last one empties the write and does.
+# A stack that set PSH on every segment fails the first line; one that set it
+# on none fails the third; one that set it only when the whole send queue
+# drained would pass here and fail `write-under-a-small-window` below.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 2941
+0.020 > .     1001:2461(1460) ack 1 win 65535
+0.020 > .     2461:3921(1460) ack 1 win 65535
+0.020 > P.    3921:3942(21) ack 1 win 65535
+0.030 < .     1:1(0) ack 3942 win 65535
+
+
+# scenario: write-under-a-small-window
+#
+# The other half of the PSH rule, and the reason it is stated in terms of the
+# write rather than of the send queue. The write is 1000 bytes -- less than one
+# MSS -- and the peer's window admits only 400 at a time, so it goes out in
+# three pieces. Every one of them carries PSH, because at each cut the whole
+# remainder of the write was already inside one segment's worth: the split is
+# the window's doing, not the MSS's, and a window split does not defer the
+# push.
+#
+# This is the line that separates the rule from the simpler "PSH when the send
+# queue empties": that rule would put PSH on the third segment alone.
+0.000 < S     0:0(0) win 400 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 400
+0.020 < write 1000
+0.020 > P.    1001:1401(400) ack 1 win 65535
+0.030 < .     1:1(0) ack 1401 win 400
+0.030 > P.    1401:1801(400) ack 1 win 65535
+0.040 < .     1:1(0) ack 1801 win 400
+0.040 > P.    1801:2001(200) ack 1 win 65535
+0.050 < .     1:1(0) ack 2001 win 400
+
+
+# scenario: a-retransmission-keeps-the-push-bit
+#
+# A retransmission reproduces the segment it lost, and PSH is part of that
+# segment. gVisor re-sends the segment object with its flags intact; a stack
+# that rebuilt the segment from the byte queue and re-derived the flags would
+# get this right only by accident, and `Sender.retransmitOldest` did exactly
+# that -- it hardcoded `.ack`.
+#
+# The write is 100 bytes, so its one segment carries PSH. At +1.000s, so does
+# the retransmission.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+0.020 > P.    1001:1101(100) ack 1 win 65535
+1.020 > P.    1001:1101(100) ack 1 win 65535
+1.030 < .     1:1(0) ack 1101 win 65535

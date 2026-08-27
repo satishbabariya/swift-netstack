@@ -132,6 +132,12 @@ struct Sender {
         var length: Int
         var transmissions: Int
         var sentAt: NIODeadline
+        /// Whether this segment went out with PSH. Recorded rather than
+        /// re-derived, because a retransmission must reproduce the segment it
+        /// lost EXACTLY, and by the time it is rebuilt the write it came from
+        /// may have more bytes queued behind it -- which would re-derive a
+        /// different answer for a segment that is already on the peer's wire.
+        var pushes: Bool
     }
 
     /// The congestion-control algorithm, readable so a caller (and the tests)
@@ -299,8 +305,12 @@ struct Sender {
         while unsent > 0, usable > 0, inFlight.count < maximumSegments {
             let length = min(segmentSize, min(unsent, usable))
             let sequence = tcb.sndNxt
-            out.append(Segment(sequence: sequence, flags: .ack, payload: gather(offset: offset, length: length)))
-            inFlight.append(InFlight(sequence: sequence, length: length, transmissions: 1, sentAt: clock.now()))
+            let pushes = bytesRemainingInWrite(from: offset) <= segmentSize
+            out.append(
+                Segment(
+                    sequence: sequence, flags: pushes ? [.ack, .psh] : .ack,
+                    payload: gather(offset: offset, length: length)))
+            inFlight.append(InFlight(sequence: sequence, length: length, transmissions: 1, sentAt: clock.now(), pushes: pushes))
             tcb.sndNxt = sequence + length
             outstanding += length
             offset += length
@@ -435,7 +445,41 @@ struct Sender {
 
         inFlight[0].transmissions += 1
         inFlight[0].sentAt = clock.now()
-        return Segment(sequence: first.sequence, flags: .ack, payload: gather(offset: offset, length: first.length))
+        return Segment(
+            sequence: first.sequence, flags: first.pushes ? [.ack, .psh] : .ack,
+            payload: gather(offset: offset, length: first.length))
+    }
+
+    /// How many bytes of the WRITE containing the byte at `offset` (counted
+    /// from SND.UNA) still remain, that byte included.
+    ///
+    /// This is what decides PSH. RFC 1122 §4.2.2.2, carried forward by
+    /// RFC 9293 §3.9.1: a sender that does not expose a push flag on its send
+    /// call — and `TCPEndpoint.send` does not — **MUST** set PSH on the last
+    /// buffered segment, "when there is no more queued data to be sent". The
+    /// unit that "queued data" is measured in is the write, not the whole
+    /// queue, which is what makes a window-split write push on every piece
+    /// while an MSS-split one pushes only on its last: at each cut, if the
+    /// rest of the write already fits in one segment, nothing more of it will
+    /// follow as a full segment and this is its last. Linux
+    /// (`tcp_write_xmit`) and gVisor (`snd.go`'s `splitSeg`, which clears PSH
+    /// only when the segment being split is larger than one MSS) both draw the
+    /// line in exactly that place, and the differential against gVisor is what
+    /// found this stack drawing it nowhere at all.
+    ///
+    /// A segment cut across a write boundary — possible only when two writes
+    /// are queued together — takes its answer from the write it STARTS in,
+    /// which is the write whose remainder it is completing.
+    private func bytesRemainingInWrite(from offset: Int) -> Int {
+        var skip = offset
+        for chunk in chunks {
+            let available = chunk.bytes.readableBytes
+            if skip < available { return available - skip }
+            skip -= available
+        }
+        // `offset` is past everything queued; there is nothing to cut, and
+        // `segmentsToTransmit`'s loop condition has already stopped.
+        return 0
     }
 
     // MARK: - Internals

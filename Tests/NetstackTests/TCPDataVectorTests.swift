@@ -227,6 +227,8 @@ private let closeVectors = "tcp-close"
     let run = [
         "in-order-data", "out-of-order-data", "retransmission-after-rto",
         "zero-window", "sequence-wrap", "rtt-sample-drives-the-rto",
+        "push-on-the-last-segment-of-a-write", "write-under-a-small-window",
+        "a-retransmission-keeps-the-push-bit",
     ]
     #expect(try transferScenarioNames(dataVectors) == run)
 }
@@ -327,6 +329,25 @@ private let closeVectors = "tcp-close"
 
 @Test func anRttSampleAboveTheFloorSetsTheRtoTheRetransmissionIsThenTimedBy() throws {
     let harness = try runTransferScenario(dataVectors, "rtt-sample-drives-the-rto")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+// The three PSH scenarios below were written from a divergence the Task 17
+// differential found, not from a reading of this stack's code — see the
+// comments above each one in `tcp-data.vec`.
+
+@Test func onlyTheSegmentThatEmptiesAWriteCarriesPush() throws {
+    let harness = try runTransferScenario(dataVectors, "push-on-the-last-segment-of-a-write")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aWriteSplitByThePeersWindowPushesOnEveryPiece() throws {
+    let harness = try runTransferScenario(dataVectors, "write-under-a-small-window")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aRetransmissionReproducesThePushBitOfTheSegmentItLost() throws {
+    let harness = try runTransferScenario(dataVectors, "a-retransmission-keeps-the-push-bit")
     #expect(harness.endpoint.connectionCountForTesting == 1)
 }
 

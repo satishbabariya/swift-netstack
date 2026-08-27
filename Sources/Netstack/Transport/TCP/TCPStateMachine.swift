@@ -347,6 +347,33 @@ struct TCPStateMachine {
         // open-provenance flag, and needs none. This is a settled ruling,
         // not an oversight.
         if header.flags.contains(.rst) {
+            // TIME-WAIT is the one synchronized state where a reset changes
+            // nothing at all. RFC 1337 §3, fix 1: a reset arriving in TIME-WAIT
+            // is IGNORED.
+            //
+            // RFC 9293 §3.10.7.4 says the opposite in as many words ("TIME-WAIT
+            // STATE: if the RST bit is set, then enter the CLOSED state, delete
+            // the TCB, and return"), and this deliberately does not follow it.
+            // The block exists precisely to stop a delayed duplicate from this
+            // connection being delivered into the next one on the same
+            // four-tuple, and a peer that resets it is a peer asking to have
+            // that protection removed. RFC 1337 names the resulting failures --
+            // old duplicate data accepted into a new connection, and a new
+            // connection killed by a stale reset -- and its fix 1 is to refuse.
+            //
+            // gVisor refuses unconditionally (`rcv.go`'s
+            // `handleTimeWaitSegment`: "we do not support TIME_WAIT
+            // assassination"). Linux hides it behind `net.ipv4.tcp_rfc1337`,
+            // off by default, on the reasoning that the peer is not usually an
+            // adversary. Here it always is: this stack terminates traffic from
+            // a sandbox whose purpose is to escape, so a default that trusts
+            // the peer not to attack is the wrong default. The Task 17
+            // differential found this by disagreeing with gVisor about it; see
+            // `tcp-close.vec`'s `a-reset-does-not-assassinate-time-wait`.
+            if tcb.state == .timeWait {
+                return [.none]
+            }
+
             guard isInReceiveWindow(header.sequence, tcb: tcb) else {
                 return [.none]
             }

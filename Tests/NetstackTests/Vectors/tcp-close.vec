@@ -307,3 +307,58 @@
 # `ack 101` would be the queued run delivered and the FIN lost forever.
 0.030 < FP. 1:51(50) ack 1001 win 65535
 0.030 > .   1001:1001(0) ack 52 win 65535
+
+
+# scenario: a-reset-does-not-assassinate-time-wait
+#
+# FOUND BY THE DIFFERENTIAL (Task 17), seed 6840123409045651495, step 10. A
+# reset arriving in TIME-WAIT used to delete the block and free the four-tuple
+# on the spot. That is RFC 9293 section 3.10.7.4 as written -- "TIME-WAIT
+# STATE: if the RST bit is set, then enter the CLOSED state, delete the TCB,
+# and return" -- and it is a documented attack:
+#
+#   RFC 1337, "TIME-WAIT Assassination Hazards in TCP", section 3, fix 1:
+#   ignore RST segments in TIME-WAIT. The block is exactly the state that stops
+#   a delayed duplicate from this connection being delivered into the next one
+#   on the same four-tuple, and the peer that resets it is the peer that gains
+#   by its absence.
+#
+# gVisor implements fix 1 unconditionally and says so in `rcv.go`'s
+# `handleTimeWaitSegment` ("we do not support TIME_WAIT assassination"); Linux
+# has it behind `net.ipv4.tcp_rfc1337`, off by default, on the reasoning that
+# the peer is not usually an adversary. Here it always is -- this stack
+# terminates traffic from a sandbox whose purpose is to escape -- so the
+# default is the wrong way round and the hardening is not optional.
+#
+# This is `time-wait-expiry`'s script with one line added at 1.000, and the two
+# probes at the end are borrowed from it deliberately: they are what make the
+# absence of an effect observable.
+#
+#   - 60.039 is INSIDE the block's lifetime, and a live block answers a bare
+#     acknowledgement with `.` (see `bare-ack-does-not-restart-time-wait` for
+#     why that probe does not restart the timer). An assassinated block would
+#     be gone, the four-tuple with it, and the same probe draws `R` from RFC
+#     9293 section 3.10.7.1's port-with-nothing-behind-it path instead. So this
+#     line fails loudly on the old behaviour rather than passing on silence --
+#     and it is the line that failed before the fix.
+#   - 60.041 is past 2*MSL, where the block really is gone and `R` is right.
+#     Without it the scenario would also pass on a stack that had stopped
+#     answering anything at all.
+0.000  < S     0:0(0) win 65535 <mss 1460>
+0.000  > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010  < .     1:1(0) ack 1001 win 65535
+0.020  < close
+0.020  > F.    1001:1001(0) ack 1 win 65535
+0.030  < .     1:1(0) ack 1002 win 65535
+0.040  < F.    1:1(0) ack 1002 win 65535
+0.040  > .     1002:1002(0) ack 2 win 65535
+# The assassination attempt: a reset at exactly RCV.NXT, which is the strongest
+# form there is and the one that WOULD tear the connection down in any other
+# synchronized state (RFC 5961 section 3.2, see `TCPStateMachine`). Nothing on
+# the wire in reply, and -- the part the next two probes establish -- nothing
+# changed inside either.
+1.000  < R     2:2(0) win 0
+60.039 < .     2:2(0) ack 1002 win 65535
+60.039 > .     1002:1002(0) ack 2 win 65535
+60.041 < .     2:2(0) ack 1002 win 65535
+60.041 > R     1002:1002(0) win 0

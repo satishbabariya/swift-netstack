@@ -241,6 +241,7 @@ private let closeVectors = "tcp-close"
         "time-wait-expiry", "fin-retransmission-restarts-time-wait",
         "bare-ack-does-not-restart-time-wait", "fin-ahead-of-rcv-nxt",
         "right-edge-trim", "data-past-the-fin",
+        "a-reset-does-not-assassinate-time-wait",
     ]
     #expect(try transferScenarioNames(closeVectors) == run)
 }
@@ -351,6 +352,14 @@ private let closeVectors = "tcp-close"
 @Test func aRetransmissionReproducesThePushBitOfTheSegmentItLost() throws {
     let harness = try runTransferScenario(dataVectors, "a-retransmission-keeps-the-push-bit")
     #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aResetArrivingInTimeWaitIsIgnored() throws {
+    let harness = try runTransferScenario(closeVectors, "a-reset-does-not-assassinate-time-wait")
+    // The block outlived the reset AND then really did expire: a stack that
+    // ignored everything forever would satisfy the wire lines up to 61.000 and
+    // fail here.
+    #expect(harness.endpoint.connectionCountForTesting == 0)
 }
 
 @Test func windowUpdatesRepeatingTheAcknowledgementNumberDoNotFastRetransmit() throws {

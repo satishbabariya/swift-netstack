@@ -175,6 +175,92 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.orderCountForTesting <= 4 * capacity + 1)
 }
 
+@Test func compactionKeepsEvictionWorkingSoTheTableStaysAtCapacity() {
+    // The bound in `orderStaysBoundedWhenOneAddressPinsTheHead` above is an
+    // upper bound on `order`, and an upper bound on `order` is satisfied
+    // perfectly by a compaction that throws LIVE appearances away — the
+    // smaller the array, the happier the assertion. That is not hypothetical
+    // slack: `evictLeastRecentlyUsed` reads its victim from `order`, and
+    //
+    //     guard orderHead < order.count else { return }
+    //
+    // means a compaction that drops live appearances turns eviction into a
+    // silent no-op. `record`'s capacity check calls it and then inserts
+    // regardless, so `entries` would grow without bound — the exact
+    // unbounded-growth failure this cache exists to prevent, reached through
+    // the fix for the other one.
+    //
+    // Verified reachable and unguarded: replacing `compactOrderIfNeeded`'s
+    // `order = compacted` with `order = []` left all 329 tests in the suite
+    // passing. Instrumented, that branch runs 784 times across the suite, so
+    // it is live code being executed and simply not asserted on — the two
+    // tests that drive compaction hard use only two distinct addresses and
+    // so never evict, while `cacheEvictsOldestButKeepsARecentlyTouchedEntry`
+    // uses capacity 4 and never grows `order` past the compaction threshold.
+    // This test is the missing intersection: enough distinct addresses that
+    // eviction runs continuously, and enough touches that the full pass runs
+    // underneath it.
+    // Getting the two to coexist takes care, and a plain flood of distinct
+    // addresses does NOT do it — measured. Once the table is at capacity,
+    // every insertion evicts, so `orderHead` advances in step with `order`
+    // and the cheap prefix-drop above (`orderHead > 64 && orderHead * 2 >
+    // order.count`) fires first and RETURNS on every call; instrumented,
+    // that shape hit the prefix drop 75 times and the full pass zero times.
+    // The full pass needs `orderHead` to stay LOW while `order` grows past
+    // `4 * capacity`, which means a live appearance pinning the front. So:
+    // fill the table, leave one address untouched to pin the head, re-touch
+    // the rest until the full pass has run, and only then start inserting
+    // new addresses so eviction runs against a compacted `order`.
+    let clock = ManualClock()
+    let capacity = 64
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: capacity)
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, UInt8($0 >> 8), UInt8($0 & 0xff)) }
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, UInt8($0 >> 8), UInt8($0 & 0xff)])! }
+
+    // Fill to capacity. ip(0) is never touched again and pins `order[0]`.
+    for i in 0..<capacity {
+        cache.record(ip(i), mac(i))
+    }
+    #expect(cache.count == capacity)
+
+    // Re-touch the other 63 (never evicts — they already exist) until
+    // `order` is well past `4 * capacity` and the full pass has run.
+    for i in 0..<400 {
+        cache.record(ip(1 + i % (capacity - 1)), mac(1 + i % (capacity - 1)))
+    }
+
+    // Now insert new addresses. Each one must evict, using an `order` that
+    // the full pass has just rebuilt.
+    for i in 0..<200 {
+        cache.record(ip(1_000 + i), mac(1_000 + i))
+    }
+
+    // The assertion that matters is WHICH entry was evicted, not how many.
+    // A count bound cannot see this failure: `evictLeastRecentlyUsed` removes
+    // exactly one entry per insertion whenever `order` has any live
+    // appearance left, and an emptied `order` refills from the very next
+    // touch, so the capacity bound self-heals within one call and reads
+    // green either way — measured, `cache.count` is 64 with the full pass
+    // correct and 64 with it replaced by `order = []`. What actually breaks
+    // is eviction ORDER: ip(0) is the oldest entry and was never re-touched,
+    // so it must be the first victim once insertions resume. With its
+    // appearance destroyed it becomes un-evictable instead — immortal, while
+    // strictly more recently used entries are evicted around it. Measured
+    // both ways: `lookup(ip(0))` is nil against the real compaction and
+    // non-nil against `order = []`.
+    #expect(cache.lookup(ip(0)) == nil, "the least recently used entry must be the one evicted, not the one that survives")
+    // A LITERAL 64, not `capacity`: this is the number the cache must not
+    // exceed, and writing it as the same variable the cache was constructed
+    // from would move the goalposts with any future change to the input.
+    #expect(cache.count == 64)
+    // And `order` is still bounded, so the fix this test protects has not
+    // been traded away for the one above.
+    #expect(cache.orderCountForTesting <= 4 * capacity + 1)
+    // The floor: an upper bound on the table is satisfied by a cache that
+    // evicted everything, so pin that the most recent insertion survived.
+    #expect(cache.lookup(ip(1_199)) == mac(1_199))
+}
+
 @Test func cacheEvictsOldestButKeepsARecentlyTouchedEntry() {
     let clock = ManualClock()
     let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: 4)

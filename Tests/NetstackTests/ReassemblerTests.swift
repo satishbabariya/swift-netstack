@@ -628,12 +628,19 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // O(1)-amortized version this replaces it with finishes in well under
     // one, a ~20x difference that only widens as the flood grows.
     let clock = ManualClock()
-    // Sized for exactly 3000 entries' worth under the new per-fragment
-    // overhead charge (see `Reassembler.perFragmentOverhead`), matching the
-    // original 8-byte-payload x 3000 intent.
-    let entryCost = 8 + Reassembler.perFragmentOverhead
+    // A LITERAL cap, deliberately not `(8 + Reassembler.perFragmentOverhead) * 3000`.
+    // Provenance: each of these datagrams is one 8-byte fragment charged
+    // `perFragmentOverhead` on top, so 8 + 176 = 184 per entry, and
+    // 184 * 3000 = 552_000 sizes the table for exactly 3000 entries — the
+    // original 8-byte-payload x 3000 intent. Writing the cap in terms of
+    // `perFragmentOverhead` made the count assertion below self-satisfying
+    // the same way `reassemblyMemoryLimitBoundsRealRetentionUnderAFloodOfMinimalFragments`
+    // was before `13add6e`: zero the charge and the cap collapses to 24_000
+    // while the entry cost collapses to 8, so 3000 entries still fit and the
+    // bound never moves. Verified — the derived form passed with the charge
+    // set to 0.
     let reassembler = Reassembler(
-        clock: clock, timeout: .seconds(3600), memoryLimit: entryCost * 3000, maximumPendingDatagrams: 1_000_000)
+        clock: clock, timeout: .seconds(3600), memoryLimit: 552_000, maximumPendingDatagrams: 1_000_000)
 
     let elapsed = ContinuousClock().measure {
         for id in 0..<50_000 {
@@ -647,8 +654,15 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     }
 
     #expect(elapsed < .seconds(5))
-    // The byte cap is doing its job regardless of how it got there.
-    #expect(reassembler.pendingCount <= 3000)
+    // The byte cap is doing its job regardless of how it got there. An
+    // EXACT count, not `<= 3000`: an upper bound alone is satisfied by a
+    // reassembler that evicted everything — verified, by changing
+    // `enforceMemoryLimit`'s loop to `while heldBytes > 0` so that every
+    // admission emptied the table, at which point `<= 3000` still passed.
+    // The accounting here is pure integer arithmetic (552_000 / 184 = 3000
+    // exactly, no allocator involved), so equality is deterministic and
+    // pins both directions at once.
+    #expect(reassembler.pendingCount == 3000)
 }
 
 @Test func rejectsEmptyFragments() {

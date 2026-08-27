@@ -53,6 +53,37 @@ private func codec() -> VectorFrames {
     #expect((Int(bytes[46] >> 4) * 4) % 4 == 0)
 }
 
+@Test func everyTCPFlagCharacterEncodesToItsRFC793WireBit() throws {
+    // `decodesWhatItEncodesForEveryForm` below cannot check this: `encode`
+    // and `decodeTCPFlags` read the SAME `tcpFlagBits` table, so a wrong bit
+    // is applied symmetrically and the round trip agrees with itself.
+    // Verified — with the table rewritten to
+    // `("F", 0x04), ("S", 0x02), ("R", 0x01), ("P", 0x80), (".", 0x10), ("U", 0x40)`
+    // — four of the six flags on the wrong wire bit — all 329 tests in the
+    // suite passed. That matters beyond this codec: `VectorRunner` decodes
+    // the REAL stack's output through this table to compare it against a
+    // script, so a wrong bit here silently mis-reads live wire bytes.
+    //
+    // Literal values from RFC 9293 §3.1 (the control-bit field, low bit
+    // first): FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10, URG 0x20.
+    // `TCPHeaderTests.crossChecksAgainstTheVectorCodec` pins "S" against
+    // `TCPHeader.parse`, an independent implementation, but only "S".
+    let expected: [(Character, UInt8)] = [("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08), (".", 0x10), ("U", 0x20)]
+    for (character, bit) in expected {
+        let line = TCPLine(flags: String(character), seqStart: 0, seqEnd: 0, payloadLength: 0, ack: nil, window: 65535, options: [])
+        let bytes = Array(try codec().encode(.tcp(line), direction: .inbound).readableBytesView)
+        // Ethernet 14 + IPv4 20 = 34; the TCP flags byte is at offset 13.
+        #expect(bytes[34 + 13] == bit, "flag '\(character)' must encode to 0x\(String(bit, radix: 16))")
+    }
+
+    // All six at once, so a table that happens to be a permutation of the
+    // right bits (each flag alone landing on some other flag's bit) cannot
+    // pass the per-character loop by accident.
+    let all = TCPLine(flags: "FSRP.U", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 65535, options: [])
+    let allBytes = Array(try codec().encode(.tcp(all), direction: .inbound).readableBytesView)
+    #expect(allBytes[34 + 13] == 0x3f)  // 0x01|0x02|0x04|0x08|0x10|0x20
+}
+
 @Test func decodesWhatItEncodesForEveryForm() throws {
     let forms: [VectorPacket] = [
         .tcp(TCPLine(flags: "S.", seqStart: 100, seqEnd: 100, payloadLength: 0, ack: 1, window: 512, options: [])),

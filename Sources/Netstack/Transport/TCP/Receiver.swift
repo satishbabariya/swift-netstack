@@ -7,19 +7,19 @@ import NIOCore
 /// read afterwards: the state machine must not be in a position to re-derive
 /// any of this, because a second derivation is a second opinion, and the two
 /// disagree the moment either is edited. See `Receiver`.
-public struct ReceiveOutcome: Sendable {
+struct ReceiveOutcome: Sendable {
     /// Bytes that became contiguous with RCV.NXT, oldest first. Possibly bytes
     /// from earlier segments this one unblocked; possibly none at all. RCV.NXT
     /// has already been advanced over them.
-    public let delivered: [ByteBuffer]
+    let delivered: [ByteBuffer]
 
     /// Whether the peer is owed an acknowledgement for this segment.
-    public let shouldAck: Bool
+    let shouldAck: Bool
 
     /// RCV.WND to advertise, already written into the TCB. See
     /// `Receiver.advertisedWindow` for why this is a `UInt16` and what Task 13
     /// has to change here.
-    public let advertisedWindow: UInt16
+    let advertisedWindow: UInt16
 
     /// True on the one call where RCV.NXT first reaches the peer's FIN, and
     /// never again. **Edge-triggered, deliberately.** A level-triggered "the
@@ -36,17 +36,24 @@ public struct ReceiveOutcome: Sendable {
     /// true there; the 2*MSL restart is decided by `TCPStateMachine`'s own
     /// retransmitted-FIN test, which is the only thing that may restart it.
     ///
+    /// **So the edge is no longer a defence, and it is worth being exact about
+    /// what it still is.** Made level-triggered, the whole suite fails in
+    /// exactly one place: `theFinIsReportedExactlyOnce`, which drives this type
+    /// directly. No test that goes through `TCPStateMachine` can tell the two
+    /// apart, and none can: every state the FIN transition leads to —
+    /// CLOSE-WAIT, CLOSING, TIME-WAIT — is one where step 5 stops driving the
+    /// receiver, so there is no second call in which a level would be read.
+    /// It is kept because it is this type's stated contract, because it costs
+    /// no stored state, and because it is what would keep the transition
+    /// once-only if step 5's list of data-accepting states were ever widened —
+    /// which step 6 already anticipates by keeping a `.synReceived` case it
+    /// cannot currently reach. It is not kept because anything hostile depends
+    /// on it, and it should not be cited as though something did.
+    ///
     /// The edge costs no stored state. Reaching the FIN advances RCV.NXT one
     /// past it (the FIN consumes a sequence number), so the equality that
     /// produced this is false on every later call by construction.
-    public let finReached: Bool
-
-    public init(delivered: [ByteBuffer], shouldAck: Bool, advertisedWindow: UInt16, finReached: Bool) {
-        self.delivered = delivered
-        self.shouldAck = shouldAck
-        self.advertisedWindow = advertisedWindow
-        self.finReached = finReached
-    }
+    let finReached: Bool
 }
 
 /// The receive side of a TCP connection: the single owner of RCV.NXT, of what
@@ -103,7 +110,7 @@ public struct ReceiveOutcome: Sendable {
 /// it. Hold exactly one per connection and pass it `inout`. The type is a
 /// struct rather than a class only because it has no identity of its own worth
 /// having; that is not a promise of value semantics.
-public struct Receiver {
+struct Receiver {
     /// The largest window expressible in the header's 16-bit field.
     ///
     /// ## The window-scale seam (Task 13)
@@ -139,7 +146,7 @@ public struct Receiver {
 
     private let reassembler: TCPReassembler
 
-    public init(reassembler: TCPReassembler = TCPReassembler()) {
+    init(reassembler: TCPReassembler = TCPReassembler()) {
         self.reassembler = reassembler
     }
 
@@ -164,7 +171,7 @@ public struct Receiver {
     /// consistent depends on the never-retract rule below: a segment the peer
     /// put in flight for space it was offered is still inside `rcvNxt + rcvWnd`
     /// when it lands, because the right edge only ever moves forward.
-    public mutating func accept(_ segment: Segment, tcb: inout TCB) -> ReceiveOutcome {
+    mutating func accept(_ segment: Segment, tcb: inout TCB) -> ReceiveOutcome {
         let offered = tcb.rcvWnd
         let delivered = reassembler.insert(segment, rcvNxt: tcb.rcvNxt)
 

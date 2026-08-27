@@ -572,7 +572,8 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     // must still get the wide window from the same queue.
     var wide = establishedTCB(rcvNxt: 1000, rcvWnd: 65535)
     var wideReceiver = Receiver(reassembler: TCPReassembler())
-    #expect(wideReceiver.accept(segment(sequence: 1000, payload: 1), tcb: &wide).advertisedWindow == 65535)
+    let wideOutcome = wideReceiver.accept(segment(sequence: 1000, payload: 1), tcb: &wide)
+    #expect(wideOutcome.advertisedWindow == 65535)
 }
 
 @Test func theResetWindowIsNotWidenedByTheReceiversDefaultQueueSize() {
@@ -597,6 +598,89 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     #expect(near == [.sendAck], "a RST inside the 100-byte window still draws a challenge ACK")
     _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1001, flags: [.rst]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closed, "and a RST at RCV.NXT exactly still tears the connection down")
+}
+
+// MARK: - Data queued past the peer's own FIN
+
+@Test func dataQueuedPastAPeersOwnFinCannotWedgeTeardown() {
+    // The residual from round 1, traced rather than assumed. The mechanism is
+    // an OVERSHOOT, not "data arriving after a FIN": the offending bytes arrive
+    // while nothing is known about any FIN at all.
+    //
+    // The peer queues 10 bytes at 1005. It then sends 5 bytes and a FIN in
+    // order at 1000, putting its FIN at 1005 -- contradicting data it has
+    // already sent. Admitting that segment used to deliver its 5 bytes AND the
+    // 10 queued behind them, landing RCV.NXT on 1015: past the FIN, never on
+    // it. `Receiver` tests `rcvNxt == fin`, an exact equality that could then
+    // never hold again, so the connection stayed ESTABLISHED for good and went
+    // on accepting data (1020, 1025, ...) with no way to ever close.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1005, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
+    #expect(tcb.rcvNxt == SequenceNumber(1000), "out of order: queued, nothing delivered yet")
+
+    let actions = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, flags: [.fin, .ack], payload: 5, fill: 0xaa), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .closeWait, "RCV.NXT must land on the FIN, not jump over it")
+    #expect(tcb.rcvNxt == SequenceNumber(1006), "five bytes plus the FIN's own sequence number")
+    #expect(
+        deliveredBytes(actions) == Array(repeating: 0xaa, count: 5),
+        "and the bytes the peer queued past its own FIN are dropped, not handed to the application")
+    #expect(hasSendAck(actions))
+}
+
+@Test func aQueuedRunStraddlingTheFinKeepsOnlyThePartBeforeIt() {
+    // The other branch of the discard: a queued run that begins before the
+    // FIN's position and continues past it is trimmed rather than dropped
+    // whole. Getting this wrong in the dropping direction loses bytes the peer
+    // legitimately sent before its FIN; getting it wrong in the keeping
+    // direction is the overshoot again, one byte at a time.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1002, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
+    let actions = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, flags: [.fin, .ack], payload: 5, fill: 0xaa), on: &tcb, receiver: &receiver)
+
+    #expect(tcb.state == .closeWait)
+    #expect(tcb.rcvNxt == SequenceNumber(1006))
+    #expect(
+        deliveredBytes(actions) == Array(repeating: 0xaa, count: 2) + Array(repeating: 0xbb, count: 3),
+        "the queued run's first three bytes are before the FIN and are delivered; the rest is not")
+}
+
+@Test func queuedDataIsOnlyDiscardedWhenAFinSaysItMustBe() {
+    // The positive control, and it is the load-bearing half of this pair: "the
+    // connection is not wedged" is satisfied perfectly by a reassembler that
+    // empties its queue on every insert, and "teardown completes" by one that
+    // tears down on anything. Neither may be true.
+    //
+    // The same shape as the wedge, minus the FIN. Nothing may be discarded, and
+    // the connection must stay open.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1005, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
+    let filled = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, payload: 5, fill: 0xaa), on: &tcb, receiver: &receiver)
+
+    #expect(
+        deliveredBytes(filled) == Array(repeating: 0xaa, count: 5) + Array(repeating: 0xbb, count: 10),
+        "with no FIN in play, every queued byte is still delivered when the gap closes")
+    #expect(tcb.state == .established, "and nothing has closed the connection")
+    #expect(tcb.rcvNxt == SequenceNumber(1015))
+
+    // And the conforming close that follows still completes, on the same
+    // connection: the peer's real FIN sits after all of its data.
+    let closing = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1015, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .closeWait)
+    #expect(tcb.rcvNxt == SequenceNumber(1016))
+    #expect(hasSendAck(closing))
 }
 
 @Test func anUnacceptableSegmentNeverReachesTheReassembler() {

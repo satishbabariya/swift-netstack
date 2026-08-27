@@ -102,7 +102,12 @@ public struct TCPStateMachine {
     /// also need a way to re-enter this function for a FIN whose gap has since
     /// filled; no such re-drive exists, and the comment that used to assume one
     /// is what left an out-of-order FIN unhandled forever.
-    public static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
+    /// Internal, not `public`, and not by choice: Swift forbids a public method
+    /// whose parameter uses an internal type, and `Receiver` is internal so that
+    /// no caller outside this module can drive it past the gates below. The
+    /// remaining public declarations in `Transport/TCP/` are mechanisms too and
+    /// should follow in one sweep; this one moved early because it had to.
+    static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
         switch tcb.state {
         case .closed:
             return closedStateSegmentArrives(segment: segment)

@@ -345,6 +345,53 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     // rule the byte ranges follow.
     _ = reassembler.insert(tcpSegment(1030, Array(repeating: 0xcc, count: 10), flags: .fin), rcvNxt: rcvNxt)
     #expect(reassembler.finSequence == SequenceNumber(1020))
+    #expect(reassembler.pendingSegments == 1, "nor is its data kept: it sits past a FIN already recorded")
+}
+
+@Test func tcpReassemblyRefusesDataAtOrBeyondARecordedFin() {
+    // A peer that has sent a FIN has promised no more data, so a byte at or
+    // past the FIN's position is a protocol violation. RFC 9293 has no notion
+    // of data after a FIN, so no conforming peer can notice this rule.
+    //
+    // Tested here rather than through `TCPStateMachine` because it cannot be
+    // reached through it: once a FIN is recorded it is also reached in the same
+    // call (round 1's gate admits a FIN only from a segment starting at
+    // RCV.NXT), the connection moves to CLOSE-WAIT, and step 5 stops driving
+    // the receiver entirely -- so no later segment gets this far. This class's
+    // own API is public and this is where the position lives, which is why the
+    // rule is enforced and asserted at this level.
+    let reassembler = TCPReassembler(maximumBytes: 4096, maximumSegments: 64)
+    let rcvNxt = SequenceNumber(1000)
+
+    _ = reassembler.insert(tcpSegment(1010, [], flags: .fin), rcvNxt: rcvNxt)
+    #expect(reassembler.finSequence == SequenceNumber(1010))
+
+    _ = reassembler.insert(tcpSegment(1010, Array(repeating: 0xcc, count: 10)), rcvNxt: rcvNxt)
+    #expect(reassembler.pendingSegments == 0, "data at the FIN's own sequence number is refused")
+
+    _ = reassembler.insert(tcpSegment(1020, Array(repeating: 0xcc, count: 10)), rcvNxt: rcvNxt)
+    #expect(reassembler.pendingSegments == 0, "and data beyond it")
+
+    // Positive control. Refusing everything satisfies both lines above, and
+    // would strand a connection whose FIN is still behind a gap: the bytes that
+    // fill that gap arrive after the FIN was recorded and must still be taken.
+    _ = reassembler.insert(tcpSegment(1005, Array(repeating: 0xdd, count: 5)), rcvNxt: rcvNxt)
+    #expect(reassembler.pendingSegments == 1, "data before the FIN is still admitted")
+
+    let delivered = reassembler.insert(tcpSegment(1000, Array(repeating: 0xaa, count: 5)), rcvNxt: rcvNxt)
+    #expect(tcpDeliveredBytes(delivered) == Array(repeating: 0xaa, count: 5) + Array(repeating: 0xdd, count: 5))
+    #expect(rcvNxt + tcpDeliveredBytes(delivered).count == reassembler.finSequence, "RCV.NXT lands exactly on the FIN")
+}
+
+@Test func tcpReassemblyTrimsAnArrivingSegmentThatStraddlesARecordedFin() {
+    let reassembler = TCPReassembler(maximumBytes: 4096, maximumSegments: 64)
+    let rcvNxt = SequenceNumber(1000)
+
+    _ = reassembler.insert(tcpSegment(1010, [], flags: .fin), rcvNxt: rcvNxt)
+    _ = reassembler.insert(tcpSegment(1008, Array(repeating: 0xcc, count: 10)), rcvNxt: rcvNxt)
+
+    // Two of its ten bytes are before the FIN; eight are not.
+    #expect(reassembler.pendingBytes == 2 + TCPReassembler.perSegmentOverhead)
 }
 
 @Test func tcpReassemblyIgnoresAFinAlreadyBehindRcvNxt() {

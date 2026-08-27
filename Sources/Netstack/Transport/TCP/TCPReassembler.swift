@@ -144,6 +144,16 @@ import NIOCore
 /// until every byte before the FIN has been delivered, so recording the FIN
 /// early can never close a connection ahead of its data.
 ///
+/// The equality is exact, so it must also be impossible to *overshoot*. It was
+/// not: bytes queued past a position a FIN later claimed were delivered in the
+/// same call as the FIN's own, carrying RCV.NXT over the FIN in one step and
+/// wedging teardown permanently. So this class enforces the promise a FIN
+/// makes — a peer that has sent one sends no more data — in the queue as well
+/// as at the position: nothing at or beyond a recorded FIN is retained
+/// (`discardQueued`, at the moment of recording) or admitted (the clamp in
+/// `insert`, for anything arriving after). RFC 9293 has no notion of data after
+/// a FIN, so no conforming peer can notice either.
+///
 /// First-received-wins applies here too: a second FIN claiming a different
 /// position never moves the first.
 ///
@@ -354,7 +364,7 @@ public final class TCPReassembler {
         guard segmentEnd > 0 else { return [] }
 
         let dataStart = segment.dataSequence - rcvNxt
-        let dataEnd = dataStart + segment.payload.readableBytes
+        var dataEnd = dataStart + segment.payload.readableBytes
 
         // Record the FIN before anything can reject this segment's data. The
         // FIN's position is knowable whether or not its bytes fit, and acting
@@ -370,6 +380,22 @@ public final class TCPReassembler {
         // expressed in.
         if let finPosition = segment.finSequence, fin == nil, dataEnd >= 0, dataEnd <= maximumOffset {
             fin = finPosition
+            // A peer that has sent a FIN has promised to send no more data, so
+            // anything already queued at or beyond the FIN's position is a
+            // protocol violation and is dropped now rather than delivered
+            // later. This is the half that matters: see `discardQueued`.
+            discardQueued(atOrBeyondOffset: dataEnd, rcvNxt: rcvNxt)
+        }
+
+        // The same promise, applied to an arriving segment once a FIN is
+        // already recorded. Data at or past the FIN is refused; the caller
+        // still acknowledges the segment (`Receiver` measures SEG.LEN, not what
+        // survived admission), which is the "drop it and ACK it" a violation
+        // deserves. Unreachable through `TCPStateMachine` -- see the type's doc
+        // comment -- and enforced here because this class is what holds the
+        // position, and its own API is public.
+        if let recordedFin = fin {
+            dataEnd = min(dataEnd, recordedFin - rcvNxt)
         }
 
         let pieces = novelRanges(dataStart: dataStart, dataEnd: dataEnd, rcvNxt: rcvNxt)
@@ -497,6 +523,47 @@ public final class TCPReassembler {
     /// rather than assuming. A run partly behind RCV.NXT keeps its original
     /// `charge` when trimmed, since moving a reader index does not release
     /// the allocation behind it.
+    /// Drop every queued byte at or beyond `offset`, trimming the one run that
+    /// straddles it. Called once, when a FIN's position is first recorded.
+    ///
+    /// This is what closes the teardown wedge, and the wedge is worth spelling
+    /// out because it is not the failure the rule's phrasing suggests. A peer
+    /// queues 10 bytes at RCV.NXT+5 while nothing is known about any FIN, then
+    /// sends 5 bytes and a FIN in order at RCV.NXT. The FIN's position is
+    /// RCV.NXT+5. Admitting that segment delivers its 5 bytes *and* the 10
+    /// already queued behind them, so the caller's RCV.NXT lands on RCV.NXT+15
+    /// — **past** the FIN, never on it. `Receiver` tests `rcvNxt == fin`, an
+    /// exact equality that can now never hold, so the FIN is never acted on and
+    /// the connection stays ESTABLISHED for good.
+    ///
+    /// The overshoot is the mechanism, not "data arriving after a FIN", and the
+    /// distinction decides where the fix goes. The offending bytes arrive
+    /// *before* any FIN is recorded, so no arrival-time test has anything to
+    /// compare them against; and in the other arrival order — FIN first, then
+    /// data past it — there is nothing to fix, because the FIN is honoured on
+    /// its own segment and `TCPStateMachine` stops driving the receiver in
+    /// CLOSE-WAIT, so the later data never reaches this class at all. The only
+    /// moment both facts are in hand is the moment the FIN is recorded, which
+    /// is here.
+    ///
+    /// A trimmed run keeps its original `charge`, for the same reason
+    /// `pruneOutsideDomain` does: moving an index does not release the
+    /// allocation behind it.
+    private func discardQueued(atOrBeyondOffset offset: Int, rcvNxt: SequenceNumber) {
+        while let last = queue.last {
+            let start = last.sequence - rcvNxt
+            if start >= offset {
+                accountedBytes -= last.charge
+                queue.removeLast()
+                continue
+            }
+            if start + last.bytes.readableBytes > offset {
+                queue[queue.count - 1].bytes.moveWriterIndex(to: last.bytes.readerIndex + (offset - start))
+            }
+            break
+        }
+    }
+
     private func pruneOutsideDomain(rcvNxt: SequenceNumber) {
         var firstLive = 0
         while firstLive < queue.count {

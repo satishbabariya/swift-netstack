@@ -240,12 +240,28 @@ public final class Stack {
         assert(maintenanceTask == nil, "Stack.start() called more than once")
         maintenanceTask?.cancel()
 
+        // `scheduleRepeatedTask` wants a `@Sendable` body, and neither
+        // `Reassembler` nor `ARPCache` is `Sendable` — deliberately, since both
+        // are loop-confined and marking them `Sendable` would claim a guarantee
+        // they do not offer to any other caller. Capturing them directly
+        // therefore warns, and under Swift 6 language mode it is an error.
+        //
+        // `MaintenanceBox` carries them behind an `@unchecked Sendable`
+        // conformance scoped to one `private` type, on the same reasoning as
+        // `ShutdownBox` above: NIO runs a repeated task's body on the event loop
+        // it was scheduled on and nowhere else, so the capture never crosses a
+        // thread boundary and the confinement every other access in this package
+        // relies on still holds. The box captures the two collaborators rather
+        // than `self` for the same reason the old capture list did — capturing
+        // `self` here would close `nic.handlers -> closure -> Stack` and leak the
+        // whole graph once per sandbox.
+        let box = MaintenanceBox(reassembler: reassembler, arpCache: arpCache)
         maintenanceTask = eventLoop.scheduleRepeatedTask(
             initialDelay: configuration.maintenanceInterval,
             delay: configuration.maintenanceInterval
-        ) { [reassembler, arpCache] _ in
-            reassembler.reapExpired()
-            arpCache.reapExpired()
+        ) { _ in
+            box.reassembler.reapExpired()
+            box.arpCache.reapExpired()
         }
     }
 
@@ -350,4 +366,14 @@ public final class Stack {
 /// loop-confined access in this package already relies on instead of a lock.
 private struct ShutdownBox: @unchecked Sendable {
     let stack: Stack
+}
+
+/// The maintenance timer's two collaborators, carried across
+/// `scheduleRepeatedTask`'s `@Sendable` requirement. Safe for exactly the reason
+/// `ShutdownBox` is: NIO runs the body on the scheduling event loop and nowhere
+/// else, so nothing here is ever touched off-loop. Scoped to this one `private`
+/// type so the claim cannot leak to any other use of either collaborator.
+private struct MaintenanceBox: @unchecked Sendable {
+    let reassembler: Reassembler
+    let arpCache: ARPCache
 }

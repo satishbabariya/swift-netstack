@@ -61,10 +61,15 @@ import NIOCore
 ///
 /// ## What this type does not do
 ///
-/// No SYN, no FIN, no zero-window probe, no Nagle, no SACK. It moves a byte
-/// stream and nothing else: the control flags occupy sequence space that this
-/// type's offsets do not model, which is why `segmentsToTransmit` refuses to
-/// act when SND.NXT has moved by an amount it did not itself send (see there).
+/// No SYN, no FIN, no Nagle, no SACK, and no sender-side silly-window-syndrome
+/// avoidance. It moves a byte stream and nothing else: the control flags occupy
+/// sequence space that this type's offsets do not model, which is why
+/// `segmentsToTransmit` refuses to act when SND.NXT has moved by an amount it
+/// did not itself send (see there), and why `persistApplies` refuses for the
+/// same reason.
+///
+/// It *does* probe a zero window — see `persistTimerFired`, which is where the
+/// one rule in this file that has no give-up condition lives.
 struct Sender {
     /// The real per-chunk cost of holding one queued write: the array element,
     /// the `ByteBuffer`'s backing storage object, and malloc's rounding of a
@@ -207,6 +212,39 @@ struct Sender {
     private var duplicates = 0
     private var fastRetransmitPending = false
 
+    /// When the next zero-window probe is due, or `nil` when the sender is not
+    /// in the persist condition. **Absolute**, and deliberately never pushed
+    /// out while it is already set: `updatePersistTimer` only ever assigns it
+    /// from `nil`. A deadline recomputed on every arriving segment would let a
+    /// peer that holds the window shut and keeps chattering defer the probe
+    /// forever, which is the failure `TCPEndpoint.finDeadline` records for the
+    /// FIN timer.
+    private var persistTimerDeadline: NIODeadline?
+
+    /// The interval between the last probe and the next. `nil` outside the
+    /// persist condition, so that leaving it and re-entering starts the ladder
+    /// again from the RTO rather than from wherever the previous episode
+    /// stopped.
+    ///
+    /// Deliberately NOT reset by `RTTEstimator.measure` the way RFC 6298 §5.7
+    /// discards the RTO's backoff. A fresh round-trip sample is evidence about
+    /// the *path*; the persist interval measures how long the *receiver* has
+    /// been unable to take data, and nothing about a round trip says anything
+    /// about that.
+    private var persistTimerInterval: TimeAmount?
+
+    /// Whether the single byte a zero-window probe put on the wire is still
+    /// unacknowledged.
+    ///
+    /// A `Bool` and not the probe's sequence number, because there is only ever
+    /// one and its position is not free: `persistApplies` runs only when the
+    /// probe is the *sole* outstanding record, so it always sits at SND.UNA and
+    /// any acknowledgement that advances SND.UNA at all has retired it. That is
+    /// what makes the two places this is cleared -- an advancing
+    /// acknowledgement, and the empty-queue branch of `retransmitTimerFired` --
+    /// the complete set.
+    private var probeOutstanding = false
+
     /// SEG.WND from the last acknowledgement that reached `acknowledged` --
     /// the number that was ON THE WIRE, not what the TCB made of it.
     ///
@@ -283,6 +321,20 @@ struct Sender {
     /// The current RTO, including any accumulated backoff.
     var retransmissionTimeout: TimeAmount { estimator.retransmissionTimeout }
 
+    /// When the next zero-window probe should go out, or `nil` when this sender
+    /// is not in RFC 9293 §3.8.6.1's persist condition. The caller owns the
+    /// actual timer; this type only says when.
+    var persistDeadline: NIODeadline? { persistTimerDeadline }
+
+    /// The interval the next probe is waiting out, or `nil` outside persist.
+    /// Doubles per probe and saturates at `RTTEstimator.maximumTimeout`.
+    var persistInterval: TimeAmount? { persistTimerInterval }
+
+    /// Whether a probe's byte is on the wire and unacknowledged. Distinct from
+    /// `flightSize == 1`: it says that the outstanding byte is a *probe*, which
+    /// is what keeps the retransmission timer off it (see `persistApplies`).
+    var hasProbeOutstanding: Bool { probeOutstanding }
+
     /// Diagnostic: the total `ByteBuffer.storageCapacity` of every queued
     /// chunk -- the size of the allocations they keep alive, not the number of
     /// bytes they declare. Not `private`, because `@testable import` elevates
@@ -350,6 +402,11 @@ struct Sender {
     /// SND.NXT is advanced over the new data before returning, so the caller
     /// must send everything returned.
     mutating func segmentsToTransmit(tcb: inout TCB, mss: Int) -> [Segment] {
+        // Every `return` below goes through this, so the persist decision is
+        // taken from the state this method LEAVES behind rather than the state
+        // it found -- including the early returns, which are precisely the
+        // paths on which nothing went out and something therefore has to.
+        defer { updatePersistTimer(tcb: tcb) }
         var out: [Segment] = []
 
         if fastRetransmitPending {
@@ -452,8 +509,22 @@ struct Sender {
     /// A window update that happens to repeat the last ACK number is not a
     /// duplicate ACK, and counting it as one retransmits segments nothing was
     /// ever lost of, on an idle connection, invisibly until throughput is
-    /// measured.
+    /// measured. Neither is the acknowledgement a stalled receiver sends back
+    /// for a zero-window probe, which satisfies every one of §3.2's five
+    /// conditions and is evidence of the opposite of loss; see the fourth
+    /// condition on the duplicate branch below.
     mutating func acknowledged(upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0, advertisedWindow: Int) -> Bool {
+        // As in `segmentsToTransmit`, and for the same reason. The one that
+        // matters here is the `advanced == 0` return: an acknowledgement that
+        // retires nothing and reopens the window is the whole point of RFC 9293
+        // §3.10.7.4 admitting SEG.ACK == SND.UNA, and it is what ENDS persist.
+        //
+        // `tcb.sndWnd` has already been updated by the caller at this point --
+        // `TCPStateMachine` runs RFC 9293's window-update rule before handing
+        // the acknowledgement on, and states that ordering as an obligation --
+        // so the window this reads is the one the sender will actually obey,
+        // including when the SND.WL1 rule deliberately refused the update.
+        defer { updatePersistTimer(tcb: tcb) }
         let windowChanged = lastAdvertisedWindow.map { $0 != advertisedWindow } ?? false
         lastAdvertisedWindow = advertisedWindow
 
@@ -469,7 +540,29 @@ struct Sender {
         let flightBefore = outstanding
 
         if advanced == 0 {
-            if segmentLength == 0, !windowChanged, flightBefore > 0 {
+            // `!answeringOnlyAProbe` is the fourth condition, and it is here
+            // because zero-window probing INTRODUCED the need for it. Before
+            // there was a probe, a sender in the persist condition had nothing
+            // outstanding, so RFC 5681 §3.2's condition (a) -- "the receiver of
+            // the ACK has outstanding data" -- was false and a zero-window ACK
+            // could not start a run. A probe makes (a) true, and (b) through (e)
+            // are all true of the ACK a stalled receiver must send back, so
+            // three of them in a row would fast-retransmit the probe byte and
+            // halve `ssthresh` on a path that has dropped nothing.
+            //
+            // §3.2's own statement of what it is for is what excludes them: it
+            // uses duplicate ACKs "as an indication that a segment has been
+            // lost". A zero-window acknowledgement is evidence of the opposite
+            // -- the probe ARRIVED, and the receiver is telling us it discarded
+            // the byte because RFC 9293 §3.10.7.4 makes any SEG.LEN > 0
+            // unacceptable against RCV.WND == 0. A stalled reader is not a
+            // congested path.
+            //
+            // Narrow on purpose: the probe must be the ONLY thing outstanding.
+            // Once the window has reopened and real data is in flight behind an
+            // unacknowledged probe byte, duplicates mean what they always mean
+            // and this must not swallow them.
+            if segmentLength == 0, !windowChanged, flightBefore > 0, !(probeOutstanding && flightBefore == 1) {
                 duplicates += 1
                 // RFC 5681 §3.2: the THIRD duplicate is the loss signal. The
                 // first two are ordinary reordering.
@@ -505,6 +598,10 @@ struct Sender {
 
         duplicates = 0
         fastRetransmitPending = false
+        // A probe's byte is always the one at SND.UNA (`persistApplies` only
+        // lets a probe exist while it is the sole outstanding record), so any
+        // acknowledgement that advances SND.UNA at all has retired it.
+        probeOutstanding = false
         let previousUna = tcb.sndUna
         tcb.sndUna = ack
         retire(previousUna: previousUna, advanced: advanced)
@@ -589,6 +686,11 @@ struct Sender {
             // again. This is the one place that is reachable with the queue
             // known to be empty.
             lostBytes = 0
+            // Same argument, one field over: an empty queue cannot be holding
+            // a probe, and a stale `true` here would hold `persistApplies`'
+            // `outstanding == probeBytes` test open against an outstanding
+            // byte that is not a probe.
+            probeOutstanding = false
             return nil
         }
 
@@ -616,6 +718,274 @@ struct Sender {
         // `min(cwnd, SND.WND)`, and this one is what guarantees forward
         // progress when that window has no room for even a single segment.
         return retransmitOldest(tcb: &tcb)
+    }
+
+    // MARK: - Zero-window probing (RFC 9293 §3.8.6.1, RFC 1122 §4.2.2.17)
+
+    /// The persist timer expired. Returns the one-byte probe to send, or `nil`
+    /// if the persist condition has passed since the timer was armed.
+    ///
+    /// ## This is the rule in this file with no give-up condition, and that is deliberate
+    ///
+    /// RFC 9293 §3.8.6.1: "Probing of zero (offered) windows MUST be supported
+    /// (MUST-36). A TCP implementation MAY keep its offered receive window
+    /// closed indefinitely (MAY-8). As long as the receiving TCP peer continues
+    /// to send acknowledgments in response to the probe segments, the sending
+    /// TCP peer MUST allow the connection to stay open (MUST-37)." RFC 1122
+    /// §4.2.5's summary table states the same thing from the other side:
+    /// "Sender timeout OK conn with zero wind" is a **MUST NOT**.
+    ///
+    /// So what is bounded here is the **interval** between probes, and not
+    /// their number. That is the opposite of the retransmission ladder next
+    /// door, and copying that ladder's shape is the mistake to avoid: a persist
+    /// timer that gives up after *N* probes turns a receiver whose application
+    /// has stopped reading -- RFC 6429 §2's printer that ran out of paper -- into
+    /// a dead connection, and the peer has done nothing wrong. RFC 1122 §4.2.2.17
+    /// authorises the interval bound and declines to pick it: "Exponential
+    /// backoff is recommended, possibly with some maximum interval not specified
+    /// here." `RTTEstimator.maximumTimeout`'s sixty seconds is the one used, so
+    /// that the probe ladder and the RTO ladder saturate at the same place.
+    ///
+    /// ## Why "probe forever" is not an unbounded resource
+    ///
+    /// Because the two things a persisting connection holds were already bounded
+    /// before this method existed, and this method adds a third that is bounded
+    /// by the interval cap:
+    ///
+    /// 1. **The connection block and its timers.** `TCPEndpoint`'s table is
+    ///    capped by the backlog. Note what this does *not* say: the block was
+    ///    already held indefinitely by a zero window before there was any probe
+    ///    at all -- a wedged connection is not a collected one -- so persist adds
+    ///    a timer to a block whose retention it did not cause.
+    /// 2. **The send queue.** `Sender.maximumBufferedBytes` --
+    ///    `TCPEndpoint.sendBufferBytes`, 256 KiB per connection. This is the
+    ///    resource that actually matters and it is far and away the largest:
+    ///    RFC 6429 §3 describes the attack in exactly these terms ("the server is
+    ///    left holding on to the response data in its sending queue... this may
+    ///    result in DoS to legitimate connections by locking up the necessary
+    ///    resources"). A statement of the bound as "one connection and one
+    ///    timer" understates it by five orders of magnitude per connection, so it
+    ///    is stated as what it is: `sendBufferBytes` x the backlog.
+    /// 3. **Probe traffic**, which is the only genuinely new resource. One
+    ///    one-byte segment per connection per interval, and the interval
+    ///    saturates at sixty seconds -- so a persisting connection costs one
+    ///    frame a minute in the steady state, for as long as it lasts.
+    ///
+    /// RFC 6429 §4 is what closes the remaining gap, and this stack satisfies it:
+    /// "a TCP implementation MUST NOT close a connection merely because it seems
+    /// to be stuck in the ZWP or persist condition. Though unstated in RFC 1122,
+    /// but implicit for system robustness, a TCP implementation needs to allow
+    /// connections in the ZWP or persist condition to be closed or aborted by
+    /// their applications or other resource management routines." Persist here
+    /// never closes a connection on its own, and `TCPEndpoint.close()` closes a
+    /// persisting one exactly as it closes any other.
+    ///
+    /// ## Karn
+    ///
+    /// Nothing special, and the absence of a special case is the decision. A
+    /// probe is an ordinary `InFlight` record carrying ordinary new data, so its
+    /// first transmission is unambiguous and its acknowledgement is a legitimate
+    /// RTT sample -- there is exactly one segment it can be answering. Every
+    /// probe after the first goes out through `retransmit`, which increments
+    /// `transmissions`, and `retire` then refuses a sample from the record for
+    /// the rest of its life. That is Karn's algorithm applying to a probe on the
+    /// same terms as to anything else, which is what makes it right: the
+    /// ambiguity Karn guards against is "which transmission is this ACK for",
+    /// and a re-probed byte has exactly that ambiguity.
+    ///
+    /// The commoner case takes no sample at all and needs no rule: a receiver
+    /// with RCV.WND == 0 finds any SEG.LEN > 0 unacceptable (RFC 9293
+    /// §3.10.7.4's acceptability table) and drops the probe's byte, so the ACK
+    /// it must still send carries SEG.ACK == SND.UNA, `advanced` is zero, and
+    /// `retire` -- the only place a sample is taken -- is never reached.
+    mutating func persistTimerFired(tcb: inout TCB) -> Segment? {
+        guard persistApplies(tcb: tcb) else {
+            persistTimerDeadline = nil
+            persistTimerInterval = nil
+            return nil
+        }
+
+        let segment: Segment?
+        if probeOutstanding {
+            // RFC 9293 §3.8.6.1's "or retransmit": once a probe is unanswered
+            // the NEXT probe is that same byte again, never the byte after it.
+            // The peer discarded the first one (see the acceptability note
+            // above), so a byte at SND.UNA + 1 would sit behind a hole the peer
+            // cannot close, and every probe after that would widen it.
+            //
+            // Index 0 is the probe: `persistApplies` has just established that
+            // it is the only record in flight.
+            segment = retransmit(0, tcb: &tcb)
+        } else {
+            segment = cutProbe(tcb: &tcb)
+        }
+
+        guard let segment else {
+            // Unreachable: `persistApplies` has checked everything both
+            // branches need. Fail closed rather than leave a timer re-arming
+            // against a sender that can no longer produce the segment it is
+            // for -- a silent no-op ladder would look exactly like a working
+            // one from outside.
+            persistTimerDeadline = nil
+            persistTimerInterval = nil
+            return nil
+        }
+
+        // RFC 9293 SHLD-30 / RFC 1122 §4.2.2.17: "SHOULD increase exponentially
+        // the interval between successive probes". Measured from the moment the
+        // probe went out, not from the answer to it -- a peer that answers every
+        // probe promptly must not thereby hold the ladder at its first rung.
+        // Never overflows: the operand is `RTTEstimator.maximumTimeout` at
+        // worst, because the previous line through here already clamped it.
+        let next = min((persistTimerInterval ?? estimator.retransmissionTimeout) * 2, RTTEstimator.maximumTimeout)
+        persistTimerInterval = next
+        persistTimerDeadline = clock.now() + next
+        return segment
+    }
+
+    /// Cut, record and hand back the first probe of an episode: **one byte**,
+    /// at SND.NXT, which under `persistApplies` is also SND.UNA.
+    ///
+    /// One byte, and not "as much as fits", because nothing fits: the whole
+    /// point of the persist condition is that the receiver's window admits
+    /// nothing at all, and RFC 9293 §3.8.6.1 asks for "at least one octet of new
+    /// data (if available)". Sending more would be a plain violation of the
+    /// window the peer advertised, and this stack's own `Receiver` would drop it.
+    ///
+    /// The byte is REAL, accounted data -- an `InFlight` record, with SND.NXT
+    /// advanced over it -- and that is load-bearing rather than tidy. The
+    /// scenario persist exists for is a window update lost in flight (RFC 1122
+    /// §4.2.2.17's DISCUSSION: "a connection may hang forever when an ACK
+    /// segment that re-opens the window is lost"), which means the receiver's
+    /// window may well be OPEN when the probe lands. It then accepts the byte
+    /// and acknowledges SND.UNA + 1 -- and a sender that had sent the byte
+    /// without advancing SND.NXT would find that acknowledgement outside RFC
+    /// 9293 §3.10.7.4's acceptable-ACK window and answer its own recovery with a
+    /// challenge ACK.
+    ///
+    /// PSH follows the same per-write rule as every other segment
+    /// (`bytesRemainingInWrite`), so a one-byte write is pushed and the first
+    /// byte of a hundred-byte one is not. Recorded on the `InFlight` record, so
+    /// re-probing reproduces it exactly.
+    private mutating func cutProbe(tcb: inout TCB) -> Segment? {
+        let sent = tcb.sndNxt - tcb.sndUna
+        guard sent == outstanding, sent < queuedBytes, inFlight.count < maximumSegments else { return nil }
+
+        let sequence = tcb.sndNxt
+        let pushes = bytesRemainingInWrite(from: sent) <= 1
+        let payload = gather(offset: sent, length: 1)
+        inFlight.append(
+            InFlight(sequence: sequence, length: 1, transmissions: 1, sentAt: clock.now(), pushes: pushes, presumedLost: false))
+        tcb.sndNxt = sequence + 1
+        outstanding += 1
+        probeOutstanding = true
+        return Segment(sequence: sequence, flags: pushes ? [.ack, .psh] : .ack, payload: payload)
+    }
+
+    /// Bring the persist timer into line with the state this sender is in now.
+    ///
+    /// Arms it from `nil` and never re-arms an already-armed one; see
+    /// `persistTimerDeadline` for why that asymmetry is the point.
+    ///
+    /// RFC 9293 SHLD-29 sets the first interval: "SHOULD send the first
+    /// zero-window probe when a zero window has existed for the retransmission
+    /// timeout period". So the ladder starts at the RTO *as it stands when
+    /// persist begins* -- including any backoff a loss episode left on it, which
+    /// is right: a path that has just been timing out is not one to probe
+    /// aggressively.
+    private mutating func updatePersistTimer(tcb: TCB) {
+        guard persistApplies(tcb: tcb) else {
+            persistTimerDeadline = nil
+            persistTimerInterval = nil
+            return
+        }
+        guard persistTimerDeadline == nil else { return }
+        let interval = estimator.retransmissionTimeout
+        persistTimerInterval = interval
+        persistTimerDeadline = clock.now() + interval
+    }
+
+    /// Whether this sender is in RFC 9293 §3.8.6.1's persist condition.
+    ///
+    /// ## The window test is the RFC's usable window, not `SND.WND == 0`
+    ///
+    /// RFC 9293 §3.8.6.2.1 defines `U = SND.UNA + SND.WND - SND.NXT`, and this
+    /// is `U <= 0`. Writing it as `SND.WND == 0` instead is a live wedge, not a
+    /// nicety: a probe that draws `win 1` while its own byte is still
+    /// outstanding leaves SND.WND at 1 and U at 0, so `SND.WND == 0` would end
+    /// persist while `segmentsToTransmit` still has room for nothing -- and
+    /// since no segment goes out, nothing arms the retransmission timer either,
+    /// and the connection stops with no timer running at all.
+    ///
+    /// `U` is also allowed to go NEGATIVE, per RFC 9293 §3.8.6's MUST-34 on
+    /// shrinking windows, which is why this is `<= 0` and not `== 0`.
+    ///
+    /// ## What happens on `win 1`, since that is the neighbouring question
+    ///
+    /// At `U >= 1` this condition is false, persist ends, and
+    /// `segmentsToTransmit` sends the one byte the window admits. With no
+    /// sender-side silly-window-syndrome avoidance -- RFC 9293 §3.8.6.2.1's
+    /// MUST-38, which this stack does not yet implement -- a peer that reopens
+    /// one byte at a time therefore gets a one-byte-per-round-trip crawl. That
+    /// is poor and it is not a wedge, and it is deliberately preferred to
+    /// staying in persist at `U >= 1`, which WOULD be a wedge: a receiver that
+    /// is genuinely draining one byte at a time is making progress, and refusing
+    /// to send into the window it opened would stall a connection that is
+    /// working. SWS avoidance is the fix and it belongs with the Nagle
+    /// interaction §3.8.6.2 describes, not here.
+    ///
+    /// ## Which timer runs when both would apply
+    ///
+    /// `outstanding == probeBytes` is the arbitration, and it makes persist and
+    /// the retransmission timer **mutually exclusive by construction** rather
+    /// than by policy:
+    ///
+    /// - **Ordinary data is outstanding and the window then shuts.** Persist is
+    ///   off; the retransmission timer is running (RFC 6298 §5.1 armed it when
+    ///   the data went out and §5.2 has not stopped it). That is the right one:
+    ///   `retransmitTimerFired`'s retransmission is already unconditional in the
+    ///   window, so the segment at SND.UNA goes out on the RTO ladder and IS a
+    ///   window probe -- RFC 9293 §3.8.6.1 asks for "at least one octet of new
+    ///   data (if available), **or retransmit**", and §3.8.6.1 requires the peer
+    ///   to answer it: "When the receiving TCP peer has a zero window and a
+    ///   segment arrives, it must still send an acknowledgment showing its next
+    ///   expected sequence number and current window (zero)." Running persist as
+    ///   well would double the probe traffic and buy nothing. RFC 1122
+    ///   §4.2.2.17's DISCUSSION anticipates exactly this: "This procedure is
+    ///   similar to that of the retransmission algorithm, and it may be possible
+    ///   to combine the two procedures in the implementation."
+    /// - **Nothing is outstanding and the window is shut.** RFC 6298 §5.2 has
+    ///   stopped the retransmission timer, so persist is the only thing that can
+    ///   move -- which is the whole gap this method closes.
+    /// - **Only a probe of ours is outstanding.** Persist owns it and the
+    ///   retransmission timer is deliberately never armed for it: nothing calls
+    ///   `armTimer` on the probe path. If it were armed, `retransmitTimerFired`
+    ///   would call `congestionControl.timeout` on every probe, collapsing cwnd
+    ///   and ratcheting `ssthresh` down towards its `2 * SMSS` floor for the
+    ///   whole life of a persist episode -- so a connection that had merely
+    ///   waited out a slow reader would leave persist believing the *path* had
+    ///   been congesting all along. A probe drawing no answer is not a
+    ///   congestion signal; it is a receiver that is still full.
+    ///
+    /// ## And the same fail-closed rule `segmentsToTransmit` uses
+    ///
+    /// `sent == outstanding` refuses to act when SND.NXT has moved by an amount
+    /// this type did not send -- a FIN, in practice. A probe cut at a SND.NXT
+    /// that is one past a FIN would put a data byte after the end of the stream.
+    /// The connection cannot wedge for want of a probe in that state either:
+    /// `TCPEndpoint` is retransmitting the FIN on its own ladder, and the peer
+    /// must acknowledge that with its current window just as it must a probe.
+    private func persistApplies(tcb: TCB) -> Bool {
+        let sent = tcb.sndNxt - tcb.sndUna
+        // RFC 9293 §3.8.6.2.1's usable window, U.
+        guard tcb.sndWnd - sent <= 0 else { return false }
+        guard sent == outstanding else { return false }
+        guard outstanding == (probeOutstanding ? 1 : 0) else { return false }
+        // Something to probe WITH: an unsent byte, or a probe already on the
+        // wire waiting to be sent again. RFC 9293 §3.8.6.1's "(if available)".
+        // With neither, a closed window costs nothing -- the next write is what
+        // starts an episode, and it comes through `segmentsToTransmit`.
+        return unsentBytes > 0 || probeOutstanding
     }
 
     /// Retransmit as many presumed-lost segments as the window has room for,

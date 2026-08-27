@@ -156,31 +156,84 @@ private final class FiringCounter {
     withExtendedLifetime(timers) {}
 }
 
-@Test func cancelAllStopsTheRetransmitAndTheTimeWaitTimerTogether() {
+@Test func cancelAllStopsTheRetransmitThePersistAndTheTimeWaitTimerTogether() {
     let fixture = TimerFixture()
     let cancelled = fixture.makeTimers(timeWaitDuration: .milliseconds(300))
     let kept = fixture.makeTimers(timeWaitDuration: .milliseconds(300))
     let cancelledRetransmit = FiringCounter()
+    let cancelledPersist = FiringCounter()
     let cancelledTimeWait = FiringCounter()
     let keptRetransmit = FiringCounter()
+    let keptPersist = FiringCounter()
     let keptTimeWait = FiringCounter()
 
     cancelled.scheduleRetransmit(after: .milliseconds(100)) { cancelledRetransmit.record() }
+    cancelled.schedulePersist(after: .milliseconds(200)) { cancelledPersist.record() }
     cancelled.startTimeWait { cancelledTimeWait.record() }
     kept.scheduleRetransmit(after: .milliseconds(100)) { keptRetransmit.record() }
+    kept.schedulePersist(after: .milliseconds(200)) { keptPersist.record() }
     kept.startTimeWait { keptTimeWait.record() }
     #expect(cancelled.hasRetransmitScheduled)
+    #expect(cancelled.hasPersistScheduled)
 
     cancelled.cancelAll()
     #expect(!cancelled.hasRetransmitScheduled)
+    #expect(!cancelled.hasPersistScheduled)
 
     fixture.advance(by: .seconds(1))
     #expect(cancelledRetransmit.count == 0)
+    #expect(cancelledPersist.count == 0, "cancelAll must reach the persist timer too — a probe firing into a torn-down connection")
     #expect(cancelledTimeWait.count == 0, "cancelAll must reach the TIME_WAIT timer too, not just the retransmit one")
-    #expect(keptRetransmit.count == 1, "both deadlines really did pass during that advance")
+    #expect(keptRetransmit.count == 1, "all three deadlines really did pass during that advance")
+    #expect(keptPersist.count == 1)
     #expect(keptTimeWait.count == 1)
 
     withExtendedLifetime((cancelled, kept)) {}
+}
+
+@Test func thePersistTimerIsASlotOfItsOwnAndNeitherTimerDisturbsTheOther() {
+    // The two never run at once — `Sender.persistApplies` arms persist only
+    // when RFC 6298 §5.2 has stopped the retransmission timer — so ONE slot
+    // would fit, and this is what says it is nevertheless two. The reason is
+    // that they have opposite give-up rules: RFC 1122 §4.2.3.5's R2 ends the
+    // retransmission ladder, and §4.2.2.17's "Sender timeout OK conn with zero
+    // wind" is a MUST NOT that forbids ending the persist one. A shared slot
+    // would put a give-up rule one edit away from the timer that must not have
+    // one, and every `scheduleRetransmit` would silently discard a pending
+    // probe.
+    let fixture = TimerFixture()
+    let timers = fixture.makeTimers()
+    let retransmit = FiringCounter()
+    let persist = FiringCounter()
+
+    timers.schedulePersist(after: .milliseconds(200)) { persist.record() }
+    timers.scheduleRetransmit(after: .milliseconds(100)) { retransmit.record() }
+    #expect(timers.hasPersistScheduled, "scheduling a retransmission must not have overwritten the pending probe")
+    #expect(timers.hasRetransmitScheduled)
+
+    // And cancelling one leaves the other armed, in both directions.
+    timers.cancelRetransmit()
+    #expect(timers.hasPersistScheduled)
+    #expect(!timers.hasRetransmitScheduled)
+
+    fixture.advance(by: .seconds(1))
+    #expect(retransmit.count == 0)
+    #expect(persist.count == 1, "the probe survived a retransmission being scheduled AND cancelled around it")
+
+    let second = fixture.makeTimers()
+    let secondRetransmit = FiringCounter()
+    let secondPersist = FiringCounter()
+    second.scheduleRetransmit(after: .milliseconds(100)) { secondRetransmit.record() }
+    second.schedulePersist(after: .milliseconds(200)) { secondPersist.record() }
+    second.cancelPersist()
+    #expect(second.hasRetransmitScheduled)
+    #expect(!second.hasPersistScheduled)
+
+    fixture.advance(by: .seconds(1))
+    #expect(secondRetransmit.count == 1, "cancelling the probe must not have taken the retransmission with it")
+    #expect(secondPersist.count == 0)
+
+    withExtendedLifetime((timers, second)) {}
 }
 
 @Test func aRetransmitCancelledAfterItsDeadlinePassesButBeforeTheLoopRunsDoesNotFire() {
@@ -242,24 +295,31 @@ private final class FiringCounter {
     var dropped: TCPTimers? = fixture.makeTimers(timeWaitDuration: .milliseconds(500))
     let kept = fixture.makeTimers(timeWaitDuration: .milliseconds(500))
     let droppedRetransmit = FiringCounter()
+    let droppedPersist = FiringCounter()
     let droppedTimeWait = FiringCounter()
     let keptRetransmit = FiringCounter()
+    let keptPersist = FiringCounter()
     let keptTimeWait = FiringCounter()
 
     dropped!.scheduleRetransmit(after: .milliseconds(500)) { droppedRetransmit.record() }
+    dropped!.schedulePersist(after: .milliseconds(500)) { droppedPersist.record() }
     dropped!.startTimeWait { droppedTimeWait.record() }
     kept.scheduleRetransmit(after: .milliseconds(500)) { keptRetransmit.record() }
+    kept.schedulePersist(after: .milliseconds(500)) { keptPersist.record() }
     kept.startTimeWait { keptTimeWait.record() }
     #expect(dropped!.hasRetransmitScheduled, "something is genuinely armed at the moment we drop the owner")
+    #expect(dropped!.hasPersistScheduled)
 
     dropped = nil
     fixture.advance(by: .seconds(5))
 
     #expect(droppedRetransmit.count == 0, "deinit must cancel the retransmit timer")
+    #expect(droppedPersist.count == 0, "deinit must cancel the persist timer")
     #expect(droppedTimeWait.count == 0, "deinit must cancel the TIME_WAIT timer")
-    // The whole test is vacuous without these two: a deadline that was never
+    // The whole test is vacuous without these three: a deadline that was never
     // reached, or bodies that were never scheduled, would also "not run".
     #expect(keptRetransmit.count == 1, "an owner that is still alive does get its retransmit")
+    #expect(keptPersist.count == 1, "an owner that is still alive does get its probe")
     #expect(keptTimeWait.count == 1, "an owner that is still alive does leave TIME_WAIT")
 
     withExtendedLifetime(kept) {}

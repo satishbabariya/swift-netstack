@@ -363,8 +363,12 @@ Every one of these is a scoped restriction with a reason, not an oversight.
   correctly refuses as outside the window it promised. The trim itself is
   pinned by `tcp-data.vec`'s `right-edge-trim`.
 - **The offered window never goes below 4096.** A closed window puts a
-  sender into RFC 9293 §3.8.6.1's persist state; gVisor has a zero-window
-  probe timer and this stack has none — see "known gaps".
+  sender into RFC 9293 §3.8.6.1's persist state. Both stacks probe one; what
+  they are not required to agree on is *when*. The probe's timing is a SHOULD
+  in both documents that specify it (RFC 9293 SHLD-29, SHLD-30) and the
+  interval ceiling is explicitly left open — RFC 1122 §4.2.2.17: "possibly
+  with some maximum interval not specified here" — so a divergence there would
+  be a report about nothing. See "what this run does NOT cover".
 - **No data after the peer's FIN, and the peer's FIN only with nothing
   queued ahead of it.** Both are cases where the two stacks' handling is
   pinned by vectors (`data-past-the-fin`, `fin-ahead-of-rcv-nxt`) and where
@@ -391,6 +395,16 @@ Every one of these is a scoped restriction with a reason, not an oversight.
 - **The full FIN retransmission budget.** The ladder reaches five rungs
   inside a sequence's virtual time; the eighth-transmission give-up is
   pinned by unit tests.
+- **Zero-window probing, in its entirety.** The generator floors the offered
+  window at 4096 (see the row above), so no sequence ever reaches the persist
+  condition and the harness exercises none of it: not the probe, not its one
+  byte, not the backoff ladder, not the absence of a give-up budget. **A green
+  differential run says nothing whatever about persist.** It is pinned by
+  `tcp-data.vec`'s `a-lost-window-update-is-recovered-by-a-zero-window-probe`
+  and `zero-window-probes-back-off-and-do-not-give-up`, and by the persist
+  section of `TCPSenderTests` — which is where the thousand-probe check that
+  actually falsifies a give-up budget lives, since no vector of a runnable
+  length can reach that far up the ladder.
 - **The duplicate-acknowledgement window condition (e) itself.** Closing the
   SND.WND-update difference above also removed the traffic that exposed
   defect 2: the differential no longer reaches it. It is pinned by
@@ -409,10 +423,6 @@ differential is where they became visible.
   data dropped.** That is an interface consequence (the specified surface
   has no `read()`), and it is the reason the harness has to drain gVisor's
   buffer to make the window field comparable at all. M5.
-- **There is no zero-window probe.** `Sender` has no persist timer, so a
-  window update lost on the way here wedges the connection until the peer
-  sends something else. Pinned by `tcp-data.vec`'s `zero-window`; the
-  generator stays out of persist state. M5.
 - **After a timeout, only the earliest unacknowledged segment is
   retransmitted, once per timeout.** RFC 6298 §5.4 asks for no more, but
   gVisor and Linux go on retransmitting the following segments as

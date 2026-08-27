@@ -157,10 +157,19 @@ private enum DiffLimits {
     /// is pinned by `tcp-data.vec`'s `right-edge-trim` scenario.
     static let maximumGapAhead = 20000
     /// The smallest window the guest ever advertises. Above zero-window
-    /// territory by a wide margin: a sender whose window closes enters RFC
-    /// 9293 §3.8.6.1's persist state, gVisor has a probe timer for it and this
-    /// stack has none, and that gap is an M5 item pinned by a vector rather
-    /// than a thing to rediscover on every second generated sequence.
+    /// territory by a wide margin, so no generated sequence ever enters RFC
+    /// 9293 §3.8.6.1's persist state.
+    ///
+    /// This floor predates the persist timer, and it stays now that there is
+    /// one — for a different and better reason than "this stack has no probe to
+    /// compare". Probe *timing* is a SHOULD in both documents that specify it
+    /// (RFC 9293 SHLD-29 and SHLD-30) and the interval ceiling is explicitly
+    /// left open: RFC 1122 §4.2.2.17 says "possibly with some maximum interval
+    /// not specified here". Two conformant stacks may therefore probe on
+    /// different ladders, and a divergence between them would be a report about
+    /// nothing. Persist is pinned by `tcp-data.vec`'s two probe scenarios and by
+    /// `TCPSenderTests`, and **is not differentially verified** — see
+    /// `differential/README.md`.
     static let minimumOfferedWindow = 4096
     /// The largest advance a single step may make, in milliseconds. Long
     /// enough to walk the whole RTO ladder across a sequence, short enough
@@ -380,15 +389,11 @@ private struct DiffGenerator {
                 // A bare ACK. Occupies no sequence space, so neither stack may
                 // answer it — two peers that acknowledge acknowledgements
                 // never stop.
-                // The window never goes below `DiffLimits.minimumOfferedWindow`.
-                //
-                // A zero or very small window puts a sender into RFC 9293
-                // §3.8.6.1's persist state, and gVisor has a zero-window
-                // probe timer while this stack has none at all — `Sender`'s
-                // omission is deliberate, stated, and pinned by
-                // `tcp-data.vec`'s `zero-window` scenario, and it is an M5 gap
-                // rather than something a fuzzer should rediscover on every
-                // second sequence. See `differential/README.md`.
+                // The window never goes below `DiffLimits.minimumOfferedWindow`,
+                // so no sequence enters RFC 9293 §3.8.6.1's persist state. Both
+                // stacks now probe a zero window; what they are not required to
+                // agree on is WHEN, so the comparison is kept away from it
+                // deliberately. See that constant, and `differential/README.md`.
                 offered = UInt16(DiffLimits.minimumOfferedWindow + Int(rng.next() % UInt64(65536 - DiffLimits.minimumOfferedWindow)))
                 try emit(
                     tcp(".", seq: wire(windowUpdatePoint()), ack: UInt32(1 + acknowledged), window: offered),

@@ -50,9 +50,16 @@
 # .send` throws `.noRoute` after asking, and `TCPEndpoint.emit` swallows that
 # deliberately because the retransmission timer will bring the segment back.
 # That is right in production and it reads as a vector failure. Every scenario
-# in this file is therefore kept well inside one ARP lifetime (the longest is
-# 2.220s), so no line here is quietly a statement about ARP. `tcp-close.vec`
-# does cross 60 seconds, and says there how it handles it.
+# in this file is therefore kept well inside one ARP lifetime, so no line here
+# is quietly a statement about ARP. `tcp-close.vec` does cross 60 seconds, and
+# says there how it handles it.
+#
+# Most scenarios here are under 2.5 seconds and the question does not arise.
+# `zero-window-probes-back-off-and-do-not-give-up` runs to 31.040 and is the one
+# that has to do the arithmetic; it does, at its own head, including why its
+# ladder stops where it does. It is also the only scenario in either file whose
+# `>` lines are NOT provoked by an inbound packet, which is the condition
+# `tcp-close.vec`'s ARP note relies on.
 #
 # ## PSH, and our advertised window barely moving
 #
@@ -178,11 +185,19 @@
 # window for exactly this reason: it retires no data, but it carries a window
 # update, and a sender with no way to act on one can never leave a zero window.
 #
-# What this stack does NOT have, stated here because this is the scenario where
-# its absence lives: a persist timer. RFC 9293 section 3.8.6.1 requires a
-# zero-window probe, and `Sender` has none, so a window update that is lost on
-# the way here wedges the connection until the peer sends something else. The
-# vector pins what the stack does; it is not a claim that nothing is missing.
+# This scenario is the case where the update ARRIVES, and nothing is on the
+# wire between the write and it. That silence is now a statement about TIMING
+# rather than about a missing feature: the persist timer is armed the moment the
+# write finds a shut window, and its first probe is due at 1.020 (0.020 plus the
+# RTO). The update at 0.100 ends persist with 920 ms to spare, so no probe is
+# due and none appears. The two scenarios at the end of this file are the other
+# side of it -- what happens when that update never comes.
+#
+# This comment used to record the absence of a persist timer as a known gap. It
+# is worth leaving the shape of that note visible: the vector was correct then
+# and is correct now, unchanged, because it only ever pinned what goes on the
+# wire in this scenario. A vector written to agree with the implementation would
+# have had to change.
 0.000 < S     0:0(0) win 65535 <mss 1460>
 0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
 0.010 < .     1:1(0) ack 1001 win 0
@@ -674,3 +689,116 @@
 # measured. A stack that sampled the ambiguous handshake retransmits later.
 2.400 > P.    1001:1101(100) ack 1 win 65535
 2.410 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: a-lost-window-update-is-recovered-by-a-zero-window-probe
+#
+# The scenario RFC 1122 section 4.2.2.17's DISCUSSION names: "It is extremely
+# important to remember that ACK segments that contain no data are not reliably
+# transmitted by TCP. If zero window probing is not supported, a connection may
+# hang forever when an ACK segment that re-opens the window is lost."
+#
+# The peer closes its window in the handshake's third leg, the application
+# writes, and the peer's window update is LOST on the way here -- which is
+# expressed by the ABSENCE of a `<` line for it, and is the whole scenario.
+# Compare `zero-window` above, which is the same opening with the update
+# arriving: there, nothing is on the wire between the write and the update.
+# Here there is no update, and the connection has to break the deadlock itself.
+#
+# The probe is ONE byte, at SND.NXT, and it goes out at 0.020 + the RTO. The
+# handshake's 10 ms round trip is folded into the estimator (see
+# `the-handshake-seeds-the-retransmission-timeout`) and lands under RFC 6298
+# section 2.4's one-second floor, so the RTO is 1.000 s exactly: RFC 9293
+# SHLD-29, "the first zero-window probe when a zero window has existed for the
+# retransmission timeout period".
+#
+# No PSH on the probe: 99 bytes of that write are still queued behind it, and
+# RFC 1122 section 4.2.2.2's rule is per-write (see `Sender
+# .bytesRemainingInWrite`).
+#
+# The peer's window had in fact reopened, so it ACCEPTS the probe's byte and
+# acknowledges 1002 -- which is the case that makes the probe's byte have to be
+# real, sequence-consuming data. A probe emitted without advancing SND.NXT
+# would find `ack 1002` outside RFC 9293 section 3.10.7.4's acceptable-ACK
+# window and answer its own recovery with a challenge ACK.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 0
+0.020 < write 100
+1.020 > .     1001:1002(1) ack 1 win 65535
+1.030 < .     1:1(0) ack 1002 win 1000
+1.030 > P.    1002:1101(99) ack 1 win 65535
+1.040 < .     1:1(0) ack 1101 win 1000
+
+
+# scenario: zero-window-probes-back-off-and-do-not-give-up
+#
+# The receiver stays full. It answers every probe -- RFC 9293 section 3.8.6.1
+# requires it to: "When the receiving TCP peer has a zero window and a segment
+# arrives, it must still send an acknowledgment showing its next expected
+# sequence number and current window (zero)" -- and the sender keeps probing.
+#
+# ## Two properties, and they pull in opposite directions
+#
+# 1. The INTERVAL grows: 1, 2, 4, 8, 16 seconds, measured from each probe's own
+#    transmission and not from the answer to it. RFC 9293 SHLD-30 / RFC 1122
+#    section 4.2.2.17: "SHOULD increase exponentially the interval between
+#    successive probes". The ceiling is 60 s (`RTTEstimator.maximumTimeout`),
+#    which this file cannot reach -- see the ARP note below -- and which
+#    `theProbeIntervalBacksOffToSixtySecondsAndTheProbeCountIsNotBoundedAtAll`
+#    pins instead.
+# 2. The COUNT does not grow into a budget. RFC 1122 section 4.2.5's summary
+#    table makes "Sender timeout OK conn with zero wind" a MUST NOT, so there is
+#    no N after which this stops -- which is the opposite of the retransmission
+#    ladder's R2 and is the whole point of the persist timer being a separate
+#    timer. Five probes here is not "indefinitely"; the unit test named above
+#    runs a thousand, which is what actually falsifies a give-up budget.
+#
+# ## Every probe is the SAME byte
+#
+# 1001:1002 five times, never 1002:1003. A receiver with RCV.WND == 0 finds any
+# SEG.LEN > 0 unacceptable (RFC 9293 section 3.10.7.4's acceptability table) and
+# discards the byte, so it stays unacknowledged and `ack 1001` never moves. A
+# probe that walked forward instead would leave a hole the peer could not close
+# and widen it once per probe -- RFC 9293 section 3.8.6.1's "or retransmit".
+#
+# ## Five identical answers and no fast retransmit
+#
+# Each `ack 1001 win 0` line meets every one of RFC 5681 section 3.2's five
+# conditions for a duplicate acknowledgement, INCLUDING (a) "the receiver of the
+# ACK has outstanding data", which the probe's own byte makes true. Three of
+# them would fast-retransmit and halve ssthresh on a path that has dropped
+# nothing; there is no such frame here, and the absence is checked -- the runner
+# fails on any frame the script does not account for.
+#
+# ## The ARP boundary, since this scenario is the first here to go near it
+#
+# `tcp-close.vec`'s header states the rule: past 60 seconds an entry expires and
+# the correct behaviour is an ARP request and no TCP segment, which reads as a
+# vector failure, and a scenario is safe only if every `>` line is emitted from
+# an entry refreshed more recently than that. The probes here are NOT provoked
+# by an inbound packet, so that argument does not cover them -- what does is the
+# arithmetic: the longest gap between an inbound packet and a probe is 15.030 to
+# 31.020, just under 16 seconds. The next rung would be 31.030 to 63.020, still
+# inside; the rung after that would be a full 60 seconds and would NOT be, which
+# is why the ladder stops where it does rather than at the ceiling.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 0
+0.020 < write 100
+1.020 > .     1001:1002(1) ack 1 win 65535
+1.030 < .     1:1(0) ack 1001 win 0
+3.020 > .     1001:1002(1) ack 1 win 65535
+3.030 < .     1:1(0) ack 1001 win 0
+7.020 > .     1001:1002(1) ack 1 win 65535
+7.030 < .     1:1(0) ack 1001 win 0
+15.020 > .    1001:1002(1) ack 1 win 65535
+15.030 < .    1:1(0) ack 1001 win 0
+31.020 > .    1001:1002(1) ack 1 win 65535
+# The peer's application drains just before this probe lands, so the fifth probe
+# finds an open window and its byte is accepted -- `ack 1002`, not `ack 1001`.
+# Five probes were sent and one round trip after the receiver recovered the
+# connection was moving again.
+31.030 < .    1:1(0) ack 1002 win 1000
+31.030 > P.   1002:1101(99) ack 1 win 65535
+31.040 < .    1:1(0) ack 1101 win 1000

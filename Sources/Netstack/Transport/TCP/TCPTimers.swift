@@ -1,8 +1,23 @@
 import NIOCore
 
-/// The two timers one TCP connection owns: retransmission and TIME_WAIT.
+/// The three timers one TCP connection owns: retransmission, persist and
+/// TIME_WAIT.
 ///
-/// Both are one-shot `Scheduled<Void>` tasks rather than NIO `RepeatedTask`s.
+/// ## Persist has a slot of its own, and sharing the retransmit slot would be a bug
+///
+/// The two never run at once — `Sender.persistApplies` arms persist only when
+/// nothing but its own probe byte is outstanding, which is exactly when RFC 6298
+/// §5.2 has stopped the retransmission timer — so one slot would *fit*. It is
+/// still two slots, because the two timers have opposite give-up rules and
+/// sharing the slot is what would let a future edit to either silently change
+/// the other. The retransmission ladder ends: RFC 1122 §4.2.3.5's R2 gives a
+/// connection up when a peer stops answering (this stack applies that budget to
+/// its FIN, in `TCPEndpoint.maximumFinTransmissions`). Persist's does not end at
+/// all: RFC 1122 §4.2.2.17 makes "Sender timeout OK conn with zero wind" a
+/// MUST NOT, and only the *interval* between probes is bounded. A shared slot
+/// would put a give-up rule one edit away from the timer that must not have one.
+///
+/// All three are one-shot `Scheduled<Void>` tasks rather than NIO `RepeatedTask`s.
 /// That is deliberate. Plan 1's `Stack` maintenance timer was a `RepeatedTask`
 /// and it leaked, in two distinct ways, and both failure modes apply here per
 /// *connection* rather than once per stack:
@@ -30,6 +45,7 @@ final class TCPTimers {
     let timeWaitDuration: TimeAmount
 
     private var retransmitTask: Scheduled<Void>?
+    private var persistTask: Scheduled<Void>?
     private var timeWaitTask: Scheduled<Void>?
 
     init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
@@ -65,6 +81,38 @@ final class TCPTimers {
         retransmitTask = nil
     }
 
+    /// Whether a zero-window probe is pending: true from `schedulePersist`
+    /// until the body fires, or until a cancellation, whichever comes first.
+    var hasPersistScheduled: Bool { persistTask != nil }
+
+    /// Arm the persist timer `delay` from *the clock's* now.
+    ///
+    /// Re-arming is the normal case — every probe's backoff does it, and
+    /// `TCPEndpoint` also re-arms on every arriving segment — so this cancels
+    /// any pending probe first, for the same reason `scheduleRetransmit` does.
+    ///
+    /// Re-arming on every arriving segment is only safe because the deadline
+    /// this is handed comes from `Sender.persistDeadline`, which is ABSOLUTE
+    /// and is not pushed out while persist is already armed. A delay recomputed
+    /// from scratch on each segment would let a peer that keeps the window shut
+    /// and chatters at us defer the probe forever — the same defect
+    /// `TCPEndpoint.finDeadline` records for the FIN timer.
+    func schedulePersist(after delay: TimeAmount, _ body: @escaping () -> Void) {
+        persistTask?.cancel()
+        persistTask = nil
+        persistTask = schedule(at: clock.now() + delay) { [weak self] in
+            // Cleared before the body for the same reason as the
+            // retransmission timer: the body re-arms this same timer.
+            self?.persistTask = nil
+            body()
+        }
+    }
+
+    func cancelPersist() {
+        persistTask?.cancel()
+        persistTask = nil
+    }
+
     /// Arm TIME_WAIT for `timeWaitDuration` from *the clock's* now.
     func startTimeWait(_ body: @escaping () -> Void) {
         timeWaitTask?.cancel()
@@ -77,11 +125,12 @@ final class TCPTimers {
 
     func cancelAll() {
         cancelRetransmit()
+        cancelPersist()
         timeWaitTask?.cancel()
         timeWaitTask = nil
     }
 
-    /// `[weak self]` in the two closures above keeps the loop's queue from
+    /// `[weak self]` in the three closures above keeps the loop's queue from
     /// retaining this object, so dropping a connection deallocates its timers
     /// and this `deinit` runs at all. What the `deinit` then buys is separate
     /// and is the reason the weak capture is not enough on its own: the

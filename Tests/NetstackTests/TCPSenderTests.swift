@@ -1074,3 +1074,472 @@ private func establishedSender(
     #expect(resumed.count == 1, "with SND.NXT back where this type left it, transmission resumes")
     #expect(resumed.first?.sequence == SequenceNumber(1100))
 }
+
+// MARK: - Zero-window probing (RFC 9293 3.8.6.1, RFC 1122 4.2.2.17)
+
+// The asymmetry these tests exist to hold: the retransmission ladder above has
+// a give-up rule and this one MUST NOT. RFC 1122 4.2.5's requirement table
+// lists "Sender probe zero window" as a MUST, "Exponential backoff" as a
+// SHOULD, and "Sender timeout OK conn with zero wind" as a MUST NOT -- so what
+// is bounded is the INTERVAL between probes and never their number.
+//
+// Both edges are pinned, because each is trivially satisfied on its own. "The
+// connection did not wedge" is true of a sender that ignores the closed window
+// and sends anyway, which is not a fix but a violation of the peer's
+// advertisement that this stack's own `Receiver` would drop; "no more than one
+// byte went out" is true of a sender that sends nothing at all. And "a probe is
+// not sent while the window is open" is what stops ordinary transmission from
+// passing for a probe.
+
+/// A sender in RFC 9293 3.8.6.1's persist condition: the peer's window is shut,
+/// there is data queued, and nothing is outstanding.
+private func persistingSender(
+    clock: ManualClock, write bytes: Int = 100, segmentSize: Int = 1000, tcb: inout TCB
+) -> Sender {
+    var sender = Sender(
+        congestionControl: Reno(maximumSegmentSize: segmentSize), clock: clock, maximumBufferedBytes: 1 << 20)
+    let accepted = sender.write(senderPayload(bytes))
+    #expect(accepted, "fixture: the write must fit the buffer bound")
+    let none = sender.segmentsToTransmit(tcb: &tcb, mss: segmentSize)
+    #expect(none.isEmpty, "fixture: a closed window puts nothing on the wire")
+    return sender
+}
+
+@Test func aClosedWindowWithDataToSendArmsThePersistTimerAtTheRetransmissionTimeout() {
+    // RFC 9293 SHLD-29: "SHOULD send the first zero-window probe when a zero
+    // window has existed for the retransmission timeout period".
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    let sender = persistingSender(clock: clock, tcb: &tcb)
+
+    #expect(sender.persistDeadline == senderStart + .seconds(1))
+    #expect(sender.persistInterval == .seconds(1))
+    #expect(sender.unsentBytes == 100, "positive control: there IS data the closed window is holding back")
+    #expect(sender.retransmitDeadline == nil, "RFC 6298 5.1 arms the retransmission timer when data is SENT; none was")
+
+    // Positive control on the other side: an identically-fed sender whose peer
+    // left its window open arms the retransmission timer and NO persist timer.
+    // Without it, `persistDeadline != nil` above is equally true of a sender
+    // that arms persist unconditionally.
+    var openTCB = senderTCB(sndWnd: 65535)
+    var open = Sender(congestionControl: Reno(maximumSegmentSize: 1000), clock: ManualClock(start: senderStart), maximumBufferedBytes: 1 << 20)
+    let written = open.write(senderPayload(100))
+    #expect(written)
+    let segments = open.segmentsToTransmit(tcb: &openTCB, mss: 1000)
+    #expect(segments.map(\.payload.readableBytes) == [100])
+    #expect(open.persistDeadline == nil)
+    #expect(open.persistInterval == nil)
+    #expect(open.retransmitDeadline == senderStart + .seconds(1))
+}
+
+@Test func aZeroWindowProbeCarriesExactlyOneByteAndTakesASequenceNumberForIt() throws {
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+    let queued = senderBytes(senderPayload(100))
+
+    clock.advance(by: .seconds(1))
+    let sent = sender.persistTimerFired(tcb: &tcb)
+    let probe = try #require(sent)
+
+    // The lower edge: something went out.
+    #expect(probe.sequence == SequenceNumber(100))
+    #expect(senderBytes(probe) == [queued[0]], "the first unsent byte, and it is a real byte off the queue")
+    // The upper edge: exactly one byte, not the queue. RFC 9293 3.8.6.1 asks
+    // for "at least one octet of new data (if available)" -- and the window
+    // admits nothing, so anything past the first byte is a plain violation of
+    // what the peer advertised.
+    #expect(probe.payload.readableBytes == 1)
+    #expect(probe.flags == .ack, "no PSH: 99 bytes of this write are still queued behind the probe")
+
+    // The probe's byte is REAL, accounted data. A probe that did not advance
+    // SND.NXT would find the acknowledgement of an ACCEPTED probe -- the very
+    // case persist exists for, since the lost segment may have been a window
+    // update -- outside RFC 9293 3.10.7.4's acceptable-ACK window.
+    #expect(tcb.sndNxt == SequenceNumber(101))
+    #expect(sender.flightSize == 1)
+    #expect(sender.hasProbeOutstanding)
+    #expect(sender.unsentBytes == 99, "the other 99 bytes are still queued, neither sent nor dropped")
+}
+
+@Test func aProbeIsNeverSentWhileTheWindowIsOpen() {
+    // Without this, ordinary transmission passes for a probe: a "probe" that is
+    // really just the sender sending what it was going to send anyway satisfies
+    // every wedge test above.
+    //
+    // The window is wide open and 10000 bytes are still queued -- the congestion
+    // window is what is holding them back, and persist is about the RECEIVER's
+    // window, so this must be no part of it.
+    var tcb = senderTCB(sndWnd: 65535)
+    let clock = ManualClock(start: senderStart)
+    var sender = establishedSender(clock: clock, write: 20000, tcb: &tcb)
+    #expect(sender.unsentBytes == 10000, "positive control: there is unsent data, so 'nothing to probe with' is not why")
+    #expect(sender.persistDeadline == nil)
+
+    clock.advance(by: .seconds(10))
+    let probe = sender.persistTimerFired(tcb: &tcb)
+
+    #expect(probe == nil)
+    #expect(tcb.sndNxt == SequenceNumber(10100), "unchanged: no byte was taken out of turn")
+    #expect(sender.flightSize == 10000)
+}
+
+@Test func theProbeIntervalBacksOffToSixtySecondsAndTheProbeCountIsNotBoundedAtAll() throws {
+    // RFC 1122 4.2.2.17: "SHOULD increase exponentially the interval between
+    // successive probes... possibly with some maximum interval not specified
+    // here", against "Sender timeout OK conn with zero wind" as a MUST NOT.
+    // Bound the interval, never the count. A thousand probes is not a round
+    // number chosen for comfort: it falsifies any give-up budget a reader
+    // might reach for by analogy with `TCPEndpoint.maximumFinTransmissions`.
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+
+    var intervals: [TimeAmount] = []
+    var probes = 0
+    for _ in 0..<1000 {
+        let deadline = try #require(sender.persistDeadline, "persist stopped after \(probes) probes")
+        clock.advance(by: deadline - clock.now())
+        if sender.persistTimerFired(tcb: &tcb) != nil { probes += 1 }
+        // The peer answers every probe, and its window is still shut. RFC 9293
+        // 3.8.6.1 requires exactly this of it: "When the receiving TCP peer has
+        // a zero window and a segment arrives, it must still send an
+        // acknowledgment showing its next expected sequence number and current
+        // window (zero)."
+        let accepted = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 0)
+        #expect(accepted)
+        intervals.append(try #require(sender.persistInterval))
+    }
+
+    #expect(probes == 1000)
+    #expect(
+        Array(intervals.prefix(8)) == [.seconds(2), .seconds(4), .seconds(8), .seconds(16), .seconds(32), .seconds(60), .seconds(60), .seconds(60)],
+        "the same ladder the RTO climbs, saturating at RTTEstimator.maximumTimeout")
+    #expect(intervals.allSatisfy { $0 <= .seconds(60) })
+    #expect(sender.flightSize == 1, "a thousand probes are a thousand transmissions of ONE byte")
+    #expect(tcb.sndNxt == SequenceNumber(101))
+}
+
+@Test func aProbeGoesOutAfterATimeoutHasCollapsedTheCongestionWindow() throws {
+    // A connection that has just timed out and then sees a closed window is the
+    // case that never recovers if the probe is gated on `min(cwnd, SND.WND)`
+    // the way ordinary transmission is: SND.WND is zero, so that quantity is
+    // zero, so no probe would ever go out at any congestion window at all.
+    var tcb = senderTCB(sndWnd: 65535)
+    let clock = ManualClock(start: senderStart)
+    var sender = establishedSender(clock: clock, write: 3000, tcb: &tcb)
+    let more = sender.write(senderPayload(1000, from: 64))
+    #expect(more)
+
+    clock.advance(by: .seconds(1))
+    _ = sender.retransmitTimerFired(tcb: &tcb)
+    #expect(sender.congestionControl.congestionWindow == 1000, "positive control: RFC 5681 3.1 collapsed cwnd to one segment")
+
+    // Everything outstanding is acknowledged, and the peer shuts its window in
+    // the same segment. `TCPStateMachine` applies the window update before
+    // handing the acknowledgement on; this is that ordering, by hand.
+    clock.advance(by: .milliseconds(10))
+    tcb.sndWnd = 0
+    let accepted = sender.acknowledged(upTo: SequenceNumber(3100), tcb: &tcb, advertisedWindow: 0)
+    #expect(accepted)
+    #expect(sender.flightSize == 0)
+    #expect(sender.unsentBytes == 1000)
+    #expect(min(sender.congestionControl.congestionWindow, tcb.sndWnd) == 0, "the quantity a copied send decision would gate the probe on")
+
+    let deadline = try #require(sender.persistDeadline)
+    clock.advance(by: deadline - clock.now())
+    let sent = sender.persistTimerFired(tcb: &tcb)
+    let probe = try #require(sent)
+
+    #expect(probe.payload.readableBytes == 1)
+    #expect(probe.sequence == SequenceNumber(3100))
+}
+
+@Test func anUnansweredProbeIsSentAgainRatherThanTheByteAfterIt() throws {
+    // RFC 9293 3.8.6.1's "or retransmit". A receiver with RCV.WND == 0 finds
+    // any SEG.LEN > 0 unacceptable (3.10.7.4's acceptability table) and
+    // discards the probe's byte, so a probe at SND.UNA + 1 would sit behind a
+    // hole the peer cannot close -- and every probe after it would widen it.
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+    let queued = senderBytes(senderPayload(100))
+
+    var sequences: [SequenceNumber] = []
+    var payloads: [[UInt8]] = []
+    for _ in 0..<4 {
+        let deadline = try #require(sender.persistDeadline)
+        clock.advance(by: deadline - clock.now())
+        let sent = sender.persistTimerFired(tcb: &tcb)
+        let probe = try #require(sent)
+        sequences.append(probe.sequence)
+        payloads.append(senderBytes(probe))
+    }
+
+    #expect(sequences == Array(repeating: SequenceNumber(100), count: 4))
+    #expect(payloads == Array(repeating: [queued[0]], count: 4))
+    #expect(tcb.sndNxt == SequenceNumber(101), "SND.NXT moved once, for the first probe, and never again")
+    #expect(sender.flightSize == 1)
+    #expect(sender.unacknowledgedCount == 1, "one record, sent four times -- not four records")
+}
+
+@Test func aNonZeroWindowEndsPersistAndOrdinaryTransmissionResumes() throws {
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+
+    clock.advance(by: .seconds(1))
+    let sent = sender.persistTimerFired(tcb: &tcb)
+    let probe = try #require(sent)
+    #expect(probe.payload.readableBytes == 1)
+    #expect(sender.persistDeadline == senderStart + .seconds(3), "positive control: the ladder had moved to its second rung")
+
+    // The peer's window had in fact reopened -- its update was what went
+    // missing -- so it ACCEPTS the probe's byte and acknowledges past it. This
+    // is RFC 1122 4.2.2.17's own scenario: "a connection may hang forever when
+    // an ACK segment that re-opens the window is lost."
+    clock.advance(by: .milliseconds(10))
+    tcb.sndWnd = 1000
+    let accepted = sender.acknowledged(upTo: SequenceNumber(101), tcb: &tcb, advertisedWindow: 1000)
+    #expect(accepted)
+
+    #expect(sender.persistDeadline == nil)
+    #expect(sender.persistInterval == nil, "the ladder is reset, so a later episode starts at the RTO again")
+    #expect(sender.hasProbeOutstanding == false)
+
+    let segments = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(segments.map(\.payload.readableBytes) == [99])
+    #expect(segments.map(\.sequence) == [SequenceNumber(101)])
+    #expect(sender.persistDeadline == nil)
+    #expect(sender.retransmitDeadline != nil, "RFC 6298 5.1: data went out, so the retransmission timer takes over")
+}
+
+@Test func aProbeAnsweredWithAWindowOfOneStaysInPersistAndAWindowOfTwoDoesNot() throws {
+    // The condition is RFC 9293 3.8.6.2.1's usable window `U = SND.UNA +
+    // SND.WND - SND.NXT`, not `SND.WND == 0`. Written the second way, a peer
+    // that answers a probe with `win 1` leaves U at zero while persist ends:
+    // nothing can go out, and because nothing goes out nothing arms the
+    // retransmission timer either, so the connection stops with no timer
+    // running at all.
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+
+    clock.advance(by: .seconds(1))
+    let sent = sender.persistTimerFired(tcb: &tcb)
+    #expect(sent != nil)
+
+    clock.advance(by: .milliseconds(10))
+    tcb.sndWnd = 1
+    let one = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 1)
+    #expect(one)
+    #expect(sender.persistDeadline == senderStart + .seconds(3), "U is 1 - 1 = 0, so the persist condition holds")
+    let none = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(none.isEmpty, "positive control: the window of one admits nothing, so nothing else can move")
+    #expect(sender.retransmitDeadline == nil, "and nothing armed the retransmission timer -- persist is the only timer running")
+
+    // One more byte of window, and U is 1. Persist ends and the byte goes out.
+    // With no sender-side silly-window-syndrome avoidance yet (RFC 9293
+    // MUST-38) that is a one-byte-per-round-trip crawl, which is poor and is
+    // not a wedge -- and it is deliberately preferred to staying in persist,
+    // which would stall a receiver that is genuinely draining.
+    tcb.sndWnd = 2
+    let two = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 2)
+    #expect(two)
+    #expect(sender.persistDeadline == nil)
+    let crawl = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(crawl.map(\.payload.readableBytes) == [1])
+    #expect(crawl.map(\.sequence) == [SequenceNumber(101)])
+}
+
+@Test func thePersistTimerAndTheRetransmissionTimerAreNeverBothRunning() throws {
+    // RFC 9293's answer is that the two are mutually exclusive in practice, and
+    // here that is true BY CONSTRUCTION rather than by policy: persist arms only
+    // when nothing but its own probe byte is outstanding, which is exactly when
+    // RFC 6298 5.2 has stopped the retransmission timer.
+    func armed(_ sender: Sender) -> [String] {
+        var names: [String] = []
+        if sender.retransmitDeadline != nil { names.append("retransmit") }
+        if sender.persistDeadline != nil { names.append("persist") }
+        return names
+    }
+
+    var tcb = senderTCB(sndWnd: 65535)
+    let clock = ManualClock(start: senderStart)
+    var sender = establishedSender(clock: clock, write: 3000, tcb: &tcb)
+    let more = sender.write(senderPayload(1000, from: 64))
+    #expect(more)
+    #expect(armed(sender) == ["retransmit"], "data outstanding, window open")
+
+    // The peer shuts its window with our data still outstanding. The RTO keeps
+    // it: `retransmitTimerFired`'s retransmission is already unconditional in
+    // the window, so the segment at SND.UNA goes out on the RTO ladder and IS
+    // the probe -- RFC 9293 3.8.6.1's "or retransmit", and 3.8.6.1 requires the
+    // peer to answer it with its current window.
+    tcb.sndWnd = 0
+    let shut = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 0)
+    #expect(shut)
+    #expect(armed(sender) == ["retransmit"], "data outstanding, window shut")
+
+    // Everything is acknowledged and the window is still shut. RFC 6298 5.2
+    // stops the retransmission timer, and persist is now the only thing that
+    // can move the connection at all.
+    clock.advance(by: .milliseconds(10))
+    let drained = sender.acknowledged(upTo: SequenceNumber(3100), tcb: &tcb, advertisedWindow: 0)
+    #expect(drained)
+    #expect(armed(sender) == ["persist"], "nothing outstanding, window shut")
+
+    let deadline = try #require(sender.persistDeadline)
+    clock.advance(by: deadline - clock.now())
+    let sent = sender.persistTimerFired(tcb: &tcb)
+    #expect(sent != nil)
+    #expect(armed(sender) == ["persist"], "only a probe of ours is outstanding, and persist owns it")
+
+    // Nothing armed the retransmission timer for the probe, and that is the
+    // point: `retransmitTimerFired` calls `congestionControl.timeout` on every
+    // expiry, so a probe on the RTO ladder would ratchet `ssthresh` down
+    // towards its floor for the whole life of a persist episode -- reporting a
+    // slow reader as a congested path.
+    #expect(sender.congestionControl.slowStartThreshold == .max, "no congestion event has happened on this connection, and a probe is not one")
+
+    tcb.sndWnd = 65535
+    let reopened = sender.acknowledged(upTo: SequenceNumber(3100), tcb: &tcb, advertisedWindow: 65535)
+    #expect(reopened)
+    #expect(armed(sender) == [], "window open, nothing sent yet")
+    let resumed = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(!resumed.isEmpty)
+    #expect(armed(sender) == ["retransmit"], "and the retransmission timer takes it back")
+}
+
+@Test func aProbeAcknowledgedOnceIsAnRttSampleAndAReProbedByteIsNot() {
+    // Karn's algorithm applies to a probe on exactly the same terms as to
+    // anything else, and the absence of a special case is the decision. A probe
+    // is an ordinary in-flight record: its first transmission is unambiguous, so
+    // an acknowledgement of it can only be answering that one transmission;
+    // every probe after the first goes out through `retransmit`, which
+    // increments `transmissions`, and `retire` then refuses a sample for the
+    // rest of the record's life.
+    //
+    // The estimator is seeded with a four-second handshake so that the samples
+    // below are above RFC 6298 2.4's one-second floor and therefore visible at
+    // all -- and so the persist ladder starts at a 12-second rung, which is what
+    // leaves room for a second probe before the acknowledgement arrives.
+    func seeded(_ clock: ManualClock, tcb: inout TCB) -> Sender {
+        var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1000), clock: clock, maximumBufferedBytes: 1 << 20)
+        sender.measureHandshakeRoundTrip(.seconds(4))
+        let accepted = sender.write(senderPayload(100))
+        #expect(accepted)
+        let none = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+        #expect(none.isEmpty)
+        return sender
+    }
+
+    // Unambiguous: probed once, then accepted.
+    var onceTCB = senderTCB(sndWnd: 0)
+    let onceClock = ManualClock(start: senderStart)
+    var once = seeded(onceClock, tcb: &onceTCB)
+    #expect(once.retransmissionTimeout == .seconds(12))
+    #expect(once.persistDeadline == senderStart + .seconds(12))
+
+    onceClock.advance(by: .seconds(12))
+    _ = once.persistTimerFired(tcb: &onceTCB)
+    onceClock.advance(by: .seconds(4))
+    onceTCB.sndWnd = 1000
+    let acceptedOnce = once.acknowledged(upTo: SequenceNumber(101), tcb: &onceTCB, advertisedWindow: 1000)
+    #expect(acceptedOnce)
+    // RFC 6298 2.3 against SRTT = RTTVAR = 4s/2s and a fresh 4s sample:
+    // RTTVAR = 2 - 0.5 + 0 = 1.5s, SRTT = 4s, RTO = 4 + max(G, 6) = 10s.
+    #expect(once.retransmissionTimeout == .seconds(10), "the sample was taken")
+
+    // Ambiguous: probed twice, then accepted. Identical in every other respect.
+    var twiceTCB = senderTCB(sndWnd: 0)
+    let twiceClock = ManualClock(start: senderStart)
+    var twice = seeded(twiceClock, tcb: &twiceTCB)
+
+    twiceClock.advance(by: .seconds(12))
+    _ = twice.persistTimerFired(tcb: &twiceTCB)
+    twiceClock.advance(by: .seconds(24))
+    _ = twice.persistTimerFired(tcb: &twiceTCB)
+    twiceClock.advance(by: .seconds(4))
+    twiceTCB.sndWnd = 1000
+    let acceptedTwice = twice.acknowledged(upTo: SequenceNumber(101), tcb: &twiceTCB, advertisedWindow: 1000)
+    #expect(acceptedTwice)
+    #expect(twice.retransmissionTimeout == .seconds(12), "unchanged: the acknowledgement could be answering either probe")
+}
+
+@Test func theAcknowledgementAStalledReceiverSendsBackIsNotADuplicateAcknowledgement() throws {
+    // Introduced BY the probe. Before there was one, a sender in persist had
+    // nothing outstanding, so RFC 5681 3.2's condition (a) was false and a
+    // zero-window acknowledgement could not start a run. The probe's byte makes
+    // (a) true, and (b) through (e) all hold of the acknowledgement RFC 9293
+    // 3.8.6.1 REQUIRES a stalled receiver to send -- so three in a row would
+    // fast-retransmit the probe and halve `ssthresh` on a path that has dropped
+    // nothing at all.
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+
+    clock.advance(by: .seconds(1))
+    let sent = sender.persistTimerFired(tcb: &tcb)
+    #expect(sent != nil)
+
+    for _ in 0..<5 {
+        clock.advance(by: .milliseconds(10))
+        let accepted = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 0)
+        #expect(accepted)
+    }
+
+    #expect(sender.duplicateAcknowledgements == 0)
+    #expect(sender.congestionControl.slowStartThreshold == .max, "nothing halved the window")
+    #expect(sender.congestionControl.congestionWindow == 10000, "and nothing inflated it either")
+    // Narrow on purpose. `theThirdDuplicateAcknowledgementRetransmitsTheOldestSegmentAndReducesTheWindow`
+    // is the positive control that the same five conditions on ordinary
+    // outstanding data still do fast-retransmit; this suppresses only the case
+    // where the probe is the sole thing in flight.
+    #expect(sender.flightSize == 1)
+    #expect(sender.hasProbeOutstanding)
+}
+
+@Test func persistRefusesToProbeWhenSomethingElseHasTakenSequenceSpace() {
+    // The same fail-closed rule `segmentsToTransmit` applies, for the same
+    // reason: a FIN moves SND.NXT by an amount this type's offsets do not
+    // account for, and a probe cut there would put a data byte past the end of
+    // the stream. The connection cannot wedge for want of a probe in that state
+    // either -- `TCPEndpoint` is retransmitting the FIN on its own ladder, and
+    // the peer must acknowledge that with its current window just as it must a
+    // probe.
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = persistingSender(clock: clock, write: 100, tcb: &tcb)
+    #expect(sender.persistDeadline == senderStart + .seconds(1), "positive control: persist WAS armed")
+
+    tcb.sndNxt = tcb.sndNxt + 1
+    clock.advance(by: .seconds(1))
+    let probe = sender.persistTimerFired(tcb: &tcb)
+
+    #expect(probe == nil)
+    #expect(sender.persistDeadline == nil)
+    #expect(sender.persistInterval == nil)
+    #expect(tcb.sndNxt == SequenceNumber(101), "and no byte was cut from the wrong place in the stream")
+    #expect(sender.flightSize == 0)
+}
+
+@Test func aClosedWindowWithNothingQueuedDoesNotProbe() {
+    // RFC 9293 3.8.6.1's "(if available)". A shut window costs nothing while
+    // there is nothing to send: the next write is what starts an episode, and
+    // it comes through `segmentsToTransmit`. Probing here would put a
+    // connection with no data to move on a timer for the life of the process.
+    var tcb = senderTCB(sndWnd: 0)
+    let clock = ManualClock(start: senderStart)
+    var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1000), clock: clock, maximumBufferedBytes: 1 << 20)
+
+    let empty = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(empty.isEmpty)
+    #expect(sender.persistDeadline == nil)
+
+    let accepted = sender.write(senderPayload(100))
+    #expect(accepted)
+    let still = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(still.isEmpty)
+    #expect(sender.persistDeadline == senderStart + .seconds(1), "the write is what starts the episode")
+}

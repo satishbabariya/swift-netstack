@@ -66,6 +66,14 @@ import NIOCore
 /// - Our own FIN is retransmitted at most `maximumFinTransmissions` times before
 ///   the connection is given up, so a peer that never acknowledges it cannot pin
 ///   a block, a registration and a timer for the life of the process.
+/// - **The zero-window probe is the one thing here with no count bound at all**,
+///   and that is required rather than overlooked: RFC 1122 §4.2.2.17 makes
+///   "Sender timeout OK conn with zero wind" a MUST NOT. What bounds it is the
+///   interval (sixty seconds in the steady state) and the two resources a
+///   persisting connection holds, both of which are capped above — the block, by
+///   the backlog, and the send queue, by `sendBufferBytes`.
+///   `Sender.persistTimerFired` states the whole argument, including what RFC
+///   6429 §3 says the real cost of a persisting connection is.
 public final class TCPEndpoint: TransportEndpointDelegate {
     /// The largest backlog any caller may ask for. The application chooses the
     /// backlog, not the guest, so this is a guard rail rather than a defence --
@@ -369,6 +377,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard connection.sender.write(bytes) else { throw StackError.wouldBlock }
         transmit(on: connection)
         armRetransmitTimer(on: connection)
+        // A write into a connection whose peer has closed its window puts
+        // nothing on the wire, so this is the ONE place an episode of persist
+        // can begin without a segment having arrived. Without it the connection
+        // waits for the peer to send something before it starts probing, which
+        // is precisely the wedge the probe exists to break.
+        armPersistTimer(on: connection)
     }
 
     /// Close every connection, release the **listening** port, and keep every
@@ -432,6 +446,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         for connection in connections.values {
             registerInOwnRight(connection)
             armRetransmitTimer(on: connection)
+            // Cancels it, in every state `close()` can leave a connection in.
+            // RFC 6429 §4 is the requirement being met here: a connection in the
+            // persist condition "needs to allow ... to be closed or aborted by
+            // their applications", which is the counterweight to persist itself
+            // having no give-up rule.
+            armPersistTimer(on: connection)
         }
         if let boundID {
             stack.transportDemuxer.unregister(boundID, protocolNumber: .tcp)
@@ -459,6 +479,18 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     var congestionWindowForTesting: Int? {
         guard connections.count == 1, let connection = connections.values.first else { return nil }
         return connection.sender.congestionControl.congestionWindow
+    }
+
+    /// Whether the single connection this endpoint holds has a zero-window probe
+    /// scheduled, or nil if it holds none or more than one.
+    ///
+    /// The NIO-level fact, not the sender's opinion: `Sender.persistDeadline`
+    /// says when a probe is due and this says that a timer was actually armed
+    /// for it. A test asserting only the former passes on an endpoint that never
+    /// calls `armPersistTimer`.
+    var hasPersistScheduledForTesting: Bool? {
+        guard connections.count == 1, let connection = connections.values.first else { return nil }
+        return connection.timers.hasPersistScheduled
     }
 
     /// How many of them are in TIME-WAIT. The cap is on this number, and a cap
@@ -580,6 +612,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
         }
         armRetransmitTimer(on: connection)
+        armPersistTimer(on: connection)
 
         switch connection.tcb.state {
         case .closeWait, .closing, .lastAck, .timeWait, .closed:
@@ -836,6 +869,54 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         }
 
         armRetransmitTimer(on: connection)
+    }
+
+    /// Bring the persist timer into line with what the sender says, exactly as
+    /// `armRetransmitTimer` does for the retransmission timer, and with the same
+    /// `[weak self]` + re-find-by-key discipline for the same reason.
+    ///
+    /// The state gate is `send()`'s: those are the two states in which the
+    /// application can put data into the send queue, so they are the only two in
+    /// which a closed receive window can be holding data back. Everything past
+    /// them either has a FIN in the sequence space -- which `Sender
+    /// .persistApplies` refuses on its own, so this is belt as well as braces --
+    /// or is a connection with nothing left to send.
+    private func armPersistTimer(on connection: Connection) {
+        switch connection.tcb.state {
+        case .established, .closeWait:
+            break
+        case .closed, .listen, .synSent, .synReceived, .finWait1, .finWait2, .closing, .lastAck, .timeWait:
+            connection.timers.cancelPersist()
+            return
+        }
+        guard let deadline = connection.sender.persistDeadline else {
+            connection.timers.cancelPersist()
+            return
+        }
+        let now = stack.clock.now()
+        let delay = deadline > now ? deadline - now : .nanoseconds(0)
+        let peer = connection.peer
+        connection.timers.schedulePersist(after: delay) { [weak self] in
+            self?.persistTimerFired(peer: peer)
+        }
+    }
+
+    /// RFC 9293 §3.8.6.1's zero-window probe, out through the single egress
+    /// point like everything else this endpoint emits.
+    ///
+    /// The deadline is re-checked against the clock before the probe is taken,
+    /// for the same reason `retransmitTimerFired` re-checks the sender's: this
+    /// body is re-armed on every arriving segment, so it can be reached with the
+    /// deadline still in the future if the schedule and the sender's own idea of
+    /// when disagree. Re-arming and returning is then the whole of the work.
+    private func persistTimerFired(peer: Peer) {
+        guard let connection = connections[peer] else { return }
+        if let deadline = connection.sender.persistDeadline, deadline <= stack.clock.now(),
+            let segment = connection.sender.persistTimerFired(tcb: &connection.tcb)
+        {
+            emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
+        }
+        armPersistTimer(on: connection)
     }
 
     /// True while a FIN we sent is still unacknowledged.

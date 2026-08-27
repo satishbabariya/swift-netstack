@@ -235,6 +235,8 @@ private let closeVectors = "tcp-close"
         "the-handshake-seeds-the-retransmission-timeout",
         "a-handshake-sample-makes-the-first-data-sample-a-subsequent-one",
         "an-ambiguous-handshake-is-not-sampled",
+        "a-lost-window-update-is-recovered-by-a-zero-window-probe",
+        "zero-window-probes-back-off-and-do-not-give-up",
     ]
     #expect(try transferScenarioNames(dataVectors) == run)
 }
@@ -425,6 +427,31 @@ private let closeVectors = "tcp-close"
     // is the only one where that check is doing real work rather than
     // restating something no line could violate.
     #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+// The two zero-window-probe scenarios. Neither is covered by the differential
+// harness and neither ever will be: the generator floors its offered window at
+// `DiffLimits.minimumOfferedWindow` on purpose, so a green differential run says
+// nothing whatever about persist. See `differential/README.md`.
+
+@Test func aWindowUpdateLostInFlightIsRecoveredByAZeroWindowProbe() throws {
+    let harness = try runTransferScenario(dataVectors, "a-lost-window-update-is-recovered-by-a-zero-window-probe")
+    // The wire lines pin the probe and the recovery; this pins the half no `>`
+    // line can state, which is that the connection was not merely noisy but
+    // actually delivered. Without a persist timer nothing at all is emitted
+    // after 0.020 and the scenario fails on the missing frame at 1.020.
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+    #expect(harness.endpoint.hasPersistScheduledForTesting == false, "persist ended when the window reopened")
+}
+
+@Test func aReceiverThatStaysFullIsProbedRepeatedlyAndTheConnectionIsNotGivenUp() throws {
+    let harness = try runTransferScenario(dataVectors, "zero-window-probes-back-off-and-do-not-give-up")
+    // Still here after five unanswered probes: RFC 1122 §4.2.5's "Sender
+    // timeout OK conn with zero wind" is a MUST NOT, so no ladder in this stack
+    // may count this connection down. A stack with a give-up budget would have
+    // removed the block and reported it closed.
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+    #expect(harness.application.closedReports == 0)
 }
 
 // MARK: - tcp-close.vec

@@ -67,6 +67,25 @@ public final class Stack {
     public let ipv4: IPv4Protocol
     public let transportDemuxer = TransportDemuxer()
 
+    /// The stack's only source of time, held so the transports built on top of
+    /// it (`TCPEndpoint`'s `Sender` and `TCPTimers`) read the same clock the
+    /// `ARPCache` and the `Reassembler` do. Nothing in this package may call
+    /// `NIODeadline.now()`, so an endpoint that could not reach this would have
+    /// no lawful way to tell the time.
+    public let clock: NetstackClock
+
+    /// The per-stack RFC 6528 initial-send-sequence generator.
+    ///
+    /// Its secret is made **once, here**, and never leaves the process — that is
+    /// the whole of what makes an ISS unguessable from another connection's.
+    /// `TCPEndpoint.init(stack:)` takes this one; the internal
+    /// `init(stack:initialSequenceNumbers:)` is the seam a test (or a
+    /// differential vector written in absolute sequence numbers) overrides.
+    /// Internal rather than public: a caller outside the module has no business
+    /// replacing it, and making it public would put "use a constant ISS" in the
+    /// package's supported surface.
+    let initialSequenceNumbers: any InitialSequenceNumbers
+
     private let allocator: ByteBufferAllocator
     private var maintenanceTask: RepeatedTask?
 
@@ -79,6 +98,8 @@ public final class Stack {
         self.eventLoop = link.eventLoop
         self.configuration = configuration
         self.allocator = allocator
+        self.clock = clock
+        self.initialSequenceNumbers = RFC6528SequenceNumbers(clock: clock)
 
         let nic = NIC(id: 1, link: link)
         nic.addAddress(configuration.gatewayAddress, prefixLength: configuration.subnet.prefixLength)
@@ -163,6 +184,54 @@ public final class Stack {
             let message = ICMPv4.destinationUnreachable(
                 code: .port, quoting: header, quotedPayload: quoted, allocator: allocator)
             try? ipv4.send(payload: message, to: header.source, from: header.destination, protocolNumber: .icmp)
+        }
+
+        // `[weak ipv4]` for the same reason as the UDP handler just above: this
+        // closure is stored in `ipv4.handlers`, so a strong capture makes
+        // `IPv4Protocol` retain itself. This is the THIRD handler closure
+        // `start()` installs and the third chance to close one of the retain
+        // cycles the two above already produced once each; see
+        // `aStartedStackWithTcpIsReleasedWhenDroppedWithoutShutdown`, which is
+        // the test that can actually see this capture on its own.
+        //
+        // `transportDemuxer` and `allocator` are captured by value into an
+        // ordinary (non-`@Sendable`) closure, exactly as the UDP handler
+        // captures them, so this adds no new "capture of non-Sendable type in a
+        // @Sendable closure" warning to the population `Stack.swift` already
+        // carries on its `scheduleRepeatedTask` closure.
+        ipv4.setHandler(for: .tcp) { [weak ipv4, transportDemuxer, allocator] header, payload in
+            guard let ipv4 else { return }
+            var packet = PacketBuffer(received: payload)
+            // Parsed here for two things: the checksum, so a corrupt segment
+            // never reaches an endpoint or provokes a reset, and the ports the
+            // demuxer keys on. The segment is then handed on WHOLE rather than
+            // as its payload — unlike UDP, where the endpoint needs nothing from
+            // the header — because a TCP endpoint needs the flags, the sequence
+            // and acknowledgement numbers, the window and the options, and
+            // `TransportEndpointDelegate.deliver` has nowhere to put a parsed
+            // header. The endpoint parses it a second time; that cost is the
+            // price of leaving the delegate protocol alone, and it is paid on a
+            // buffer already known to be well formed.
+            guard let tcp = TCPHeader.parse(&packet, header: header) else { return }
+            let delivered = transportDemuxer.deliver(
+                protocolNumber: .tcp, header: header, payload: payload,
+                localPort: tcp.destinationPort, remotePort: tcp.sourcePort)
+            guard !delivered else { return }
+
+            // Nothing is listening. RFC 9293 §3.10.7.1: answer with a reset, so
+            // a guest's connect() fails fast instead of retrying into a void —
+            // the TCP counterpart of the ICMP port-unreachable the UDP handler
+            // above sends. `closedSegmentArrives` is the one place that chooses
+            // between the RFC's two reset forms, and it is called rather than
+            // reimplemented here.
+            let segment = TCPSegment(header: tcp, payload: packet.payload)
+            for action in TCPStateMachine.closedSegmentArrives(segment: segment) {
+                guard case .sendRst(let sequence, let ack) = action else { continue }
+                TCPWire.sendReset(
+                    sequence: sequence, ack: ack,
+                    sourcePort: tcp.destinationPort, destinationPort: tcp.sourcePort,
+                    from: header.destination, to: header.source, via: ipv4, allocator: allocator)
+            }
         }
 
         // A second start() would overwrite the reference to a task that keeps

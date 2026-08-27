@@ -43,7 +43,7 @@ private func segment(sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], pa
 /// by anything the first time.
 private func stateMachineReceive(segment: TCPSegment, on tcb: inout TCB) -> [TCPAction] {
     var receiver = Receiver(reassembler: TCPReassembler())
-    return TCPStateMachine.receive(segment: segment, on: &tcb, receiver: &receiver)
+    return receiveDrivingASender(segment: segment, on: &tcb, receiver: &receiver)
 }
 
 private func listenTCB(iss: UInt32 = 1000) -> TCB {
@@ -636,4 +636,19 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     let actions = stateMachineReceive(segment: segment(sequence: 5000, flags: ecnSetupSyn), on: &tcb)
     #expect(tcb.state == .synReceived)
     #expect(containsSendSynAck(actions))
+}
+
+/// `TCPStateMachine.receive` drives a `Sender` as well as a `Receiver` — it is
+/// the single advancer of SND.UNA over data, and is called from inside the
+/// machine so no caller can acknowledge separately (see `TCPStateMachine`'s doc
+/// comment on the split). Nothing in this file asserts anything about the send
+/// side, so a fresh sender per call is exactly right: it makes SND.UNA advance
+/// the way the machine expects while carrying no queue, no in-flight record and
+/// no duplicate-ACK run from one call into the next. A shared one would quietly
+/// turn every test here into an integration test of two components, which is
+/// the same reasoning the fresh-receiver helper above rests on.
+private func receiveDrivingASender(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
+    var sender = Sender(
+        congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 64 * 1024)
+    return TCPStateMachine.receive(segment: segment, on: &tcb, receiver: &receiver, sender: &sender)
 }

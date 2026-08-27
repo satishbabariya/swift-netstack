@@ -300,10 +300,10 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1000, payload: 10), on: &tcb, receiver: &receiver)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1000, payload: 10), on: &tcb, receiver: &receiver)
     #expect(tcb.rcvNxt == SequenceNumber(1010), "ten bytes, advanced once")
 
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1010, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1010, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
     #expect(tcb.rcvNxt == SequenceNumber(1011), "and the FIN's one sequence number, also once")
     #expect(tcb.state == .closeWait)
 }
@@ -312,13 +312,13 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    let outOfOrder = TCPStateMachine.receive(
+    let outOfOrder = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1010, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
     #expect(!hasDeliver(outOfOrder), "nothing is deliverable while 1000..<1010 is missing")
     #expect(tcb.rcvNxt == SequenceNumber(1000))
     #expect(hasSendAck(outOfOrder), "but it is acknowledged -- this is the duplicate ACK fast retransmit counts")
 
-    let inOrder = TCPStateMachine.receive(
+    let inOrder = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(deliveredBytes(inOrder) == Array(repeating: 0xaa, count: 10) + Array(repeating: 0xbb, count: 10))
     #expect(tcb.rcvNxt == SequenceNumber(1020))
@@ -339,12 +339,12 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    let ahead = TCPStateMachine.receive(
+    let ahead = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1010, flags: [.fin, .ack], payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .established, "the FIN is ahead of a gap; its position is not trusted")
     #expect(hasSendAck(ahead), "and the peer is told where we actually are, so it retransmits from there")
 
-    let filled = TCPStateMachine.receive(
+    let filled = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(
         deliveredBytes(filled) == Array(repeating: 0xaa, count: 10) + Array(repeating: 0xbb, count: 10),
@@ -352,7 +352,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     #expect(tcb.state == .established, "filling the gap does not resurrect a FIN we declined to record")
     #expect(tcb.rcvNxt == SequenceNumber(1020), "twenty payload bytes and no FIN")
 
-    let retransmitted = TCPStateMachine.receive(
+    let retransmitted = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1020, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closeWait, "the retransmission arrives at RCV.NXT and is honoured")
     #expect(tcb.rcvNxt == SequenceNumber(1021))
@@ -372,7 +372,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    let forged = TCPStateMachine.receive(
+    let forged = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1500, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .established, "a FIN 500 bytes ahead of RCV.NXT must not be recorded")
     #expect(hasSendAck(forged), "it is answered, exactly as an off-position RST is challenged")
@@ -380,12 +380,12 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
 
     // The peer now streams 1000 bytes in two segments. The first is what used
     // to reach the forged position.
-    let first = TCPStateMachine.receive(
+    let first = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 500, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .established, "reaching the forged position must not close the connection")
     #expect(deliveredBytes(first).count == 500)
 
-    let second = TCPStateMachine.receive(
+    let second = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1500, payload: 500, fill: 0xbb), on: &tcb, receiver: &receiver)
     #expect(deliveredBytes(second) == Array(repeating: 0xbb, count: 500), "the second half must not be silently dropped")
     #expect(tcb.rcvNxt == SequenceNumber(2000), "all 1000 bytes, not 500")
@@ -393,7 +393,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     // Positive control. "Never closes" is satisfied perfectly by a connection
     // that can no longer close at all, which is the failure mode this fix could
     // plausibly introduce -- so the peer's real FIN, in order, must still work.
-    let genuine = TCPStateMachine.receive(
+    let genuine = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 2000, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closeWait, "the peer's own FIN, at RCV.NXT, still closes the connection")
     #expect(tcb.rcvNxt == SequenceNumber(2001))
@@ -409,9 +409,9 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 3000, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(tcb.rcvNxt == SequenceNumber(1010))
 
@@ -420,7 +420,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     // ignored, and because a fix that worked only on a retransmission would be
     // a different bug wearing this test's green tick.
     for attempt in 1...3 {
-        let actions = TCPStateMachine.receive(
+        let actions = receiveDrivingASender(
             segment: stateMachineSegment(sequence: 1010, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
         #expect(tcb.state == .closeWait, "the peer's real FIN was ignored on attempt \(attempt)")
         #expect(hasSendAck(actions), "and a FIN must be acknowledged, on attempt \(attempt)")
@@ -439,14 +439,14 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    let challenged = TCPStateMachine.receive(
+    let challenged = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1500, flags: [.rst]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .established, "an in-window RST that is not at RCV.NXT must not tear the connection down")
     #expect(challenged == [.sendAck], "it draws a challenge ACK and nothing else")
 
     // And the RST at RCV.NXT still works: "does not tear down" is satisfied by
     // a machine that can no longer be reset at all.
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1000, flags: [.rst]), on: &tcb, receiver: &receiver)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1000, flags: [.rst]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closed, "a RST at RCV.NXT exactly is still honoured")
 }
 
@@ -462,7 +462,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     let queue = TCPReassembler()
     var receiver = Receiver(reassembler: queue)
 
-    let actions = TCPStateMachine.receive(
+    let actions = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 5000, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(deliveredBytes(actions).count == 4, "only the four bytes the peer was offered")
     #expect(tcb.rcvNxt == SequenceNumber(1004), "RCV.NXT must not run 5000 bytes past a 4-byte window")
@@ -474,7 +474,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var offsetTcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
     let offsetQueue = TCPReassembler()
     var offsetReceiver = Receiver(reassembler: offsetQueue)
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1003, payload: 5000, fill: 0xbb), on: &offsetTcb, receiver: &offsetReceiver)
     #expect(offsetTcb.rcvNxt == SequenceNumber(1000), "it is out of order, so nothing is delivered")
     #expect(offsetQueue.pendingBytes == 1 + TCPReassembler.perSegmentOverhead, "exactly the one byte inside the window is held")
@@ -488,7 +488,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     // arrive whole, in order and out of order alike.
     var inOrder = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
     var inOrderReceiver = Receiver(reassembler: TCPReassembler())
-    let actions = TCPStateMachine.receive(
+    let actions = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 4, fill: 0xaa), on: &inOrder, receiver: &inOrderReceiver)
     #expect(deliveredBytes(actions) == Array(repeating: 0xaa, count: 4), "a segment filling the window exactly is delivered whole")
     #expect(inOrder.rcvNxt == SequenceNumber(1004))
@@ -496,7 +496,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var outOfOrder = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
     let queue = TCPReassembler()
     var outOfOrderReceiver = Receiver(reassembler: queue)
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1050, payload: 10, fill: 0xbb), on: &outOfOrder, receiver: &outOfOrderReceiver)
     #expect(queue.pendingBytes == 10 + TCPReassembler.perSegmentOverhead, "and an out-of-order one well inside the window is held whole")
 }
@@ -553,7 +553,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, flags: [.fin, .ack], payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .established, "the FIN is past the right edge; it is not ours to record")
     #expect(tcb.rcvNxt == SequenceNumber(1004), "four bytes were accepted and the rest, FIN included, refused")
@@ -591,18 +591,18 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     // side effect of a convenience default that had nothing to do with resets.
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
     var receiver = Receiver(reassembler: TCPReassembler())
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1000, payload: 1), on: &tcb, receiver: &receiver)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1000, payload: 1), on: &tcb, receiver: &receiver)
     #expect(tcb.rcvWnd == 100)
 
-    let far = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 21_001, flags: [.rst]), on: &tcb, receiver: &receiver)
+    let far = receiveDrivingASender(segment: stateMachineSegment(sequence: 21_001, flags: [.rst]), on: &tcb, receiver: &receiver)
     #expect(far == [.none], "a RST 20000 past RCV.NXT is outside the offered window and is discarded in silence")
     #expect(tcb.state == .established)
 
     // Positive controls: silence is also what a machine that ignores every RST
     // produces. Both live behaviours must survive the narrowing.
-    let near = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1050, flags: [.rst]), on: &tcb, receiver: &receiver)
+    let near = receiveDrivingASender(segment: stateMachineSegment(sequence: 1050, flags: [.rst]), on: &tcb, receiver: &receiver)
     #expect(near == [.sendAck], "a RST inside the 100-byte window still draws a challenge ACK")
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1001, flags: [.rst]), on: &tcb, receiver: &receiver)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1001, flags: [.rst]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closed, "and a RST at RCV.NXT exactly still tears the connection down")
 }
 
@@ -623,11 +623,11 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1005, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
     #expect(tcb.rcvNxt == SequenceNumber(1000), "out of order: queued, nothing delivered yet")
 
-    let actions = TCPStateMachine.receive(
+    let actions = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, flags: [.fin, .ack], payload: 5, fill: 0xaa), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closeWait, "RCV.NXT must land on the FIN, not jump over it")
     #expect(tcb.rcvNxt == SequenceNumber(1006), "five bytes plus the FIN's own sequence number")
@@ -646,9 +646,9 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1002, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
-    let actions = TCPStateMachine.receive(
+    let actions = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, flags: [.fin, .ack], payload: 5, fill: 0xaa), on: &tcb, receiver: &receiver)
 
     #expect(tcb.state == .closeWait)
@@ -669,9 +669,9 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(
+    _ = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1005, payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
-    let filled = TCPStateMachine.receive(
+    let filled = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1000, payload: 5, fill: 0xaa), on: &tcb, receiver: &receiver)
 
     #expect(
@@ -682,7 +682,7 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
 
     // And the conforming close that follows still completes, on the same
     // connection: the peer's real FIN sits after all of its data.
-    let closing = TCPStateMachine.receive(
+    let closing = receiveDrivingASender(
         segment: stateMachineSegment(sequence: 1015, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
     #expect(tcb.state == .closeWait)
     #expect(tcb.rcvNxt == SequenceNumber(1016))
@@ -704,13 +704,28 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     let rejected = TCPReassembler()
     var farOutOfWindow = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
     var rejecting = Receiver(reassembler: rejected)
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 50_000, payload: 10), on: &farOutOfWindow, receiver: &rejecting)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 50_000, payload: 10), on: &farOutOfWindow, receiver: &rejecting)
     #expect(rejected.pendingSegments == 0)
     #expect(farOutOfWindow.rcvNxt == SequenceNumber(1000))
 
     let accepted = TCPReassembler()
     var inWindow = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
     var accepting = Receiver(reassembler: accepted)
-    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1050, payload: 10), on: &inWindow, receiver: &accepting)
+    _ = receiveDrivingASender(segment: stateMachineSegment(sequence: 1050, payload: 10), on: &inWindow, receiver: &accepting)
     #expect(accepted.pendingSegments == 1, "an acceptable out-of-order segment is held, not discarded")
+}
+
+/// `TCPStateMachine.receive` drives a `Sender` as well as a `Receiver` — it is
+/// the single advancer of SND.UNA over data, and is called from inside the
+/// machine so no caller can acknowledge separately (see `TCPStateMachine`'s doc
+/// comment on the split). Nothing in this file asserts anything about the send
+/// side, so a fresh sender per call is exactly right: it makes SND.UNA advance
+/// the way the machine expects while carrying no queue, no in-flight record and
+/// no duplicate-ACK run from one call into the next. A shared one would quietly
+/// turn every test here into an integration test of two components, which is
+/// the same reasoning the fresh-receiver helper above rests on.
+private func receiveDrivingASender(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
+    var sender = Sender(
+        congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 64 * 1024)
+    return TCPStateMachine.receive(segment: segment, on: &tcb, receiver: &receiver, sender: &sender)
 }

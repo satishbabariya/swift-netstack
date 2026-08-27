@@ -80,6 +80,37 @@ struct TCPSegment: Sendable {
 /// in-order-FIN gate in step 5 is not one of those: `Receiver` compares RCV.NXT
 /// against a *recorded* FIN position, this file compares an *arriving segment's*
 /// start against RCV.NXT, and they answer different questions.)
+///
+/// ## SND.UNA is split the same way, and the split is by *phase* here too
+///
+/// State it exactly, because the stronger claim is the one that lets a defect
+/// through:
+///
+/// - This file writes SND.UNA at **two** kinds of site. `.listen` sets it to
+///   ISS (initialisation). `.synSent` and the SYN-RECEIVED arm of step 4 move
+///   it over our own **SYN**, which is the one sequence number `Sender` does
+///   not model — that type moves a byte stream and holds no record of a SYN, so
+///   handing it the acknowledgement of one would have it grow the congestion
+///   window by a byte the path never carried. Both of those sites can *only*
+///   retire the SYN: in SYN-SENT and SYN-RECEIVED the only acceptable
+///   acknowledgement is ISS+1, since nothing else has been sent.
+/// - `Sender.acknowledged` moves it over **data**, and it is the only advancer
+///   of data. The ESTABLISHED arm of step 4 calls it instead of assigning
+///   SND.UNA itself.
+///
+/// The two cannot run for one segment: they are different arms of one `switch`
+/// on `tcb.state`, and by the time the ESTABLISHED arm is reachable SND.UNA is
+/// already past the SYN. That is the whole invariant; it is weaker than "this
+/// file never writes SND.UNA", and the weaker true statement is the one worth
+/// having.
+///
+/// `Sender` is driven from **inside** this function for the same reason
+/// `Receiver` is: a caller that ran the state machine and then acknowledged
+/// separately would have both write SND.UNA for the same segment, and the
+/// second writer would see nothing left to acknowledge — the sender would
+/// silently retire nothing, keep every transmitted segment outstanding forever,
+/// and refuse every later write (`segmentsToTransmit` fails closed when
+/// SND.NXT and its own accounting disagree).
 struct TCPStateMachine {
     /// `receiver` owns RCV.NXT, delivery and the advertised window, and is
     /// `inout` because it carries per-connection state.
@@ -106,7 +137,12 @@ struct TCPStateMachine {
     /// mechanisms, and no caller outside this module can drive them past the
     /// gates below. The module's public surface is `Stack` and the Channel
     /// types.
-    static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
+    /// `sender` owns SND.UNA's advancement over data and the retransmit queue,
+    /// and is `inout` for the same reason `receiver` is. It is driven here, at
+    /// the one site that has just decided the acknowledgement is acceptable, so
+    /// that no caller is in a position to acknowledge separately — see the
+    /// type's doc comment on the SND.UNA split.
+    static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver, sender: inout Sender) -> [TCPAction] {
         switch tcb.state {
         case .closed:
             return closedStateSegmentArrives(segment: segment)
@@ -115,7 +151,7 @@ struct TCPStateMachine {
         case .synSent:
             return synSentStateSegmentArrives(segment: segment, tcb: &tcb)
         case .synReceived, .established, .finWait1, .finWait2, .closeWait, .closing, .lastAck, .timeWait:
-            return generalSegmentArrives(segment: segment, tcb: &tcb, receiver: &receiver)
+            return generalSegmentArrives(segment: segment, tcb: &tcb, receiver: &receiver, sender: &sender)
         }
     }
 
@@ -126,6 +162,16 @@ struct TCPStateMachine {
     /// kept faithful to the RFC for the sake of completeness, and because a
     /// TCB legitimately reaches `.closed` mid-flight (e.g. LAST-ACK + ACK)
     /// and could in principle see one more stray segment after that.
+    /// Internal rather than private: `Stack`'s TCP handler answers a segment
+    /// for a port with no endpoint behind it, and that is exactly this
+    /// function's case — a CLOSED connection with no TCB. Calling it there
+    /// rather than reimplementing the reset is what keeps the choice between
+    /// RFC 9293 §3.10.7.1's two reset forms (see `TCPAction.sendRst`) in one
+    /// place. It was dead code until that call site existed.
+    static func closedSegmentArrives(segment: TCPSegment) -> [TCPAction] {
+        closedStateSegmentArrives(segment: segment)
+    }
+
     private static func closedStateSegmentArrives(segment: TCPSegment) -> [TCPAction] {
         let header = segment.header
         if header.flags.contains(.rst) {
@@ -222,6 +268,12 @@ struct TCPStateMachine {
             tcb.irs = header.sequence
             tcb.rcvNxt = header.sequence + 1
             if header.flags.contains(.ack), ackAcceptable {
+                // Handshake retirement of our own SYN, which is the one
+                // sequence number `Sender` does not model. The acceptable range
+                // checked above is `ISS < SEG.ACK =< SND.NXT` with SND.NXT ==
+                // ISS+1, so this can only ever be ISS+1: it puts SND.UNA on the
+                // first data byte and never moves over data. See the type's doc
+                // comment on the SND.UNA split.
                 tcb.sndUna = header.acknowledgement
             }
 
@@ -263,7 +315,9 @@ struct TCPStateMachine {
     /// depend on earlier ones having already run (in particular, the RST
     /// and SYN checks assume the segment has already passed the sequence
     /// acceptability test).
-    private static func generalSegmentArrives(segment: TCPSegment, tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
+    private static func generalSegmentArrives(
+        segment: TCPSegment, tcb: inout TCB, receiver: inout Receiver, sender: inout Sender
+    ) -> [TCPAction] {
         let header = segment.header
         var actions: [TCPAction] = []
 
@@ -327,6 +381,31 @@ struct TCPStateMachine {
             if tcb.state == .timeWait, isRetransmissionOfProcessedFin(segment, tcb: tcb) {
                 return [.sendAck, .startTimeWait]
             }
+
+            // The second place an *unacceptable* segment must do more than draw
+            // an ACK, and for the same reason as the TIME-WAIT case above: it
+            // sits one behind the window by construction and so can be
+            // recognised nowhere else. A peer whose SYN-ACK was lost
+            // retransmits its SYN, which is at IRS -- one before RCV.NXT --
+            // and answering that with a bare ACK tells it nothing it can use:
+            // it has no connection yet, so it keeps retransmitting the SYN
+            // until it gives up. Resending the SYN-ACK is what every stack this
+            // one is compared against does, and it is what the differential
+            // vectors expect (the same SYN twice, the same SYN-ACK twice).
+            //
+            // The SYN-ACK is reproduced from the TCB this connection already
+            // holds, so the sequence number is identical. Regenerating it would
+            // be worse than useless: a peer that has recorded the first one
+            // would either fail to connect or reset.
+            //
+            // The bar is the same exact one as everywhere else in this file:
+            // name IRS precisely. A blind sender that cannot guess the peer's
+            // own ISS gets a bare ACK, and one that can has nothing to gain --
+            // this resends a frame already sent, to the same peer, and creates
+            // no state.
+            if tcb.state == .synReceived, isRetransmissionOfTheSynWeAnswered(segment, tcb: tcb) {
+                return [.sendSynAck]
+            }
             return [.sendAck]
         }
 
@@ -352,8 +431,31 @@ struct TCPStateMachine {
             // A forward-distance range test, never a negated `lessThan` --
             // see the acceptance-test section of `SequenceNumber`.
             if header.acknowledgement.isInRange(after: tcb.sndUna, throughAndIncluding: tcb.sndNxt) {
+                // Handshake retirement, not data advancement: in SYN-RECEIVED
+                // the only thing sent is the SYN|ACK, so SND.NXT is ISS+1 and
+                // this range admits exactly ISS+1. `Sender` does not model the
+                // SYN and must not be told about it (see the type's doc
+                // comment); it takes over on the ESTABLISHED arm below, from a
+                // SND.UNA this line has already put on the first data byte.
                 tcb.sndUna = header.acknowledgement
                 tcb.state = .established
+                // RFC 9293 §3.10.7.4, SYN-RECEIVED: "enter ESTABLISHED state
+                // and continue processing with the variables below set to:
+                // SND.WND <- SEG.WND, SND.WL1 <- SEG.SEQ, SND.WL2 <- SEG.ACK."
+                //
+                // This was missing, and it is the whole of the send window on
+                // the passive-open path: nothing in LISTEN or SYN-RECEIVED sets
+                // SND.WND otherwise, so a connection opened by a guest began
+                // life with a send window of ZERO and could not transmit a byte
+                // until some later segment happened to trip the window update
+                // in the ESTABLISHED arm below. `Sender.segmentsToTransmit`
+                // sends `min(cwnd, SND.WND)` bytes, so the first write after
+                // every accepted handshake silently emitted nothing. Nothing
+                // could see it until an endpoint drove the two together; see
+                // `dataWrittenByTheApplicationIsSegmentedAndSent`.
+                tcb.sndWnd = Int(header.window)  // Snd.Wind.Scale: a fourth peer-window decode; see synSent above.
+                tcb.sndWl1 = header.sequence
+                tcb.sndWl2 = header.acknowledgement
             } else if header.acknowledgement.lessThan(tcb.sndUna) {
                 break  // old duplicate ACK of the SYN itself; ignore, continue to steps 5-6.
             } else {
@@ -385,7 +487,13 @@ struct TCPStateMachine {
                 return [.sendAck]
             }
 
-            tcb.sndUna = header.acknowledgement
+            // The window update runs FIRST, before the acknowledgement is
+            // handed on. `Sender.acknowledged` reads `tcb.sndWnd` to tell a
+            // duplicate ACK from a window update that happens to repeat the
+            // last acknowledgement number, and counting the latter as the
+            // former fast-retransmits segments nothing was ever lost of. Its
+            // doc comment states that ordering as the caller's obligation, and
+            // this is the caller.
             if tcb.sndWl1.lessThan(header.sequence)
                 || (tcb.sndWl1 == header.sequence && header.acknowledgement.isAtOrAfter(tcb.sndWl2))
             {
@@ -393,6 +501,24 @@ struct TCPStateMachine {
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
             }
+
+            // SND.UNA moves HERE and nowhere else on the data path: this file
+            // decided the acknowledgement is acceptable (a state question,
+            // where RFC 5961's hardening lives) and hands it to the single
+            // advancer, which retires the queue, takes an RTT sample, feeds
+            // congestion control and moves SND.UNA. Assigning `tcb.sndUna`
+            // here as well would leave the sender nothing to retire: it would
+            // read `advanced == 0`, classify a genuine acknowledgement as a
+            // duplicate, keep every transmitted segment outstanding forever and
+            // refuse every subsequent write.
+            //
+            // The return value is discarded because it cannot be false: it
+            // guards on `isInRange(from: tcb.sndUna, throughAndIncluding:
+            // tcb.sndNxt)`, the identical test the `guard` above has just
+            // passed. That guard is `acknowledged`'s own, for callers that
+            // reach it without coming through here, and is not a second opinion
+            // this file relies on.
+            _ = sender.acknowledged(upTo: header.acknowledgement, tcb: &tcb, segmentLength: segment.length)
 
             switch tcb.state {
             case .finWait1:
@@ -654,6 +780,19 @@ struct TCPStateMachine {
     /// an *unacceptable* segment to do more than draw an ACK, and the position
     /// it must match is exact, so a peer cannot refresh a TIME-WAIT block
     /// without knowing where the connection actually is.
+    /// Whether this segment is a retransmission of the very SYN this connection
+    /// answered: a bare SYN, occupying exactly its own sequence number, sitting
+    /// at IRS.
+    ///
+    /// Only SYN-RECEIVED asks. `segment.length == 1` is what makes "bare"
+    /// exact — a SYN carrying data or a FIN is not a retransmission of
+    /// anything this connection has seen, and must not be answered as one.
+    private static func isRetransmissionOfTheSynWeAnswered(_ segment: TCPSegment, tcb: TCB) -> Bool {
+        let header = segment.header
+        return header.flags.contains(.syn) && !header.flags.contains(.ack)
+            && header.sequence == tcb.irs && segment.length == 1
+    }
+
     private static func isRetransmissionOfProcessedFin(_ segment: TCPSegment, tcb: TCB) -> Bool {
         guard let finPosition = segment.reassemblySegment.finSequence else { return false }
         return finPosition + 1 == tcb.rcvNxt

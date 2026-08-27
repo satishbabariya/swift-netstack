@@ -8,11 +8,21 @@ import NIOCore
 /// same one: `Receiver` owns RCV.NXT and the bytes coming in, this type owns
 /// SND.UNA and the bytes going out, and `TCPStateMachine` owns the state. Only
 /// one component advances any given sequence variable. `acknowledged` is
-/// therefore the single place SND.UNA moves, and `segmentsToTransmit` the
-/// single place SND.NXT does -- both take the TCB `inout` for exactly that
-/// reason. The state machine still assigns SND.UNA in its own ACK path today
-/// (RFC 9293 §3.10.7.4); that is the seam wiring this type in has to close, and
-/// it belongs to the task that does the wiring, not here.
+/// therefore the single place SND.UNA moves **over data**, and
+/// `segmentsToTransmit` the single place SND.NXT does -- both take the TCB
+/// `inout` for exactly that reason.
+///
+/// Stated exactly, because the stronger version of it is false and a false
+/// invariant in a comment is what stops the next reader checking:
+/// `TCPStateMachine` still writes SND.UNA at three sites, all of them outside
+/// the data stream. One initialises it to ISS on a passive open; the other two
+/// retire our own **SYN** in SYN-SENT and SYN-RECEIVED, where the only
+/// acceptable acknowledgement is ISS+1. This type holds no record of a SYN --
+/// see "What this type does not do" below -- so being handed one would have it
+/// grow the congestion window by a byte the path never carried. Past the
+/// handshake, the ESTABLISHED arm of RFC 9293 §3.10.7.4's step 4 calls
+/// `acknowledged` instead of assigning SND.UNA, and the two can never run for
+/// one segment: they are different arms of one switch on the connection state.
 ///
 /// ## The retransmit queue is a peer-controlled allocation
 ///

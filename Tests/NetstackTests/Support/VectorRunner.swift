@@ -47,6 +47,36 @@ struct VectorScriptOutOfOrder: Error, CustomStringConvertible {
     }
 }
 
+/// The application side of a script: what `write <n>` and `close` lines drive.
+///
+/// Two closures rather than a reference to the endpoint, because the runner
+/// deliberately knows nothing about TCP — it drives a `Stack` through a link,
+/// and which endpoint a script's `write` reaches is the harness's business.
+/// Both are `throws`: a refused write (`.wouldBlock`) or a refused close is a
+/// divergence the script must not survive, and a script that quietly wrote
+/// nothing would then fail on the *missing frame* two lines later, naming the
+/// wrong line.
+struct VectorApplication {
+    var write: (Int) throws -> Void
+    var close: () throws -> Void
+}
+
+/// Thrown when a script contains an application call and `run` was given no
+/// `VectorApplication` to drive it.
+///
+/// Not a `VectorMismatch`: nothing about the stack is in question. Without it
+/// the call would be silently skipped, and the script would fail on the frame
+/// the write was supposed to produce — reporting a line that is correct, about
+/// a stack that is correct, because of a harness that forgot to pass an
+/// argument.
+struct VectorScriptNeedsAnApplication: Error, CustomStringConvertible {
+    var line: Int
+
+    var description: String {
+        "line \(line): this script makes an application call, but `run` was given no VectorApplication to drive it"
+    }
+}
+
 /// A frame drained from the link, stamped with the logical time it was
 /// observed at and the script event whose processing produced it.
 private struct TimedFrame {
@@ -125,7 +155,10 @@ struct VectorRunner {
     /// logged for this package's cache/reassembler stress tests.
     private static let subStep = TimeAmount.milliseconds(1)
 
-    func run(against stack: Stack, link: RecordingEndpoint, clock: ManualClock, loop: EmbeddedEventLoop) throws {
+    func run(
+        against stack: Stack, link: RecordingEndpoint, clock: ManualClock, loop: EmbeddedEventLoop,
+        application: VectorApplication? = nil
+    ) throws {
         var elapsed = TimeAmount.zero
         var pending: [TimedFrame] = []
 
@@ -159,9 +192,22 @@ struct VectorRunner {
                 drainAndStamp(sourceLine: event.sourceLine)
             }
 
-            if event.direction == .inbound {
-                let frame = try codec.encode(event.packet, direction: .inbound)
-                link.inject(frame)
+            // An application call and an inbound frame are both "something
+            // enters the stack now", and both are followed by the same drain —
+            // the frames a `write` produces are captured exactly as the frames
+            // an injected segment produces are.
+            switch event.packet {
+            case .applicationWrite(let bytes):
+                guard let application else { throw VectorScriptNeedsAnApplication(line: event.sourceLine) }
+                try application.write(bytes)
+            case .applicationClose:
+                guard let application else { throw VectorScriptNeedsAnApplication(line: event.sourceLine) }
+                try application.close()
+            case .tcp, .icmpEcho, .icmpUnreachable, .udp, .arpRequest, .arpReply:
+                if event.direction == .inbound {
+                    let frame = try codec.encode(event.packet, direction: .inbound)
+                    link.inject(frame)
+                }
             }
 
             // Drain and stamp again after the event's own action — this is

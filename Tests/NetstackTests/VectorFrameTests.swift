@@ -241,3 +241,16 @@ private func codec() -> VectorFrames {
     #expect(Array(bytes[26..<30]) == IPv4Address("192.168.127.1")!.bytes)
     #expect(Array(bytes[30..<34]) == IPv4Address("192.168.127.2")!.bytes)
 }
+
+@Test func encodingAnApplicationCallThrowsRatherThanBuildingAFrame() {
+    // `write` and `close` are not frames and have no wire representation. The
+    // codec refuses them so that a runner which failed to handle one fails
+    // loudly, rather than silently injecting nothing where the script said the
+    // application acted.
+    #expect(throws: VectorFrameError.notAFrame) {
+        try codec().encode(.applicationWrite(bytes: 100), direction: .inbound)
+    }
+    #expect(throws: VectorFrameError.notAFrame) {
+        try codec().encode(.applicationClose, direction: .inbound)
+    }
+}

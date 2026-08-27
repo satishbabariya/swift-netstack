@@ -166,3 +166,35 @@ import Testing
     // between the two commas instead of failing.
     #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.000 < S 0:0(0) <mss 1460,,sackOK>") }
 }
+
+@Test func parsesTheApplicationCallForms() throws {
+    // A packet-only DSL cannot state a send-side vector at all — "the
+    // application wrote 300 bytes here" is not something any sequence of
+    // packets says. See `VectorPacket`.
+    let script = try VectorScript.parse("""
+        0.010 < write 300
+        0.020 < close
+        """)
+    #expect(script.events.count == 2)
+    #expect(script.events[0].time == .milliseconds(10))
+    #expect(script.events[0].packet == .applicationWrite(bytes: 300))
+    #expect(script.events[1].time == .milliseconds(20))
+    #expect(script.events[1].packet == .applicationClose)
+    // Both are `<`: something entering the stack, from above rather than off
+    // the wire.
+    #expect(script.events.allSatisfy { $0.direction == .inbound })
+}
+
+@Test func rejectsMalformedApplicationCallLines() {
+    // An application call in the `>` direction would be a claim that the stack
+    // emits a system call, which is not a thing a script can mean.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.010 > write 300") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.010 > close") }
+    // A zero-byte write reads as "the application wrote" and asserts nothing:
+    // `Sender.write` treats an empty buffer as a no-op that succeeds, so the
+    // line would sit in a file looking like a specification and be none.
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.010 < write 0") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.010 < write -5") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.010 < write banana") }
+    #expect(throws: VectorScriptError.self) { try VectorScript.parse("0.010 < close now") }
+}

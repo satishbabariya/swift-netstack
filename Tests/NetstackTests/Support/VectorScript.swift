@@ -20,6 +20,24 @@ struct TCPLine: Equatable {
     var options: [String]
 }
 
+/// What one script line is about.
+///
+/// Six of these are frames. The last two are not: they are calls the local
+/// APPLICATION makes, and they are here because a send-side vector cannot be
+/// written without them. A packetdrill script interleaves system calls with
+/// packets for exactly this reason — "the application wrote 100 bytes here,
+/// and *this* is what appeared on the wire" is a statement about the stack
+/// that no sequence of packets alone can make. Without them a vector for a
+/// retransmission, a zero window or a local close would have to smuggle the
+/// call into the harness, where its position in the script (and therefore in
+/// logical time) would be invisible to a reader of the `.vec` file.
+///
+/// They are `.inbound` lines — something entering the stack, from above rather
+/// than off the wire — and `VectorScript.parse` rejects them in the `>`
+/// direction, where they would mean nothing. `VectorFrames.encode` refuses
+/// them outright: they have no wire representation, and a runner that tried to
+/// build one must fail loudly rather than emit a frame the script never asked
+/// for.
 enum VectorPacket: Equatable {
     case tcp(TCPLine)
     case icmpEcho(request: Bool, identifier: UInt16, sequence: UInt16)
@@ -27,6 +45,10 @@ enum VectorPacket: Equatable {
     case udp(source: UInt16, destination: UInt16, length: Int)
     case arpRequest(target: IPv4Address, sender: IPv4Address)
     case arpReply(address: IPv4Address, mac: MACAddress)
+    /// `write <n>`: the application queues `n` bytes for transmission.
+    case applicationWrite(bytes: Int)
+    /// `close`: the application closes the endpoint.
+    case applicationClose
 }
 
 struct VectorEvent: Equatable {
@@ -54,9 +76,11 @@ enum VectorScriptError: Error, Equatable {
 /// A packetdrill-shaped script.
 ///
 /// `<` is a frame delivered to the stack; `>` is a frame the stack must emit.
-/// Time is logical and drives a `ManualClock`, so nothing here races a wall
-/// clock. The point of the format is that a vector states the expected wire
-/// behaviour independently of the implementation that produces it.
+/// `<` also carries the two application-call forms — `write <n>` and `close` —
+/// which are not frames at all; see `VectorPacket`. Time is logical and drives
+/// a `ManualClock`, so nothing here races a wall clock. The point of the format
+/// is that a vector states the expected wire behaviour independently of the
+/// implementation that produces it.
 struct VectorScript {
     var events: [VectorEvent]
 
@@ -100,8 +124,20 @@ struct VectorScript {
         default: throw VectorScriptError.malformedLine(line)
         }
 
-        return VectorEvent(
-            time: time, direction: direction, packet: try parsePacket(fields, line: line), sourceLine: sourceLine)
+        let packet = try parsePacket(fields, line: line)
+        // An application call is something entering the stack from above, so it
+        // is written with `<`. In the `>` direction it would be a claim that the
+        // stack emits a system call, which is not a thing a script can mean —
+        // reject it here rather than let it sit in a file reading as a
+        // specification while the runner quietly does whatever it does with it.
+        switch packet {
+        case .applicationWrite, .applicationClose:
+            guard direction == .inbound else { throw VectorScriptError.malformedLine(line) }
+        case .tcp, .icmpEcho, .icmpUnreachable, .udp, .arpRequest, .arpReply:
+            break
+        }
+
+        return VectorEvent(time: time, direction: direction, packet: packet, sourceLine: sourceLine)
     }
 
     private static func parsePacket(_ fields: [String], line: String) throws -> VectorPacket {
@@ -109,8 +145,26 @@ struct VectorScript {
         case "arp": return try parseARP(fields, line: line)
         case "icmp": return try parseICMP(fields, line: line)
         case "udp": return try parseUDP(fields, line: line)
+        case "write", "close": return try parseApplicationCall(fields, line: line)
         default: return .tcp(try parseTCP(fields, line: line))
         }
+    }
+
+    /// `write <n>` and `close`. See `VectorPacket` for why a packet-only DSL
+    /// cannot express a send-side vector at all.
+    ///
+    /// A zero-byte write is refused rather than accepted as a no-op: `write 0`
+    /// in a file reads as "the application wrote", and `Sender.write` treats an
+    /// empty buffer as a no-op that succeeds, so the line would sit there
+    /// asserting nothing while looking like it asserted something.
+    private static func parseApplicationCall(_ fields: [String], line: String) throws -> VectorPacket {
+        if fields.count == 1, fields[0] == "close" {
+            return .applicationClose
+        }
+        if fields.count == 2, fields[0] == "write", let bytes = Int(fields[1]), bytes > 0 {
+            return .applicationWrite(bytes: bytes)
+        }
+        throw VectorScriptError.unknownPacketForm(line)
     }
 
     private static func parseARP(_ fields: [String], line: String) throws -> VectorPacket {

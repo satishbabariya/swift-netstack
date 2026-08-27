@@ -5,6 +5,11 @@ import NIOCore
 /// Errors `VectorFrames.encode` can throw building a wire frame from a
 /// `VectorPacket` that does not describe one.
 enum VectorFrameError: Error, Equatable {
+    /// An application call (`write`/`close`) reached the codec. It has no wire
+    /// representation; see `VectorPacket`. Thrown rather than ignored so a
+    /// runner that failed to handle one fails loudly instead of silently
+    /// injecting nothing where the script said the application acted.
+    case notAFrame
     case unrecognizedTCPFlag(Character)
     case malformedTCPOption(String)
     case udpPayloadTooLarge
@@ -85,6 +90,9 @@ struct VectorFrames {
             EthernetHeader(destination: addr.destinationMAC, source: mac, etherType: .arp).prepend(to: &frame)
             return frame.frame
 
+        case .applicationWrite, .applicationClose:
+            throw VectorFrameError.notAFrame
+
         default:
             let (transportBytes, protocolNumber) = try encodeIPv4Payload(packet, addr: addr)
             var frame = PacketBuffer(allocator: allocator, payload: transportBytes)
@@ -135,6 +143,9 @@ struct VectorFrames {
 
         case .arpRequest, .arpReply:
             preconditionFailure("ARP is handled by encode(_:direction:) directly; it has no IPv4 layer")
+
+        case .applicationWrite, .applicationClose:
+            preconditionFailure("an application call is not a frame; encode(_:direction:) throws on it before reaching here")
         }
     }
 

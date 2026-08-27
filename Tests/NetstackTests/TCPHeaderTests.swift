@@ -78,7 +78,8 @@ private func validSynHeaderBytes() -> [UInt8] {
     var bytes = validSynHeaderBytes()
     bytes[16] ^= 0xff
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count)) == nil)
+    let parsed = TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count))
+    #expect(parsed == nil)
 }
 
 @Test func rejectsADataOffsetBelowFive() {
@@ -93,7 +94,8 @@ private func validSynHeaderBytes() -> [UInt8] {
     ]
     embedChecksum(in: &bytes)
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count)) == nil)
+    let parsed = TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count))
+    #expect(parsed == nil)
 }
 
 @Test func rejectsADataOffsetThatOverrunsTheSegment() {
@@ -108,7 +110,8 @@ private func validSynHeaderBytes() -> [UInt8] {
     ]
     embedChecksum(in: &bytes)
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count)) == nil)
+    let parsed = TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count))
+    #expect(parsed == nil)
 }
 
 @Test func skipsAnUnknownTCPOptionKindByItsLength() {
@@ -137,7 +140,8 @@ private func validSynHeaderBytes() -> [UInt8] {
     bytes[20] = 2  // kind: MSS
     bytes[21] = 0  // length: 0
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count)) == nil)
+    let parsed = TCPHeader.parse(&packet, header: sampleIPv4Header(payloadLength: bytes.count))
+    #expect(parsed == nil)
 }
 
 /// Step 6 of the Task 7 brief: encode a SYN with all three options using

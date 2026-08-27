@@ -39,24 +39,28 @@ private let sampleHeader: [UInt8] = [
     bytes[10] = 0xff
     bytes[11] = 0xff
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(IPv4Header.parse(&packet) == nil)
+    let parsed = IPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func rejectsWrongVersionAndShortIHL() {
     var wrongVersion = sampleHeader
     wrongVersion[0] = 0x65  // version 6
     var a = PacketBuffer(received: ByteBuffer(bytes: wrongVersion))
-    #expect(IPv4Header.parse(&a) == nil)
+    let parsedWrongVersion = IPv4Header.parse(&a)
+    #expect(parsedWrongVersion == nil)
 
     var shortIHL = sampleHeader
     shortIHL[0] = 0x44  // IHL 4, below the 5-word minimum
     var b = PacketBuffer(received: ByteBuffer(bytes: shortIHL))
-    #expect(IPv4Header.parse(&b) == nil)
+    let parsedShortIHL = IPv4Header.parse(&b)
+    #expect(parsedShortIHL == nil)
 }
 
 @Test func rejectsATruncatedPacket() {
     var packet = PacketBuffer(received: ByteBuffer(bytes: Array(sampleHeader.prefix(12))))
-    #expect(IPv4Header.parse(&packet) == nil)
+    let parsed = IPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func rejectsTotalLengthLongerThanTheFrame() {
@@ -67,7 +71,8 @@ private let sampleHeader: [UInt8] = [
     bytes[10] = UInt8(checksum >> 8)
     bytes[11] = UInt8(checksum & 0xff)
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(IPv4Header.parse(&packet) == nil)
+    let parsed = IPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func rejectsTotalLengthShorterThanTheHeader() {
@@ -80,7 +85,8 @@ private let sampleHeader: [UInt8] = [
     bytes[10] = UInt8(checksum >> 8)
     bytes[11] = UInt8(checksum & 0xff)
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(IPv4Header.parse(&packet) == nil)
+    let parsed = IPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func rejectsAnIHLThatOverrunsTheFrame() {
@@ -93,7 +99,8 @@ private let sampleHeader: [UInt8] = [
     bytes[11] = UInt8(checksum & 0xff)
     // Frame is only 20 bytes — shorter than the claimed 24-byte header.
     var packet = PacketBuffer(received: ByteBuffer(bytes: bytes))
-    #expect(IPv4Header.parse(&packet) == nil)
+    let parsed = IPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func skipsOptionsAndReportsTheirLength() {

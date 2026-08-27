@@ -37,10 +37,12 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
         b.setInteger(UInt16(6), at: 0, endianness: .big)  // not ethernet
         return b
     }())
-    #expect(ARPPacket.parse(&wrongHardware) == nil)
+    let parsedWrongHardware = ARPPacket.parse(&wrongHardware)
+    #expect(parsedWrongHardware == nil)
 
     var truncated = PacketBuffer(received: ByteBuffer(bytes: [0x00, 0x01, 0x08, 0x00]))
-    #expect(ARPPacket.parse(&truncated) == nil)
+    let parsedTruncated = ARPPacket.parse(&truncated)
+    #expect(parsedTruncated == nil)
 }
 
 @Test func cacheExpiresEntries() {

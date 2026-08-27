@@ -252,10 +252,12 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // would retransmit FINs the peer has already acknowledged. Without this,
     // "returns .sendFin" could be satisfied by returning it unconditionally.
     var finWait1 = finWait1TCB(sndUna: 100)
-    #expect(!containsSendFin(TCPStateMachine.close(on: &finWait1)))
+    let finWait1Actions = TCPStateMachine.close(on: &finWait1)
+    #expect(!containsSendFin(finWait1Actions))
     var timeWait = establishedTCB(sndUna: 100)
     timeWait.state = .timeWait
-    #expect(!containsSendFin(TCPStateMachine.close(on: &timeWait)))
+    let timeWaitActions = TCPStateMachine.close(on: &timeWait)
+    #expect(!containsSendFin(timeWaitActions))
     var listening = listenTCB()
     let listenActions = TCPStateMachine.close(on: &listening)
     #expect(!containsSendFin(listenActions))

@@ -57,8 +57,10 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     let reassembler = TCPReassembler(maximumBytes: 4096, maximumSegments: 64)
     let rcvNxt = SequenceNumber(0xffff_fff6)
 
-    #expect(reassembler.insert(tcpSegment(0xffff_fffe, [0xcc, 0xcc]), rcvNxt: rcvNxt).isEmpty)
-    #expect(reassembler.insert(tcpSegment(0x0000_0000, [0xdd, 0xdd]), rcvNxt: rcvNxt).isEmpty)
+    let beforeWrap = reassembler.insert(tcpSegment(0xffff_fffe, [0xcc, 0xcc]), rcvNxt: rcvNxt)
+    #expect(beforeWrap.isEmpty)
+    let afterWrap = reassembler.insert(tcpSegment(0x0000_0000, [0xdd, 0xdd]), rcvNxt: rcvNxt)
+    #expect(afterWrap.isEmpty)
     #expect(reassembler.pendingSegments == 2)
 
     let delivered = reassembler.insert(tcpSegment(0xffff_fff6, Array(repeating: 0xaa, count: 8)), rcvNxt: rcvNxt)
@@ -73,7 +75,8 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     let rcvNxt = SequenceNumber(1000)
 
     // [1100, 1110) arrives first and is queued behind a gap.
-    #expect(reassembler.insert(tcpSegment(1100, Array(repeating: 0xbb, count: 10)), rcvNxt: rcvNxt).isEmpty)
+    let queued = reassembler.insert(tcpSegment(1100, Array(repeating: 0xbb, count: 10)), rcvNxt: rcvNxt)
+    #expect(queued.isEmpty)
 
     // A later segment claims [1000, 1150) — overlapping the ten bytes already
     // accepted. Those ten must NOT be rewritten by the newcomer.
@@ -94,8 +97,10 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     // queued and extends past them. Dropping the whole segment because it
     // overlaps (which is what the IPv4 reassembler does) would lose the
     // extension; first-received-wins has to be per BYTE here, not per segment.
-    #expect(reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10)), rcvNxt: rcvNxt).isEmpty)
-    #expect(reassembler.insert(tcpSegment(1010, Array(repeating: 0xcc, count: 20)), rcvNxt: rcvNxt).isEmpty)
+    let firstQueued = reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10)), rcvNxt: rcvNxt)
+    #expect(firstQueued.isEmpty)
+    let repacketised = reassembler.insert(tcpSegment(1010, Array(repeating: 0xcc, count: 20)), rcvNxt: rcvNxt)
+    #expect(repacketised.isEmpty)
 
     let delivered = reassembler.insert(tcpSegment(1000, Array(repeating: 0xaa, count: 10)), rcvNxt: rcvNxt)
     #expect(
@@ -223,7 +228,8 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     let reassembler = TCPReassembler(maximumBytes: 400, maximumSegments: 1)
     let rcvNxt = SequenceNumber(1000)
 
-    #expect(reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10)), rcvNxt: rcvNxt).isEmpty)
+    let held = reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10)), rcvNxt: rcvNxt)
+    #expect(held.isEmpty)
     #expect(reassembler.pendingSegments == 1)
 
     let delivered = reassembler.insert(tcpSegment(1000, Array(repeating: 0xaa, count: 30)), rcvNxt: rcvNxt)
@@ -291,7 +297,8 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     let rcvNxt = SequenceNumber(1000)
 
     let inside = TCPReassembler.maximumSequenceOffset - 1
-    #expect(reassembler.insert(Segment(sequence: rcvNxt + inside, flags: [], payload: ByteBuffer(bytes: [0xaa])), rcvNxt: rcvNxt).isEmpty)
+    let atTheEdge = reassembler.insert(Segment(sequence: rcvNxt + inside, flags: [], payload: ByteBuffer(bytes: [0xaa])), rcvNxt: rcvNxt)
+    #expect(atTheEdge.isEmpty)
     #expect(reassembler.pendingSegments == 1)
 }
 
@@ -311,7 +318,8 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     let rcvNxt = SequenceNumber(1000)
 
     // FIN-bearing segment arrives out of order: data [1010, 1020), FIN at 1020.
-    #expect(reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10), flags: .fin), rcvNxt: rcvNxt).isEmpty)
+    let outOfOrderFin = reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10), flags: .fin), rcvNxt: rcvNxt)
+    #expect(outOfOrderFin.isEmpty)
     #expect(reassembler.finSequence == SequenceNumber(1020))
 
     let delivered = reassembler.insert(tcpSegment(1000, Array(repeating: 0xaa, count: 10)), rcvNxt: rcvNxt)
@@ -338,7 +346,8 @@ private func tcpSegment(_ sequence: UInt32, _ bytes: [UInt8], flags: TCPFlags = 
     let reassembler = TCPReassembler(maximumBytes: 4096, maximumSegments: 64)
     let rcvNxt = SequenceNumber(1000)
 
-    #expect(reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10), flags: .fin), rcvNxt: rcvNxt).isEmpty)
+    let firstFin = reassembler.insert(tcpSegment(1010, Array(repeating: 0xbb, count: 10), flags: .fin), rcvNxt: rcvNxt)
+    #expect(firstFin.isEmpty)
     #expect(reassembler.finSequence == SequenceNumber(1020))
 
     // A second, contradictory FIN never moves it: same first-received-wins

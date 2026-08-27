@@ -22,7 +22,8 @@ import Testing
 
 @Test func rejectsARunt() {
     var packet = PacketBuffer(received: ByteBuffer(bytes: [0x01, 0x02, 0x03]))
-    #expect(EthernetHeader.parse(&packet) == nil)
+    let parsed = EthernetHeader.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func prependsAnEthernetHeader() {

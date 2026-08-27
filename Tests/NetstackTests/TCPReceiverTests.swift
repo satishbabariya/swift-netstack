@@ -150,19 +150,25 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     var tcb = establishedTCB(rcvNxt: 1000)
     var receiver = Receiver(reassembler: TCPReassembler(maximumBytes: 4096, maximumSegments: 64))
 
-    #expect(
-        !receiver.accept(segment(sequence: 1000), tcb: &tcb).shouldAck,
-        "acknowledging a bare ACK would put two peers in an ACK loop")
-    #expect(receiver.accept(segment(sequence: 1000, payload: 1), tcb: &tcb).shouldAck, "one byte is enough to owe an ACK")
-    #expect(receiver.accept(segment(sequence: 1001, flags: .fin), tcb: &tcb).shouldAck, "and so is a FIN carrying no data at all")
+    let bareAck = receiver.accept(segment(sequence: 1000), tcb: &tcb)
+    #expect(!bareAck.shouldAck, "acknowledging a bare ACK would put two peers in an ACK loop")
+
+    let oneByte = receiver.accept(segment(sequence: 1000, payload: 1), tcb: &tcb)
+    #expect(oneByte.shouldAck, "one byte is enough to owe an ACK")
+
+    let bareFin = receiver.accept(segment(sequence: 1001, flags: .fin), tcb: &tcb)
+    #expect(bareFin.shouldAck, "and so is a FIN carrying no data at all")
 }
 
 @Test func aSegmentFillingAGapDeliversItselfAndEverythingQueuedBehindIt() {
     var tcb = establishedTCB(rcvNxt: 1000)
     var receiver = Receiver(reassembler: TCPReassembler(maximumBytes: 4096, maximumSegments: 64))
 
-    #expect(receiver.accept(segment(sequence: 1020, payload: 10, fill: 0xcc), tcb: &tcb).delivered.isEmpty)
-    #expect(receiver.accept(segment(sequence: 1010, payload: 10, fill: 0xbb), tcb: &tcb).delivered.isEmpty)
+    let third = receiver.accept(segment(sequence: 1020, payload: 10, fill: 0xcc), tcb: &tcb)
+    #expect(third.delivered.isEmpty)
+
+    let second = receiver.accept(segment(sequence: 1010, payload: 10, fill: 0xbb), tcb: &tcb)
+    #expect(second.delivered.isEmpty)
 
     let outcome = receiver.accept(segment(sequence: 1000, payload: 10, fill: 0xaa), tcb: &tcb)
 

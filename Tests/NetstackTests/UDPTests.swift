@@ -52,7 +52,8 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     let ipHeader = IPv4Header(
         source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
-    #expect(UDPHeader.parse(&packet, header: ipHeader) == nil)
+    let parsed = UDPHeader.parse(&packet, header: ipHeader)
+    #expect(parsed == nil)
 }
 
 @Test func acceptsAZeroChecksum() {
@@ -63,7 +64,8 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     let ipHeader = IPv4Header(
         source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
-    #expect(UDPHeader.parse(&packet, header: ipHeader)?.sourcePort == 4000)
+    let parsed = UDPHeader.parse(&packet, header: ipHeader)
+    #expect(parsed?.sourcePort == 4000)
 }
 
 // `UDPHeader.serialize`'s `let total = UInt16(length + payload.readableBytes)`
@@ -165,14 +167,16 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     var runt = PacketBuffer(received: ByteBuffer(bytes: [0x00, 0x35, 0x00]))
     let ipHeader = IPv4Header(
         source: IPv4Address("1.2.3.4")!, destination: IPv4Address("5.6.7.8")!, protocolNumber: .udp, payloadLength: 3)
-    #expect(UDPHeader.parse(&runt, header: ipHeader) == nil)
+    let parsedRunt = UDPHeader.parse(&runt, header: ipHeader)
+    #expect(parsedRunt == nil)
 
     // Length field claiming more than is present.
     var datagram = udpDatagram(from: "1.2.3.4", to: "5.6.7.8", sourcePort: 1, destinationPort: 2, payload: [0x01])
     datagram.setInteger(UInt16(500), at: 4, endianness: .big)
     datagram.setInteger(UInt16(0), at: 6, endianness: .big)  // disable checksum so length is the only fault
     var packet = PacketBuffer(received: datagram)
-    #expect(UDPHeader.parse(&packet, header: ipHeader) == nil)
+    let parsedBadLength = UDPHeader.parse(&packet, header: ipHeader)
+    #expect(parsedBadLength == nil)
 }
 
 @Test func aBoundEndpointReceivesDatagrams() throws {

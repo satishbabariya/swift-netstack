@@ -724,8 +724,17 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
 /// no duplicate-ACK run from one call into the next. A shared one would quietly
 /// turn every test here into an integration test of two components, which is
 /// the same reasoning the fresh-receiver helper above rests on.
+///
+/// A fresh `ChallengeACKBudget` per call, for the third time and the same
+/// reason: RFC 5961 §7's throttle is stack-wide state that survives across
+/// segments, and letting it accumulate here would make a test in this file fail
+/// because of how many segments an unrelated test above it had sent. The
+/// throttle's own behaviour is asserted where it is observable —
+/// `TCPEndpointTests`' challenge-ACK section, against real emitted frames.
 private func receiveDrivingASender(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
     var sender = Sender(
         congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 64 * 1024)
-    return TCPStateMachine.receive(segment: segment, on: &tcb, receiver: &receiver, sender: &sender)
+    var challengeACKs = ChallengeACKBudget(clock: ManualClock())
+    return TCPStateMachine.receive(
+        segment: segment, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &challengeACKs)
 }

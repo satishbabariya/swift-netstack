@@ -31,6 +31,12 @@ enum TCPAction: Equatable, Sendable {
     /// Send a bare ACK built from the TCB's current `sndNxt`/`rcvNxt`.
     /// Covers both an ordinary "data received" ACK and an RFC 5961
     /// challenge ACK -- both are, on the wire, the same segment shape.
+    ///
+    /// Which is why RFC 5961 §7's rate limit cannot live on this side of the
+    /// interface: a caller holding an action list can no longer tell the two
+    /// apart, and throttling here would throttle a guest's flow control along
+    /// with the challenges. `TCPStateMachine` spends the budget before it
+    /// forms this case; by the time one exists, it has already been paid for.
     case sendAck
     /// Send a RST at the given sequence number, optionally with the ACK bit
     /// set and acknowledging `ack`.

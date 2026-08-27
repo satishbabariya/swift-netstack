@@ -647,8 +647,18 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
 /// no duplicate-ACK run from one call into the next. A shared one would quietly
 /// turn every test here into an integration test of two components, which is
 /// the same reasoning the fresh-receiver helper above rests on.
+///
+/// A fresh `ChallengeACKBudget` per call, and for the same reason again. Every
+/// test in this file that asserts a challenge ACK — the blind reset, the SYN on
+/// a synchronized connection, the unacceptable segment — would otherwise start
+/// failing once the file accumulated more than a hundred of them between clock
+/// advances, which is a coupling between unrelated tests and not a property of
+/// the machine. The throttle is asserted where it is observable, in
+/// `TCPEndpointTests`' challenge-ACK section, against real emitted frames.
 private func receiveDrivingASender(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
     var sender = Sender(
         congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 64 * 1024)
-    return TCPStateMachine.receive(segment: segment, on: &tcb, receiver: &receiver, sender: &sender)
+    var challengeACKs = ChallengeACKBudget(clock: ManualClock())
+    return TCPStateMachine.receive(
+        segment: segment, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &challengeACKs)
 }

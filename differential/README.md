@@ -418,9 +418,51 @@ differential is where they became visible.
   gVisor and Linux go on retransmitting the following segments as
   acknowledgements arrive; recovering an *n*-segment loss burst here costs
   *n* timeouts on a backing-off ladder. M5.
-- **No RFC 5961 challenge-ACK rate limit.** This stack acknowledges every
-  unacceptable segment, which is RFC 9293 §3.10.7.4 step 1 and is also an
-  amplification the guest controls.
+- **~~No RFC 5961 challenge-ACK rate limit.~~ Closed in M5.** This stack used to
+  acknowledge every unacceptable segment, which is RFC 9293 §3.10.7.4 step 1 and
+  is also an amplification the guest controls. There is now a stack-wide token
+  bucket (`ChallengeACKBudget`, 100 per second, refilled from the injected
+  `NetstackClock`) that **all six** challenge-ACK sites in `TCPStateMachine`
+  spend from — RFC 5961 §3.2's blind reset, §4's SYN on a synchronized
+  connection, §5's acknowledgement of data never sent, and RFC 9293 §3.10.7.4
+  step 1's acknowledge-and-drop in each of its three arms. It is a limit on the
+  ACK only: the 2·MSL restart that travels with a TIME-WAIT FIN retransmission is
+  unconditional, or a guest could expire a TIME-WAIT block by emptying the budget
+  elsewhere. See `TCPEndpointTests`' challenge-ACK section.
+
+  Two adjacent 1:1 emitters are deliberately **not** throttled, and both are worth
+  knowing about before someone reports them as the same gap: the SYN-ACK
+  reproduced for a retransmitted SYN in SYN-RECEIVED, and the reset `Stack`'s TCP
+  handler sends for a port with no endpoint. Neither is a challenge ACK, both are
+  what lets a peer make progress, and throttling either turns a flood on one
+  connection into a refusal to open another.
+
+  The generator still never places a zero-length segment behind RCV.NXT, so the
+  differential does not exercise the throttle. **If it is ever widened to, the two
+  stacks will diverge, and here is the shape of it**, because gVisor throttles as
+  well and does it differently in both dimensions
+  (`transport/tcp/endpoint.go`'s `allowOutOfWindowAck`, called from
+  `connect.go`'s handshake and from `snd.go`'s `maybeSendOutOfWindowAck`):
+
+  | | this stack | gVisor at the pinned version |
+  |---|---|---|
+  | shape | token bucket, 100 tokens, one second to refill | minimum *interval* between two out-of-window ACKs, no bucket |
+  | rate | 100 per second, burstable to 100 at once | `defaultTCPInvalidRateLimit` = 500 ms, so 2 per second and never two together |
+  | scope | one budget per `Stack` | `lastOutOfWindowAckTime` per **endpoint**; only the interval is a stack option |
+  | data-bearing segments | throttled like any other | **exempt** — `maybeSendOutOfWindowAck` always ACKs a segment with a payload |
+
+  That last row is a deliberate disagreement, not an oversight. gVisor's exemption
+  is aimed at ACK loops, where a data segment is unlikely to be one; the threat
+  here is amplification, and a one-byte payload would turn the exemption into a
+  bypass of the whole budget for the price of one byte per segment. Pinned by
+  `aFloodOfUnacceptableSegmentsCarryingDataIsBoundedToo`.
+
+  That also explains part of a row in the table above: "gVisor drops an
+  unacceptable segment in silence" is not only a policy difference, it is this
+  limiter, which at 500 ms suppresses everything a generated sequence sends after
+  the first. A widened generator would see gVisor answer roughly one challenge and
+  this stack answer a hundred, both conformant — RFC 5961 §7 fixes no number and
+  offers "no more than 10 in any 5 second window" only as an example.
 
 ## CI must build the harness for the SWIFT job
 

@@ -482,8 +482,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// Drive one segment through the state machine and act on what it returns.
     private func process(segment: TCPSegment, on connection: Connection) {
         let stateBefore = connection.tcb.state
+        // The challenge-ACK budget comes from the STACK, not from the connection:
+        // every connection this endpoint holds, and every connection every other
+        // endpoint on the same stack holds, spends from one bucket. See
+        // `ChallengeACKBudget`.
         let actions = TCPStateMachine.receive(
-            segment: segment, on: &connection.tcb, receiver: &connection.receiver, sender: &connection.sender)
+            segment: segment, on: &connection.tcb, receiver: &connection.receiver, sender: &connection.sender,
+            challengeACKs: &stack.tcpChallengeACKs)
 
         var wantsAck = false
         var deleted = false

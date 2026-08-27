@@ -12,7 +12,10 @@ concurrency:
 jobs:
   test:
     name: Build and test
-    runs-on: macos-14
+    # `Package.swift` declares swift-tools-version 6.2, so the runner needs a
+    # toolchain at least that new. macos-14 ships Swift 5.10 and fails before it
+    # compiles a line.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 

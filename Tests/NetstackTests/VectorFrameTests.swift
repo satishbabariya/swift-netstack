@@ -84,6 +84,88 @@ private func codec() -> VectorFrames {
     #expect(allBytes[34 + 13] == 0x3f)  // 0x01|0x02|0x04|0x08|0x10|0x20
 }
 
+@Test func theWholeTCPFrameLayoutIsPinnedToRFC9293ByteOffsets() throws {
+    // The flags table was only where the problem showed. The general defect
+    // is that `encode` and `decode` are inverses of each other BY
+    // CONSTRUCTION: every field's offset and width is shared between them,
+    // so any of them can be wrong on the wire and still round-trip cleanly.
+    // `decodesWhatItEncodesForEveryForm` cannot see the sequence number, the
+    // acknowledgement, the window, the data offset, the urgent pointer, the
+    // checksum's span, or any option's kind/length byte for the same reason
+    // it could not see the flags.
+    //
+    // That matters well beyond this file: `VectorRunner` decodes the REAL
+    // stack's output through this codec to decide whether the stack is
+    // correct. A codec that agrees with itself would validate the stack
+    // against a wrong specification and pass every vector while the wire was
+    // wrong.
+    //
+    // So: one frame, a distinctive value in every field, asserted against
+    // RFC 9293 §3.1's layout at literal byte offsets — never against what
+    // `encode` produced. Ethernet 14 + IPv4 20 puts the TCP header at 34.
+    let line = TCPLine(
+        flags: "S.", seqStart: 0x1122_3344, seqEnd: 0x1122_3348, payloadLength: 4,
+        ack: 0x5566_7788, window: 0x9abc, options: ["mss 1460", "wscale 7", "sackOK"])
+    let bytes = Array(try codec().encode(.tcp(line), direction: .inbound).readableBytesView)
+
+    // Ethernet 14 + IPv4 20 + TCP 20 + options 12 + payload 4.
+    #expect(bytes.count == 70)
+
+    // --- Ethernet, offsets 0..13 ---
+    #expect(Array(bytes[0..<6]) == MACAddress("5a:94:ef:e4:0c:ee")!.bytes)   // to the gateway
+    #expect(Array(bytes[6..<12]) == MACAddress("0a:0b:0c:0d:0e:0f")!.bytes)  // from the guest
+    #expect(bytes[12] == 0x08 && bytes[13] == 0x00)                          // ethertype IPv4
+
+    // --- IPv4, offsets 14..33 (RFC 791 §3.1) ---
+    #expect(bytes[14] == 0x45)                                                // version 4, IHL 5
+    #expect(UInt16(bytes[16]) << 8 | UInt16(bytes[17]) == 56)                 // total length: 20 + 36
+    #expect(bytes[23] == 6)                                                   // protocol TCP
+    #expect(Array(bytes[26..<30]) == IPv4Address("192.168.127.2")!.bytes)     // source: the guest
+    #expect(Array(bytes[30..<34]) == IPv4Address("192.168.127.1")!.bytes)     // destination: the gateway
+
+    // --- TCP, offsets 34.. (RFC 9293 §3.1) ---
+    let tcp = 34
+    #expect(UInt16(bytes[tcp + 0]) << 8 | UInt16(bytes[tcp + 1]) == 50_000)   // source port
+    #expect(UInt16(bytes[tcp + 2]) << 8 | UInt16(bytes[tcp + 3]) == 8_080)    // destination port
+    #expect(Array(bytes[(tcp + 4)..<(tcp + 8)]) == [0x11, 0x22, 0x33, 0x44])  // sequence number, big endian
+    #expect(Array(bytes[(tcp + 8)..<(tcp + 12)]) == [0x55, 0x66, 0x77, 0x88])  // acknowledgement number
+    // Byte 12 is data offset in the high nibble and four reserved bits in
+    // the low nibble, which RFC 9293 requires to be zero. 8 words = 20 bytes
+    // of fixed header plus 12 of options.
+    #expect(bytes[tcp + 12] == 0x80)
+    #expect(bytes[tcp + 13] == 0x12)                                          // SYN|ACK: 0x02|0x10
+    #expect(UInt16(bytes[tcp + 14]) << 8 | UInt16(bytes[tcp + 15]) == 0x9abc)  // window
+    #expect(UInt16(bytes[tcp + 18]) << 8 | UInt16(bytes[tcp + 19]) == 0)      // urgent pointer, URG not set
+
+    // Options at offset 20, each pinned to its RFC kind/length pair rather
+    // than to whatever `encodeTCPOptions` emitted: MSS is kind 2 length 4
+    // (RFC 9293 §3.2), window scale kind 3 length 3 (RFC 7323 §2.2),
+    // SACK-permitted kind 4 length 2 (RFC 2018 §2), NOP kind 1 as padding to
+    // the 4-byte boundary the data offset counts in.
+    #expect(Array(bytes[(tcp + 20)..<(tcp + 32)]) == [2, 4, 0x05, 0xb4, 3, 3, 7, 4, 2, 1, 1, 1])
+
+    // The payload follows the options, not the fixed header.
+    #expect(Array(bytes[(tcp + 32)..<70]) == [0, 0, 0, 0])
+
+    // --- Checksum, offsets 16..17 of the TCP header ---
+    // Verified rather than compared: build RFC 9293 §3.1's pseudo-header
+    // here from literals — source, destination, a zero byte, protocol 6, and
+    // the TCP length — and confirm the ones-complement sum over
+    // pseudo-header + segment folds to zero. This pins the SPAN the checksum
+    // covers, which a round trip cannot: a checksum computed over the wrong
+    // range still decodes back to the same packet.
+    let segment = Array(bytes[34...])
+    var pseudo: [UInt8] = []
+    pseudo += IPv4Address("192.168.127.2")!.bytes
+    pseudo += IPv4Address("192.168.127.1")!.bytes
+    pseudo += [0, 6, UInt8(segment.count >> 8), UInt8(segment.count & 0xff)]
+    #expect(segment.count == 36)
+    #expect((pseudo + segment).withUnsafeBytes { Checksum.compute($0) } == 0)
+    // A ones-complement sum of zero is also what an all-zero buffer gives,
+    // so pin that a checksum was actually written into the field.
+    #expect(UInt16(bytes[tcp + 16]) << 8 | UInt16(bytes[tcp + 17]) != 0)
+}
+
 @Test func decodesWhatItEncodesForEveryForm() throws {
     let forms: [VectorPacket] = [
         .tcp(TCPLine(flags: "S.", seqStart: 100, seqEnd: 100, payloadLength: 0, ack: 1, window: 512, options: [])),

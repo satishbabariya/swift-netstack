@@ -223,15 +223,23 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     }
     #expect(cache.count == capacity)
 
-    // Re-touch the other 63 (never evicts — they already exist) until
-    // `order` is well past `4 * capacity` and the full pass has run.
-    for i in 0..<400 {
-        cache.record(ip(1 + i % (capacity - 1)), mac(1 + i % (capacity - 1)))
+    // Grow `order` past `4 * capacity` so the full pass fires, by re-touching
+    // ONLY the newest entry. Re-touching an existing key never evicts, and
+    // hammering just ip(63) keeps the LRU order of everything else exactly as
+    // the fill left it: ip(0) oldest, then ip(1), ip(2), ... That makes the
+    // eviction sequence below predictable from first principles rather than
+    // read back from the implementation. 250 > 4 * 64 - 64, so `order`
+    // crosses the threshold; `orderHead` stays 0 throughout because ip(0)'s
+    // appearance at the front is live, so the prefix-drop cannot pre-empt the
+    // full pass.
+    for _ in 0..<250 {
+        cache.record(ip(capacity - 1), mac(capacity - 1))
     }
 
-    // Now insert new addresses. Each one must evict, using an `order` that
-    // the full pass has just rebuilt.
-    for i in 0..<200 {
+    // Now insert ten new addresses. Each must evict, using an `order` the
+    // full pass has just rebuilt, and LRU says the victims are ip(0) through
+    // ip(9) in that order.
+    for i in 0..<10 {
         cache.record(ip(1_000 + i), mac(1_000 + i))
     }
 
@@ -248,7 +256,23 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     // strictly more recently used entries are evicted around it. Measured
     // both ways: `lookup(ip(0))` is nil against the real compaction and
     // non-nil against `order = []`.
-    #expect(cache.lookup(ip(0)) == nil, "the least recently used entry must be the one evicted, not the one that survives")
+    // Assert the whole eviction SEQUENCE, not just its first victim. A
+    // single-victim check is blind to a full pass that keeps every live
+    // appearance but reverses their order (`Array(compacted.reversed())`),
+    // which inverts LRU into MRU: the cache then evicts the most recently
+    // used entry and keeps the stalest, so a guest's own gateway entry — the
+    // one address it talks to constantly — is thrown out under any sustained
+    // traffic while junk survives. Ten victims in a known order distinguishes
+    // that from correct behaviour; one victim does not.
+    //
+    // Probing has to happen AFTER all ten insertions, never between them:
+    // `lookup` is itself a touch that appends to `order`, so interleaving the
+    // checks would rewrite the very ordering under test. A miss is free — it
+    // returns on `entries[ip] == nil` before touching anything.
+    let evicted = (0..<10).map { cache.lookup(ip($0)) == nil }
+    #expect(evicted == Array(repeating: true, count: 10), "ip(0)...ip(9) are the ten least recently used and must be the ten evicted")
+    let survived = (10..<capacity).map { cache.lookup(ip($0)) != nil }
+    #expect(survived == Array(repeating: true, count: 54), "ip(10)...ip(63) are more recently used and must all survive")
     // A LITERAL 64, not `capacity`: this is the number the cache must not
     // exceed, and writing it as the same variable the cache was constructed
     // from would move the goalposts with any future change to the input.
@@ -258,7 +282,7 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.orderCountForTesting <= 4 * capacity + 1)
     // The floor: an upper bound on the table is satisfied by a cache that
     // evicted everything, so pin that the most recent insertion survived.
-    #expect(cache.lookup(ip(1_199)) == mac(1_199))
+    #expect(cache.lookup(ip(1_009)) == mac(1_009))
 }
 
 @Test func cacheEvictsOldestButKeepsARecentlyTouchedEntry() {

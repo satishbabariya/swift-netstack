@@ -61,6 +61,10 @@ private final class TCPFixture {
         // arrived, so the cache is primed here for every test rather than in
         // the two that would otherwise silently emit ARP where a SYN was
         // expected.
+        primeARP()
+    }
+
+    private func primeARP() {
         for guest in [tcpGuest, tcpOtherGuest] {
             stack.arpCache.record(guest, tcpGuestMAC)
         }
@@ -68,6 +72,21 @@ private final class TCPFixture {
 
     func advance(by amount: TimeAmount) {
         clock.advance(by: amount)
+        // `ARPCache`'s entries live sixty seconds, and this stands in for a
+        // guest that is still on the link and still answers ARP.
+        //
+        // Not a convenience. Any test that crosses that TTL without it stops
+        // measuring TCP: `IPv4Protocol.send` throws `.noRoute` and emits an ARP
+        // REQUEST when the next hop is unknown, so a FIN retransmission on a
+        // backed-off sixty-second timer produces an ARP frame and no segment,
+        // and `drainSegments` -- which filters non-TCP frames -- reports
+        // silence. That is correct production behaviour (the retransmission
+        // simply waits for the next backoff), and it is exactly the kind of
+        // second cause that makes an assertion about TCP pass or fail for
+        // reasons of its own. Inbound frames re-prime the cache on their own
+        // (`IPv4Protocol.handleInbound` records every sender), so only
+        // timer-driven emissions on an otherwise idle connection are affected.
+        primeARP()
         loop.advanceTime(by: amount)
     }
 
@@ -1009,8 +1028,298 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
             #expect(fin.first?.header.flags.contains(.fin) == true)
             #expect(fin.first?.header.flags.contains(.ack) == true)
             #expect(fin.first?.header.sequence == SequenceNumber(gatewayISS + 1))
-            #expect(endpoint.connectionCountForTesting == 0)
+            // The connection is NOT discarded: it is in FIN-WAIT-1, holding its
+            // own four-tuple until the close completes. Dropping it here is what
+            // made TIME-WAIT unreachable in this endpoint's first version.
+            #expect(endpoint.connectionCountForTesting == 1)
         }
     }
+    fixture.drain()
+}
+
+// MARK: - Teardown: FIN retransmission, TIME-WAIT, and the cap on it
+
+/// Take one connection from ESTABLISHED to TIME-WAIT: our FIN is acknowledged,
+/// then the peer sends its own.
+///
+/// `finSequence` is where our FIN sat, which is SND.NXT - 1 after
+/// `TCPStateMachine.close` reserved it -- for a connection that sent no data,
+/// `gatewayISS + 1`.
+private func driveToTimeWait(_ fixture: TCPFixture, peerPort: UInt16 = tcpPeerPort, finSequence: UInt32 = gatewayISS + 1) {
+    fixture.inject(guestSegment(sequence: guestISS + 1, ack: finSequence + 1, flags: [.ack], peerPort: peerPort))
+    fixture.inject(guestSegment(sequence: guestISS + 1, ack: finSequence + 1, flags: [.fin, .ack], peerPort: peerPort))
+}
+
+/// A segment that plausibly belongs to a connection that has just closed: in
+/// window for the old block, and carrying an acknowledgement it would accept.
+private func lateSegment(peerPort: UInt16 = tcpPeerPort) -> TCPHeader {
+    guestSegment(sequence: guestISS + 2, ack: gatewayISS + 2, flags: [.ack], peerPort: peerPort)
+}
+
+@Test func aClosedConnectionHoldsItsFourTupleThroughTimeWaitWhileThePortIsRebindable() throws {
+    // The two halves of "close" are different, and this is the one that was
+    // wrong. A LISTENING key has nothing in flight and is released at once. A
+    // CONNECTED four-tuple is held for 2*MSL, because that is the entire purpose
+    // of TIME-WAIT: a late or duplicate segment from the old connection must be
+    // absorbed by the dying block rather than delivered into a NEW connection
+    // that has reused the tuple. An endpoint that releases it immediately has
+    // the timer and none of the protection.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let successor = TCPEndpoint(stack: fixture.stack, initialSequenceNumbers: FixedInitialSequenceNumbers(9000))
+        try withExtendedLifetime((endpoint, successor)) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            // Positive control: the port is genuinely taken before the close.
+            #expect(throws: StackError.portInUse) {
+                try successor.bind(address: tcpGateway, port: tcpLocalPort)
+            }
+
+            endpoint.close()
+            #expect(fixture.drainSegments().count == 1, "the FIN")
+
+            // The LISTENING key is free the instant `close()` returns...
+            try successor.bind(address: tcpGateway, port: tcpLocalPort)
+            try successor.listen(backlog: 4)
+
+            driveToTimeWait(fixture)
+            _ = fixture.drainSegments()
+            #expect(endpoint.timeWaitCountForTesting == 1)
+
+            // ...but the CONNECTED four-tuple is not. A late segment for it is
+            // absorbed by the dying block, which acknowledges it -- it does not
+            // reach the successor, which would answer a segment for an unknown
+            // connection with a reset.
+            fixture.inject(lateSegment())
+            let absorbed = fixture.drainSegments()
+            #expect(absorbed.count == 1)
+            #expect(absorbed.first?.header.flags.contains(.ack) == true)
+            #expect(absorbed.first?.header.flags.contains(.rst) == false, "TIME-WAIT absorbs; it does not refuse")
+            #expect(successor.connectionCountForTesting == 0)
+
+            // 2*MSL later the block is gone and the tuple really is reusable:
+            // the identical segment now reaches the successor and is refused.
+            fixture.advance(by: .seconds(60))
+            #expect(endpoint.connectionCountForTesting == 0)
+
+            fixture.inject(lateSegment())
+            let refused = fixture.drainSegments()
+            #expect(refused.count == 1)
+            #expect(refused.first?.header.flags.contains(.rst) == true, "the tuple is free, so this is a new connection's problem")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func timeWaitBlocksAreCappedAndEvictedOldestFirst() throws {
+    // A TIME-WAIT block is guest-reachable state that outlives its connection by
+    // sixty seconds, so it is capped like everything else a guest can drive. It
+    // is the one table here that EVICTS rather than refusing: a connection that
+    // has already closed cannot be refused, so the only question is which block
+    // to give up, and the oldest is the one whose late segments have had longest
+    // to drain.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = TCPEndpoint(
+            stack: fixture.stack, initialSequenceNumbers: FixedInitialSequenceNumbers(gatewayISS),
+            maximumTimeWaitConnections: 2)
+        try endpoint.bind(address: tcpGateway, port: tcpLocalPort)
+        try endpoint.listen(backlog: 8)
+        withExtendedLifetime(endpoint) {
+            for port: UInt16 in [50001, 50002, 50003] {
+                completeHandshake(fixture, peerPort: port)
+            }
+            _ = fixture.drainSegments()
+            #expect(endpoint.connectionCountForTesting == 3)
+
+            endpoint.close()
+            _ = fixture.drainSegments()
+
+            driveToTimeWait(fixture, peerPort: 50001)
+            driveToTimeWait(fixture, peerPort: 50002)
+            _ = fixture.drainSegments()
+            // Positive control, and the one that matters: the table DOES hold
+            // blocks. "It did not grow without bound" is satisfied perfectly by
+            // an endpoint that holds nothing at all.
+            #expect(endpoint.timeWaitCountForTesting == 2)
+
+            driveToTimeWait(fixture, peerPort: 50003)
+            _ = fixture.drainSegments()
+            #expect(endpoint.timeWaitCountForTesting == 2, "the cap binds")
+
+            // And it is the OLDEST that went. A late segment for 50001 no longer
+            // finds a block and is refused; the identical segment for 50002 is
+            // still absorbed.
+            fixture.inject(lateSegment(peerPort: 50001))
+            let evicted = fixture.drainSegments()
+            #expect(evicted.count == 1)
+            #expect(evicted.first?.header.flags.contains(.rst) == true)
+
+            fixture.inject(lateSegment(peerPort: 50002))
+            let retained = fixture.drainSegments()
+            #expect(retained.count == 1)
+            #expect(retained.first?.header.flags.contains(.rst) == false)
+            #expect(retained.first?.header.flags.contains(.ack) == true)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aLostFinIsRetransmittedOnABackingOffTimerUntilItIsAcknowledged() throws {
+    // Tasks 16 and 17 need this: a peer that loses our FIN must see it again, or
+    // the close never completes and every teardown sequence in the differential
+    // diverges for a reason that has nothing to do with what is under test.
+    //
+    // `Sender` cannot carry it -- an in-flight record for a FIN has no bytes in
+    // its chunk queue, so `retransmitOldest`'s bounds guard fails and it stops
+    // retransmitting DATA as well -- so the endpoint owns it.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            endpoint.close()
+            let first = fixture.drainSegments()
+            #expect(first.count == 1)
+            #expect(first.first?.header.flags.contains(.fin) == true)
+
+            // RFC 6298 §2.1's initial one second, then §5.5's doubling. Each
+            // advance produces exactly one retransmission, at the same sequence
+            // number -- a FIN that moved would be a different FIN.
+            fixture.advance(by: .seconds(1))
+            let second = fixture.drainSegments()
+            #expect(second.count == 1)
+            #expect(second.first?.header.flags.contains(.fin) == true)
+            #expect(second.first?.header.sequence == first.first?.header.sequence)
+
+            fixture.advance(by: .seconds(1))
+            #expect(fixture.drainSegments().isEmpty, "the timer backed off; one second is no longer enough")
+
+            fixture.advance(by: .seconds(1))
+            let third = fixture.drainSegments()
+            #expect(third.count == 1)
+            #expect(third.first?.header.sequence == first.first?.header.sequence)
+
+            // Acknowledged: it must stop.
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 2, flags: [.ack]))
+            _ = fixture.drainSegments()
+            for _ in 0..<5 {
+                fixture.advance(by: .seconds(120))
+            }
+            #expect(fixture.drainSegments().isEmpty, "an acknowledged FIN is not retransmitted")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aPeerCannotDeferOurFinRetransmissionBySendingSegments() throws {
+    // The FIN's retransmission deadline is ABSOLUTE, and this is why.
+    //
+    // Every arriving segment re-arms the retransmission timer, and
+    // `TCPTimers.scheduleRetransmit` cancels what was pending before it
+    // schedules. A deadline recomputed as `now + timeout` on each re-arm
+    // therefore slips forward by whatever the peer chooses, and a peer that
+    // sends any acceptable segment just under the RTO -- a one-byte write, a
+    // window probe, anything -- defers our FIN indefinitely and holds the
+    // connection, its four-tuple and its timer open for free.
+    //
+    // Falsifying the absolute deadline was INERT before this test existed: no
+    // other test sends anything to a connection between two FIN retransmissions.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            endpoint.close()
+            #expect(fixture.drainSegments().count == 1, "the FIN")
+
+            // Half an RTO in, the peer sends something acceptable. It draws an
+            // acknowledgement, which is the positive control that the segment
+            // really was processed and really did re-arm the timer.
+            fixture.advance(by: .milliseconds(500))
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]), payload: tcpPayload(1))
+            let answered = fixture.drainSegments()
+            #expect(answered.count == 1)
+            #expect(answered.first?.header.flags.contains(.fin) == false)
+
+            // The rest of the original RTO. The FIN is due now, not half a
+            // second from now.
+            fixture.advance(by: .milliseconds(500))
+            let retransmitted = fixture.drainSegments().filter { $0.header.flags.contains(.fin) }
+            #expect(retransmitted.count == 1, "an arriving segment must not push our FIN's deadline out")
+            #expect(retransmitted.first?.header.sequence == SequenceNumber(gatewayISS + 1))
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aFinThatIsNeverAcknowledgedGivesTheConnectionUpRatherThanPinningIt() throws {
+    // RFC 1122 §4.2.3.5's R2. Without a budget a peer that simply never answers
+    // pins the block, its four-tuple registration and its timer for the life of
+    // the process -- and it costs the peer nothing to do it.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            endpoint.close()
+            var fins = fixture.drainSegments().count
+            // Positive control: the connection and its registration exist to be
+            // given up.
+            #expect(endpoint.connectionCountForTesting == 1)
+            #expect(fixture.stack.transportDemuxer.registrationCountForTesting == 1)
+
+            for _ in 0..<12 {
+                fixture.advance(by: .seconds(120))
+                fins += fixture.drainSegments().count
+            }
+            #expect(fins == TCPEndpoint.maximumFinTransmissions)
+            #expect(endpoint.connectionCountForTesting == 0)
+            #expect(
+                fixture.stack.transportDemuxer.registrationCountForTesting == 0,
+                "giving the connection up must release its four-tuple too")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aConnectionInTimeWaitIsReleasedWhenTheEndpointIsDropped() throws {
+    // The TIME-WAIT timer's `[weak self]`, which was unfalsifiable while
+    // `close()` released the four-tuple: no connection could reach TIME-WAIT at
+    // all, so making the capture strong failed nothing. It is reachable now.
+    let fixture = TCPFixture()
+    weak var weakEndpoint: TCPEndpoint?
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+            endpoint.close()
+            driveToTimeWait(fixture)
+            _ = fixture.drainSegments()
+
+            // Positive control: there really is an armed 2*MSL timer and a
+            // registration held open by it.
+            #expect(endpoint.timeWaitCountForTesting == 1)
+            #expect(fixture.stack.transportDemuxer.registrationCountForTesting == 1)
+            weakEndpoint = endpoint
+            #expect(weakEndpoint != nil)
+        }
+    }
+    #expect(weakEndpoint == nil, "a 2*MSL timer must not keep a dropped endpoint alive for a minute")
+    #expect(
+        fixture.stack.transportDemuxer.registrationCountForTesting == 0,
+        "and `deinit` must release the four-tuple it was holding")
+    fixture.advance(by: .seconds(120))
+    #expect(fixture.drainSegments().isEmpty)
     fixture.drain()
 }

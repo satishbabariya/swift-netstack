@@ -462,3 +462,49 @@ private func injectRawUDPDatagram(_ datagram: ByteBuffer, into link: RecordingEn
     frame.writeBuffer(&body)
     link.inject(frame)
 }
+
+@Test func aDroppedUdpEndpointReclaimsItsSlotInTheDemuxer() throws {
+    // `UDPEndpoint.deinit`'s own comment already says what it does and does not
+    // buy -- "the demuxer holds delegates weakly, so a dropped endpoint stops
+    // receiving on its own; this only reclaims the table slot" -- and nothing
+    // was checking the half it does buy. Deleting that `unregister` left the
+    // whole suite green; this is the assertion that now fails alone.
+    //
+    // The identical hole was found first in `TCPEndpoint.deinit` and is the
+    // same shape for the same reason: `register` refuses a key only when its
+    // weak delegate is still alive, so a REBIND succeeds either way and cannot
+    // be the thing under test. What is left is the slot, one dictionary entry
+    // per dropped endpoint, held for the life of the stack on any port never
+    // touched again.
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!),
+        clock: ManualClock())
+    stack.start()
+
+    weak var weakEndpoint: UDPEndpoint?
+    do {
+        let endpoint = UDPEndpoint(stack: stack)
+        try endpoint.bind(address: IPv4Address("192.168.127.1")!, port: 53)
+        weakEndpoint = endpoint
+        // Positive controls: the endpoint is alive, its slot is occupied, and
+        // the port really is taken while it lives.
+        #expect(weakEndpoint != nil)
+        #expect(stack.transportDemuxer.registrationCountForTesting == 1)
+
+        let rival = UDPEndpoint(stack: stack)
+        #expect(throws: StackError.portInUse) {
+            try rival.bind(address: IPv4Address("192.168.127.1")!, port: 53)
+        }
+        withExtendedLifetime(rival) {}
+        withExtendedLifetime(endpoint) {}
+    }
+    #expect(weakEndpoint == nil)
+    #expect(
+        stack.transportDemuxer.registrationCountForTesting == 0,
+        "a dropped endpoint must not leave its table slot behind")
+
+    withExtendedLifetime(stack) {}
+}

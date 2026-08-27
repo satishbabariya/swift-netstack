@@ -24,12 +24,11 @@ import NIOCore
 ///
 /// - `send(_:)` has no way to name a connection, so it refuses to guess: it
 ///   throws unless exactly one connection exists.
-/// - `close()` frees the four-tuple immediately, as its contract requires, so
-///   it cannot linger to complete a four-way handshake. It sends a FIN on every
-///   connection and then tears the endpoint down; a graceful half-close needs a
-///   lingering state this interface has nowhere to express. The consequence is
-///   that **TIME-WAIT is unreachable from here**, and it is spelled out at
-///   `armTimeWaitTimer` rather than left to be discovered.
+/// - `close()` releases the **listening** key immediately, as its contract
+///   requires, but a **connected** four-tuple is held until that connection is
+///   finished — through FIN retransmission, and through TIME-WAIT. Releasing it
+///   at `close()` is what made TIME-WAIT unreachable in this type's first
+///   version: the state without the protection. See `close()`.
 ///
 /// ## Egress goes through exactly one point
 ///
@@ -61,6 +60,12 @@ import NIOCore
 /// - The connection table is bounded by the backlog. A SYN arriving when it is
 ///   full is **dropped** (not reset): a legitimate peer retransmits its SYN,
 ///   whereas a reset would turn a transient overload into a hard failure.
+/// - TIME-WAIT blocks are bounded by `maximumTimeWaitConnections`, and this one
+///   evicts oldest-first rather than refusing, because a connection that has
+///   already closed cannot be refused. See that constant.
+/// - Our own FIN is retransmitted at most `maximumFinTransmissions` times before
+///   the connection is given up, so a peer that never acknowledges it cannot pin
+///   a block, a registration and a timer for the life of the process.
 public final class TCPEndpoint: TransportEndpointDelegate {
     /// The largest backlog any caller may ask for. The application chooses the
     /// backlog, not the guest, so this is a guard rail rather than a defence --
@@ -83,6 +88,32 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
     /// says nothing has told us nothing about the path.
     static let defaultPeerSegmentSize = 536
+
+    /// How many connections may sit in TIME-WAIT at once.
+    ///
+    /// A TIME-WAIT block is guest-reachable state that outlives the connection
+    /// by 2·MSL — sixty seconds here — and a guest that opens and closes in a
+    /// loop accumulates one per connection. Everything a guest can drive in this
+    /// stack is capped, so this is too.
+    ///
+    /// **The policy is oldest-first eviction, and it is the opposite of the
+    /// refuse-the-newcomer rule `TCPReassembler` and `Sender` follow.** Those
+    /// can refuse, because a refused segment is retransmitted and nothing is
+    /// lost. A connection that has reached TIME-WAIT cannot be refused — it has
+    /// already closed — so the only question is which block to give up, and the
+    /// oldest is the one whose late segments have had the longest to drain and
+    /// is therefore worth the least. That is also what Linux does.
+    static let defaultMaximumTimeWaitConnections = 256
+
+    /// How many times our FIN is retransmitted before the connection is given
+    /// up. RFC 1122 §4.2.3.5's R2, in retransmissions rather than in seconds:
+    /// with the RTO doubling from one second and capped at
+    /// `RTTEstimator.maximumTimeout`, eight attempts is about three minutes.
+    ///
+    /// A bound is required, not tidiness: a peer that never acknowledges our FIN
+    /// would otherwise pin the connection, its four-tuple registration and its
+    /// timer for the life of the process.
+    static let maximumFinTransmissions = 8
 
     private struct Peer: Hashable {
         let address: IPv4Address
@@ -111,6 +142,29 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// both "this stream is over", and a connection can meet both.
         var closedReported = false
 
+        /// The four-tuple this connection holds in the demuxer in its own right,
+        /// once `close()` has released the endpoint's listening key. Nil while
+        /// the listening key still covers it. See `close()`.
+        var registeredID: TransportEndpointID?
+
+        /// The sequence number our FIN occupies, once one has been sent.
+        /// `Sender` deliberately models no control flags, so the FIN's
+        /// retransmission is this endpoint's to drive; see
+        /// `finNeedsRetransmission`.
+        var finSequence: SequenceNumber?
+        /// When the FIN should next be retransmitted. An **absolute** deadline
+        /// rather than a delay, so that re-arming the timer on every arriving
+        /// segment cannot push it further out -- a peer that sends anything at
+        /// all would otherwise defer our FIN indefinitely.
+        var finDeadline: NIODeadline?
+        var finTimeout: TimeAmount = RTTEstimator.minimumTimeout
+        var finTransmissions = 0
+
+        /// The order in which this connection entered TIME-WAIT, or nil if it
+        /// has not. An ordinary counter, so that eviction can pick the oldest
+        /// with an `Int` comparison and never a `SequenceNumber` one.
+        var timeWaitOrder: UInt64?
+
         init(
             peer: Peer, localAddress: IPv4Address, localPort: UInt16, timers: TCPTimers, tcb: TCB,
             receiver: Receiver, sender: Sender, mss: Int
@@ -130,10 +184,15 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     private let initialSequenceNumbers: any InitialSequenceNumbers
     private let allocator = ByteBufferAllocator()
 
+    private let maximumTimeWaitConnections: Int
+
     private var boundID: TransportEndpointID?
     private var isListening = false
     private var backlog = 0
     private var connections: [Peer: Connection] = [:]
+    /// Hands out `Connection.timeWaitOrder`. Monotonic, so "oldest" is a fact
+    /// rather than a guess about dictionary order.
+    private var timeWaitSequence: UInt64 = 0
 
     /// In-order bytes from the peer, oldest first.
     public var onData: ((ByteBuffer) -> Void)?
@@ -158,21 +217,36 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// generator through the public initialiser above. Internal, so "use a
     /// constant ISS" never becomes part of this package's supported surface --
     /// see `InitialSequenceNumbers` for what a predictable one costs.
-    init(stack: Stack, initialSequenceNumbers: any InitialSequenceNumbers) {
+    ///
+    /// `maximumTimeWaitConnections` is injected for the same reason
+    /// `TCPReassembler`'s caps are: a cap that can only be exercised by building
+    /// its production value's worth of state is a cap nothing tests.
+    init(
+        stack: Stack, initialSequenceNumbers: any InitialSequenceNumbers,
+        maximumTimeWaitConnections: Int = TCPEndpoint.defaultMaximumTimeWaitConnections
+    ) {
         self.stack = stack
         self.initialSequenceNumbers = initialSequenceNumbers
+        self.maximumTimeWaitConnections = max(1, maximumTimeWaitConnections)
     }
 
     deinit {
         // `TransportDemuxer` holds delegates weakly, so a dropped endpoint stops
-        // receiving on its own; this reclaims the table SLOT, without which the
-        // port stays unbindable until something else happens to evict the
-        // stale entry. The connections' `TCPTimers` cancel themselves in their
-        // own `deinit`, which is why the timer bodies below must capture this
+        // receiving on its own; this reclaims the table SLOTS, without which a
+        // port stays occupied until something else happens to evict the stale
+        // entry. The connections' `TCPTimers` cancel themselves in their own
+        // `deinit`, which is why the timer bodies below must capture this
         // endpoint weakly: a strong capture would keep it -- and the whole
         // connection graph -- alive on the loop's queue until the deadline.
+        //
+        // Both kinds of key have to go: the listening key, and the per-connection
+        // four-tuples a closed-but-lingering connection holds (see `close()`).
         if let boundID {
             stack.transportDemuxer.unregister(boundID, protocolNumber: .tcp)
+        }
+        for connection in connections.values {
+            guard let id = connection.registeredID else { continue }
+            stack.transportDemuxer.unregister(id, protocolNumber: .tcp)
         }
     }
 
@@ -257,19 +331,68 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         armRetransmitTimer(on: connection)
     }
 
-    /// Close every connection and free the four-tuple.
+    /// Close every connection, release the **listening** port, and keep every
+    /// connection's own four-tuple until that connection is actually finished.
     ///
-    /// The port is rebindable the instant this returns. See the type's doc
-    /// comment for why that forecloses a graceful half-close.
+    /// ## The two things "close" means here are genuinely different
+    ///
+    /// - The **listening key** — `(localAddress, localPort, any, 0)` — is
+    ///   released immediately. Nothing is in flight for it, and the port is
+    ///   rebindable the instant this returns.
+    /// - A **connected** four-tuple is not. It stays registered, in this
+    ///   endpoint's own name, until the connection reaches CLOSED or its
+    ///   TIME-WAIT timer fires.
+    ///
+    /// The second half is the whole point of TIME-WAIT and it took a measurement
+    /// to see. This method used to drop every connection and release everything,
+    /// which left `.startTimeWait` unreachable: making its timer body's `[weak
+    /// self]` a strong capture failed nothing, because no connection could ever
+    /// get there. That is not a missing test — it is the protection missing.
+    /// RFC 9293 §3.10.7.4 holds the four-tuple for 2·MSL precisely so that a
+    /// late or duplicate segment from the old connection is absorbed by the
+    /// dying block rather than delivered into a **new** connection that has
+    /// reused the same tuple. Releasing it at `close()` pays for the timer and
+    /// buys none of that.
+    ///
+    /// `TransportDemuxer.deliver` tries the exact four-tuple before either
+    /// wildcard, so a successor that binds the same local port gets everything
+    /// except the segments belonging to a connection still dying here — which is
+    /// exactly the discrimination TIME-WAIT is for.
+    ///
+    /// ## What this cannot do
+    ///
+    /// The demuxer holds delegates weakly, so these registrations live only as
+    /// long as the `TCPEndpoint` object does. Dropping a closed endpoint ends
+    /// its TIME-WAIT protection early (`deinit` unregisters, deliberately, so
+    /// nothing is left dangling). Surviving that would mean moving TIME-WAIT
+    /// blocks into the `Stack`, which is a larger design than this interface
+    /// implies; a caller that wants the protection must hold the endpoint.
+    ///
+    /// `onData` and `onEstablished` are cleared — the application asked to stop
+    /// — but `onClosed` is **not**, because `close()` is now asynchronous and
+    /// that callback is the only way to learn it finished.
     public func close() {
         for connection in connections.values {
-            for action in TCPStateMachine.close(on: &connection.tcb) where action == .sendFin {
-                emitFin(on: connection)
+            for action in TCPStateMachine.close(on: &connection.tcb) {
+                switch action {
+                case .sendFin:
+                    emitFin(on: connection)
+                case .deleteTCB:
+                    // LISTEN or SYN-SENT: nothing was ever established, so there
+                    // is no four-tuple worth holding and nothing to wait out.
+                    remove(connection)
+                default:
+                    break
+                }
             }
-            connection.timers.cancelAll()
         }
-        connections.removeAll()
 
+        // Register what survives under its own key BEFORE releasing the
+        // listening one, so no segment can fall through the gap between them.
+        for connection in connections.values {
+            registerInOwnRight(connection)
+            armRetransmitTimer(on: connection)
+        }
         if let boundID {
             stack.transportDemuxer.unregister(boundID, protocolNumber: .tcp)
         }
@@ -277,14 +400,20 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         isListening = false
         onData = nil
         onEstablished = nil
-        onClosed = nil
     }
 
-    /// How many connections this endpoint currently holds. Not `private`,
-    /// because `@testable import` elevates `internal` and not `private`, and
-    /// "the backlog refused it" is otherwise indistinguishable from "the
-    /// segment was silently mis-parsed".
+    /// How many connections this endpoint currently holds, live and lingering
+    /// alike. Not `private`, because `@testable import` elevates `internal` and
+    /// not `private`, and "the backlog refused it" is otherwise
+    /// indistinguishable from "the segment was silently mis-parsed".
     var connectionCountForTesting: Int { connections.count }
+
+    /// How many of them are in TIME-WAIT. The cap is on this number, and a cap
+    /// asserted without it would be satisfied by an endpoint that holds nothing
+    /// at all.
+    var timeWaitCountForTesting: Int {
+        connections.values.reduce(0) { $0 + ($1.tcb.state == .timeWait ? 1 : 0) }
+    }
 
     // MARK: - Ingress
 
@@ -493,8 +622,24 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     /// Our FIN. `TCPStateMachine.close(on:)` has already bumped SND.NXT to
     /// reserve the sequence number it consumes, so the FIN occupies SND.NXT - 1.
+    ///
+    /// Also arms its own retransmission deadline. `Sender` models a byte stream
+    /// and no control flags -- deliberately, and the alternative was measured:
+    /// giving it an in-flight record for the FIN makes `retransmitOldest`'s
+    /// `offset + length <= queuedBytes` guard fail, so it returns nil and stops
+    /// retransmitting **data** as well, on a timer that keeps re-arming. So the
+    /// FIN's retransmission is this endpoint's, and this is where its clock
+    /// starts.
     private func emitFin(on connection: Connection) {
-        emit([.fin, .ack], sequence: connection.tcb.sndNxt + (-1), on: connection)
+        let sequence = connection.tcb.sndNxt + (-1)
+        if connection.finSequence == nil {
+            connection.finSequence = sequence
+            connection.finTimeout = connection.sender.retransmissionTimeout
+            connection.finTransmissions = 0
+        }
+        connection.finTransmissions += 1
+        connection.finDeadline = stack.clock.now() + connection.finTimeout
+        emit([.fin, .ack], sequence: sequence, on: connection)
     }
 
     /// Put whatever the sender has ready on the wire: a pending fast
@@ -523,8 +668,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// rather than silent), so a strong capture here would keep the whole
     /// connection graph alive on the loop's queue until the deadline and then
     /// drive a connection that no longer exists.
+    /// One timer, two deadlines: the sender's, for unacknowledged data, and this
+    /// endpoint's own, for an unacknowledged FIN. Arm at whichever comes first
+    /// and let the body work out what is actually due.
     private func armRetransmitTimer(on connection: Connection) {
-        guard let deadline = connection.sender.retransmitDeadline else {
+        guard let deadline = nextRetransmitDeadline(of: connection) else {
             connection.timers.cancelRetransmit()
             return
         }
@@ -536,40 +684,123 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         }
     }
 
+    private func nextRetransmitDeadline(of connection: Connection) -> NIODeadline? {
+        let data = connection.sender.retransmitDeadline
+        let fin = finNeedsRetransmission(connection) ? connection.finDeadline : nil
+        switch (data, fin) {
+        case (nil, nil): return nil
+        case (let data?, nil): return data
+        case (nil, let fin?): return fin
+        case (let data?, let fin?): return min(data, fin)
+        }
+    }
+
     private func retransmitTimerFired(peer: Peer) {
         guard let connection = connections[peer] else { return }
-        if let segment = connection.sender.retransmitTimerFired(tcb: &connection.tcb) {
+        let now = stack.clock.now()
+
+        if let deadline = connection.sender.retransmitDeadline, deadline <= now,
+            let segment = connection.sender.retransmitTimerFired(tcb: &connection.tcb)
+        {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
         }
+
+        if finNeedsRetransmission(connection), let deadline = connection.finDeadline, deadline <= now {
+            guard connection.finTransmissions < Self.maximumFinTransmissions else {
+                // RFC 1122 §4.2.3.5's R2: give the connection up rather than
+                // hold its four-tuple, its timer and its block for a peer that
+                // is never going to answer.
+                remove(connection)
+                reportClosed(connection)
+                return
+            }
+            // RFC 6298 §5.5's backoff, run here because the sender's estimator
+            // only backs off for segments the sender itself holds.
+            connection.finTimeout = min(connection.finTimeout * 2, RTTEstimator.maximumTimeout)
+            emitFin(on: connection)
+        }
+
         armRetransmitTimer(on: connection)
     }
 
-    /// **Unreachable today, and it is worth saying so rather than letting this
-    /// read as live code.**
+    /// True while a FIN we sent is still unacknowledged.
     ///
-    /// TIME-WAIT is only entered by the side that closes FIRST: FIN-WAIT-1 or
-    /// FIN-WAIT-2 plus the peer's FIN, or CLOSING plus its acknowledgement. All
-    /// three require this endpoint to still be receiving after `close()`, and
-    /// `close()` frees the four-tuple as its contract requires -- after which
-    /// nothing is delivered here and no connection can leave FIN-WAIT-1. So
-    /// `.startTimeWait` never arrives, and the `[weak self]` below is
-    /// **unfalsifiable**: making it strong leaves the whole suite green, which
-    /// was measured rather than assumed.
+    /// The test is `SND.UNA != SND.NXT` in the three states that can hold an
+    /// unacknowledged FIN — the same criterion `TCPStateMachine` itself uses to
+    /// decide FIN-WAIT-1 -> FIN-WAIT-2 and LAST-ACK -> CLOSED, reused rather
+    /// than re-derived. An equality, so there is no ordering question and
+    /// nothing to get wrong at the half-space point. FIN-WAIT-2 and TIME-WAIT
+    /// are excluded because reaching either required SND.UNA == SND.NXT.
+    private func finNeedsRetransmission(_ connection: Connection) -> Bool {
+        guard connection.finSequence != nil else { return false }
+        switch connection.tcb.state {
+        case .finWait1, .closing, .lastAck:
+            return connection.tcb.sndUna != connection.tcb.sndNxt
+        case .closed, .listen, .synSent, .synReceived, .established, .finWait2, .closeWait, .timeWait:
+            return false
+        }
+    }
+
+    /// Enter TIME-WAIT: hold the four-tuple for 2·MSL so late or duplicate
+    /// segments from this connection are absorbed here rather than delivered
+    /// into a new connection that reuses the tuple, then release it.
     ///
-    /// It is written correctly anyway, because the reachability is the
-    /// interface's, not the state machine's -- `TCPStateMachine` returns the
-    /// action in three places, and the day this endpoint can linger past
-    /// `close()` it will arrive. Reaching it needs, in order: registering each
-    /// closing connection under its own exact four-tuple as the bind key is
-    /// released (`TransportDemuxer.deliver` already prefers the specific key,
-    /// so the port stays rebindable), and retransmitting our FIN, without which
-    /// a connection whose FIN is lost pins the endpoint forever. Neither is
-    /// small, and neither belongs in a wiring task.
+    /// This was unreachable in round 1, because `close()` released the
+    /// four-tuple immediately — the state without the protection. It is
+    /// reachable now, and the `[weak self]` below is falsifiable: making it
+    /// strong fails `aConnectionInTimeWaitIsReleasedWhenTheEndpointIsDropped`.
     private func armTimeWaitTimer(on connection: Connection) {
+        if connection.timeWaitOrder == nil {
+            timeWaitSequence &+= 1
+            connection.timeWaitOrder = timeWaitSequence
+        }
         let peer = connection.peer
         connection.timers.startTimeWait { [weak self] in
             guard let self, let connection = self.connections[peer] else { return }
             self.remove(connection)
+            self.reportClosed(connection)
+        }
+        enforceTimeWaitCap()
+    }
+
+    /// Oldest-first eviction, once more blocks are in TIME-WAIT than the cap
+    /// allows. See `defaultMaximumTimeWaitConnections` for why this is the one
+    /// table in this package that evicts rather than refusing.
+    ///
+    /// "Oldest" is `timeWaitOrder`, a plain monotonic counter — never a
+    /// `SequenceNumber`, whose ordering is not a strict weak ordering over the
+    /// whole space and would garble a `min`.
+    private func enforceTimeWaitCap() {
+        while timeWaitCountForTesting > maximumTimeWaitConnections {
+            var oldest: Connection?
+            for connection in connections.values {
+                guard let order = connection.timeWaitOrder, connection.tcb.state == .timeWait else { continue }
+                if let current = oldest?.timeWaitOrder, current <= order { continue }
+                oldest = connection
+            }
+            guard let oldest else { return }
+            remove(oldest)
+            reportClosed(oldest)
+        }
+    }
+
+    /// Give a connection a demuxer registration of its own, under its exact
+    /// four-tuple, so it keeps receiving after the endpoint's listening key is
+    /// released. Called from `close()`.
+    ///
+    /// A failure here can only mean the exact tuple is already registered, which
+    /// nothing else in this endpoint can have done. Failing closed — dropping
+    /// the connection — is the right direction: a lingering block that receives
+    /// nothing is the useless half of TIME-WAIT.
+    private func registerInOwnRight(_ connection: Connection) {
+        let id = TransportEndpointID(
+            localAddress: connection.localAddress, localPort: connection.localPort,
+            remoteAddress: connection.peer.address, remotePort: connection.peer.port)
+        do {
+            try stack.transportDemuxer.register(id, protocolNumber: .tcp, delegate: self)
+            connection.registeredID = id
+        } catch {
+            remove(connection)
         }
     }
 
@@ -610,6 +841,15 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     private func remove(_ connection: Connection) {
         connection.timers.cancelAll()
+        // A connection that outlived `close()` holds a four-tuple of its own.
+        // Releasing it here, at the single point every connection leaves by, is
+        // what makes "TIME-WAIT ends and the tuple becomes reusable" true of
+        // every exit — the timer firing, a reset, LAST-ACK completing, the cap
+        // evicting, and the FIN retry budget running out.
+        if let id = connection.registeredID {
+            stack.transportDemuxer.unregister(id, protocolNumber: .tcp)
+            connection.registeredID = nil
+        }
         connections.removeValue(forKey: connection.peer)
     }
 

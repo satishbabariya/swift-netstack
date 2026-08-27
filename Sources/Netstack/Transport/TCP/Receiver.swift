@@ -113,23 +113,30 @@ struct ReceiveOutcome: Sendable {
 struct Receiver {
     /// The largest window expressible in the header's 16-bit field.
     ///
-    /// ## The window-scale seam (Task 13)
+    /// ## The window-scale seam
     ///
     /// `advertisedWindow` is the on-the-wire field, so it is what the peer will
     /// actually decode — not a "real" window this receiver would like to have.
-    /// Nothing in the stack negotiates a window scale yet: `TCPOptions` parses
-    /// `.windowScale`, but no `TCB` field records a negotiated shift, so there
-    /// is no scale factor available to this task and none is invented here.
+    /// `TCB.rcvWindScale` now records the shift *we* negotiated, but it is zero
+    /// on every connection — this stack sends no Window Scale option yet, and
+    /// RFC 7323 §2.2 scales nothing unless both sides did — so there is still no
+    /// scale factor to apply here and none is invented.
     ///
-    /// When Task 13 adds one, the change to *this* side of the connection —
+    /// When the shift is applied, the change to *this* side of the connection —
     /// the window we advertise — belongs in `advertisedWindow(...)` below and
     /// nowhere else. **That is not the whole of window scaling.** RFC 7323 §2.3
     /// negotiates a scale in each direction independently, and the peer's
-    /// direction is decoded in `TCPStateMachine`, at the three sites marked
-    /// "Snd.Wind.Scale" there (`tcb.sndWnd = Int(header.window)`), each of which
-    /// needs `<< Snd.Wind.Scale` once a scale is recorded. Those three matter as
-    /// much as this one: `CongestionControl` already commits the send decision
-    /// to `min(cwnd, sndWnd)` in bytes, so leaving them unscaled would under-use
+    /// direction is decoded in `TCPStateMachine`, at the four sites marked
+    /// "Snd.Wind.Scale" there (`tcb.sndWnd = Int(header.window)`). Exactly **two**
+    /// of those four take `<< tcb.sndWindScale`: the SYN-RECEIVED and ESTABLISHED
+    /// window updates in `generalSegmentArrives`. The other two read the window
+    /// out of a SYN or SYN-ACK, and RFC 7323 §2.3 exempts `<SYN>` segments from
+    /// the shift — the peer chose that window before it knew scaling had been
+    /// agreed, so shifting it would inflate the peer's opening window by up to
+    /// 2^14. (An earlier revision of this paragraph said all of them needed the
+    /// shift. They do not.) The two that do matter as much as this one:
+    /// `CongestionControl` already commits the send decision to
+    /// `min(cwnd, sndWnd)` in bytes, so leaving them unscaled would under-use
     /// the path by up to 2^14 while this side looked perfectly correct.
     ///
     /// On this side, the value advertised becomes the real window

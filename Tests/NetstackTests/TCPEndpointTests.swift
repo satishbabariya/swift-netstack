@@ -256,6 +256,46 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
     fixture.drain()
 }
 
+@Test func aGuestSynOfferingAWindowScaleStillGetsAnMssOnlySynAckAndATrueWindow() throws {
+    // The ordering guard for window scaling, at the one place it is observable:
+    // on the wire.
+    //
+    // `TCB.negotiateWindowScale(fromSynOptions:)` now runs on this SYN and
+    // records the negotiation, so "nothing in this stack records a scale" has
+    // stopped being the reason the SYN-ACK carries no `wscale`. The reason is
+    // `TCPEndpoint.windowScaleToOffer`, which is nil — and RFC 7323 §2.2 scales
+    // nothing unless both sides sent the option, so both of this connection's
+    // shifts are zero however generous the guest's offer.
+    //
+    // Answering the offer before the shifts are applied is the defect this
+    // ordering exists to prevent: `wscale 7` alongside a 65535 window promises
+    // the guest 8 MB — at the maximum shift of 14, 1 GB — against a reassembler
+    // that caps at 256 KiB. The guest fills the pipe it was promised, most of it
+    // is dropped, and it presents as packet loss with no error raised anywhere.
+    //
+    // So this asserts both halves: no option, and a window that still means
+    // exactly the number of bytes it says.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .windowScale(7)]))
+
+            let emitted = fixture.drainSegments()
+            #expect(emitted.count == 1)
+            let synAck = try #require(emitted.first).header
+            #expect(synAck.flags.contains(.syn))
+            #expect(synAck.flags.contains(.ack))
+            #expect(synAck.options == [.maximumSegmentSize(1460)])
+            #expect(synAck.window == UInt16(TCPEndpoint.receiveWindowBytes))
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aRetransmittedSynReproducesTheSameSynAck() throws {
     // Task 15's vector sends the same SYN twice and requires the same SYN-ACK
     // both times. RFC 6528's function is deterministic in the four-tuple, but

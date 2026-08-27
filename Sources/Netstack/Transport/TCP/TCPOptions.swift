@@ -53,6 +53,12 @@ enum TCPOptionCodec {
     /// itself just under 2^31 — the reason 15 is excluded is not that one
     /// window overruns the half-space but that two out-of-phase ones do,
     /// which is exactly when a comparison stops meaning anything.
+    ///
+    /// `TCB.negotiateWindowScale(fromSynOptions:)` **depends on this clamp** and
+    /// re-checks nothing: it records whatever shift reaches it as
+    /// `TCB.sndWindScale`, on the guarantee that it is at most 14. Moving or
+    /// relaxing the bound here changes what a peer can make this stack
+    /// left-shift a window by.
     private static let maximumWindowScale: UInt8 = 14
 
     /// Decode the options area of a TCP header. `bytes` must hold exactly

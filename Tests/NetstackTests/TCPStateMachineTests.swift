@@ -9,18 +9,25 @@ import Testing
 /// byte count only (its content is never inspected by the state machine
 /// except for its length and, when delivered, its identity), so it is
 /// filled with zero bytes.
-private func segment(sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], payload: Int = 0, window: UInt16 = 4096) -> TCPSegment {
+private func segment(
+    sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags = [], payload: Int = 0, window: UInt16 = 4096,
+    options: [TCPOption] = []
+) -> TCPSegment {
     let header = TCPHeader(
         sourcePort: 55000,
         destinationPort: 80,
         sequence: SequenceNumber(sequence),
         acknowledgement: SequenceNumber(ack),
-        dataOffset: 5,
+        // Derived rather than fixed at 5, so a fixture carrying options is not
+        // internally inconsistent. The state machine never reads it; a header
+        // that says "no options" while carrying three would still be a
+        // misleading thing to leave in a fixture.
+        dataOffset: 5 + TCPOptionCodec.encode(options).count / 4,
         flags: flags,
         window: window,
         checksum: 0,
         urgentPointer: 0,
-        options: [])
+        options: options)
     var buffer = ByteBuffer()
     if payload > 0 {
         buffer.writeBytes([UInt8](repeating: 0, count: payload))
@@ -46,7 +53,12 @@ private func stateMachineReceive(segment: TCPSegment, on tcb: inout TCB) -> [TCP
     return receiveDrivingASender(segment: segment, on: &tcb, receiver: &receiver)
 }
 
-private func listenTCB(iss: UInt32 = 1000) -> TCB {
+/// `windowScaleToOffer` defaults to nil, which is what every connection this
+/// stack actually creates carries (`TCPEndpoint.windowScaleToOffer`). The
+/// negotiation tests below pass a non-nil one on purpose: the rule has to be
+/// exercised with a real offer *before* the stack starts making one, or the
+/// step that starts advertising the option would be the first thing to run it.
+private func listenTCB(iss: UInt32 = 1000, windowScaleToOffer: UInt8? = nil) -> TCB {
     TCB(
         state: .listen,
         sndUna: SequenceNumber(iss),
@@ -57,10 +69,11 @@ private func listenTCB(iss: UInt32 = 1000) -> TCB {
         iss: SequenceNumber(iss),
         rcvNxt: SequenceNumber(0),
         rcvWnd: 4096,
-        irs: SequenceNumber(0))
+        irs: SequenceNumber(0),
+        windowScaleToOffer: windowScaleToOffer)
 }
 
-private func synSentTCB(iss: UInt32 = 2000) -> TCB {
+private func synSentTCB(iss: UInt32 = 2000, windowScaleToOffer: UInt8? = nil) -> TCB {
     TCB(
         state: .synSent,
         sndUna: SequenceNumber(iss),
@@ -71,7 +84,26 @@ private func synSentTCB(iss: UInt32 = 2000) -> TCB {
         iss: SequenceNumber(iss),
         rcvNxt: SequenceNumber(0),
         rcvWnd: 4096,
-        irs: SequenceNumber(0))
+        irs: SequenceNumber(0),
+        windowScaleToOffer: windowScaleToOffer)
+}
+
+/// A Window Scale option as it arrives from the wire: the three option bytes
+/// (kind 3, length 3, shift) plus a NOP pad, run through `TCPOptionCodec.parse`.
+///
+/// Deliberately not a `.windowScale(shift)` case written by hand, and not
+/// `TCPOptionCodec.encode` either. RFC 7323 §2.3's clamp to a maximum shift of
+/// 14 lives in `parse`, and `TCB.negotiateWindowScale(fromSynOptions:)` relies
+/// on it rather than re-checking. A fixture that skipped the parser would be
+/// feeding the TCB a shift no peer could actually deliver, and
+/// `aPeerWindowScaleOfFourteenIsRecordedAndFifteenArrivesAlreadyClampedToIt`
+/// would then assert nothing about this stack at all.
+///
+/// The mutating `parse(&bytes)` is hoisted here so no `#expect` contains it.
+private func windowScaleOptionFromTheWire(shift: UInt8) -> [TCPOption] {
+    var bytes = ByteBuffer()
+    bytes.writeBytes([3, 3, shift, 1])
+    return TCPOptionCodec.parse(&bytes) ?? []
 }
 
 private func synReceivedTCB(iss: UInt32 = 3000, irs: UInt32 = 8000) -> TCB {
@@ -661,4 +693,183 @@ private func receiveDrivingASender(segment: TCPSegment, on tcb: inout TCB, recei
     var challengeACKs = ChallengeACKBudget(clock: ManualClock())
     return TCPStateMachine.receive(
         segment: segment, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &challengeACKs)
+}
+
+// MARK: - RFC 7323 Window Scale negotiation
+
+// Every connection this stack opens today records **zero** in both directions,
+// because `TCPEndpoint.windowScaleToOffer` is nil and RFC 7323 §2.2 scales
+// nothing unless both sides sent the option. So these tests drive the rule with
+// an offer supplied by the fixture rather than by the endpoint, and they assert
+// the rule rather than the live values.
+//
+// That matters because the obvious version of this section is vacuous: state it
+// as "the peer offered and we did not, both zero" four times over and a `TCB`
+// that records nothing at all passes every one. Three of the eight tests below
+// are positive controls that such a TCB fails — the two that negotiate a real
+// pair in each direction of open, and the ignore-outside-the-handshake test,
+// which negotiates 9/5 first and then requires them to *survive* rather than
+// requiring zero to stay zero. `peerOfferedWindowScale` carries two more: it is
+// true in the "peer offered, we did not" case, where every shift is zero.
+
+@Test func aPassiveOpenRecordsBothWindowScalesWhenBothSidesSendTheOption() {
+    var tcb = listenTCB(iss: 1000, windowScaleToOffer: 5)
+    let actions = stateMachineReceive(
+        segment: segment(sequence: 5000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 9)), on: &tcb)
+    #expect(tcb.state == .synReceived)
+    #expect(containsSendSynAck(actions))
+
+    // Both shifts, asserted distinctly, and deliberately different numbers. 9
+    // is the PEER's and applies to SND.WND; 5 is OURS and applies to the window
+    // we advertise. RFC 7323 negotiates the two directions independently, and a
+    // test that offered the same shift on both sides could not see an
+    // implementation that swapped them.
+    #expect(tcb.sndWindScale == 9)
+    #expect(tcb.rcvWindScale == 5)
+    #expect(tcb.peerOfferedWindowScale)
+}
+
+@Test func anActiveOpenRecordsBothWindowScalesFromTheSynAck() {
+    var tcb = synSentTCB(iss: 2000, windowScaleToOffer: 5)
+    let actions = stateMachineReceive(
+        segment: segment(
+            sequence: 9000, ack: 2001, flags: [.syn, .ack], options: windowScaleOptionFromTheWire(shift: 9)),
+        on: &tcb)
+    #expect(tcb.state == .established)
+    #expect(containsSendAck(actions))
+    #expect(tcb.sndWindScale == 9)
+    #expect(tcb.rcvWindScale == 5)
+    #expect(tcb.peerOfferedWindowScale)
+}
+
+@Test func aSimultaneousOpenRecordsBothWindowScalesFromThePeersOwnSyn() {
+    // The other way out of SYN-SENT: the peer's bare SYN arrives before it has
+    // acknowledged ours. Both sides have already sent their option by then, so
+    // the negotiation runs ahead of the branch that tells the two apart.
+    var tcb = synSentTCB(iss: 2000, windowScaleToOffer: 5)
+    let actions = stateMachineReceive(
+        segment: segment(sequence: 9000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 9)), on: &tcb)
+    #expect(tcb.state == .synReceived)
+    #expect(containsSendSynAck(actions))
+    #expect(tcb.sndWindScale == 9)
+    #expect(tcb.rcvWindScale == 5)
+}
+
+@Test func aPeerWindowScaleWeDoNotAnswerIsAppliedInNeitherDirection() {
+    // The half an implementation gets wrong. The peer's shift is right there in
+    // the SYN and it is tempting to record it *because we received it*, but RFC
+    // 7323 §2.2 makes the option an offer both sides must take up: "both sides
+    // MUST send Window Scale options in their <SYN> segments to enable window
+    // scaling in either direction." A peer that offers one and gets no reply
+    // does not scale, so a stack that recorded 9 here would left-shift a window
+    // the peer never right-shifted and believe SND.WND to be 512 times what the
+    // peer actually offered.
+    var tcb = listenTCB(iss: 1000, windowScaleToOffer: nil)
+    _ = stateMachineReceive(
+        segment: segment(sequence: 5000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 9)), on: &tcb)
+    #expect(tcb.state == .synReceived)
+    #expect(tcb.sndWindScale == 0)
+    #expect(tcb.rcvWindScale == 0)
+
+    // The offer itself is still recorded, and this assertion is why this test
+    // is not one more restatement that zero is zero: a TCB that recorded
+    // nothing at all fails it. RFC 7323 §2.2 makes the option's presence in our
+    // SYN-ACK conditional on its presence in this SYN -- "If a Window Scale
+    // option was received in the initial <SYN> segment, then this option MAY be
+    // sent in the <SYN,ACK> segment" -- and this arriving SYN is the only moment
+    // that fact is observable.
+    #expect(tcb.peerOfferedWindowScale)
+}
+
+@Test func aWindowScaleWeOfferAloneIsAppliedInNeitherDirection() {
+    // The mirror of the case above, and the one that governs an active open
+    // whose SYN-ACK comes back without the option.
+    var tcb = listenTCB(iss: 1000, windowScaleToOffer: 5)
+    _ = stateMachineReceive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
+    #expect(tcb.state == .synReceived)
+    #expect(tcb.sndWindScale == 0)
+    #expect(tcb.rcvWindScale == 0)
+    #expect(!tcb.peerOfferedWindowScale)
+}
+
+@Test func aHandshakeWithNoWindowScaleOnEitherSideScalesNeitherDirection() {
+    // The shape of every connection this stack currently opens.
+    var tcb = listenTCB(iss: 1000)
+    _ = stateMachineReceive(segment: segment(sequence: 5000, flags: [.syn]), on: &tcb)
+    #expect(tcb.state == .synReceived)
+    #expect(tcb.sndWindScale == 0)
+    #expect(tcb.rcvWindScale == 0)
+    #expect(!tcb.peerOfferedWindowScale)
+}
+
+@Test func aWindowScaleOutsideTheHandshakeIsIgnored() {
+    // RFC 7323 §2.2: "A Window Scale option in a segment without a SYN bit MUST
+    // be ignored."
+    //
+    // Negotiated first, so this asserts that the recorded shifts SURVIVE rather
+    // than that zero stays zero. "Capture it from the first segment that
+    // carried one" is a plausible implementation, and it would overwrite 9 with
+    // 2 here — a renegotiation channel open to anyone who can guess the
+    // four-tuple, which is exactly what the SYN-bit restriction closes. A TCB
+    // that recorded nothing would never have had 9 to lose, so this fails
+    // against that too.
+    var tcb = listenTCB(iss: 1000, windowScaleToOffer: 5)
+    _ = stateMachineReceive(
+        segment: segment(sequence: 5000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 9)), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 5001, ack: 1001, flags: [.ack]), on: &tcb)
+    #expect(tcb.state == .established)
+
+    _ = stateMachineReceive(
+        segment: segment(
+            sequence: 5001, ack: 1001, flags: [.ack], payload: 4, options: windowScaleOptionFromTheWire(shift: 2)),
+        on: &tcb)
+    #expect(tcb.sndWindScale == 9)
+    #expect(tcb.rcvWindScale == 5)
+}
+
+@Test func aSynOnASynchronizedConnectionDoesNotRenegotiateTheWindowScale() {
+    // The SYN-bearing case the rule above does not cover: RFC 5961 §4's SYN on
+    // an already-synchronized connection, which draws a challenge ACK and is
+    // dropped. It carries a SYN bit, so "ignore the option unless the segment
+    // has a SYN" is not on its own enough — the negotiation has to be tied to
+    // the handshake, not to the flag.
+    var tcb = listenTCB(iss: 1000, windowScaleToOffer: 5)
+    _ = stateMachineReceive(
+        segment: segment(sequence: 5000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 9)), on: &tcb)
+    _ = stateMachineReceive(segment: segment(sequence: 5001, ack: 1001, flags: [.ack]), on: &tcb)
+    #expect(tcb.state == .established)
+
+    let actions = stateMachineReceive(
+        segment: segment(sequence: 5001, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 2)), on: &tcb)
+    #expect(containsSendAck(actions), "RFC 5961 §4 challenges it rather than accepting it")
+    #expect(tcb.state == .established)
+    #expect(tcb.sndWindScale == 9)
+    #expect(tcb.rcvWindScale == 5)
+}
+
+@Test func aPeerWindowScaleOfFourteenIsRecordedAndFifteenArrivesAlreadyClampedToIt() {
+    // The seam with `TCPOptionCodec`'s clamp. `TCB` re-checks nothing — it
+    // records whatever shift reaches it — so this pair is what says the bound
+    // is still where RFC 7323 §2.3 puts it. If either fails, the clamp moved,
+    // and the defect is there rather than here.
+    //
+    // Both offer shift 0 on our side, which is a real offer and not the absence
+    // of one: RFC 7323 §2.2 calls shift.cnt = 0 "offering to scale, while
+    // applying a scale factor of 1". That is why `peerOfferedWindowScale` is
+    // stored separately from the shifts — a recorded 0 cannot tell "offered
+    // zero" from "offered nothing", and the option we may put in a SYN-ACK
+    // depends on the difference.
+    var atTheBound = listenTCB(iss: 1000, windowScaleToOffer: 0)
+    _ = stateMachineReceive(
+        segment: segment(sequence: 5000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 14)),
+        on: &atTheBound)
+    #expect(atTheBound.sndWindScale == 14)
+    #expect(atTheBound.rcvWindScale == 0)
+    #expect(atTheBound.peerOfferedWindowScale)
+
+    var beyondIt = listenTCB(iss: 1000, windowScaleToOffer: 0)
+    _ = stateMachineReceive(
+        segment: segment(sequence: 5000, flags: [.syn], options: windowScaleOptionFromTheWire(shift: 15)),
+        on: &beyondIt)
+    #expect(beyondIt.sndWindScale == 14, "15 must have arrived clamped; the clamp is TCPOptionCodec's")
 }

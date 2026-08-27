@@ -84,6 +84,34 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// option list in `emitSynAck` for why not.
     static let receiveWindowBytes = 65535
 
+    /// The Window Scale shift this stack puts in its own SYN and SYN-ACK, or
+    /// `nil` for "send no Window Scale option". **`nil`, deliberately, and this
+    /// is the single input that turns window scaling on.**
+    ///
+    /// It reaches every connection through `TCB.windowScaleToOffer`, and
+    /// `TCB.negotiateWindowScale(fromSynOptions:)` is the rule it feeds: RFC
+    /// 7323 §2.2 uses scaling only if *both* sides send the option, so a `nil`
+    /// here holds `sndWindScale` and `rcvWindScale` at zero on every connection
+    /// no matter what the peer offers.
+    ///
+    /// **Do not make this non-`nil` before the shifts are actually applied.**
+    /// The four steps are ordered: record the negotiated shifts, apply
+    /// `sndWindScale` to SND.WND (the two non-SYN sites in `TCPStateMachine`),
+    /// apply `rcvWindScale` to the window we advertise
+    /// (`Receiver.advertisedWindow` and `advertisedWindow(of:)` below), and only
+    /// then send the option. Reversing that order means advertising `win 65535`
+    /// *meaning up to 1 GB* against a reassembler that caps at 256 KiB: the peer
+    /// fills the pipe it was promised, most of it is dropped, and it presents as
+    /// packet loss with no error raised anywhere. See `emitSynAck`.
+    ///
+    /// Flipping it is not the whole of that last step either — the option has to
+    /// be added to the SYN in `connect` and to the SYN-ACK in `emitSynAck`, and
+    /// the SYN-ACK's copy must be gated on `tcb.peerOfferedWindowScale`. RFC
+    /// 7323 §2.2: "If a Window Scale option was received in the initial `<SYN>`
+    /// segment, then this option MAY be sent in the `<SYN,ACK>` segment." See
+    /// `TCB.peerOfferedWindowScale` for how exactly to read that clause.
+    static let windowScaleToOffer: UInt8? = nil
+
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
     /// says nothing has told us nothing about the path.
@@ -632,6 +660,18 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     ///   it to actually send SACK blocks back.
     ///
     /// MSS stays, because it is the one option this stack acts on.
+    ///
+    /// ## The window scale is now *negotiated*, and still not *advertised*
+    ///
+    /// `TCB.negotiateWindowScale(fromSynOptions:)` records both shifts as of the
+    /// task that added it, so "nothing in this stack records a scale" is no
+    /// longer the reason the option is absent here. The reason is the ordering:
+    /// `windowScaleToOffer` is `nil`, so both shifts are zero on every
+    /// connection and the window below is a true, unscaled 65535. Nothing about
+    /// this list may change until the shifts are actually applied in both
+    /// directions -- see `windowScaleToOffer` for the four steps and for what
+    /// adding the option here will additionally require
+    /// (`tcb.peerOfferedWindowScale`, per RFC 7323 §2.2).
     private func emitSynAck(on connection: Connection) {
         emit(
             [.syn, .ack], sequence: connection.tcb.iss, on: connection,
@@ -849,7 +889,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 iss: iss,
                 rcvNxt: SequenceNumber(0),
                 rcvWnd: Self.receiveWindowBytes,
-                irs: SequenceNumber(0)),
+                irs: SequenceNumber(0),
+                windowScaleToOffer: Self.windowScaleToOffer),
             receiver: Receiver(reassembler: TCPReassembler()),
             sender: Sender(
                 congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,
@@ -913,7 +954,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     /// RCV.WND for the wire. `Receiver` owns the figure and has already written
     /// it into the TCB; this only clamps it to the field, which cannot be
-    /// exceeded with no window scale negotiated.
+    /// exceeded while `connection.tcb.rcvWindScale` is zero -- which it is on
+    /// every connection, since `windowScaleToOffer` is `nil` and RFC 7323 §2.2
+    /// scales nothing unless both sides sent the option. The step that applies
+    /// our own shift turns this clamp into `RCV.WND >> rcvWindScale` against a
+    /// ceiling of `65535 << rcvWindScale`, and must round the shift *downwards*
+    /// (see `Receiver.advertisedWindow`, which owns that arithmetic).
     private func advertisedWindow(of connection: Connection) -> UInt16 {
         UInt16(min(max(0, connection.tcb.rcvWnd), Int(UInt16.max)))
     }

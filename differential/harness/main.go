@@ -8,15 +8,21 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -38,62 +44,103 @@ const (
 	gatewayIP  = "192.168.127.1"
 	gatewayMAC = "\x5a\x94\xef\xe4\x0c\xee"
 
+	guestIP  = "192.168.127.2"
+	guestMAC = "\x0a\x0b\x0c\x0d\x0e\x0f"
+
 	guestSubnetCIDR = "192.168.127.0/24"
 
 	linkMTU = 1500
 
-	// tcpForwarderMaxInFlight bounds the number of not-yet-established
-	// connections the forwarder will track concurrently; the harness only
-	// ever drives one scripted connection at a time; 10 leaves headroom
-	// without being unbounded.
-	tcpForwarderMaxInFlight = 10
+	// The port the harness listens on. VectorFrames (the Swift-side codec)
+	// fixes every TCP line's ports at 50000 -> 8080, so a listener anywhere
+	// else would describe a connection to somewhere the vectors never
+	// address.
+	listenPort = 8080
 
-	// handshakeSignalTimeout bounds how long the per-frame loop will wait,
-	// in real wall-clock time, for the forwarder's handshake goroutine to
-	// signal completion before moving on. gVisor's tcp.Forwarder dispatches
-	// its handler with a bare `go f.handler(...)` — not a clock.AfterFunc
-	// timer — so ManualClock.Advance has no visibility into it at all; no
-	// amount of simulated time will make the goroutine run. This wait is
-	// therefore real time standing in for goroutine scheduling latency
-	// only (the handler is typically already most of the way done — SYN
-	// processing and CreateEndpoint have already run — by the time the
-	// main goroutine reaches this wait), not for any simulated protocol
-	// delay. 200ms is generous for that under a loaded or sandboxed CI
-	// runner while still keeping a script of a realistic size (tens of
-	// frames) well under a second of added wall time; every frame pays it
-	// when no handshake is pending, since the harness cannot know in
-	// advance which frames are SYNs.
-	handshakeSignalTimeout = 200 * time.Millisecond
+	// listenBacklog bounds the accept queue. It is deliberately larger than
+	// any generated sequence needs: gVisor switches to SYN cookies once the
+	// pending queue reaches capacity-1 (see accept.go's handleListenSegment),
+	// and a SYN-cookie SYN-ACK carries a different option set and a different
+	// ISS derivation than the ordinary path. A differential run that silently
+	// crossed that threshold would be comparing two different gVisor
+	// behaviours, not two stacks.
+	listenBacklog = 64
 )
 
-// request is the harness's stdin contract: a list of base64-encoded
-// ethernet frames to inject, paired index-for-index with how many
-// milliseconds to advance the manual clock after injecting each one.
-type request struct {
+// step is one entry of a run: an optional frame to inject, how far to
+// advance the manual clock afterwards, and an optional application-level
+// action to perform. The three lists are index-aligned; `Actions` may be
+// absent entirely, and any element may be the empty string for "nothing".
+type run struct {
 	Frames    []string `json:"frames"`
 	AdvanceMs []int64  `json:"advanceMs"`
+	Actions   []string `json:"actions,omitempty"`
 }
 
-// response is the harness's stdout contract: every frame the stack emitted,
-// base64-encoded, in emission order.
+// request is the harness's stdin contract. A request carries either a single
+// run inline (the original one-run form, still used by the ARP/ICMP
+// validation test) or a batch of independent runs in `Runs`, each played
+// against its own freshly built stack.
+//
+// Batching exists because process spawn dominates: the M4 gate is ten
+// thousand generated sequences, and paying a fork+exec and a stack build per
+// sequence turns a two-minute run into a twenty-minute one for no gain in
+// what is actually compared.
+type request struct {
+	run
+	Runs []run `json:"runs,omitempty"`
+}
+
+// response is always the batched shape, one entry per run, each entry one
+// list of base64 frames PER STEP.
+//
+// Per-step rather than one flat list per run, because a flat list cannot tell
+// "retransmitted at 1 s" from "retransmitted at 8 s": both stacks would emit
+// the same frames in the same order and compare equal while disagreeing about
+// the entire RTO ladder. The step boundary is the only timing information a
+// frame-level differential has, and throwing it away costs exactly the
+// property a retransmission comparison exists to check.
 type response struct {
-	Emitted []string `json:"emitted"`
+	Runs [][][]string `json:"runs"`
 }
 
 func main() {
-	if err := run(os.Stdin, os.Stdout); err != nil {
+	if err := execute(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "harness:", err)
 		os.Exit(1)
 	}
 }
 
-func run(stdin *os.File, stdout *os.File) error {
+func execute(stdin *os.File, stdout *os.File) error {
 	var req request
 	if err := json.NewDecoder(bufio.NewReader(stdin)).Decode(&req); err != nil {
 		return fmt.Errorf("decode request: %w", err)
 	}
-	if len(req.Frames) != len(req.AdvanceMs) {
-		return fmt.Errorf("frames (%d) and advanceMs (%d) must be the same length", len(req.Frames), len(req.AdvanceMs))
+
+	runs := req.Runs
+	if len(runs) == 0 {
+		runs = []run{req.run}
+	}
+
+	resp := response{Runs: make([][][]string, len(runs))}
+	for i, r := range runs {
+		steps, err := play(r)
+		if err != nil {
+			return fmt.Errorf("run %d: %w", i, err)
+		}
+		resp.Runs[i] = steps
+	}
+	return json.NewEncoder(stdout).Encode(&resp)
+}
+
+// play builds a fresh stack, drives it through one run, and returns the
+// frames it emitted during each step, base64-encoded, in emission order.
+func play(r run) ([][]string, error) {
+	if len(r.Frames) != len(r.AdvanceMs) {
+		return nil, fmt.Errorf("frames (%d) and advanceMs (%d) must be the same length", len(r.Frames), len(r.AdvanceMs))
+	}
+	if r.Actions != nil && len(r.Actions) != len(r.Frames) {
+		return nil, fmt.Errorf("actions (%d) and frames (%d) must be the same length", len(r.Actions), len(r.Frames))
 	}
 
 	clock := faketime.NewManualClock()
@@ -112,18 +159,18 @@ func run(stdin *os.File, stdout *os.File) error {
 	defer s.Close()
 
 	if err := s.CreateNIC(nicID, link); err != nil {
-		return fmt.Errorf("create NIC: %s", err)
+		return nil, fmt.Errorf("create NIC: %s", err)
 	}
 
 	gatewayAddr := net.ParseIP(gatewayIP).To4()
 	if gatewayAddr == nil {
-		return fmt.Errorf("gatewayIP %q is not a valid IPv4 address", gatewayIP)
+		return nil, fmt.Errorf("gatewayIP %q is not a valid IPv4 address", gatewayIP)
 	}
 	if err := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
 		Protocol:          ipv4.ProtocolNumber,
 		AddressWithPrefix: tcpip.AddrFrom4Slice(gatewayAddr).WithPrefix(),
 	}, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("add protocol address: %s", err)
+		return nil, fmt.Errorf("add protocol address: %s", err)
 	}
 
 	// Both spoofing and promiscuous mode, deliberately — see link.go's and
@@ -131,100 +178,349 @@ func run(stdin *os.File, stdout *os.File) error {
 	// sets both and so does the Swift stack; a differential run between a
 	// promiscuous stack and a non-promiscuous one diverges on every frame
 	// for reasons that have nothing to do with TCP.
+	// Pin gVisor's retransmission tuning to the Swift stack's own documented
+	// constants, so the differential compares the ALGORITHM rather than two
+	// different choices of constant.
+	//
+	// gVisor ships Linux's numbers: a 200 ms RTO floor, a 120 s ceiling, and
+	// fifteen retries. This stack ships RFC 6298 §2.4's 1 s floor
+	// (`RTTEstimator.minimumTimeout`), a 60 s ceiling
+	// (`RTTEstimator.maximumTimeout`) and an eight-transmission budget
+	// (`TCPEndpoint.maximumFinTransmissions`). Both sets are defensible —
+	// RFC 6298 §2.4 makes the 1 s floor a SHOULD and explicitly contemplates a
+	// lower one — and each is already pinned on its own side by unit tests and
+	// by `tcp-data.vec`/`tcp-close.vec`. Left unaligned they would put every
+	// retransmission in every generated sequence on a different rung of the
+	// ladder, burying whatever the run was actually meant to find.
+	for _, opt := range []tcpip.SettableTransportProtocolOption{
+		ptr(tcpip.TCPMinRTOOption(1 * time.Second)),
+		ptr(tcpip.TCPMaxRTOOption(60 * time.Second)),
+		ptr(tcpip.TCPMaxRetriesOption(8)),
+		// Auto-tuning makes the advertised window a function of how much the
+		// application has read and when, which is a gVisor heuristic with no
+		// counterpart here and no RFC behind it. Off, with a receive buffer
+		// far wider than the 16-bit window field, the advertised window is
+		// pinned at its ceiling — which is exactly where this stack's sits,
+		// since it delivers synchronously and holds nothing. See ../README.md.
+		ptr(tcpip.TCPModerateReceiveBufferOption(false)),
+	} {
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
+			return nil, fmt.Errorf("set transport protocol option %T: %s", opt, err)
+		}
+	}
+
 	if err := s.SetSpoofing(nicID, true); err != nil {
-		return fmt.Errorf("set spoofing: %s", err)
+		return nil, fmt.Errorf("set spoofing: %s", err)
 	}
 	if err := s.SetPromiscuousMode(nicID, true); err != nil {
-		return fmt.Errorf("set promiscuous mode: %s", err)
+		return nil, fmt.Errorf("set promiscuous mode: %s", err)
 	}
 
 	_, guestSubnet, err := net.ParseCIDR(guestSubnetCIDR)
 	if err != nil {
-		return fmt.Errorf("parse guest subnet: %w", err)
+		return nil, fmt.Errorf("parse guest subnet: %w", err)
 	}
 	subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(guestSubnet.IP), tcpip.MaskFromBytes(guestSubnet.Mask))
 	if err != nil {
-		return fmt.Errorf("build subnet: %w", err)
+		return nil, fmt.Errorf("build subnet: %w", err)
 	}
 	s.SetRouteTable([]tcpip.Route{{Destination: subnet, NIC: nicID}})
 
-	// gVisor's tcp.Forwarder dispatches this handler on its own goroutine
-	// (a bare `go f.handler(...)`, not anything ManualClock tracks) as soon
-	// as a SYN arrives, and the SYN-ACK is written — synchronously, inside
-	// this goroutine — by the time r.CreateEndpoint returns. handshakeDone
-	// is how the per-frame loop below finds out that has happened, since
-	// clock.Advance cannot: it only waits on clock.AfterFunc-scheduled
-	// work, and this goroutine is not that.
+	// A STATIC neighbour entry for the guest, not a learned one.
 	//
-	// tcp.NewForwarder(s, 0, 10, handler) matches upstream's
-	// pkg/services/forwarder/tcp.go: a handler that completes the endpoint
-	// and immediately closes it, rather than proxying it anywhere. The
-	// point of this harness is what gVisor's TCP emits on the wire around
-	// connection setup and teardown, not any application behavior on top.
-	handshakeDone := make(chan struct{}, tcpForwarderMaxInFlight)
-	forwarder := tcp.NewForwarder(s, 0, tcpForwarderMaxInFlight, func(r *tcp.ForwarderRequest) {
-		defer func() {
-			select {
-			case handshakeDone <- struct{}{}:
-			default:
-				// The channel is sized to tcpForwarderMaxInFlight, the same
-				// bound the forwarder itself enforces on concurrent
-				// in-flight connections, so this default case is a
-				// safety net rather than something a normal run can hit.
+	// gVisor's NUD gives a learned entry a reachable lifetime of
+	// BaseReachableTime scaled by a factor drawn uniformly from
+	// [MinRandomFactor, MaxRandomFactor] — a *random* lifetime, which under a
+	// manual clock is a random point at which the stack stops answering with
+	// TCP and answers with an ARP request instead. That is correct behaviour
+	// and fatal to a comparison: the frame counts and the frame types both
+	// change, for reasons that have nothing to do with TCP. A static entry
+	// never expires and never probes.
+	//
+	// The Swift side is held to the same shape by its differential fixture,
+	// which records the guest in `Stack.arpCache` and re-asserts it as it
+	// advances the clock (`ARPCache` entries live 60 seconds, and an RTO
+	// backoff ladder crosses that). Neither stack emits ARP during a
+	// generated sequence, so an ARP frame appearing in a diff is a real
+	// divergence rather than an expected one.
+	guestAddr := net.ParseIP(guestIP).To4()
+	if guestAddr == nil {
+		return nil, fmt.Errorf("guestIP %q is not a valid IPv4 address", guestIP)
+	}
+	if err := s.AddStaticNeighbor(nicID, ipv4.ProtocolNumber, tcpip.AddrFrom4Slice(guestAddr), tcpip.LinkAddress(guestMAC)); err != nil {
+		return nil, fmt.Errorf("add static neighbor: %s", err)
+	}
+
+	// A real listening endpoint, not tcp.Forwarder.
+	//
+	// The forwarder dispatches its handler on a bare `go f.handler(...)` that
+	// nothing observable ever completes, so a harness built on it has to
+	// stand a wall-clock sleep in for goroutine scheduling — and the handler
+	// it must install can only complete the connection and immediately close
+	// it, which tears the connection down one round trip after it opens and
+	// makes every data-transfer comparison structurally impossible. A
+	// listening endpoint keeps the connection for as long as the script does,
+	// and every segment it processes runs on the TCP dispatcher's processor
+	// goroutines, which `settle` below drains deterministically. There is no
+	// sleep anywhere in this binary.
+	var listenQueue waiter.Queue
+	listener, tcpErr := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &listenQueue)
+	if tcpErr != nil {
+		return nil, fmt.Errorf("new endpoint: %s", tcpErr)
+	}
+	defer listener.Close()
+	if tcpErr := listener.Bind(tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4Slice(gatewayAddr), Port: listenPort}); tcpErr != nil {
+		return nil, fmt.Errorf("bind: %s", tcpErr)
+	}
+	if tcpErr := listener.Listen(listenBacklog); tcpErr != nil {
+		return nil, fmt.Errorf("listen: %s", tcpErr)
+	}
+
+	var accepted []tcpip.Endpoint
+	defer func() {
+		for _, ep := range accepted {
+			ep.Close()
+		}
+	}()
+
+	// settle blocks until every processor goroutine has drained its endpoint
+	// queue. Stack.Pause asserts each processor's pause waker; a processor
+	// that still has queued endpoints re-asserts and keeps working, and only
+	// signals once its queue is empty (dispatcher.go's processor.start). So
+	// this is a POSITIVE completion signal, not a timeout — the thing the
+	// previous forwarder-based harness had to approximate with a 200 ms wall
+	// clock wait on every single frame.
+	settle := func() {
+		s.Pause()
+		s.Resume()
+	}
+
+	// harvest accepts whatever the listener has completed and drains every
+	// accepted endpoint's receive buffer.
+	//
+	// The drain models the Swift stack's receive side, which has no socket
+	// buffer at all: `TCPEndpoint` hands in-order bytes straight to `onData`
+	// and frees the space in the same pass. Leaving gVisor's buffer full
+	// instead would make its advertised window fall while ours stayed put, on
+	// every data segment, for a reason that is a design difference rather
+	// than a defect. See ../README.md.
+	harvest := func() {
+		for {
+			ep, _, tcpErr := listener.Accept(nil)
+			if tcpErr != nil {
+				break
 			}
-		}()
-
-		var wq waiter.Queue
-		ep, err := r.CreateEndpoint(&wq)
-		r.Complete(err != nil)
-		if err != nil {
-			return
+			accepted = append(accepted, ep)
 		}
-		ep.Close()
-	})
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
-
-	var emitted [][]byte
-	for i, encoded := range req.Frames {
-		frame, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			return fmt.Errorf("frame %d: decode base64: %w", i, err)
+		live := accepted[:0]
+		for _, ep := range accepted {
+			for {
+				var sink bytes.Buffer
+				if _, tcpErr := ep.Read(&sink, tcpip.ReadOptions{}); tcpErr != nil {
+					break
+				}
+			}
+			// An endpoint whose connection is over is CLOSED by the
+			// application here, which is what releases its four-tuple.
+			//
+			// Not tidiness: gVisor keeps a dead endpoint registered until the
+			// application closes it, so a segment arriving for that tuple
+			// afterwards is delivered to the corpse and dropped. The Swift
+			// stack deletes the block the moment the connection ends, so the
+			// same segment falls through to the LISTENER and is answered with
+			// a reset, exactly as RFC 9293 §3.10.7.1 requires. Leaving the
+			// corpse registered would report that as a divergence on every
+			// sequence whose connection is reset and then probed.
+			switch tcp.EndpointState(ep.State()) {
+			case tcp.StateClose, tcp.StateError:
+				ep.Close()
+			default:
+				live = append(live, ep)
+			}
 		}
-		link.Inject(frame)
-		clock.Advance(time.Duration(req.AdvanceMs[i]) * time.Millisecond)
-		waitForHandshake(handshakeDone, handshakeSignalTimeout)
-		emitted = append(emitted, link.TakeEmitted()...)
+		accepted = live
 	}
-	// A handshake goroutine triggered by the very last input frame has had
-	// no later frame's wait to be caught by; give it the same bounded
-	// window here so its SYN-ACK (or close) is not silently dropped from
-	// the response.
-	waitForHandshake(handshakeDone, handshakeSignalTimeout)
-	emitted = append(emitted, link.TakeEmitted()...)
 
-	resp := response{Emitted: make([]string, len(emitted))}
-	for i, frame := range emitted {
-		resp.Emitted[i] = base64.StdEncoding.EncodeToString(frame)
+	// The gateway-side initial send sequence, learned from the first SYN this
+	// stack emits. Every inbound acknowledgement number in a request is
+	// expressed in a normalized space where that ISS is zero, and is shifted
+	// into this stack's real space here — see shiftAck.
+	var gatewayISS uint32
+	var gatewayISSKnown bool
+
+	steps := make([][]string, len(r.Frames))
+	for i := range r.Frames {
+		if encoded := r.Frames[i]; encoded != "" {
+			frame, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				return nil, fmt.Errorf("frame %d: decode base64: %w", i, err)
+			}
+			if gatewayISSKnown {
+				shiftAck(frame, gatewayISS)
+			}
+			link.Inject(frame)
+			settle()
+		}
+
+		clock.Advance(time.Duration(r.AdvanceMs[i]) * time.Millisecond)
+		settle()
+
+		harvest()
+		settle()
+
+		if r.Actions != nil {
+			if err := apply(r.Actions[i], accepted); err != nil {
+				return nil, fmt.Errorf("step %d: %w", i, err)
+			}
+			settle()
+		}
+
+		emitted := link.TakeEmitted()
+		steps[i] = make([]string, len(emitted))
+		for j, frame := range emitted {
+			if !gatewayISSKnown {
+				if iss, ok := synSequence(frame); ok {
+					gatewayISS, gatewayISSKnown = iss, true
+				}
+			}
+			steps[i][j] = base64.StdEncoding.EncodeToString(frame)
+		}
 	}
-	return json.NewEncoder(stdout).Encode(resp)
+
+	return steps, nil
 }
 
-// waitForHandshake blocks for up to timeout waiting for a single signal on
-// done, then drains any further signals that are already available without
-// waiting any further. It is not a poll loop and it does not sleep: a
-// signal that arrives promptly is consumed promptly, and a frame that
-// provokes no handshake costs exactly one bounded wait rather than hanging.
-func waitForHandshake(done <-chan struct{}, timeout time.Duration) {
-	select {
-	case <-done:
-	case <-time.After(timeout):
+// ptr is a helper for the option list above: SetTransportProtocolOption wants
+// a pointer, and Go has no address-of for a composite literal of a named
+// scalar type.
+func ptr[T any](v T) *T { return &v }
+
+// tcpOf returns the TCP header of an ethernet frame carrying an
+// option-less-or-not IPv4 packet, along with the IPv4 header it sits in, or
+// nil for anything that is not TCP over IPv4.
+func tcpOf(frame []byte) (header.IPv4, header.TCP) {
+	if len(frame) < header.EthernetMinimumSize {
+		return nil, nil
+	}
+	eth := header.Ethernet(frame[:header.EthernetMinimumSize])
+	if eth.Type() != header.IPv4ProtocolNumber {
+		return nil, nil
+	}
+	rest := frame[header.EthernetMinimumSize:]
+	if len(rest) < header.IPv4MinimumSize {
+		return nil, nil
+	}
+	ip := header.IPv4(rest)
+	headerLength := int(ip.HeaderLength())
+	if ip.TransportProtocol() != tcp.ProtocolNumber || len(rest) < headerLength+header.TCPMinimumSize {
+		return nil, nil
+	}
+	return ip, header.TCP(rest[headerLength:int(ip.TotalLength())])
+}
+
+// synSequence reports the sequence number of a frame carrying a TCP SYN.
+//
+// The gateway's SYN-ACK is the only place its initial send sequence appears
+// on the wire, and two independently implemented stacks never choose the same
+// one — that is the first of the three divergences spec §8.2 permits. Rather
+// than discard sequence numbers from the comparison because of it, both sides
+// of this differential learn their own ISS here and express every sequence
+// relative to it, so the sequence SPACE stays fully comparable while only the
+// arbitrary origin is allowed to differ.
+func synSequence(frame []byte) (uint32, bool) {
+	_, t := tcpOf(frame)
+	if t == nil || t.Flags()&header.TCPFlagSyn == 0 {
+		return 0, false
+	}
+	return t.SequenceNumber(), true
+}
+
+// shiftAck adds iss to a TCP frame's acknowledgement number in place and
+// repairs the checksum.
+//
+// A guest cannot acknowledge a sequence number it has not been told, so a
+// script written against one stack's ISS is meaningless against the other's.
+// Shifting rather than rewriting preserves every DELIBERATE error: a script
+// that acknowledges five bytes too many still does so, against whichever ISS
+// the stack under test actually chose.
+func shiftAck(frame []byte, iss uint32) {
+	ip, t := tcpOf(frame)
+	if t == nil || t.Flags()&header.TCPFlagAck == 0 {
 		return
 	}
-	for {
-		select {
-		case <-done:
-		default:
-			return
+	t.SetAckNumber(t.AckNumber() + iss)
+	t.SetChecksum(0)
+	sum := header.PseudoHeaderChecksum(tcp.ProtocolNumber, ip.SourceAddress(), ip.DestinationAddress(), uint16(len(t)))
+	sum = checksum.Checksum(t, sum)
+	t.SetChecksum(^sum)
+}
+
+// apply performs one application-level action against the accepted
+// connection. The vocabulary mirrors the Swift-side vector DSL's application
+// lines (`write <n>` and `close`, see Tests/NetstackTests/Support/VectorScript.swift)
+// so that a generated sequence drives the same application on both stacks.
+//
+// An action naming no connection is an error rather than a silent no-op: a
+// sequence whose write vanished on one side and not the other would diverge
+// several frames later, reporting the wrong step.
+func apply(action string, accepted []tcpip.Endpoint) error {
+	if action == "" {
+		return nil
+	}
+	if len(accepted) == 0 {
+		return fmt.Errorf("action %q has no accepted connection to act on", action)
+	}
+	ep := accepted[len(accepted)-1]
+
+	switch {
+	case action == "close":
+		// Shutdown(Write), NOT Close.
+		//
+		// `close` in the Swift stack's interface — and in RFC 9293 §3.10.4 —
+		// closes the SEND direction: it sends a FIN and goes on accepting the
+		// peer's data until the peer's own FIN arrives. gVisor's
+		// Endpoint.Close is a socket close, which is shutdown(RDWR) plus
+		// release: data arriving afterwards draws a RESET, the way Linux
+		// resets a socket closed with data still coming. Driving one stack
+		// with a half close and the other with a full one is comparing two
+		// different programs, and it shows up as a reset on one side and an
+		// acknowledgement on the other for every sequence that receives
+		// anything after closing.
+		return errorOrNil(ep.Shutdown(tcpip.ShutdownWrite))
+	case strings.HasPrefix(action, "write:"):
+		n, err := strconv.Atoi(strings.TrimPrefix(action, "write:"))
+		if err != nil || n <= 0 {
+			return fmt.Errorf("malformed action %q", action)
 		}
+		payload := bytes.NewReader(make([]byte, n))
+		written, tcpErr := ep.Write(readerPayloader{payload}, tcpip.WriteOptions{})
+		if tcpErr != nil {
+			return fmt.Errorf("write %d bytes: %s", n, tcpErr)
+		}
+		if written != int64(n) {
+			return fmt.Errorf("write %d bytes: only %d accepted", n, written)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown action %q", action)
 	}
 }
+
+// errorOrNil turns a tcpip.Error (an interface, so a typed nil is not nil)
+// into a plain error or nil.
+func errorOrNil(err tcpip.Error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", err)
+}
+
+// readerPayloader adapts a *bytes.Reader to tcpip.Payloader, which wants a
+// Len() alongside io.Reader.
+type readerPayloader struct{ r *bytes.Reader }
+
+func (p readerPayloader) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (p readerPayloader) Len() int                   { return p.r.Len() }
+
+var _ tcpip.Payloader = readerPayloader{}
+var _ io.Reader = readerPayloader{}

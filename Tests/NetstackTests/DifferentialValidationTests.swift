@@ -65,7 +65,11 @@ private func harness() -> (Stack, RecordingEndpoint, ManualClock, EmbeddedEventL
     try withExtendedLifetime(stack) {
         let run = DifferentialRun(harnessPath: harness, codec: codec)
         let divergences = try run.compare(
-            frames: frames, advanceMs: [0, 10], against: stack, link: link, clock: clock, loop: loop)
+            steps: [
+                DifferentialStep(frame: frames[0], advanceMs: 0),
+                DifferentialStep(frame: frames[1], advanceMs: 10),
+            ],
+            against: stack, link: link, clock: clock, loop: loop)
         #expect(divergences.isEmpty, "stacks diverged on protocols both already implement: \(divergences)")
     }
 }
@@ -91,25 +95,27 @@ private func harness() -> (Stack, RecordingEndpoint, ManualClock, EmbeddedEventL
             link.write([PacketBuffer(received: extra)])
         }
 
-        let frames = [
-            try codec.encode(
-                .arpRequest(target: IPv4Address("192.168.127.1")!, sender: IPv4Address("192.168.127.2")!), direction: .inbound)
-        ]
+        let arp = try codec.encode(
+            .arpRequest(target: IPv4Address("192.168.127.1")!, sender: IPv4Address("192.168.127.2")!), direction: .inbound)
 
         let run = DifferentialRun(harnessPath: harnessPath, codec: codec)
         let divergences = try run.compare(
-            frames: frames, advanceMs: [10], against: stack, link: link, clock: clock, loop: loop)
+            steps: [DifferentialStep(frame: arp, advanceMs: 10)],
+            against: stack, link: link, clock: clock, loop: loop)
 
         // Both stacks answer the ARP request identically, so the two
         // emitted lists share a matching PREFIX (index 0). The Swift-only
-        // extra frame is a pure TAIL: Swift emits 2 frames total, Go emits
-        // 1. `zip(swiftFrames, goFrames)` would compare only that matching
-        // prefix, find it equal, and report nothing — this must fail
+        // extra frame is a pure TAIL: Swift emits 2 frames in that step, Go
+        // emits 1. `zip(swiftFrames, goFrames)` would compare only that
+        // matching prefix, find it equal, and report nothing — this must fail
         // against exactly that bug, not just against a driver that never
         // compares anything at all.
         #expect(!divergences.isEmpty, "the driver must report the Swift-only extra frame, not silently drop it via a shorter zip")
         #expect(
             divergences.contains { $0.frameIndex == 1 && $0.goBytes == nil },
             "expected a divergence naming index 1 with no Go counterpart, got: \(divergences)")
+        #expect(
+            divergences.allSatisfy { $0.recognised == nil },
+            "an extra frame must never be classified as a recognised difference: \(divergences)")
     }
 }

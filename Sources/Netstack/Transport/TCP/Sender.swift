@@ -55,7 +55,7 @@ import NIOCore
 /// stream and nothing else: the control flags occupy sequence space that this
 /// type's offsets do not model, which is why `segmentsToTransmit` refuses to
 /// act when SND.NXT has moved by an amount it did not itself send (see there).
-public struct Sender {
+struct Sender {
     /// The real per-chunk cost of holding one queued write: the array element,
     /// the `ByteBuffer`'s backing storage object, and malloc's rounding of a
     /// small allocation -- none of which `readableBytes` sees.
@@ -87,7 +87,7 @@ public struct Sender {
     /// test built on it can read no growth on regressed code and pass. That is
     /// why the guarding test uses `storageCapacity` instead, and why this
     /// measurement was taken with `--filter` selecting it alone.
-    public static let perChunkOverhead = 256
+    static let perChunkOverhead = 256
 
     /// `G` in RFC 6298's `RTO = SRTT + max(G, 4 * RTTVAR)`.
     ///
@@ -95,7 +95,7 @@ public struct Sender {
     /// can be reproduced against a stated granularity, but the sender's
     /// interface has nowhere to put it, so it is stated here instead of being
     /// hidden inside the estimator's default.
-    public static let clockGranularity = TimeAmount.milliseconds(1)
+    static let clockGranularity = TimeAmount.milliseconds(1)
 
     /// One admitted write. `bytes` is always freshly allocated, exactly-sized
     /// storage -- never the buffer handed to `write`, which may be a slice.
@@ -127,7 +127,7 @@ public struct Sender {
     /// The congestion-control algorithm, readable so a caller (and the tests)
     /// can see the window this sender is actually obeying rather than
     /// re-deriving it.
-    public private(set) var congestionControl: any CongestionControl
+    private(set) var congestionControl: any CongestionControl
 
     private let clock: any NetstackClock
     private let maximumBufferedBytes: Int
@@ -155,7 +155,7 @@ public struct Sender {
     /// classified as a change against a window that was never advertised.
     private var lastAdvertisedWindow: Int?
 
-    public init(congestionControl: any CongestionControl, clock: any NetstackClock, maximumBufferedBytes: Int) {
+    init(congestionControl: any CongestionControl, clock: any NetstackClock, maximumBufferedBytes: Int) {
         self.congestionControl = congestionControl
         self.clock = clock
         self.maximumBufferedBytes = max(0, maximumBufferedBytes)
@@ -173,31 +173,31 @@ public struct Sender {
 
     /// Bytes transmitted and not yet acknowledged: RFC 5681's FlightSize, and
     /// what every loss signal has to be measured against.
-    public var flightSize: Int { outstanding }
+    var flightSize: Int { outstanding }
 
     /// Transmitted, unacknowledged **segments**. Distinct from `flightSize`,
     /// which counts their bytes.
-    public var unacknowledgedCount: Int { inFlight.count }
+    var unacknowledgedCount: Int { inFlight.count }
 
     /// Written but not yet transmitted. Non-zero means there is data the
     /// window, not the application, is holding back.
-    public var unsentBytes: Int { max(0, queuedBytes - outstanding) }
+    var unsentBytes: Int { max(0, queuedBytes - outstanding) }
 
     /// Total charge held: every queued chunk's allocation plus
     /// `perChunkOverhead` each. This is the figure `maximumBufferedBytes`
     /// bounds, and it is deliberately larger than the bytes written.
-    public var bufferedBytes: Int { accountedBytes }
+    var bufferedBytes: Int { accountedBytes }
 
     /// Consecutive duplicate acknowledgements, by RFC 5681 §3.2's definition
     /// and not by "the ACK number repeated" -- see `acknowledged`.
-    public var duplicateAcknowledgements: Int { duplicates }
+    var duplicateAcknowledgements: Int { duplicates }
 
     /// When the retransmission timer should next fire, or `nil` when it is
     /// off. The caller owns the actual timer; this type only says when.
-    public var retransmitDeadline: NIODeadline? { timerDeadline }
+    var retransmitDeadline: NIODeadline? { timerDeadline }
 
     /// The current RTO, including any accumulated backoff.
-    public var retransmissionTimeout: TimeAmount { estimator.retransmissionTimeout }
+    var retransmissionTimeout: TimeAmount { estimator.retransmissionTimeout }
 
     /// Diagnostic: the total `ByteBuffer.storageCapacity` of every queued
     /// chunk -- the size of the allocations they keep alive, not the number of
@@ -223,7 +223,7 @@ public struct Sender {
     /// The bytes are copied into fresh, exactly-sized storage before anything
     /// else happens to them; see the type's doc comment for why the copy is
     /// load-bearing rather than defensive.
-    public mutating func write(_ bytes: ByteBuffer) -> Bool {
+    mutating func write(_ bytes: ByteBuffer) -> Bool {
         let length = bytes.readableBytes
         // An empty write is a no-op rather than a refusal: there is nothing to
         // account for and nothing to hold, so reporting failure would push a
@@ -261,7 +261,7 @@ public struct Sender {
     /// rather than from `acknowledged` because that method returns whether the
     /// ACK was acceptable, and a caller that acknowledges and then transmits
     /// -- the ordinary loop -- sends it in the same pass either way.
-    public mutating func segmentsToTransmit(tcb: inout TCB, mss: Int) -> [Segment] {
+    mutating func segmentsToTransmit(tcb: inout TCB, mss: Int) -> [Segment] {
         var out: [Segment] = []
 
         if fastRetransmitPending {
@@ -331,7 +331,7 @@ public struct Sender {
     /// duplicate ACK, and counting it as one retransmits segments nothing was
     /// ever lost of, on an idle connection, invisibly until throughput is
     /// measured.
-    public mutating func acknowledged(upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0) -> Bool {
+    mutating func acknowledged(upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0) -> Bool {
         let windowChanged = lastAdvertisedWindow.map { $0 != tcb.sndWnd } ?? false
         lastAdvertisedWindow = tcb.sndWnd
 
@@ -398,7 +398,7 @@ public struct Sender {
     /// the loss episode discards the accumulated backoff (RFC 6298 §5.7).
     /// Karn's algorithm is what makes that the *first unambiguous* sample and
     /// not the next one to arrive.
-    public mutating func retransmitTimerFired(tcb: inout TCB) -> Segment? {
+    mutating func retransmitTimerFired(tcb: inout TCB) -> Segment? {
         // A timeout supersedes any duplicate-ACK run: the segment those
         // duplicates were pointing at is about to be resent anyway, and
         // counting the run across the timeout would fast-retransmit it again.

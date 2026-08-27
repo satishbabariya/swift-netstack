@@ -3,16 +3,16 @@ import NIOCore
 /// FIN/SYN/RST/PSH/ACK/URG — the classic (pre-ECN) TCP control bits, in
 /// wire-bit order (bit 0 is FIN, matching the low byte of the flags field).
 /// This stack does not model CWR/ECE/NS.
-public struct TCPFlags: OptionSet, Sendable, Equatable {
-    public let rawValue: UInt8
-    public init(rawValue: UInt8) { self.rawValue = rawValue }
+struct TCPFlags: OptionSet, Sendable, Equatable {
+    let rawValue: UInt8
+    init(rawValue: UInt8) { self.rawValue = rawValue }
 
-    public static let fin = TCPFlags(rawValue: 1 << 0)
-    public static let syn = TCPFlags(rawValue: 1 << 1)
-    public static let rst = TCPFlags(rawValue: 1 << 2)
-    public static let psh = TCPFlags(rawValue: 1 << 3)
-    public static let ack = TCPFlags(rawValue: 1 << 4)
-    public static let urg = TCPFlags(rawValue: 1 << 5)
+    static let fin = TCPFlags(rawValue: 1 << 0)
+    static let syn = TCPFlags(rawValue: 1 << 1)
+    static let rst = TCPFlags(rawValue: 1 << 2)
+    static let psh = TCPFlags(rawValue: 1 << 3)
+    static let ack = TCPFlags(rawValue: 1 << 4)
+    static let urg = TCPFlags(rawValue: 1 << 5)
 }
 
 /// A parsed (or about-to-be-serialized) TCP segment header.
@@ -22,27 +22,27 @@ public struct TCPFlags: OptionSet, Sendable, Equatable {
 /// two are cross-checked against each other in `TCPHeaderTests.swift`
 /// rather than sharing any code, so that a defect one of them shares with
 /// the other cannot cancel out and hide.
-public struct TCPHeader: Equatable, Sendable {
+struct TCPHeader: Equatable, Sendable {
     /// The fixed-field header length in bytes, before options. The wire's
     /// own "data offset" field (see `dataOffset` below) is in 32-bit words,
     /// not bytes.
-    public static let minimumLength = 20
+    static let minimumLength = 20
 
-    public var sourcePort: UInt16
-    public var destinationPort: UInt16
-    public var sequence: SequenceNumber
-    public var acknowledgement: SequenceNumber
+    var sourcePort: UInt16
+    var destinationPort: UInt16
+    var sequence: SequenceNumber
+    var acknowledgement: SequenceNumber
     /// In 32-bit words, exactly as the wire field is defined (RFC 793 §3.1)
     /// — NOT bytes. Multiply by 4 to get the header length in bytes.
     /// `parse` only ever returns a value >= 5 (the fixed header alone).
-    public var dataOffset: Int
-    public var flags: TCPFlags
-    public var window: UInt16
-    public var checksum: UInt16
-    public var urgentPointer: UInt16
-    public var options: [TCPOption]
+    var dataOffset: Int
+    var flags: TCPFlags
+    var window: UInt16
+    var checksum: UInt16
+    var urgentPointer: UInt16
+    var options: [TCPOption]
 
-    public init(
+    init(
         sourcePort: UInt16,
         destinationPort: UInt16,
         sequence: SequenceNumber,
@@ -97,7 +97,7 @@ public struct TCPHeader: Equatable, Sendable {
     /// the checksum covers, so a checksum-first ordering can silently mask
     /// whether the option-length guard (the thing that stands between a
     /// hostile segment and a hung parser) is even doing anything.
-    public static func parse(_ packet: inout PacketBuffer, header ipHeader: IPv4Header) -> TCPHeader? {
+    static func parse(_ packet: inout PacketBuffer, header ipHeader: IPv4Header) -> TCPHeader? {
         let available = packet.readableBytes
         guard available >= minimumLength else { return nil }
 
@@ -147,7 +147,7 @@ public struct TCPHeader: Equatable, Sendable {
 
     /// Build a complete segment: header, options, and payload, with the
     /// checksum filled in.
-    public func serialize(
+    func serialize(
         payload: ByteBuffer, source: IPv4Address, destination: IPv4Address, allocator: ByteBufferAllocator
     ) -> ByteBuffer {
         let optionBytes = TCPOptionCodec.encode(options)

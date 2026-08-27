@@ -29,7 +29,7 @@ import NIOCore
 /// toward zero, which would make the RTTVAR update depend on the *sign* of
 /// `SRTT - R`; `measure` takes the absolute difference before shifting so the
 /// sample-below-SRTT case follows the same path as every other.
-public struct RTTEstimator: Sendable, Equatable {
+struct RTTEstimator: Sendable, Equatable {
     /// RFC 6298 §2.4. The floor is deliberately the standard one second even
     /// though this stack's real RTTs are host-local microseconds: the
     /// differential compares loss recovery against gVisor, which uses the
@@ -37,10 +37,10 @@ public struct RTTEstimator: Sendable, Equatable {
     /// comparison diverge for reasons that have nothing to do with
     /// correctness. Lowering it is a decision for after the differential is
     /// clean, not before.
-    public static let minimumTimeout = TimeAmount.seconds(1)
+    static let minimumTimeout = TimeAmount.seconds(1)
 
     /// RFC 6298 §2.5 permits any ceiling of at least 60 seconds.
-    public static let maximumTimeout = TimeAmount.seconds(60)
+    static let maximumTimeout = TimeAmount.seconds(60)
 
     /// `G` in `RTO = SRTT + max(G, 4 * RTTVAR)`. Injected rather than assumed,
     /// so the differential can be reproduced with a stated granularity instead
@@ -52,7 +52,7 @@ public struct RTTEstimator: Sendable, Equatable {
     private var hasSample: Bool
     private var rto: Int64
 
-    public init(clockGranularity: TimeAmount) {
+    init(clockGranularity: TimeAmount) {
         self.granularity = max(0, clockGranularity.nanoseconds)
         self.srtt = 0
         self.rttvar = 0
@@ -64,14 +64,14 @@ public struct RTTEstimator: Sendable, Equatable {
     }
 
     /// SRTT. Zero before the first measurement.
-    public var smoothed: TimeAmount { .nanoseconds(srtt) }
+    var smoothed: TimeAmount { .nanoseconds(srtt) }
 
     /// RTTVAR. Zero before the first measurement.
-    public var variance: TimeAmount { .nanoseconds(rttvar) }
+    var variance: TimeAmount { .nanoseconds(rttvar) }
 
     /// The current RTO, clamped to `minimumTimeout ... maximumTimeout` and
     /// including any accumulated `backOff()`.
-    public var retransmissionTimeout: TimeAmount { .nanoseconds(rto) }
+    var retransmissionTimeout: TimeAmount { .nanoseconds(rto) }
 
     /// Fold one unambiguous RTT sample into the estimate.
     ///
@@ -79,7 +79,7 @@ public struct RTTEstimator: Sendable, Equatable {
     /// RFC 6298 §5.7: a fresh measurement is evidence the path is delivering
     /// again, so the doubled timers from the previous loss episode no longer
     /// describe it.
-    public mutating func measure(_ sample: TimeAmount) {
+    mutating func measure(_ sample: TimeAmount) {
         let r = sample.nanoseconds
         // A zero or negative sample means the clock moved backwards or the
         // sample was taken wrongly -- not that the path is instantaneous.
@@ -109,7 +109,7 @@ public struct RTTEstimator: Sendable, Equatable {
     /// The ceiling makes this saturate rather than run away: without it a
     /// connection to a black hole reaches hour-long timers and stops looking
     /// like a connection at all.
-    public mutating func backOff() {
+    mutating func backOff() {
         rto = Self.clamped(rto.multipliedSaturating(by: 2))
     }
 
@@ -119,7 +119,7 @@ public struct RTTEstimator: Sendable, Equatable {
     /// The estimate describes a path. When the path changes underneath the
     /// connection, blending new samples into the old estimate converges slowly
     /// through values that describe neither.
-    public mutating func reset() {
+    mutating func reset() {
         srtt = 0
         rttvar = 0
         hasSample = false

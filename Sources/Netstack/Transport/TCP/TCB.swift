@@ -6,7 +6,7 @@ import NIOCore
 /// that transitions into it (e.g. LAST-ACK + ACK -> CLOSED) are ordinary
 /// switch cases in `TCPStateMachine` rather than a special-cased teardown
 /// path.
-public enum TCPState: Equatable, Sendable {
+enum TCPState: Equatable, Sendable {
     case closed
     case listen
     case synSent
@@ -25,7 +25,7 @@ public enum TCPState: Equatable, Sendable {
 /// every RFC 9293 transition that would "send a segment" instead returns
 /// one of these, which is what keeps the machine a pure, directly testable
 /// function of `(segment, TCB) -> (TCB, [TCPAction])`.
-public enum TCPAction: Equatable, Sendable {
+enum TCPAction: Equatable, Sendable {
     /// Send a SYN|ACK built from the TCB's current `iss`/`rcvNxt`.
     case sendSynAck
     /// Send a bare ACK built from the TCB's current `sndNxt`/`rcvNxt`.
@@ -71,28 +71,28 @@ public enum TCPAction: Equatable, Sendable {
 /// variables plus the current state. This struct holds no I/O handles and
 /// no data buffers of its own -- it is exactly the state RFC 9293's state
 /// machine reads and mutates, and nothing else.
-public struct TCB: Equatable, Sendable {
-    public var state: TCPState
+struct TCB: Equatable, Sendable {
+    var state: TCPState
 
     // Send Sequence Variables (RFC 9293 §3.3.1).
     /// SND.UNA: oldest unacknowledged sequence number.
-    public var sndUna: SequenceNumber
+    var sndUna: SequenceNumber
     /// SND.NXT: next sequence number to be sent.
-    public var sndNxt: SequenceNumber
+    var sndNxt: SequenceNumber
     /// SND.WND: send window, as last advertised by the peer.
-    public var sndWnd: Int
+    var sndWnd: Int
     /// SND.WL1: segment sequence number used for the last window update.
-    public var sndWl1: SequenceNumber
+    var sndWl1: SequenceNumber
     /// SND.WL2: segment acknowledgment number used for the last window update.
-    public var sndWl2: SequenceNumber
+    var sndWl2: SequenceNumber
     /// ISS: initial send sequence number.
-    public var iss: SequenceNumber
+    var iss: SequenceNumber
 
     // Receive Sequence Variables (RFC 9293 §3.3.1).
     /// RCV.NXT: next sequence number expected on an incoming segment.
-    public var rcvNxt: SequenceNumber
+    var rcvNxt: SequenceNumber
     /// RCV.WND: receive window we have advertised to the peer.
-    public var rcvWnd: Int
+    var rcvWnd: Int
     /// The largest receive window this connection may ever advertise: whatever
     /// `rcvWnd` was configured with when the block was created.
     ///
@@ -109,11 +109,11 @@ public struct TCB: Equatable, Sendable {
     /// Derived from `rcvWnd` in the initialiser rather than taken as a separate
     /// parameter: two independently supplied figures could disagree, and the
     /// only sensible initial advertisement is the configured one.
-    public let rcvWndMax: Int
+    let rcvWndMax: Int
     /// IRS: initial receive sequence number.
-    public var irs: SequenceNumber
+    var irs: SequenceNumber
 
-    public init(
+    init(
         state: TCPState,
         sndUna: SequenceNumber,
         sndNxt: SequenceNumber,

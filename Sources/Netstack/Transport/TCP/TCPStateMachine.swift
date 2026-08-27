@@ -9,11 +9,11 @@ import NIOCore
 /// to build `.deliver` actions. This is the one addition beyond what the
 /// brief's interface list named; it is unavoidable plumbing, not a design
 /// choice, since `receive(segment:on:receiver:)` takes a single `segment` argument.
-public struct TCPSegment: Sendable {
-    public var header: TCPHeader
-    public var payload: ByteBuffer
+struct TCPSegment: Sendable {
+    var header: TCPHeader
+    var payload: ByteBuffer
 
-    public init(header: TCPHeader, payload: ByteBuffer = ByteBuffer()) {
+    init(header: TCPHeader, payload: ByteBuffer = ByteBuffer()) {
         self.header = header
         self.payload = payload
     }
@@ -80,7 +80,7 @@ public struct TCPSegment: Sendable {
 /// in-order-FIN gate in step 5 is not one of those: `Receiver` compares RCV.NXT
 /// against a *recorded* FIN position, this file compares an *arriving segment's*
 /// start against RCV.NXT, and they answer different questions.)
-public struct TCPStateMachine {
+struct TCPStateMachine {
     /// `receiver` owns RCV.NXT, delivery and the advertised window, and is
     /// `inout` because it carries per-connection state.
     ///
@@ -102,11 +102,10 @@ public struct TCPStateMachine {
     /// also need a way to re-enter this function for a FIN whose gap has since
     /// filled; no such re-drive exists, and the comment that used to assume one
     /// is what left an out-of-order FIN unhandled forever.
-    /// Internal, not `public`, and not by choice: Swift forbids a public method
-    /// whose parameter uses an internal type, and `Receiver` is internal so that
-    /// no caller outside this module can drive it past the gates below. The
-    /// remaining public declarations in `Transport/TCP/` are mechanisms too and
-    /// should follow in one sweep; this one moved early because it had to.
+    /// Internal, like everything else in `Transport/TCP/`: these types are
+    /// mechanisms, and no caller outside this module can drive them past the
+    /// gates below. The module's public surface is `Stack` and the Channel
+    /// types.
     static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver) -> [TCPAction] {
         switch tcb.state {
         case .closed:
@@ -705,7 +704,7 @@ extension TCPStateMachine {
     /// an unsent FIN" from `state` and `sndNxt` would be an unwritten
     /// contract between two files, and a sender that got it subtly wrong
     /// would produce connections that open correctly and then never close.
-    public static func close(on tcb: inout TCB) -> [TCPAction] {
+    static func close(on tcb: inout TCB) -> [TCPAction] {
         switch tcb.state {
         case .listen, .synSent:
             tcb.state = .closed

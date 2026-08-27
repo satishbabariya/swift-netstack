@@ -182,7 +182,7 @@ import NIOCore
 /// domain this file's offset arithmetic requires. It is a domain bound, not a
 /// security check, and it is not a second opinion about whether the FIN is
 /// legitimate: this class deliberately does not have one.
-public final class TCPReassembler {
+final class TCPReassembler {
     /// The real, per-segment cost of holding one queued piece: the array
     /// element, the `ByteBuffer`'s backing storage object, and malloc's
     /// rounding of that tiny allocation — none of which shows up in
@@ -206,7 +206,7 @@ public final class TCPReassembler {
     /// a queue of very small segments fills sooner, which is the right
     /// direction to be wrong in: the cap must bound what is actually
     /// retained, not what was declared on the wire.
-    public static let perSegmentOverhead = 256
+    static let perSegmentOverhead = 256
 
     /// The furthest past RCV.NXT a segment may sit and still be queued.
     ///
@@ -214,19 +214,19 @@ public final class TCPReassembler {
     /// legitimately advertise (RFC 7323 caps window scale at 14, so under
     /// 2^30), and far below the 2^31 distance at which RFC 1982 ordering
     /// stops being total. See the type's doc comment.
-    public static let maximumSequenceOffset = 1 << 30
+    static let maximumSequenceOffset = 1 << 30
 
     /// Enough for a full 64 KiB receive window of ordinary 1460-byte segments
     /// (~45 of them, ~73 KB once overhead is charged) with generous headroom,
     /// so ordinary reordering is absorbed rather than forced into
     /// retransmission.
-    public static let defaultMaximumBytes = 256 * 1024
+    static let defaultMaximumBytes = 256 * 1024
 
     /// Bounds entry count independently of `defaultMaximumBytes`. Well above
     /// the ~45 segments a full receive window of ordinary segments occupies,
     /// and low enough that a flood of minimal segments hits it long before
     /// the byte cap.
-    public static let defaultMaximumSegments = 512
+    static let defaultMaximumSegments = 512
 
     /// One contiguous run of queued bytes. `bytes` is always freshly
     /// allocated, exactly-sized storage — never the slice it arrived in; see
@@ -263,7 +263,7 @@ public final class TCPReassembler {
     ///     from above, so no caller can widen the domain into the range where
     ///     RFC 1982 ordering stops being total — that bound is a correctness
     ///     invariant of this class, not a tunable.
-    public init(
+    init(
         maximumBytes: Int = TCPReassembler.defaultMaximumBytes,
         maximumSegments: Int = TCPReassembler.defaultMaximumSegments,
         maximumSequenceOffset: Int = TCPReassembler.maximumSequenceOffset
@@ -277,11 +277,11 @@ public final class TCPReassembler {
     /// `perSegmentOverhead` each. This is the figure `maximumBytes` bounds,
     /// and it is deliberately larger than the payload bytes alone — see
     /// `perSegmentOverhead`.
-    public var pendingBytes: Int { accountedBytes }
+    var pendingBytes: Int { accountedBytes }
 
     /// Number of queued contiguous runs. One arriving segment can become more
     /// than one run when it straddles a gap between runs already queued.
-    public var pendingSegments: Int { queue.count }
+    var pendingSegments: Int { queue.count }
 
     /// How much of `maximumBytes` is still free, in the same (overhead-charged)
     /// units `pendingBytes` reports.
@@ -296,12 +296,12 @@ public final class TCPReassembler {
     /// room actually left, so a window derived from it under-promises. That is
     /// the right direction — the alternative advertises space the queue would
     /// then refuse.
-    public var availableBytes: Int { max(0, maximumBytes - accountedBytes) }
+    var availableBytes: Int { max(0, maximumBytes - accountedBytes) }
 
     /// The sequence number a FIN occupies, once one has been seen at or ahead
     /// of RCV.NXT. The caller's FIN is in order when its own RCV.NXT equals
     /// this. See the type's doc comment.
-    public var finSequence: SequenceNumber? { fin }
+    var finSequence: SequenceNumber? { fin }
 
     /// Diagnostic: the total `ByteBuffer.storageCapacity` of every queued
     /// run's payload — the size of the allocations those payloads keep alive,
@@ -341,7 +341,7 @@ public final class TCPReassembler {
     /// nothing here retains them past the call, so copying them would be
     /// pointless work on the in-order path. Only bytes that must be *held*
     /// are copied.
-    public func insert(_ segment: Segment, rcvNxt: SequenceNumber) -> [ByteBuffer] {
+    func insert(_ segment: Segment, rcvNxt: SequenceNumber) -> [ByteBuffer] {
         // Defensive: the caller's RCV.NXT is an argument, so nothing here can
         // assume it only ever moves the way this class's own return values
         // moved it. Re-establish "every queued offset is in
@@ -393,7 +393,8 @@ public final class TCPReassembler {
         // survived admission), which is the "drop it and ACK it" a violation
         // deserves. Unreachable through `TCPStateMachine` -- see the type's doc
         // comment -- and enforced here because this class is what holds the
-        // position, and its own API is public.
+        // position, and its own API can still be called directly from inside
+        // the module.
         if let recordedFin = fin {
             dataEnd = min(dataEnd, recordedFin - rcvNxt)
         }
@@ -403,7 +404,7 @@ public final class TCPReassembler {
     }
 
     /// Forget everything queued. For a connection being torn down.
-    public func reset() {
+    func reset() {
         queue.removeAll()
         accountedBytes = 0
         fin = nil

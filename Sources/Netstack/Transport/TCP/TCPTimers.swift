@@ -18,7 +18,7 @@ import NIOCore
 ///
 /// Loop-confined like everything else in this package: no locks, and time
 /// comes from the injected `NetstackClock`, never `NIODeadline.now()`.
-public final class TCPTimers {
+final class TCPTimers {
     private let eventLoop: EventLoop
     private let clock: NetstackClock
 
@@ -27,12 +27,12 @@ public final class TCPTimers {
     /// Injected rather than hardcoded for two reasons: the differential
     /// harness needs it stated rather than buried, and a test that had to
     /// wait 60 real seconds is a test nobody runs.
-    public let timeWaitDuration: TimeAmount
+    let timeWaitDuration: TimeAmount
 
     private var retransmitTask: Scheduled<Void>?
     private var timeWaitTask: Scheduled<Void>?
 
-    public init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
+    init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
         self.eventLoop = eventLoop
         self.clock = clock
         self.timeWaitDuration = timeWaitDuration
@@ -40,7 +40,7 @@ public final class TCPTimers {
 
     /// Whether a retransmission is pending: true from `scheduleRetransmit`
     /// until the body fires, or until a cancellation, whichever comes first.
-    public var hasRetransmitScheduled: Bool { retransmitTask != nil }
+    var hasRetransmitScheduled: Bool { retransmitTask != nil }
 
     /// Arm the retransmission timer `delay` from *the clock's* now.
     ///
@@ -48,7 +48,7 @@ public final class TCPTimers {
     /// cancels any pending retransmission first. Assigning over the handle
     /// without cancelling would leave the previous task on the loop's queue,
     /// unreachable and therefore uncancellable, and both bodies would run.
-    public func scheduleRetransmit(after delay: TimeAmount, _ body: @escaping () -> Void) {
+    func scheduleRetransmit(after delay: TimeAmount, _ body: @escaping () -> Void) {
         retransmitTask?.cancel()
         retransmitTask = nil
         retransmitTask = schedule(at: clock.now() + delay) { [weak self] in
@@ -60,13 +60,13 @@ public final class TCPTimers {
         }
     }
 
-    public func cancelRetransmit() {
+    func cancelRetransmit() {
         retransmitTask?.cancel()
         retransmitTask = nil
     }
 
     /// Arm TIME_WAIT for `timeWaitDuration` from *the clock's* now.
-    public func startTimeWait(_ body: @escaping () -> Void) {
+    func startTimeWait(_ body: @escaping () -> Void) {
         timeWaitTask?.cancel()
         timeWaitTask = nil
         timeWaitTask = schedule(at: clock.now() + timeWaitDuration) { [weak self] in
@@ -75,7 +75,7 @@ public final class TCPTimers {
         }
     }
 
-    public func cancelAll() {
+    func cancelAll() {
         cancelRetransmit()
         timeWaitTask?.cancel()
         timeWaitTask = nil

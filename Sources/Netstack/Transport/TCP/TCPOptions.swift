@@ -9,7 +9,7 @@ import NIOCore
 /// peer is free to send options we know nothing about — so parsing records
 /// that one was there (by kind) rather than aborting or silently dropping
 /// it.
-public enum TCPOption: Equatable, Sendable {
+enum TCPOption: Equatable, Sendable {
     case maximumSegmentSize(UInt16)
     case windowScale(UInt8)
     case sackPermitted

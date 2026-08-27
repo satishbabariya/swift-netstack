@@ -6,12 +6,12 @@
 /// not cross the wrap, which is why it survives so easily. At exactly half
 /// the space (2^31 apart), RFC 1982 leaves the ordering undefined; see
 /// `lessThan` for the deliberate, non-contradictory choice made here.
-public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
-    public let value: UInt32
+struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
+    let value: UInt32
 
-    public init(_ value: UInt32) { self.value = value }
+    init(_ value: UInt32) { self.value = value }
 
-    public static func + (lhs: SequenceNumber, rhs: Int) -> SequenceNumber {
+    static func + (lhs: SequenceNumber, rhs: Int) -> SequenceNumber {
         SequenceNumber(lhs.value &+ UInt32(truncatingIfNeeded: rhs))
     }
 
@@ -23,7 +23,7 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// representable extreme regardless of which operand is which.
     /// `lessThan` does not build its half-space decision on this operator; it
     /// special-cases that distance directly instead.
-    public static func - (lhs: SequenceNumber, rhs: SequenceNumber) -> Int {
+    static func - (lhs: SequenceNumber, rhs: SequenceNumber) -> Int {
         Int(Int32(bitPattern: lhs.value &- rhs.value))
     }
 
@@ -48,7 +48,7 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// RFC 1982 leaves this point undefined precisely because the number is
     /// chosen remotely; the only correct response is to define an answer and
     /// return it.
-    public func lessThan(_ other: SequenceNumber) -> Bool {
+    func lessThan(_ other: SequenceNumber) -> Bool {
         let diff = value &- other.value
         if diff == 0x8000_0000 {
             return SequenceNumber.halfSpaceOrdering()
@@ -97,7 +97,7 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// This is RFC 9293's "SND.UNA < SEG.ACK =< SND.NXT" acceptable-ACK
     /// window. Both bounds are TCB values a segment must fall between, and
     /// `self` is the wire-supplied number under test.
-    public func isInRange(after low: SequenceNumber, throughAndIncluding high: SequenceNumber) -> Bool {
+    func isInRange(after low: SequenceNumber, throughAndIncluding high: SequenceNumber) -> Bool {
         SequenceNumber.isInRange(offset: self - low, span: high - low, includingLow: false)
     }
 
@@ -106,7 +106,7 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     /// RFC 9293's other ACK window: a segment acknowledging exactly SND.UNA
     /// is a duplicate that advances nothing, but it still carries a window
     /// update, so the inclusive bound is load-bearing rather than cosmetic.
-    public func isInRange(from low: SequenceNumber, throughAndIncluding high: SequenceNumber) -> Bool {
+    func isInRange(from low: SequenceNumber, throughAndIncluding high: SequenceNumber) -> Bool {
         SequenceNumber.isInRange(offset: self - low, span: high - low, includingLow: true)
     }
 
@@ -114,7 +114,7 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     ///
     /// The open-ended relation, for the one place with a lower bound and no
     /// upper one (RFC 9293's "SND.WL2 =< SEG.ACK" window-update test).
-    public func isAtOrAfter(_ other: SequenceNumber) -> Bool {
+    func isAtOrAfter(_ other: SequenceNumber) -> Bool {
         (self - other) >= 0
     }
 
@@ -158,14 +158,14 @@ public struct SequenceNumber: Hashable, Sendable, CustomStringConvertible {
     ///   are mathematically inside the window, because a forward distance of
     ///   exactly 2^31 cannot be represented as a positive signed offset (see
     ///   `-` above).
-    public func inWindow(start: SequenceNumber, size: Int) -> Bool {
+    func inWindow(start: SequenceNumber, size: Int) -> Bool {
         assert(size < 0x8000_0000, "window size \(size) is outside the valid TCP domain (must be < 2^31)")
         guard size > 0 else { return false }
         let offset = self - start
         return offset >= 0 && offset < size
     }
 
-    public var description: String { String(value) }
+    var description: String { String(value) }
 }
 
 extension SequenceNumber: Comparable {
@@ -175,5 +175,5 @@ extension SequenceNumber: Comparable {
     /// 1982, which leaves that point undefined. Beyond a single window,
     /// comparing values that are not close to each other is not meaningful:
     /// callers must not rely on transitivity over distances beyond 2^31.
-    public static func < (lhs: SequenceNumber, rhs: SequenceNumber) -> Bool { lhs.lessThan(rhs) }
+    static func < (lhs: SequenceNumber, rhs: SequenceNumber) -> Bool { lhs.lessThan(rhs) }
 }

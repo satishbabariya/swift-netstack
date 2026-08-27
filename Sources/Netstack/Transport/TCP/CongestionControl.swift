@@ -12,7 +12,7 @@
 /// can sit far above what is in flight, and halving the window there sets the
 /// threshold from a rate the path has never been asked to carry. Only the
 /// sender knows the flight size, so it has to be passed in.
-public protocol CongestionControl {
+protocol CongestionControl {
     /// The current congestion window, in bytes.
     var congestionWindow: Int { get }
     /// The slow-start threshold, in bytes. At or above it, the algorithm is in
@@ -32,7 +32,7 @@ public protocol CongestionControl {
 /// inflation on `lossDetected`, but the duplicate-ACK counting that decides
 /// when a loss has been detected, and the deflation when recovery ends, belong
 /// to the sender, which is the thing that sees the acknowledgements.
-public struct Reno: CongestionControl, Sendable, Equatable {
+struct Reno: CongestionControl, Sendable, Equatable {
     /// SMSS. Clamped to at least one byte at initialisation: a zero segment
     /// size can arrive from a peer-influenced MSS option, and it would
     /// otherwise divide by zero in congestion avoidance and produce an empty
@@ -42,7 +42,7 @@ public struct Reno: CongestionControl, Sendable, Equatable {
     private var cwnd: Int
     private var ssthresh: Int
 
-    public init(maximumSegmentSize: Int) {
+    init(maximumSegmentSize: Int) {
         let smss = max(1, maximumSegmentSize)
         self.segmentSize = smss
         // Initial window of ten segments (RFC 6928), which is also what gVisor
@@ -58,10 +58,10 @@ public struct Reno: CongestionControl, Sendable, Equatable {
         self.ssthresh = .max
     }
 
-    public var congestionWindow: Int { cwnd }
-    public var slowStartThreshold: Int { ssthresh }
+    var congestionWindow: Int { cwnd }
+    var slowStartThreshold: Int { ssthresh }
 
-    public mutating func acked(bytes: Int, flightSize: Int) {
+    mutating func acked(bytes: Int, flightSize: Int) {
         // Nothing acknowledged means nothing learned about the path.
         guard bytes > 0 else { return }
 
@@ -99,7 +99,7 @@ public struct Reno: CongestionControl, Sendable, Equatable {
         // sender's behalf would hide it.
     }
 
-    public mutating func lossDetected(flightSize: Int) {
+    mutating func lossDetected(flightSize: Int) {
         // RFC 5681 §3.2, fast retransmit and fast recovery.
         ssthresh = reducedThreshold(flightSize: flightSize)
         // The three duplicate ACKs that signalled the loss are three segments
@@ -107,7 +107,7 @@ public struct Reno: CongestionControl, Sendable, Equatable {
         cwnd = ssthresh.addingSaturating(segmentSize.multipliedSaturating(by: 3))
     }
 
-    public mutating func timeout(flightSize: Int) {
+    mutating func timeout(flightSize: Int) {
         // RFC 5681 §3.1. The window collapses to ONE segment, not to half.
         // A timeout means nothing is known about the state of the pipe --
         // neither how much is in it nor whether anything is draining -- so

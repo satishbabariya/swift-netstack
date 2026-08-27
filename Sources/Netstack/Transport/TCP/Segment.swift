@@ -16,12 +16,12 @@ import NIOCore
 /// copies could drift, and a drift between them would mean the acceptability
 /// test and the reassembler's gap arithmetic disagreeing about how much
 /// sequence space a segment occupies.
-public struct Segment: Sendable {
-    public let sequence: SequenceNumber
-    public let flags: TCPFlags
-    public let payload: ByteBuffer
+struct Segment: Sendable {
+    let sequence: SequenceNumber
+    let flags: TCPFlags
+    let payload: ByteBuffer
 
-    public init(sequence: SequenceNumber, flags: TCPFlags, payload: ByteBuffer = ByteBuffer()) {
+    init(sequence: SequenceNumber, flags: TCPFlags, payload: ByteBuffer = ByteBuffer()) {
         self.sequence = sequence
         self.flags = flags
         self.payload = payload
@@ -33,7 +33,7 @@ public struct Segment: Sendable {
     /// carrying no data, so a reassembler that measured segments by
     /// `payload.readableBytes` would compute a zero-width range for it and
     /// never notice it at all.
-    public var length: Int {
+    var length: Int {
         payload.readableBytes + (flags.contains(.syn) ? 1 : 0) + (flags.contains(.fin) ? 1 : 0)
     }
 
@@ -41,7 +41,7 @@ public struct Segment: Sendable {
     /// the segment's first sequence number, so on a SYN-bearing segment the
     /// data begins one past `sequence` — off by one from `sequence` itself,
     /// which is the whole reason this is spelled out rather than assumed.
-    public var dataSequence: SequenceNumber {
+    var dataSequence: SequenceNumber {
         flags.contains(.syn) ? sequence + 1 : sequence
     }
 
@@ -59,7 +59,7 @@ public struct Segment: Sendable {
     /// a retransmission of a FIN already processed. Three independent
     /// derivations of one sequence number is exactly how the two halves of a
     /// FIN decision come to disagree.
-    public var finSequence: SequenceNumber? {
+    var finSequence: SequenceNumber? {
         flags.contains(.fin) ? dataSequence + payload.readableBytes : nil
     }
 }
@@ -69,7 +69,7 @@ extension TCPSegment {
     /// seam between the state machine's segment type and the reassembler's is
     /// written down in one place instead of being re-derived (and eventually
     /// mis-derived) at each call site.
-    public var reassemblySegment: Segment {
+    var reassemblySegment: Segment {
         Segment(sequence: header.sequence, flags: header.flags, payload: payload)
     }
 }

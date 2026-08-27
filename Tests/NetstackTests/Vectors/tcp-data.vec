@@ -257,45 +257,74 @@
 # bytes so each acknowledgement releases exactly one more segment, which makes
 # every round trip a clean, unambiguous sample under Karn's algorithm.
 #
-# Sample 1 is 500 ms (sent 0.010, acknowledged 0.510). RFC 6298 section 2.2,
-# the first-sample rule: SRTT = R = 500 ms, RTTVAR = R/2 = 250 ms, and
-# RTO = SRTT + max(G, 4*RTTVAR) = 500 ms + 1000 ms = 1.500 s. Above the floor,
-# so the floor is not what decides it.
+# ## Every number below was re-derived when the handshake began to be sampled
 #
-# Sample 2 is 100 ms (sent 0.510, acknowledged 0.610). RFC 6298 section 2.3 in
-# Jacobson's fixed-point form, which is what `RTTEstimator` implements and what
-# every stack this one is compared against implements:
+# This scenario used to open at 0.010 and read 500 ms and 100 ms as its two
+# samples, with the FIRST of them taking RFC 6298 section 2.2's first-measurement
+# path. That is no longer what happens, and the old numbers were not merely
+# stale -- they had stopped describing this stack. `TCPEndpoint` now takes a
+# sample from the handshake itself, so the first-measurement path belongs to the
+# HANDSHAKE and every data sample after it is a subsequent one.
+#
+# The old lines could not simply be kept: a 10 ms handshake sample starts SRTT
+# near zero, and a subsequent sample only moves SRTT by R/8, so both of the old
+# samples then produced an RTO UNDER the one-second floor (576 ms and 482 ms).
+# The scenario would still have passed -- at 1.610, the exact time its own last
+# comment named as the signature of a stack that ignores its measurements -- and
+# it would have been pinning the floor while claiming to pin the estimator. So
+# the handshake here is deliberately slow, and the samples are chosen so that
+# all three round trips stay above the floor.
+#
+# Measurement 1 is the HANDSHAKE: 500 ms, from the SYN-ACK at 0.000 to the ACK
+# at 0.500, and our SYN-ACK went out exactly once so Karn permits it. RFC 6298
+# section 2.2, the first-measurement rule: SRTT = R = 500 ms, RTTVAR = R/2 =
+# 250 ms, RTO = 500 + max(G, 4*250) = 1.500 s. Above the floor, so the floor is
+# not what decides it.
+#
+# Measurement 2 is 1300 ms (sent 0.500, acknowledged 1.800). RFC 6298 section
+# 2.3 in Jacobson's fixed-point form, which is what `RTTEstimator` implements
+# and what every stack this one is compared against implements:
 #
 #   RTTVAR = RTTVAR - (RTTVAR >> 2) + (|SRTT - R| >> 2)
-#          = 250 - 62.5 + 100 = 287.5 ms
+#          = 250 - 62.5 + 200 = 387.5 ms
 #   SRTT   = SRTT - (SRTT >> 3) + (R >> 3)
-#          = 500 - 62.5 + 12.5 = 450 ms
-#   RTO    = 450 + max(1, 4 * 287.5) = 1.600 s
+#          = 500 - 62.5 + 162.5 = 600 ms
+#   RTO    = 600 + max(1, 4 * 387.5) = 2.150 s
 #
-# The third segment goes out at 0.610 and is never acknowledged, so the RTO is
-# read off the wire as the gap to its retransmission: 0.610 + 1.600 = 2.210.
+# Measurement 3 is 100 ms (sent 1.800, acknowledged 1.900) -- a sample BELOW
+# SRTT, kept from the original scenario because `>>` on a negative `Int64`
+# rounds toward negative infinity and `measure` takes the absolute difference
+# first precisely so that this case follows the same path as every other:
+#
+#   RTTVAR = 387.5 - 96.875 + 125 = 415.625 ms
+#   SRTT   = 600 - 75 + 12.5 = 537.5 ms
+#   RTO    = 537.5 + max(1, 4 * 415.625) = 2.200 s
+#
+# The third segment goes out at 1.900 and is never acknowledged, so the RTO is
+# read off the wire as the gap to its retransmission: 1.900 + 2.200 = 4.100.
 # One millisecond either side is a different SRTT or a different RTTVAR, and
 # `3/4 * RTTVAR` computed with integer division instead of the shift form
 # differs in the low bits -- which is exactly the divergence the shift form was
 # chosen to avoid, made visible here as a retransmission at the wrong time.
 0.000 < S     0:0(0) win 65535 <mss 1460>
 0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
-0.010 < .     1:1(0) ack 1001 win 100
-0.010 < write 300
+# The third leg at 0.500, not 0.010. This line IS measurement 1.
+0.500 < .     1:1(0) ack 1001 win 100
+0.500 < write 300
 # `P.` on all three pieces, EDITED by Task 17. Three hundred bytes is less than
 # one MSS, so this write is split by the peer's hundred-byte WINDOW and not by
 # the MSS -- and a window split does not defer the push. This is the same rule
 # `write-under-a-small-window` below exists to pin, met here by accident, which
 # is why that scenario states it deliberately rather than relying on this one.
-0.010 > P.    1001:1101(100) ack 1 win 65535
-0.510 < .     1:1(0) ack 1101 win 100
-0.510 > P.    1101:1201(100) ack 1 win 65535
-0.610 < .     1:1(0) ack 1201 win 100
-0.610 > P.    1201:1301(100) ack 1 win 65535
-# 0.610 + 1.600. Not 0.610 + 1.000: the floor has been left behind, and a stack
-# that ignored its own measurements would retransmit at 1.610 instead.
-2.210 > P.    1201:1301(100) ack 1 win 65535
-2.220 < .     1:1(0) ack 1301 win 100
+0.500 > P.    1001:1101(100) ack 1 win 65535
+1.800 < .     1:1(0) ack 1101 win 100
+1.800 > P.    1101:1201(100) ack 1 win 65535
+1.900 < .     1:1(0) ack 1201 win 100
+1.900 > P.    1201:1301(100) ack 1 win 65535
+# 1.900 + 2.200. Not 1.900 + 1.000: the floor has been left behind, and a stack
+# that ignored its own measurements would retransmit at 2.900 instead.
+4.100 > P.    1201:1301(100) ack 1 win 65535
+4.110 < .     1:1(0) ack 1301 win 100
 
 
 # scenario: push-on-the-last-segment-of-a-write
@@ -516,3 +545,132 @@
 1.050 < .     1:1(0) ack 5381 win 65535
 1.060 < .     1:1(0) ack 6841 win 65535
 1.070 < .     1:1(0) ack 8301 win 65535
+
+
+# scenario: the-handshake-seeds-the-retransmission-timeout
+#
+# FOUND BY THE DIFFERENTIAL. gVisor takes an RTT sample from the SYN-ACK/ACK
+# round trip and this stack took none, so its first data sample was a FIRST
+# measurement rather than a subsequent one -- and RFC 6298 section 2.2 makes a
+# first measurement deliberately conservative (RTTVAR = R/2, so RTO = 3R). A
+# 716 ms sample put this stack's first FIN retransmission at +2.148 s against
+# gVisor's +1.000 s.
+#
+# This scenario pins the sample itself, one line, before any data has been
+# acknowledged. The handshake takes 400 ms -- SYN-ACK at 0.000, ACK at
+# 0.400 -- and our SYN-ACK went out exactly once, so the sample is unambiguous
+# under Karn:
+#
+#   SRTT = 400 ms, RTTVAR = 200 ms, RTO = 400 + max(G, 4*200) = 1.200 s
+#
+# 400 ms is chosen so the result clears the one-second floor. Under it the
+# scenario would read 1.000 s whether or not the sample was ever taken, and
+# would be satisfied by a stack that samples nothing at all.
+#
+# The one segment is never acknowledged, so its retransmission times the RTO the
+# HANDSHAKE alone produced. Three implementations give three different answers
+# on the line below, which is what makes it worth a scenario:
+#
+#   +1.200s  this stack: the handshake was sampled, before the data went out
+#   +1.000s  no handshake sample at all -- RFC 6298 section 2.1's initial RTO
+#   +1.000s  the sample taken, but fed to the estimator AFTER the first data
+#            send: the timer was already armed off the unseeded RTO, so the
+#            measurement arrives too late to be worth anything
+#
+# That third line is the ordering bug this scenario exists for. It is invisible
+# in the estimator's own fields -- which by then hold exactly the right
+# numbers -- and visible here as a frame 200 ms early.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.400 < .     1:1(0) ack 1001 win 65535
+0.400 < write 100
+0.400 > P.    1001:1101(100) ack 1 win 65535
+# 0.400 + 1.200, and not 0.400 + 1.000.
+1.600 > P.    1001:1101(100) ack 1 win 65535
+1.610 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: a-handshake-sample-makes-the-first-data-sample-a-subsequent-one
+#
+# The other half of the finding, and the half that is actually worth the code.
+# The handshake sample matters far less for its own value than for what it does
+# to the sample AFTER it: with one already in hand, the first data sample takes
+# RFC 6298 section 2.3's Jacobson update instead of section 2.2's
+# first-measurement rule, and section 2.2 is deliberately the conservative one.
+#
+# Same 400 ms handshake as above, then one data round trip of 800 ms (sent
+# 0.400, acknowledged 1.200). Two derivations from the SAME 800 ms sample:
+#
+#   seeded (this stack)   RTTVAR = 200 - 50 + 100 = 250 ms
+#                         SRTT   = 400 - 50 + 100 = 450 ms
+#                         RTO    = 450 + 4*250     = 1.450 s
+#
+#   unseeded              SRTT = R = 800 ms, RTTVAR = R/2 = 400 ms
+#                         RTO  = 800 + 4*400       = 2.400 s
+#
+# So the second segment's retransmission lands at 1.200 + 1.450 = 2.650 here and
+# at 1.200 + 2.400 = 3.600 on a stack that took no handshake sample. Both are
+# above the floor, on purpose: a scenario whose two answers are 1.000 and 1.000
+# proves nothing, and this is the pairing that makes "the estimator has a
+# sample" mean "the RTO it produces is lower", rather than a flag being set
+# somewhere nobody reads.
+#
+# The first data segment is acknowledged at 1.200, which is inside BOTH the
+# seeded RTO (0.400 + 1.200 = 1.600) and the unseeded one (0.400 + 1.000 =
+# 1.400), so removing the handshake sample changes exactly one line here -- the
+# last retransmission -- rather than cascading into an early retransmission that
+# would then suppress the data sample under Karn and fail for a second reason.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.400 < .     1:1(0) ack 1001 win 65535
+0.400 < write 100
+0.400 > P.    1001:1101(100) ack 1 win 65535
+1.200 < .     1:1(0) ack 1101 win 65535
+1.200 < write 100
+1.200 > P.    1101:1201(100) ack 1 win 65535
+# 1.200 + 1.450. A stack that started its estimator from this 800 ms sample
+# would put this frame at 3.600 instead.
+2.650 > P.    1101:1201(100) ack 1 win 65535
+2.660 < .     1:1(0) ack 1201 win 65535
+
+
+# scenario: an-ambiguous-handshake-is-not-sampled
+#
+# Karn's algorithm, on the handshake. The peer never saw our first SYN-ACK and
+# retransmits its SYN; `TCPStateMachine` reproduces the SYN-ACK from the TCB
+# (`isRetransmissionOfTheSynWeAnswered`), so the same frame goes out twice. The
+# ACK that eventually arrives may be answering EITHER of them, and RFC 6298
+# section 3 forbids computing a sample from it -- a sample measured against the
+# wrong transmission corrupts the RTO for the whole connection, not just for the
+# handshake.
+#
+# This is the path an implementation quietly gets wrong, because the happy path
+# never exercises it: nothing here fails, no frame is missing, and the only
+# symptom is an RTO built on a number that was never measured.
+#
+# The times are chosen so that all three possible implementations are
+# distinguishable on the last line, which is the whole difficulty of testing
+# this. A naive stack that recorded the LATEST SYN-ACK rather than the first
+# would sample 1000 ms and land at 4.400; one that recorded the FIRST and
+# ignored the retransmission would sample 1400 ms and land at 5.600; the correct
+# one takes no sample at all, keeps RFC 6298 section 2.1's initial 1.000 s, and
+# lands at 2.400. Compressing the handshake would collapse the first of those
+# onto the floor and make the scenario pass against a stack with no Karn check
+# in it at all.
+#
+#   sample from the 1st SYN-ACK  1400 ms -> RTO 4.200 s -> +5.600
+#   sample from the 2nd SYN-ACK  1000 ms -> RTO 3.000 s -> +4.400
+#   no sample (correct)                  -> RTO 1.000 s -> +2.400
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+# The peer's SYN again: our SYN-ACK was lost. The reply is the same frame, from
+# the same TCB, and it is what makes the handshake ambiguous.
+0.400 < S     0:0(0) win 65535 <mss 1460>
+0.400 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+1.400 < .     1:1(0) ack 1001 win 65535
+1.400 < write 100
+1.400 > P.    1001:1101(100) ack 1 win 65535
+# 1.400 + 1.000: the initial RTO, because nothing on this connection has been
+# measured. A stack that sampled the ambiguous handshake retransmits later.
+2.400 > P.    1001:1101(100) ack 1 win 65535
+2.410 < .     1:1(0) ack 1101 win 65535

@@ -520,6 +520,34 @@ struct Sender {
         return true
     }
 
+    // MARK: - Round-trip time
+
+    /// Fold the handshake's round trip into the estimator, before any data has
+    /// been sent.
+    ///
+    /// This type models no SYN and must not start to: Task 14 of Plan 2 measured
+    /// the cost of feeding it one -- `cwnd` grows by a byte and a stray one-byte
+    /// segment can reach the wire. So `TCPEndpoint` owns the handshake, times
+    /// it, and applies Karn's algorithm to it (`HandshakeRTT`); this method is
+    /// the one seam through which the finished sample reaches the estimator, and
+    /// it is the whole of this type's involvement in the handshake.
+    ///
+    /// Deliberately a sample rather than an assignment. The caller hands over a
+    /// measurement and `RTTEstimator` decides what it is worth, so the handshake
+    /// takes RFC 6298 §2.2's first-measurement path exactly as any other first
+    /// sample would. What that buys is not the handshake's own value --
+    /// microseconds, under a one-second floor -- but the first DATA sample,
+    /// which then takes §2.3's Jacobson update instead of §2.2's deliberately
+    /// conservative `RTTVAR = R / 2`. See `HandshakeRTT` for the arithmetic and
+    /// for what the differential measured it to be worth.
+    ///
+    /// Nothing is in flight when this is called -- the connection has only just
+    /// reached ESTABLISHED -- so there is no armed timer for the recomputed RTO
+    /// to contradict and no accumulated backoff for it to discard.
+    mutating func measureHandshakeRoundTrip(_ sample: TimeAmount) {
+        estimator.measure(sample)
+    }
+
     // MARK: - Retransmission
 
     /// The retransmission timer expired. Returns the segment to send again, or

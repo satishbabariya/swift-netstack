@@ -170,6 +170,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// both "this stream is over", and a connection can meet both.
         var closedReported = false
 
+        /// When our half of the handshake went out and how many times, so that
+        /// the round trip can be sampled once it completes -- and refused when
+        /// Karn says it is ambiguous. Defaulted rather than passed to `init`,
+        /// because every connection starts with nothing recorded. See
+        /// `HandshakeRTT`.
+        var handshake = HandshakeRTT()
+
         /// The four-tuple this connection holds in the demuxer in its own right,
         /// once `close()` has released the endpoint's listening key. Nil while
         /// the listening key still covers it. See `close()`.
@@ -331,6 +338,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         connection.tcb.sndNxt = connection.tcb.iss + 1
         connections[peer] = connection
 
+        // The active open's half of the handshake: our SYN goes out here and
+        // the SYN-ACK answering it closes the round trip. Recorded immediately
+        // before the emit rather than after it because `emit` is synchronous and
+        // the clock cannot move inside it, so the two instants are the same one.
+        connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn], sequence: connection.tcb.iss, on: connection,
             options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))],
@@ -549,6 +561,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard connections[connection.peer] === connection else { return }
 
         if stateBefore != .established, connection.tcb.state == .established {
+            seedRoundTripEstimateFromHandshake(on: connection)
             onEstablished?()
         }
 
@@ -673,6 +686,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// adding the option here will additionally require
     /// (`tcb.peerOfferedWindowScale`, per RFC 7323 §2.2).
     private func emitSynAck(on connection: Connection) {
+        // Every SYN-ACK this stack sends passes through here, including the
+        // repeat that answers a retransmitted SYN in SYN-RECEIVED -- which is
+        // exactly the transmission Karn has to count. A second emission point
+        // would not be a missing count so much as a silently wrong RTO.
+        connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn, .ack], sequence: connection.tcb.iss, on: connection,
             options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))])
@@ -713,6 +731,45 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
         }
         return segments.count
+    }
+
+    /// Fold the handshake's round trip into the connection's RTT estimator, at
+    /// the one moment both ends of it are known.
+    ///
+    /// ## Both directions, one call site
+    ///
+    /// A passive open times SYN-ACK -> ACK and an active open times SYN ->
+    /// SYN-ACK, and both finish at the same event: the transition INTO
+    /// ESTABLISHED. Hooking the transition rather than the two segment paths
+    /// separately is what makes the active and passive cases impossible to
+    /// implement inconsistently, and it is why there is no second copy of this
+    /// below.
+    ///
+    /// ## Ordering, which is the whole difficulty
+    ///
+    /// Two orderings have to hold, and neither raises anything when it does not:
+    ///
+    /// - **Before the first data send.** This runs inside `process`, ahead of
+    ///   the `transmit` below it, so the first data segment's retransmission
+    ///   timer is armed from the seeded RTO. Move it after `transmit` and the
+    ///   estimator still ends up holding exactly the right numbers while the
+    ///   timer that matters was armed from the wrong ones --
+    ///   `the-handshake-seeds-the-retransmission-timeout` in `tcp-data.vec` is
+    ///   the vector that catches that, as a frame 200 ms early.
+    /// - **After `adoptPeerSegmentSize`.** On an active open, a SYN-ACK
+    ///   carrying an MSS option makes `deliver` REBUILD `connection.sender`
+    ///   from scratch, which throws away the estimator with everything else in
+    ///   it. That happens before `process` runs, so seeding here is after the
+    ///   rebuild and survives it. Seeding anywhere in `deliver` ahead of that
+    ///   call would be discarded silently -- no error, no failing test, and an
+    ///   active open that quietly keeps the unseeded behaviour.
+    ///
+    /// `HandshakeRTT` decides whether there is a sample at all; Karn's refusal
+    /// and a zero-length round trip both arrive here as `nil`, and a connection
+    /// that gets no sample simply keeps RFC 6298 §2.1's initial one-second RTO.
+    private func seedRoundTripEstimateFromHandshake(on connection: Connection) {
+        guard let sample = connection.handshake.sample(at: stack.clock.now()) else { return }
+        connection.sender.measureHandshakeRoundTrip(sample)
     }
 
     // MARK: - Timers

@@ -232,6 +232,9 @@ private let closeVectors = "tcp-close"
         "window-updates-are-not-duplicate-acknowledgements",
         "three-identical-duplicate-acknowledgements-still-fast-retransmit",
         "a-timeout-keeps-retransmitting",
+        "the-handshake-seeds-the-retransmission-timeout",
+        "a-handshake-sample-makes-the-first-data-sample-a-subsequent-one",
+        "an-ambiguous-handshake-is-not-sampled",
     ]
     #expect(try transferScenarioNames(dataVectors) == run)
 }
@@ -393,6 +396,35 @@ private let closeVectors = "tcp-close"
     // 5705 -- and both would satisfy every line of the vector, because the
     // window is not on the wire.
     #expect(harness.endpoint.congestionWindowForTesting == 5705)
+}
+
+// The three handshake-RTT scenarios below. All three read the RTO off WHEN a
+// retransmission appears rather than off `Sender.retransmissionTimeout`, which
+// is the bar `rtt-sample-drives-the-rto` set: an estimator field can hold the
+// right number while the timer that was armed from it holds the wrong one, and
+// only the second of those is on the wire.
+
+@Test func theHandshakeRoundTripSeedsTheEstimatorBeforeAnyDataIsSent() throws {
+    let harness = try runTransferScenario(dataVectors, "the-handshake-seeds-the-retransmission-timeout")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aSeededEstimatorGivesTheFirstDataSampleALowerRtoThanAnUnseededOne() throws {
+    let harness = try runTransferScenario(
+        dataVectors, "a-handshake-sample-makes-the-first-data-sample-a-subsequent-one")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aHandshakeWhoseSynAckWentOutTwiceIsNotSampled() throws {
+    let harness = try runTransferScenario(dataVectors, "an-ambiguous-handshake-is-not-sampled")
+    // One connection, not two. The second SYN is a RETRANSMISSION of the first
+    // and must be answered from the block that already exists -- a stack that
+    // built a second block would draw a second ISS, and `runTransferScenario`
+    // already checks `sequenceNumbers.calls == 1`. Stated again here because
+    // this is the one scenario in the file that sends the same SYN twice, so it
+    // is the only one where that check is doing real work rather than
+    // restating something no line could violate.
+    #expect(harness.endpoint.connectionCountForTesting == 1)
 }
 
 // MARK: - tcp-close.vec

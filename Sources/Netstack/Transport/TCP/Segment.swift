@@ -47,6 +47,18 @@ public struct Segment: Sendable {
 
     /// The sequence number the FIN occupies, if this segment carries one:
     /// SEG.SEQ + SEG.LEN - 1, i.e. immediately after the last payload byte.
+    ///
+    /// Like `length`, this is the module's **only** definition of the quantity.
+    /// It was briefly dead code while `TCPReassembler` computed the same thing
+    /// from its own offset arithmetic (`rcvNxt + dataEnd`) — the same SEG.LEN
+    /// duplication this file's header records as collapsed, reproduced one
+    /// field over. It has been made live rather than deleted because three
+    /// places now need "where does this segment's FIN sit": the reassembler,
+    /// which records it; `TCPStateMachine`'s in-order-FIN gate, which decides
+    /// whether it may be recorded at all; and that machine's TIME-WAIT test for
+    /// a retransmission of a FIN already processed. Three independent
+    /// derivations of one sequence number is exactly how the two halves of a
+    /// FIN decision come to disagree.
     public var finSequence: SequenceNumber? {
         flags.contains(.fin) ? dataSequence + payload.readableBytes : nil
     }

@@ -24,9 +24,17 @@ public struct ReceiveOutcome: Sendable {
     /// True on the one call where RCV.NXT first reaches the peer's FIN, and
     /// never again. **Edge-triggered, deliberately.** A level-triggered "the
     /// FIN is in order" would be true for every subsequent segment on the
-    /// connection, and the state machine's FIN handling is not idempotent: in
-    /// TIME-WAIT it restarts the 2*MSL timer, so a peer could hold a TIME-WAIT
-    /// block open indefinitely by sending anything at all.
+    /// connection, and the state machine reads this as *an event*: it is what
+    /// drives the once-only transition out of ESTABLISHED (or FIN-WAIT-*) and
+    /// what makes RFC 9293's "acknowledge the FIN" fire once rather than on
+    /// every segment thereafter.
+    ///
+    /// This once *also* carried the 2*MSL timer: level-triggering it would have
+    /// let a peer hold a TIME-WAIT block open indefinitely by sending anything
+    /// at all. It no longer does, and the claim is not repeated here as though
+    /// it did. The receiver is not driven in TIME-WAIT at all, so this is never
+    /// true there; the 2*MSL restart is decided by `TCPStateMachine`'s own
+    /// retransmitted-FIN test, which is the only thing that may restart it.
     ///
     /// The edge costs no stored state. Reaching the FIN advances RCV.NXT one
     /// past it (the FIN consumes a sequence number), so the equality that
@@ -69,14 +77,24 @@ public struct ReceiveOutcome: Sendable {
 ///
 /// ## What this type does not do
 ///
-/// It does not test acceptability. It must be driven only after RFC 9293
-/// §3.10.7.4's checks have passed, which is why `TCPStateMachine` owns the call
-/// rather than the other way round: the acceptability test is what confines a
-/// peer's data to the window it was offered, and a receiver driven ahead of it
-/// would queue, and eventually deliver, bytes the connection said it would not
-/// accept. `TCPReassembler`'s own domain bound limits the damage but does not
-/// replace that test — it admits anything within a quarter of the sequence
-/// space, which is vastly wider than any window we advertise.
+/// It does not test acceptability, it does not trim to the window, and it does
+/// not decide whether a FIN may be honoured. It must be driven only after RFC
+/// 9293 §3.10.7.4's checks have passed *and* after the segment has been trimmed
+/// to the offered window, which is why `TCPStateMachine` owns the call rather
+/// than the other way round.
+///
+/// Both halves are needed and neither is sufficient alone. The acceptability
+/// test admits a segment whose *first or last* byte is in the window; it bounds
+/// neither the segment's extent nor its end, so on its own it lets a peer that
+/// merely starts inside a 4-byte window hand this type 5000 bytes. Trimming is
+/// the half that actually confines the data (RFC 9293 §3.9), and it happens in
+/// `TCPStateMachine.receiverInput(for:tcb:)` immediately after the test. Only
+/// with both in place is it true that `TCPReassembler`'s own domain bound —
+/// which admits anything within a quarter of the sequence space, vastly wider
+/// than any window we advertise — never becomes the operative limit.
+///
+/// A receiver driven ahead of either would queue, and eventually deliver, bytes
+/// the connection said it would not accept.
 ///
 /// ## A struct wrapping a class
 ///
@@ -96,8 +114,18 @@ public struct Receiver {
     /// `.windowScale`, but no `TCB` field records a negotiated shift, so there
     /// is no scale factor available to this task and none is invented here.
     ///
-    /// When Task 13 adds one, the change belongs in `advertisedWindow(...)`
-    /// below and nowhere else: the value advertised becomes the real window
+    /// When Task 13 adds one, the change to *this* side of the connection —
+    /// the window we advertise — belongs in `advertisedWindow(...)` below and
+    /// nowhere else. **That is not the whole of window scaling.** RFC 7323 §2.3
+    /// negotiates a scale in each direction independently, and the peer's
+    /// direction is decoded in `TCPStateMachine`, at the three sites marked
+    /// "Snd.Wind.Scale" there (`tcb.sndWnd = Int(header.window)`), each of which
+    /// needs `<< Snd.Wind.Scale` once a scale is recorded. Those three matter as
+    /// much as this one: `CongestionControl` already commits the send decision
+    /// to `min(cwnd, sndWnd)` in bytes, so leaving them unscaled would under-use
+    /// the path by up to 2^14 while this side looked perfectly correct.
+    ///
+    /// On this side, the value advertised becomes the real window
     /// shifted right by the negotiated scale, and the shift is **lossy** — the
     /// peer decodes `advertised << scale`, so rounding must go downwards or the
     /// connection promises space it does not have. The clamp here becomes
@@ -116,10 +144,17 @@ public struct Receiver {
     }
 
     /// Offer one segment that has already passed RFC 9293 §3.10.7.4's
-    /// acceptability test.
+    /// acceptability test and been trimmed to the offered window.
     ///
-    /// Mutates `tcb.rcvNxt` and `tcb.rcvWnd`, which no other code in this
-    /// module writes.
+    /// Mutates `tcb.rcvNxt` and `tcb.rcvWnd`. The split with `TCPStateMachine`
+    /// is by *phase*, not by field: that file **initialises** RCV.NXT from the
+    /// peer's ISS during the handshake (`TCPStateMachine.swift`'s `.listen` and
+    /// `.synSent` handlers), and this file **advances** it over received bytes.
+    /// The two can never run for the same segment — `generalSegmentArrives`,
+    /// which is the only path that reaches here, is never entered in LISTEN or
+    /// SYN-SENT, and the initialising writes live nowhere else. Advancement has
+    /// exactly one writer, and it is this method; that is the property worth
+    /// keeping, and it is weaker than "no other code writes the field".
     ///
     /// Writing `rcvWnd` back is not bookkeeping: `TCPStateMachine`'s
     /// acceptability test measures the next segment against it, so leaving it
@@ -154,7 +189,7 @@ public struct Receiver {
             finReached = true
         }
 
-        let window = advertisedWindow(offered: offered, consumed: consumed)
+        let window = advertisedWindow(offered: offered, consumed: consumed, maximum: tcb.rcvWndMax)
         tcb.rcvWnd = Int(window)
 
         // Every segment that occupies sequence space is acknowledged: in order,
@@ -186,13 +221,28 @@ public struct Receiver {
     /// refuse the excess and the peer retransmits, which is the outcome RFC
     /// 9293 asks a receiver to prefer over breaking its word.
     ///
-    /// The `UInt16` clamp is the wire's limit and takes precedence over the
-    /// floor. A TCB configured with an `rcvWnd` above 65535 was never
-    /// expressible in the first place, since no window scale is negotiated;
-    /// see `maximumUnscaledWindow`.
-    private func advertisedWindow(offered: Int, consumed: Int) -> UInt16 {
+    /// `maximum` is `TCB.rcvWndMax`, the window the connection was configured
+    /// with, and it is a **cap as well as a floor**. Free queue space is what
+    /// the receiver *could* offer, not what it was asked to offer: with the
+    /// default 256 KiB queue, a TCB configured with `rcvWnd: 100` would
+    /// otherwise advertise 65535 after one 1-byte segment. That is not only a
+    /// broken configuration knob — `TCPStateMachine.isInReceiveWindow`, RFC
+    /// 5961's RST test, measures against the same `rcvWnd`, so the convenience
+    /// default would silently widen a security test from 100 bytes to 65535,
+    /// admitting a blind RST 20000 past RCV.NXT that the configured window
+    /// would have discarded in silence. A security test must not be widened as
+    /// a side effect of a defaulted queue size.
+    ///
+    /// Order matters where the two conflict. The never-retract floor wins over
+    /// the cap — a promise already made to the peer cannot be withdrawn by
+    /// lowering the configured window afterwards — and the `UInt16` clamp is
+    /// the wire's limit and wins over both, since a `rcvWnd` above 65535 was
+    /// never expressible with no window scale negotiated (see
+    /// `maximumUnscaledWindow`) and `UInt16(_:)` would trap on it.
+    private func advertisedWindow(offered: Int, consumed: Int, maximum: Int) -> UInt16 {
         let free = reassembler.availableBytes
         let floor = max(0, offered - consumed)
-        return UInt16(min(max(free, floor), Self.maximumUnscaledWindow))
+        let ceiling = max(0, min(maximum, Self.maximumUnscaledWindow))
+        return UInt16(min(max(floor, min(free, ceiling)), Self.maximumUnscaledWindow))
     }
 }

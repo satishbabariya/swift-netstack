@@ -240,7 +240,13 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     // 65535 is also the real ceiling today, not a placeholder: no window scale
     // is negotiated anywhere in the stack yet. See `Receiver`'s doc comment on
     // the seam Task 13 opens.
-    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    //
+    // The TCB is configured at 65535 rather than 4096 so that the wire clamp is
+    // the only thing standing between the 256 KiB queue and the advertisement.
+    // With 4096 configured, `TCB.rcvWndMax` caps first and the truncation this
+    // test exists to catch would never be reached -- see
+    // `theAdvertisedWindowNeverExceedsTheConfiguredReceiveWindow`.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 65535)
     var receiver = Receiver(reassembler: TCPReassembler())
 
     let outcome = receiver.accept(segment(sequence: 1000, payload: 10), tcb: &tcb)
@@ -312,22 +318,285 @@ private func rightEdge(_ tcb: TCB, window: UInt16) -> SequenceNumber {
     #expect(tcb.rcvNxt == SequenceNumber(1020))
 }
 
-@Test func aFinBehindAGapClosesTheConnectionOnlyWhenTheGapFills() {
-    // The case the previous implementation could not reach at all: it tested
-    // the arriving segment's own sequence against RCV.NXT, so a FIN behind a
-    // gap was seen once, found out of order, and never looked at again.
+@Test func aFinAheadOfAGapIsRefusedUntilThePeerRetransmitsItInOrder() {
+    // The legitimate half of the in-order-FIN gate, and the reason its cost to
+    // real traffic is one retransmission rather than a hang.
+    //
+    // A FIN ahead of a gap is stripped: its position cannot be trusted, because
+    // nothing distinguishes it from a forged one (see
+    // `aForgedFinCannotTruncateAStream`). Its *data* is still queued, the peer
+    // is still ACKed, and the peer -- which retransmits a FIN until it is
+    // acknowledged -- sends it again once our ACK has moved its SND.UNA. That
+    // retransmission arrives at RCV.NXT and closes the connection. Nothing
+    // re-drives the state machine for a gap that has since filled, and nothing
+    // needs to.
     var tcb = establishedTCB(rcvNxt: 1000)
     var receiver = Receiver(reassembler: TCPReassembler())
 
-    _ = TCPStateMachine.receive(
+    let ahead = TCPStateMachine.receive(
         segment: stateMachineSegment(sequence: 1010, flags: [.fin, .ack], payload: 10, fill: 0xbb), on: &tcb, receiver: &receiver)
-    #expect(tcb.state == .established, "the FIN is behind a gap; the connection is not closing yet")
+    #expect(tcb.state == .established, "the FIN is ahead of a gap; its position is not trusted")
+    #expect(hasSendAck(ahead), "and the peer is told where we actually are, so it retransmits from there")
+
+    let filled = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
+    #expect(
+        deliveredBytes(filled) == Array(repeating: 0xaa, count: 10) + Array(repeating: 0xbb, count: 10),
+        "the data that travelled with the refused FIN is not lost -- only the flag was stripped")
+    #expect(tcb.state == .established, "filling the gap does not resurrect a FIN we declined to record")
+    #expect(tcb.rcvNxt == SequenceNumber(1020), "twenty payload bytes and no FIN")
+
+    let retransmitted = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1020, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .closeWait, "the retransmission arrives at RCV.NXT and is honoured")
+    #expect(tcb.rcvNxt == SequenceNumber(1021))
+    #expect(hasSendAck(retransmitted))
+}
+
+// MARK: - The forged FIN (RFC 5961 §3.2, applied to the FIN by analogy)
+
+@Test func aForgedFinCannotTruncateAStream() {
+    // The worst of the three, because the application is told the stream ended
+    // normally. One bare FIN carrying no data, at any sequence number in the
+    // offered window -- no guessing worth the name against a 4096-byte window
+    // -- used to fix the FIN's position permanently (first-received-wins), and
+    // the connection then reported EOF the moment RCV.NXT reached that forged
+    // position. Everything the peer sent afterwards was silently dropped: the
+    // state was already CLOSE-WAIT, where step 5 delivers nothing.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    let forged = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1500, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .established, "a FIN 500 bytes ahead of RCV.NXT must not be recorded")
+    #expect(hasSendAck(forged), "it is answered, exactly as an off-position RST is challenged")
+    #expect(tcb.rcvNxt == SequenceNumber(1000))
+
+    // The peer now streams 1000 bytes in two segments. The first is what used
+    // to reach the forged position.
+    let first = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, payload: 500, fill: 0xaa), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .established, "reaching the forged position must not close the connection")
+    #expect(deliveredBytes(first).count == 500)
+
+    let second = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1500, payload: 500, fill: 0xbb), on: &tcb, receiver: &receiver)
+    #expect(deliveredBytes(second) == Array(repeating: 0xbb, count: 500), "the second half must not be silently dropped")
+    #expect(tcb.rcvNxt == SequenceNumber(2000), "all 1000 bytes, not 500")
+
+    // Positive control. "Never closes" is satisfied perfectly by a connection
+    // that can no longer close at all, which is the failure mode this fix could
+    // plausibly introduce -- so the peer's real FIN, in order, must still work.
+    let genuine = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 2000, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .closeWait, "the peer's own FIN, at RCV.NXT, still closes the connection")
+    #expect(tcb.rcvNxt == SequenceNumber(2001))
+    #expect(hasSendAck(genuine))
+}
+
+@Test func aForgedFinCannotWedgeTeardownForever() {
+    // The second injection: name a position the stream will never reach. The
+    // forged FIN at 3000 used to be recorded permanently, so the peer's real
+    // FIN at 1010 was discarded as "a second FIN claiming a different position"
+    // and RCV.NXT never reached 3000. The connection stayed ESTABLISHED through
+    // three retransmissions and would have stayed so forever.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 3000, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
+    #expect(tcb.rcvNxt == SequenceNumber(1010))
+
+    // The peer's real FIN, and its retransmissions. The first one is enough;
+    // the other two are here because the review drove three and found all three
+    // ignored, and because a fix that worked only on a retransmission would be
+    // a different bug wearing this test's green tick.
+    for attempt in 1...3 {
+        let actions = TCPStateMachine.receive(
+            segment: stateMachineSegment(sequence: 1010, flags: [.fin, .ack]), on: &tcb, receiver: &receiver)
+        #expect(tcb.state == .closeWait, "the peer's real FIN was ignored on attempt \(attempt)")
+        #expect(hasSendAck(actions), "and a FIN must be acknowledged, on attempt \(attempt)")
+    }
+    #expect(tcb.rcvNxt == SequenceNumber(1011), "and RCV.NXT crossed the FIN exactly once across all three")
+}
+
+@Test func theSameGuessSentAsAResetIsAlreadyHarmlessAndStillIs() {
+    // The control the review ran alongside the two injections above, kept here
+    // so the symmetry is visible: the identical guess, in the identical window,
+    // sent as a RST does nothing but draw a challenge ACK, because RFC 5961
+    // step 1 insists on RCV.NXT exactly. That was the whole argument -- the FIN
+    // reaches the application as nearly the same outcome and had no such check
+    // -- so if this control ever stops holding, the FIN gate above is being
+    // measured against a bar that has itself slipped.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4096)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    let challenged = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1500, flags: [.rst]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .established, "an in-window RST that is not at RCV.NXT must not tear the connection down")
+    #expect(challenged == [.sendAck], "it draws a challenge ACK and nothing else")
+
+    // And the RST at RCV.NXT still works: "does not tear down" is satisfied by
+    // a machine that can no longer be reset at all.
+    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1000, flags: [.rst]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .closed, "a RST at RCV.NXT exactly is still honoured")
+}
+
+// MARK: - Trimming to the offered window (RFC 9293 §3.9)
+
+@Test func aSegmentIsTrimmedToTheRightEdgeOfTheOfferedWindow() {
+    // The acceptability test accepts a segment whose first OR last byte is in
+    // the window; it bounds neither the extent nor the end. So a segment that
+    // merely starts at RCV.NXT passed it and then went to the reassembler
+    // whole, where the only remaining limit was a quarter of the sequence
+    // space. 5000 bytes against a 4-byte window were delivered in full.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
+    let queue = TCPReassembler()
+    var receiver = Receiver(reassembler: queue)
 
     let actions = TCPStateMachine.receive(
-        segment: stateMachineSegment(sequence: 1000, payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
-    #expect(tcb.state == .closeWait)
-    #expect(tcb.rcvNxt == SequenceNumber(1021))
-    #expect(hasSendAck(actions))
+        segment: stateMachineSegment(sequence: 1000, payload: 5000, fill: 0xaa), on: &tcb, receiver: &receiver)
+    #expect(deliveredBytes(actions).count == 4, "only the four bytes the peer was offered")
+    #expect(tcb.rcvNxt == SequenceNumber(1004), "RCV.NXT must not run 5000 bytes past a 4-byte window")
+    #expect(queue.pendingSegments == 0, "and the remainder is dropped, not queued for later")
+
+    // The same segment, offset so that its start is in the window and its bulk
+    // is past the right edge: the reviewer's second row. Everything past the
+    // edge used to be queued.
+    var offsetTcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
+    let offsetQueue = TCPReassembler()
+    var offsetReceiver = Receiver(reassembler: offsetQueue)
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1003, payload: 5000, fill: 0xbb), on: &offsetTcb, receiver: &offsetReceiver)
+    #expect(offsetTcb.rcvNxt == SequenceNumber(1000), "it is out of order, so nothing is delivered")
+    #expect(offsetQueue.pendingBytes == 1 + TCPReassembler.perSegmentOverhead, "exactly the one byte inside the window is held")
+}
+
+@Test func aSegmentThatFitsTheOfferedWindowIsNotTrimmedAtAll() {
+    // The positive control for the trim. "Nothing past the right edge reaches
+    // the reassembler" is satisfied completely by a receiver that is never
+    // driven at all, and a trim with an off-by-one or an inverted bound would
+    // look identical from the test above. So: a segment that fits exactly must
+    // arrive whole, in order and out of order alike.
+    var inOrder = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
+    var inOrderReceiver = Receiver(reassembler: TCPReassembler())
+    let actions = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, payload: 4, fill: 0xaa), on: &inOrder, receiver: &inOrderReceiver)
+    #expect(deliveredBytes(actions) == Array(repeating: 0xaa, count: 4), "a segment filling the window exactly is delivered whole")
+    #expect(inOrder.rcvNxt == SequenceNumber(1004))
+
+    var outOfOrder = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
+    let queue = TCPReassembler()
+    var outOfOrderReceiver = Receiver(reassembler: queue)
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1050, payload: 10, fill: 0xbb), on: &outOfOrder, receiver: &outOfOrderReceiver)
+    #expect(queue.pendingBytes == 10 + TCPReassembler.perSegmentOverhead, "and an out-of-order one well inside the window is held whole")
+}
+
+@Test func aTrimHandsTheReceiverNothingOutsideTheWindowInEitherDirection() {
+    // White-box, on `receiverInput`'s own return value, and the reason is worth
+    // stating: the LOW side of the trim -- dropping bytes below RCV.NXT -- has
+    // no connection-level consequence today, because `TCPReassembler` clips at
+    // RCV.NXT itself a moment later. Setting `below` to zero was falsified
+    // against the whole 339-test suite and nothing failed. An assertion driven
+    // through `TCPStateMachine.receive` therefore cannot guard that line at
+    // all, and writing one that appears to would be worse than writing none.
+    //
+    // What is being pinned is the seam's own contract -- the receiver is handed
+    // only bytes inside the window -- so that it holds on this function's terms
+    // rather than on a neighbour's silent behaviour. The same neighbour's
+    // clipping was already noted by the midpoint review as an undocumented
+    // dependency of exactly this kind.
+    var tcb = establishedTCB(rcvNxt: 1010, rcvWnd: 20)
+
+    // Overlapping the left edge: a retransmission the peer resent because our
+    // ACK was lost. Ten bytes are already received; ten are new.
+    let overlapping = TCPStateMachine.receiverInput(
+        for: stateMachineSegment(sequence: 1000, payload: 20, fill: 0xaa), tcb: tcb)
+    #expect(overlapping.segment.sequence == SequenceNumber(1010), "the already-received prefix is dropped, not re-offered")
+    #expect(overlapping.segment.payload.readableBytes == 10)
+
+    // Overlapping the right edge, and both edges at once.
+    let past = TCPStateMachine.receiverInput(for: stateMachineSegment(sequence: 1010, payload: 50, fill: 0xbb), tcb: tcb)
+    #expect(past.segment.sequence == SequenceNumber(1010))
+    #expect(past.segment.payload.readableBytes == 20, "nothing past RCV.NXT + RCV.WND")
+
+    let straddling = TCPStateMachine.receiverInput(for: stateMachineSegment(sequence: 1000, payload: 100, fill: 0xcc), tcb: tcb)
+    #expect(straddling.segment.sequence == SequenceNumber(1010))
+    #expect(straddling.segment.payload.readableBytes == 20, "exactly the offered window, from both directions at once")
+
+    // Positive control: a segment already inside the window is handed over
+    // untouched. Every assertion above is satisfied by returning an empty
+    // segment always, which would drop the connection's entire data path.
+    tcb.rcvNxt = SequenceNumber(1010)
+    let fits = TCPStateMachine.receiverInput(for: stateMachineSegment(sequence: 1012, payload: 5, fill: 0xdd), tcb: tcb)
+    #expect(fits.segment.sequence == SequenceNumber(1012), "an in-window segment keeps its own sequence number")
+    #expect(Array(fits.segment.payload.readableBytesView) == Array(repeating: 0xdd, count: 5), "and all of its bytes")
+    #expect(!fits.finRefused)
+}
+
+@Test func aFinPastTheRightEdgeOfTheWindowIsNotRecorded() {
+    // The FIN gate and the trim have to agree at one point: a segment that
+    // starts at RCV.NXT but runs past the right edge has its tail trimmed, and
+    // the FIN sits in the part that was trimmed away. Recording it would place
+    // the FIN behind bytes this connection has just refused, which is the
+    // wedge of `aForgedFinCannotWedgeTeardownForever` reached by a legal
+    // segment start.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 4)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    _ = TCPStateMachine.receive(
+        segment: stateMachineSegment(sequence: 1000, flags: [.fin, .ack], payload: 10, fill: 0xaa), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .established, "the FIN is past the right edge; it is not ours to record")
+    #expect(tcb.rcvNxt == SequenceNumber(1004), "four bytes were accepted and the rest, FIN included, refused")
+}
+
+// MARK: - The advertised window is bounded by the configured one
+
+@Test func theAdvertisedWindowNeverExceedsTheConfiguredReceiveWindow() {
+    // The configured RCV.WND used to enter `advertisedWindow` only as a floor,
+    // so free reassembly space -- 256 KiB by default -- decided what was
+    // advertised. A TCB configured with `rcvWnd: 100` advertised 65535 after
+    // one byte.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
+    var receiver = Receiver(reassembler: TCPReassembler())
+
+    let outcome = receiver.accept(segment(sequence: 1000, payload: 1), tcb: &tcb)
+    #expect(outcome.advertisedWindow == 100, "the queue's free space is what we could offer, not what we said we would")
+    #expect(tcb.rcvWnd == 100)
+
+    // Positive control: a cap is satisfied by advertising a closed window
+    // forever, and by any figure below the cap. A connection configured wide
+    // must still get the wide window from the same queue.
+    var wide = establishedTCB(rcvNxt: 1000, rcvWnd: 65535)
+    var wideReceiver = Receiver(reassembler: TCPReassembler())
+    #expect(wideReceiver.accept(segment(sequence: 1000, payload: 1), tcb: &wide).advertisedWindow == 65535)
+}
+
+@Test func theResetWindowIsNotWidenedByTheReceiversDefaultQueueSize() {
+    // Why the cap above is a security fix and not a tidy-up. RFC 5961's RST
+    // test (`isInReceiveWindow`) measures against the same `rcvWnd` the
+    // receiver writes back, so a window widened by a defaulted queue size
+    // widens the band of blind RSTs that draw a challenge ACK -- from the 100
+    // bytes this connection actually offered to 65535, a factor of 655, as a
+    // side effect of a convenience default that had nothing to do with resets.
+    var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
+    var receiver = Receiver(reassembler: TCPReassembler())
+    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1000, payload: 1), on: &tcb, receiver: &receiver)
+    #expect(tcb.rcvWnd == 100)
+
+    let far = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 21_001, flags: [.rst]), on: &tcb, receiver: &receiver)
+    #expect(far == [.none], "a RST 20000 past RCV.NXT is outside the offered window and is discarded in silence")
+    #expect(tcb.state == .established)
+
+    // Positive controls: silence is also what a machine that ignores every RST
+    // produces. Both live behaviours must survive the narrowing.
+    let near = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1050, flags: [.rst]), on: &tcb, receiver: &receiver)
+    #expect(near == [.sendAck], "a RST inside the 100-byte window still draws a challenge ACK")
+    _ = TCPStateMachine.receive(segment: stateMachineSegment(sequence: 1001, flags: [.rst]), on: &tcb, receiver: &receiver)
+    #expect(tcb.state == .closed, "and a RST at RCV.NXT exactly still tears the connection down")
 }
 
 @Test func anUnacceptableSegmentNeverReachesTheReassembler() {

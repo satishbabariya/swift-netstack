@@ -145,10 +145,33 @@ import NIOCore
 /// early can never close a connection ahead of its data.
 ///
 /// First-received-wins applies here too: a second FIN claiming a different
-/// position never moves the first. A FIN whose position is already behind
-/// RCV.NXT is ignored, both because the caller has necessarily already dealt
-/// with it and because that keeps `finSequence`, like every queued offset,
-/// inside the bounded domain.
+/// position never moves the first.
+///
+/// **That rule is not what makes the recorded position trustworthy, and it must
+/// not be read as though it were.** It was, and the reasoning went: a FIN whose
+/// position is behind RCV.NXT is ignored, so the caller has necessarily already
+/// dealt with it. That covers a *later* FIN behind the true one and says nothing
+/// whatever about a *first* FIN ahead of it — and a first FIN ahead of it is
+/// free to claim any position it likes, permanently, from a segment carrying no
+/// deliverable byte. A guest that guessed nothing at all could truncate a stream
+/// (the application sees a clean EOF mid-stream while the bytes behind the
+/// forged FIN are dropped) or wedge teardown forever (by claiming a position the
+/// stream never reaches, so the peer's real FIN is never acted on).
+///
+/// What makes the position trustworthy is the caller: `TCPStateMachine` honours
+/// a FIN only on a segment that starts at exactly RCV.NXT and whose FIN sits
+/// inside the offered window, and strips the flag otherwise — the RFC 5961
+/// treatment it already gives a RST, for a flag whose blast radius is much the
+/// same. So a FIN reaching this class has been accepted in sequence and there is
+/// nothing left to re-validate. First-received-wins is then about duplicates
+/// only, which is all it was ever able to be about.
+///
+/// This class keeps its own domain guard on the recorded position — behind
+/// RCV.NXT or past `maximumSequenceOffset` and it is not recorded — because that
+/// is what keeps `finSequence`, like every queued offset, inside the bounded
+/// domain this file's offset arithmetic requires. It is a domain bound, not a
+/// security check, and it is not a second opinion about whether the FIN is
+/// legitimate: this class deliberately does not have one.
 public final class TCPReassembler {
     /// The real, per-segment cost of holding one queued piece: the array
     /// element, the `ByteBuffer`'s backing storage object, and malloc's
@@ -336,9 +359,17 @@ public final class TCPReassembler {
         // Record the FIN before anything can reject this segment's data. The
         // FIN's position is knowable whether or not its bytes fit, and acting
         // on it requires RCV.NXT to reach it, which requires the data. See
-        // the type's doc comment.
-        if segment.flags.contains(.fin), fin == nil, dataEnd >= 0, dataEnd <= maximumOffset {
-            fin = rcvNxt + dataEnd
+        // the type's doc comment -- including what this guard is and is not:
+        // a domain bound on the offset, not a judgement about whether the FIN
+        // may be honoured. That judgement is the caller's, and it is made
+        // before the flag ever gets here.
+        //
+        // `segment.finSequence` rather than `rcvNxt + dataEnd`: the two are the
+        // same number, and one of them has to be the definition (see
+        // `Segment.finSequence`). `dataEnd` remains the offset the bound is
+        // expressed in.
+        if let finPosition = segment.finSequence, fin == nil, dataEnd >= 0, dataEnd <= maximumOffset {
+            fin = finPosition
         }
 
         let pieces = novelRanges(dataStart: dataStart, dataEnd: dataEnd, rcvNxt: rcvNxt)

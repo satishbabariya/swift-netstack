@@ -93,6 +93,23 @@ public struct TCB: Equatable, Sendable {
     public var rcvNxt: SequenceNumber
     /// RCV.WND: receive window we have advertised to the peer.
     public var rcvWnd: Int
+    /// The largest receive window this connection may ever advertise: whatever
+    /// `rcvWnd` was configured with when the block was created.
+    ///
+    /// Not an RFC 9293 §3.3.1 variable. It exists because `rcvWnd` is
+    /// *overwritten* on every arriving segment with the window just advertised
+    /// (see `Receiver.accept`), so the configured figure survives nowhere else
+    /// — and without it a connection configured with a small window advertises
+    /// whatever the reassembly queue happens to have free, which on the default
+    /// queue is 65535 after a single byte. That is not merely a wider window
+    /// than was asked for: `TCPStateMachine.isInReceiveWindow`, RFC 5961's
+    /// RST test, measures against `rcvWnd` too, so a convenience default would
+    /// otherwise widen a security test by 655x as a side effect.
+    ///
+    /// Derived from `rcvWnd` in the initialiser rather than taken as a separate
+    /// parameter: two independently supplied figures could disagree, and the
+    /// only sensible initial advertisement is the configured one.
+    public let rcvWndMax: Int
     /// IRS: initial receive sequence number.
     public var irs: SequenceNumber
 
@@ -117,6 +134,7 @@ public struct TCB: Equatable, Sendable {
         self.iss = iss
         self.rcvNxt = rcvNxt
         self.rcvWnd = rcvWnd
+        self.rcvWndMax = rcvWnd
         self.irs = irs
     }
 }

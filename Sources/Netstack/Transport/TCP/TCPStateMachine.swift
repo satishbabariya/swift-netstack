@@ -63,21 +63,41 @@ public struct TCPSegment: Sendable {
 /// RCV.NXT, is the shape behind every serious defect this stack has produced:
 /// the connection's idea of what it has received would depend on which path a
 /// segment happened to take, and no test of either component alone can see it.
-/// So there is exactly one writer of `tcb.rcvNxt` and `tcb.rcvWnd`, and it is
-/// not this file. Do not reintroduce a sequence comparison here that `Receiver`
-/// already makes — if the same comparison appears in both files, the defect is
-/// back.
+///
+/// The split is by *phase*, and it is worth stating exactly, because the
+/// stronger claim that used to stand here — "exactly one writer of `tcb.rcvNxt`
+/// and `tcb.rcvWnd`, and it is not this file" — is contradicted two screens
+/// down, at the `.listen` and `.synSent` handlers. This file **initialises**
+/// RCV.NXT from the peer's ISS during the handshake, at those two sites and
+/// nowhere else. `Receiver` **advances** it over received bytes, and owns
+/// `tcb.rcvWnd` outright. The two writers cannot both run for one segment:
+/// `generalSegmentArrives`, which is the only path that drives the receiver, is
+/// never entered in LISTEN or SYN-SENT. There is exactly one *advancer*, and it
+/// is not this file.
+///
+/// Do not reintroduce a sequence comparison here that `Receiver` already makes —
+/// if the same comparison appears in both files, the defect is back. (The
+/// in-order-FIN gate in step 5 is not one of those: `Receiver` compares RCV.NXT
+/// against a *recorded* FIN position, this file compares an *arriving segment's*
+/// start against RCV.NXT, and they answer different questions.)
 public struct TCPStateMachine {
     /// `receiver` owns RCV.NXT, delivery and the advertised window, and is
     /// `inout` because it carries per-connection state.
     ///
     /// It is driven here rather than by the caller, and only after the segment
-    /// has passed the RST, acceptability, SYN and ACK checks, so that nothing
-    /// unacceptable ever reaches the reassembly queue. That ordering is a
-    /// security property, not an optimisation: the acceptability test is what
-    /// confines a peer's data to the window it was offered, and a receiver
-    /// driven ahead of it would queue — and eventually deliver — bytes the
-    /// connection said it would not accept. Reversing the two, so that a caller
+    /// has passed the RST, acceptability, SYN and ACK checks and been trimmed to
+    /// the offered window, so that nothing unacceptable and nothing outside the
+    /// window ever reaches the reassembly queue. That ordering is a security
+    /// property, not an optimisation, and it takes both halves. The
+    /// acceptability test admits a segment whose first *or* last byte is in the
+    /// window and bounds neither its extent nor its end, so it alone does not
+    /// confine anything: 5000 bytes starting at RCV.NXT pass it against a 4-byte
+    /// window. `receiverInput(for:tcb:)` is the half that confines (RFC 9293
+    /// §3.9's trim), and it runs here, between the test and the receiver. A
+    /// receiver driven ahead of either would queue — and eventually deliver —
+    /// bytes the connection said it would not accept, with `TCPReassembler`'s
+    /// quarter-of-the-sequence-space domain bound as the only remaining limit.
+    /// Reversing the two, so that a caller
     /// reassembled first and then asked the state machine what to do, would
     /// also need a way to re-enter this function for a FIN whose gap has since
     /// filled; no such re-drive exists, and the comment that used to assume one
@@ -204,6 +224,14 @@ public struct TCPStateMachine {
             if tcb.iss.lessThan(tcb.sndUna) {
                 // Our SYN has been acknowledged: the handshake is complete.
                 tcb.state = .established
+                // Snd.Wind.Scale (RFC 7323 §2.3): one of three sites that decode
+                // the PEER's window. Unscaled today because nothing negotiates a
+                // scale; when Task 13 does, each of the three needs
+                // `<< Snd.Wind.Scale` here. This is not the same change as the
+                // one `Receiver.advertisedWindow` owns -- that is our direction,
+                // this is theirs, and RFC 7323 negotiates the two separately.
+                // `CongestionControl` sends `min(cwnd, sndWnd)` bytes, so an
+                // unscaled decode under-uses the path by up to 2^14.
                 tcb.sndWnd = Int(header.window)
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
@@ -214,7 +242,7 @@ public struct TCPStateMachine {
             // acknowledged ours. Answer with our own SYN|ACK and wait in
             // SYN-RECEIVED for it to be acknowledged in turn.
             tcb.state = .synReceived
-            tcb.sndWnd = Int(header.window)
+            tcb.sndWnd = Int(header.window)  // Snd.Wind.Scale: second of three peer-window decodes; see above.
             tcb.sndWl1 = header.sequence
             tcb.sndWl2 = header.acknowledgement
             return [.sendSynAck]
@@ -277,6 +305,24 @@ public struct TCPStateMachine {
         // must not be allowed to touch RCV.NXT or anything else in the
         // TCB, or a peer could inject data anywhere in the stream.
         guard isSegmentAcceptable(segment, tcb: tcb) else {
+            // RFC 9293 §3.10.7.4, TIME-WAIT: "the only thing that can arrive is
+            // a retransmission of the remote FIN. Acknowledge it, and restart
+            // the 2 MSL timeout." That retransmission is *unacceptable* by the
+            // test just above -- it sits at RCV.NXT - 1, one behind the window
+            // -- so this is the only place it can be recognised, and before the
+            // fix it was recognised nowhere: a real FIN retransmission got a
+            // bare ACK and no timer, while any acceptable segment at all (an
+            // empty ACK will do) restarted the timer from step 4. Exactly
+            // backwards, and the wrong half was the one a peer could drive for
+            // free.
+            //
+            // The bar for restarting the timer is now the same as the bar for
+            // honouring a RST in step 1 or a FIN in step 5: name RCV.NXT
+            // exactly. A blind sender cannot hold a TIME-WAIT block open
+            // without it.
+            if tcb.state == .timeWait, isRetransmissionOfProcessedFin(segment, tcb: tcb) {
+                return [.sendAck, .startTimeWait]
+            }
             return [.sendAck]
         }
 
@@ -339,7 +385,7 @@ public struct TCPStateMachine {
             if tcb.sndWl1.lessThan(header.sequence)
                 || (tcb.sndWl1 == header.sequence && header.acknowledgement.isAtOrAfter(tcb.sndWl2))
             {
-                tcb.sndWnd = Int(header.window)
+                tcb.sndWnd = Int(header.window)  // Snd.Wind.Scale: third of three peer-window decodes; see synSent above.
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
             }
@@ -360,10 +406,17 @@ public struct TCPStateMachine {
                     return [.deleteTCB]
                 }
             case .timeWait:
-                // Only a retransmission of the remote's already-processed
-                // FIN reaches here; re-ACK it and restart the 2*MSL timer.
+                // Acknowledge it, and nothing more. A retransmission of the
+                // peer's FIN does NOT reach here -- it fails the acceptability
+                // test above and is handled there. What reaches here is any
+                // acceptable segment with a plausible ACK: a bare ACK, a window
+                // probe, a duplicate. Restarting the 2*MSL timer for those,
+                // which is what this used to do while claiming only a FIN
+                // retransmission could arrive, let a peer hold the block open
+                // indefinitely by sending anything at all -- the very threat
+                // `ReceiveOutcome.finReached` was made edge-triggered to close,
+                // reachable by another route.
                 actions.append(.sendAck)
-                actions.append(.startTimeWait)
             case .established, .finWait2, .closeWait:
                 break
             case .closed, .listen, .synSent, .synReceived:
@@ -388,9 +441,12 @@ public struct TCPStateMachine {
         // SYN-RECEIVED to ESTABLISHED, which is what lets a handshake-
         // completing segment carry data.
         var outcome: ReceiveOutcome?
+        var finRefused = false
         switch tcb.state {
         case .established, .finWait1, .finWait2:
-            outcome = receiver.accept(segment.reassemblySegment, tcb: &tcb)
+            let input = receiverInput(for: segment, tcb: tcb)
+            finRefused = input.finRefused
+            outcome = receiver.accept(input.segment, tcb: &tcb)
         case .synReceived:
             // Only reachable through the "old duplicate ACK of our SYN|ACK"
             // break above, since an acceptable ACK has already moved the
@@ -409,28 +465,43 @@ public struct TCPStateMachine {
             for buffer in outcome.delivered {
                 actions.append(.deliver(buffer))
             }
-            // `finReached` is currently implied by `shouldAck` -- a segment
-            // that occupies no sequence space cannot advance RCV.NXT and so
-            // cannot be the one that reaches the FIN. Kept as an explicit
-            // disjunct anyway: RFC 9293 requires a FIN to be acknowledged,
-            // and that requirement must not become contingent on how
-            // `shouldAck` is defined tomorrow.
-            if outcome.shouldAck || outcome.finReached {
-                actions.append(.sendAck)
-            }
+        }
+
+        // `finReached` is currently implied by `shouldAck` -- a segment
+        // that occupies no sequence space cannot advance RCV.NXT and so
+        // cannot be the one that reaches the FIN. Kept as an explicit
+        // disjunct anyway: RFC 9293 requires a FIN to be acknowledged,
+        // and that requirement must not become contingent on how
+        // `shouldAck` is defined tomorrow.
+        //
+        // `finRefused` is the third disjunct and the one that costs nothing to
+        // legitimate traffic: a peer whose FIN was stripped for being out of
+        // position must be told where we actually are, so that its FIN
+        // retransmission -- which a peer that has sent a FIN repeats until it
+        // is acknowledged -- arrives at RCV.NXT and is honoured. A bare refused
+        // FIN occupies no sequence space once stripped, so without this it
+        // would draw no ACK at all and the peer would wait out its RTO.
+        if outcome?.shouldAck == true || outcome?.finReached == true || finRefused {
+            actions.append(.sendAck)
         }
 
         // Step 6: the FIN bit. The *transition* is a state change and stays
         // here; deciding *when* the FIN's sequence has been reached is byte
         // arithmetic and belongs to the receiver, which reports it exactly
-        // once, on whichever segment finally makes the FIN in-order. That
-        // segment need not be the one that carried the FIN -- a FIN behind a
-        // gap is acted on when the gap fills, which the previous
-        // implementation could not do at all: it tested the arriving
-        // segment's own sequence against RCV.NXT and left an out-of-order FIN
-        // "for a later segment to complete the sequence up to it", a re-drive
-        // that nothing ever performed, so the connection simply never reached
-        // CLOSE-WAIT.
+        // once.
+        //
+        // Since step 5 only lets an in-order FIN through, the segment that
+        // carries the FIN and the segment that reaches it are now the same one.
+        // The receiver's `finReached` is still not a restatement of that: it
+        // fires only once RCV.NXT has actually advanced over every byte in
+        // front of the FIN, which an in-order FIN-bearing segment does not
+        // guarantee on its own (its own payload can be refused by a full
+        // reassembly queue). A FIN that arrives ahead of a gap is not lost by
+        // being refused here -- a peer that has sent a FIN retransmits it until
+        // it is acknowledged, and the ACK step 5 sends tells it where to
+        // restart. Waiting one retransmission is the entire cost of closing the
+        // hole; nothing re-drives this function for a gap that has since
+        // filled, and nothing needs to.
         if outcome?.finReached == true {
             switch tcb.state {
             case .synReceived, .established:
@@ -448,16 +519,140 @@ public struct TCPStateMachine {
             case .finWait2:
                 tcb.state = .timeWait
                 actions.append(.startTimeWait)
-            case .closeWait, .closing, .lastAck:
-                break  // already past this point; a retransmitted FIN changes nothing further.
-            case .timeWait:
-                actions.append(.startTimeWait)  // restart the 2*MSL timer.
+            case .closeWait, .closing, .lastAck, .timeWait:
+                // Already past this point; a retransmitted FIN changes nothing
+                // further. TIME-WAIT is in this list rather than restarting the
+                // 2*MSL timer here because it cannot reach here at all: step 5
+                // does not drive the receiver in TIME-WAIT, so `outcome` is nil
+                // and `finReached` is never true. That branch was dead, and it
+                // was dead while carrying a security rationale, which is worse
+                // than either alone -- it read as the place the timer was
+                // governed while the live restart sat unguarded in step 4. The
+                // restart now lives in step 2, on the retransmitted FIN, and
+                // nowhere else.
+                break
             case .closed, .listen, .synSent:
                 break  // unreachable here.
             }
         }
 
         return actions.isEmpty ? [.none] : actions
+    }
+
+    // MARK: - What the receiver is allowed to see
+
+    /// The segment as `Receiver` should see it: trimmed to the offered window,
+    /// and with a FIN that is not exactly in order stripped off.
+    ///
+    /// ## The FIN, hardened like the RST (RFC 5961 §3.2, applied by analogy)
+    ///
+    /// Step 1 above will not tear a connection down on a RST that is merely
+    /// somewhere in the window; it insists on RCV.NXT exactly, and challenges
+    /// anything else with an ACK. A FIN reaches the application as very nearly
+    /// the same outcome — the stream is over — and it had no such check at all.
+    /// A guest that could name any sequence number in a 64 KiB window, which is
+    /// no guess worth the name, could send one bare FIN carrying no data and
+    /// either **truncate** the stream (the FIN's position is recorded on
+    /// admission and first-received-wins makes it authoritative forever, so the
+    /// application gets a clean EOF mid-stream while the bytes behind the forged
+    /// position are dropped) or **wedge teardown permanently** (name a position
+    /// the stream never reaches and the peer's real FIN, retransmit as it may,
+    /// is never acted on). Both were demonstrated. The truncation is the worse
+    /// of the two: the application is told the stream ended normally.
+    ///
+    /// So the FIN is honoured only when the segment carrying it starts at
+    /// exactly RCV.NXT and the FIN's own sequence number falls inside the
+    /// window we offered. Otherwise the flag is stripped, the segment's data (if
+    /// any) is processed as ordinary out-of-order or trimmed data, and the peer
+    /// gets an ACK. The attacker's job is now identical for the two flags: name
+    /// RCV.NXT exactly.
+    ///
+    /// The check reads the *arriving* segment's start, before trimming, and
+    /// that ordering is load-bearing. Trimming first would move the start of any
+    /// segment overlapping RCV.NXT up to RCV.NXT, and the gate would then admit
+    /// a FIN from a segment that merely reached back over the left edge — which
+    /// needs no knowledge of RCV.NXT at all, and would hand the whole hole back.
+    ///
+    /// ## The trim (RFC 9293 §3.9)
+    ///
+    /// `isSegmentAcceptable` admits a segment whose first *or* last byte is in
+    /// the window. It bounds neither the extent nor the end, so 5000 bytes at
+    /// RCV.NXT and 5000 bytes at RCV.NXT+3 both pass against a 4-byte window,
+    /// and everything past the right edge would otherwise be delivered or queued
+    /// on the strength of `TCPReassembler`'s quarter-of-the-sequence-space
+    /// domain bound — the one limit two files' comments assert must never be the
+    /// operative one. RFC 9293 §3.9 expects the segment to be trimmed instead:
+    /// the portion beyond the right edge is dropped, and so is the portion below
+    /// RCV.NXT, which has already been received.
+    ///
+    /// Trimming here rather than in `Receiver` is deliberate. The window is the
+    /// state machine's to interpret — `Receiver`'s own contract is that it does
+    /// not test acceptability — and doing it here keeps every comparison against
+    /// RCV.WND in the file that also owns `isSegmentAcceptable` and
+    /// `isInReceiveWindow`. A window comparison in `Receiver` would be the
+    /// second-owner shape both files exist to avoid.
+    ///
+    /// ## The low side of the trim is redundant, and deliberately kept anyway
+    ///
+    /// Dropping the portion *below* RCV.NXT changes no observable behaviour
+    /// today: `TCPReassembler.novelRanges` clips its cursor at RCV.NXT and
+    /// `insert` refuses a segment that ends at or behind it, so the bytes this
+    /// removes are bytes the reassembler would discard a moment later. Setting
+    /// `below` to zero was falsified against the whole suite and nothing failed.
+    /// It is kept because it is what makes the sentence above — nothing outside
+    /// the window reaches the receiver — true of *this* function rather than
+    /// true only in combination with a neighbour's silent behaviour, which is
+    /// the dependency shape that has produced this stack's worst defects. It is
+    /// also not the two-owner hazard that shape usually is: both sides clamp to
+    /// the same boundary, so they cannot disagree about the result, only about
+    /// who did it.
+    ///
+    /// Because no connection-level behaviour can see it,
+    /// `aTrimHandsTheReceiverNothingOutsideTheWindowInEitherDirection` asserts
+    /// this function's own return value, which is why it is `internal` rather
+    /// than `private` (`@testable import` elevates `internal`, not `private`).
+    /// The alternative was an unguarded line that reads as protection.
+    ///
+    /// - Returns: the segment to hand the receiver, and whether a FIN was
+    ///   stripped (which owes the peer an ACK even when nothing else does).
+    static func receiverInput(for segment: TCPSegment, tcb: TCB) -> (segment: Segment, finRefused: Bool) {
+        let arriving = segment.reassemblySegment
+        // Step 3 has already returned for anything carrying a SYN, so the
+        // segment's first sequence number is its first payload byte.
+        let start = arriving.sequence
+        let payloadLength = arriving.payload.readableBytes
+
+        var honourFin = false
+        if let finPosition = arriving.finSequence {
+            honourFin = start == tcb.rcvNxt && finPosition.inWindow(start: tcb.rcvNxt, size: tcb.rcvWnd)
+        }
+
+        let below = max(0, tcb.rcvNxt - start)
+        let above = max(0, (start + payloadLength) - (tcb.rcvNxt + tcb.rcvWnd))
+        let kept = max(0, payloadLength - below - above)
+        var payload = ByteBuffer()
+        if kept > 0 {
+            payload = arriving.payload.getSlice(at: arriving.payload.readerIndex + below, length: kept) ?? ByteBuffer()
+        }
+
+        let trimmed = Segment(
+            sequence: start + below,
+            flags: honourFin ? arriving.flags : arriving.flags.subtracting(.fin),
+            payload: payload)
+        return (trimmed, arriving.flags.contains(.fin) && !honourFin)
+    }
+
+    /// Whether this segment is a retransmission of the peer's FIN — the one
+    /// this connection has already processed, which by construction sits at
+    /// `RCV.NXT - 1`, since reaching a FIN steps RCV.NXT one past it.
+    ///
+    /// Only TIME-WAIT asks. It is the one state where RFC 9293 §3.10.7.4 wants
+    /// an *unacceptable* segment to do more than draw an ACK, and the position
+    /// it must match is exact, so a peer cannot refresh a TIME-WAIT block
+    /// without knowing where the connection actually is.
+    private static func isRetransmissionOfProcessedFin(_ segment: TCPSegment, tcb: TCB) -> Bool {
+        guard let finPosition = segment.reassemblySegment.finSequence else { return false }
+        return finPosition + 1 == tcb.rcvNxt
     }
 
     // MARK: - Acceptability tests

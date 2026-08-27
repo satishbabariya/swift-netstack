@@ -146,6 +146,23 @@ private func lastAckTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: Int
         irs: SequenceNumber(rcvNxt))
 }
 
+/// TIME-WAIT: our FIN has been sent and acknowledged (`sndUna == sndNxt`), and
+/// the peer's FIN has been received and processed, so RCV.NXT sits one past it
+/// -- the peer's FIN occupied `rcvNxt - 1`.
+private func timeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: Int = 100) -> TCB {
+    TCB(
+        state: .timeWait,
+        sndUna: SequenceNumber(sndUna),
+        sndNxt: SequenceNumber(sndUna),
+        sndWnd: 4096,
+        sndWl1: SequenceNumber(rcvNxt),
+        sndWl2: SequenceNumber(sndUna),
+        iss: SequenceNumber(sndUna),
+        rcvNxt: SequenceNumber(rcvNxt),
+        rcvWnd: rcvWnd,
+        irs: SequenceNumber(rcvNxt))
+}
+
 private func containsSendSynAck(_ actions: [TCPAction]) -> Bool {
     actions.contains { if case .sendSynAck = $0 { return true }; return false }
 }
@@ -555,6 +572,51 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     #expect(tcb.sndUna == SequenceNumber(3000), "a half-space ACK must not retire our SYN")
     #expect(tcb.state == .synReceived, "nor complete the handshake")
     #expect(actions == [.sendRst(sequence: hostile, ack: nil)], "it is an unacceptable ACK, so it is reset")
+}
+
+// MARK: - TIME-WAIT (RFC 9293 §3.10.7.4)
+
+@Test func aBareAckInTimeWaitDoesNotRestartTheTwoMslTimer() {
+    // The threat `ReceiveOutcome.finReached` was made edge-triggered to close,
+    // open by another route. Any acceptable segment with a plausible ACK -- an
+    // empty one will do, costing the sender nothing -- used to return
+    // `.startTimeWait`, under a comment claiming that "only a retransmission of
+    // the remote's already-processed FIN reaches here". It does not: a FIN
+    // retransmission sits one behind the window and is unacceptable, so it
+    // never reached that branch at all, while bare ACKs reached it every time.
+    // A peer could hold the block open indefinitely.
+    var tcb = timeWaitTCB(sndUna: 100, rcvNxt: 1000, rcvWnd: 100)
+    for attempt in 1...3 {
+        let actions = stateMachineReceive(segment: segment(sequence: 1000, ack: 100, flags: [.ack]), on: &tcb)
+        #expect(!containsStartTimeWait(actions), "bare ACK \(attempt) restarted the 2*MSL timer")
+        #expect(containsSendAck(actions), "it is still acknowledged -- refusing the timer is not refusing the segment")
+        #expect(tcb.state == .timeWait)
+    }
+
+    // A FIN elsewhere in the sequence space is no better than a bare ACK: it is
+    // not the FIN this connection processed, so it earns no timer either.
+    let forged = stateMachineReceive(segment: segment(sequence: 1500, ack: 100, flags: [.fin, .ack]), on: &tcb)
+    #expect(!containsStartTimeWait(forged), "a FIN that is not the one already processed must not refresh TIME-WAIT")
+}
+
+@Test func aRetransmittedFinInTimeWaitDoesRestartTheTwoMslTimer() {
+    // The positive control, and the half RFC 9293 §3.10.7.4 actually asks for:
+    // "the only thing that can arrive in this state is a retransmission of the
+    // remote FIN. Acknowledge it, and restart the 2 MSL timeout." Without this,
+    // the test above is satisfied by never restarting the timer at all -- which
+    // would drop a peer whose final ACK was lost back into a fresh connection
+    // attempt against a block that had already gone away.
+    //
+    // The peer's FIN occupied `rcvNxt - 1`, which is one behind the receive
+    // window, so this segment is deliberately an *unacceptable* one: that is
+    // the only shape a FIN retransmission can have here, and recognising it is
+    // the whole of the fix.
+    var tcb = timeWaitTCB(sndUna: 100, rcvNxt: 1000, rcvWnd: 100)
+    let actions = stateMachineReceive(segment: segment(sequence: 999, ack: 100, flags: [.fin, .ack]), on: &tcb)
+    #expect(containsStartTimeWait(actions), "a retransmission of the peer's FIN must restart the 2*MSL timer")
+    #expect(containsSendAck(actions), "and be re-acknowledged, since our last ACK evidently did not arrive")
+    #expect(tcb.state == .timeWait, "TIME-WAIT is not left by a FIN retransmission")
+    #expect(tcb.rcvNxt == SequenceNumber(1000), "and RCV.NXT does not move a second time over a FIN already crossed")
 }
 
 @Test func ecnBitsOnASynAreTreatedAsAPlainSyn() {

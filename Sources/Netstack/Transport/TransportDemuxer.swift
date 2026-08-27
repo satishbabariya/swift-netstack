@@ -19,6 +19,23 @@ public final class TransportDemuxer {
 
     public init() {}
 
+    /// How many table slots are occupied, live delegates and stale ones alike.
+    ///
+    /// Not `private`, because `@testable import` elevates `internal` and not
+    /// `private`, and this is the ONLY observable consequence of an endpoint's
+    /// `deinit` unregistering itself. Every other route is foreclosed: the
+    /// delegate is held weakly, so `register` overwrites a slot whose delegate
+    /// has gone (a rebind therefore succeeds either way),
+    /// `allocateEphemeralPort` skips such slots, and `deliver` evicts them
+    /// lazily as it finds them. What is left is the slot itself, which nothing
+    /// reclaims if the port is never touched again -- one dictionary entry per
+    /// dropped endpoint, for the life of the stack.
+    ///
+    /// Without this, `aDroppedTcpEndpointUnregistersItselfFromTheDemuxer`
+    /// passes with the `deinit` deleted, which was measured rather than
+    /// assumed.
+    var registrationCountForTesting: Int { registrations.count }
+
     public func register(_ id: TransportEndpointID, protocolNumber: IPProtocol, delegate: TransportEndpointDelegate) throws {
         let key = Key(protocolNumber: protocolNumber.rawValue, id: id)
         if let existing = registrations[key], existing.delegate != nil {

@@ -64,7 +64,8 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         let frames = link.drainTransmitted()
         #expect(frames.count == 1)
         var reply = PacketBuffer(received: frames[0])
-        #expect(EthernetHeader.parse(&reply)?.etherType == .arp)
+        let ethernetHeader = EthernetHeader.parse(&reply)
+        #expect(ethernetHeader?.etherType == .arp)
         let arp = ARPPacket.parse(&reply)
         #expect(arp?.operation == .reply)
         #expect(arp?.senderIP == IPv4Address("192.168.127.1"))
@@ -96,8 +97,7 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         let header = IPv4Header(
             source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
             protocolNumber: .icmp, payloadLength: echo.readableBytes)
-        var mutableHeader = header
-        mutableHeader.prepend(to: &ipPacket)
+        header.prepend(to: &ipPacket)
 
         var frame = ByteBuffer()
         frame.writeBytes(MACAddress("5a:94:ef:e4:0c:ee")!.bytes)
@@ -110,7 +110,8 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         let frames = link.drainTransmitted()
         #expect(frames.count == 1)
         var reply = PacketBuffer(received: frames[0])
-        #expect(EthernetHeader.parse(&reply)?.destination == MACAddress("0a:0b:0c:0d:0e:0f"))
+        let ethernetHeader = EthernetHeader.parse(&reply)
+        #expect(ethernetHeader?.destination == MACAddress("0a:0b:0c:0d:0e:0f"))
         let replyHeader = IPv4Header.parse(&reply)
         #expect(replyHeader?.source == IPv4Address("192.168.127.1"))
         #expect(replyHeader?.destination == IPv4Address("192.168.127.2"))
@@ -337,4 +338,139 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     #expect(firstCompleted)
 
     try stack.shutdown().wait()
+}
+
+@Test func aStartedStackIsReleasedWhenDroppedWithoutShutdown() {
+    // The companion to `aStartedStackIsReleasedWhenDropped`, and the one that
+    // actually pins the `[weak ipv4]`/`[weak arpResponder]` captures in
+    // `start()`.
+    //
+    // That test calls `shutdown()` first, which empties `nic.handlers` and
+    // `ipv4.handlers` — and an emptied handler table breaks the same cycles
+    // the weak captures do. So each fix hides the other's absence: with the
+    // captures made strong again, the whole graph still deallocates there
+    // (shutdown cleared the tables), and with the table-clearing removed it
+    // still deallocates too (the captures are weak). Neither is individually
+    // falsifiable through that test; removing BOTH is what it detects.
+    //
+    // Dropping a started stack WITHOUT shutting it down leaves the handler
+    // tables fully populated, so the weak captures are the only thing left
+    // breaking `NIC -> handlers -> closure -> IPv4Protocol -> RouteTable ->
+    // NIC` and `NIC -> handlers -> closure -> ARPResponder -> NIC`. This is
+    // also the shape that actually leaked in production: a sandbox torn down
+    // by dropping its stack rather than by an orderly shutdown leaked the
+    // entire graph, once per sandbox, for the life of the host process.
+    weak var weakNIC: NIC?
+    weak var weakRoutes: RouteTable?
+    weak var weakIPv4: IPv4Protocol?
+    weak var weakARPResponder: ARPResponder?
+    weak var weakLink: RecordingEndpoint?
+    do {
+        let (stack, link, _) = makeStack()
+        weakNIC = stack.nic
+        weakRoutes = stack.routes
+        weakIPv4 = stack.ipv4
+        weakARPResponder = stack.arpResponder
+        weakLink = link
+        // Positive control: everything is genuinely alive while the stack is,
+        // so the assertions below cannot pass merely because nothing was ever
+        // constructed.
+        #expect(weakNIC != nil)
+        #expect(weakRoutes != nil)
+        #expect(weakIPv4 != nil)
+        #expect(weakARPResponder != nil)
+        #expect(weakLink != nil)
+        withExtendedLifetime(stack) {}
+    }
+    #expect(weakNIC == nil)
+    #expect(weakRoutes == nil)
+    #expect(weakIPv4 == nil)
+    #expect(weakARPResponder == nil)
+    #expect(weakLink == nil)
+}
+
+@Test func shutdownDetachesTheIngressPath() {
+    // The other half of the pair above: what `shutdown()`'s
+    // `removeAllHandlers()` calls are for, stated as behaviour rather than as
+    // a lifetime.
+    //
+    // `aStartedStackIsReleasedWhenDropped` cannot see them: the weak captures
+    // in `start()` already break every cycle on their own, so deleting both
+    // `removeAllHandlers()` calls changes no lifetime it observes. What it
+    // does change is that a shut-down stack keeps answering — `arpResponder`
+    // and `ipv4` are still alive through `Stack`'s own strong fields, so the
+    // weakly-captured handler closures still fire. A frame arriving after
+    // shutdown has begun must be dropped at the NIC, not serviced.
+    let (stack, link, loop) = makeStack()
+    withExtendedLifetime(stack) {
+        // Positive control: the ingress path answers before shutdown, so the
+        // silence asserted afterwards is shutdown's doing and not a
+        // mis-built frame.
+        link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
+        #expect(link.drainTransmitted().count == 1)
+
+        var completed = false
+        stack.shutdown().whenSuccess { completed = true }
+        loop.run()
+        #expect(completed)
+
+        link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
+        #expect(link.drainTransmitted().isEmpty)
+    }
+}
+
+@Test func droppingAStartedStackStopsItsMaintenanceTimer() {
+    // `deinit`'s `maintenanceTask?.cancel()`, stated as something observable.
+    //
+    // NIO's `RepeatedTask` reschedules itself through the event loop's own
+    // queue, so it outlives every external reference to the `Stack` that
+    // started it: dropping the stack does not stop it, only `cancel()` does.
+    // A timer that keeps firing keeps the `Reassembler` and the `ARPCache` it
+    // captured alive with it, forever, once per sandbox — and no assertion
+    // about the stack's own behaviour can see that, because the stack is gone.
+    //
+    // What IS observable is the sweeping: hold the `Reassembler` past the
+    // stack, park an incomplete datagram in it, then advance both clocks past
+    // the reassembly timeout. If the timer was cancelled nothing sweeps and
+    // the datagram stays; if it was orphaned it fires and reaps. Deterministic
+    // either way — a count, not a memory measurement.
+    let loop = EmbeddedEventLoop()
+    let clock = ManualClock()
+    let reassembler: Reassembler
+    do {
+        let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: IPv4Address("192.168.127.1")!,
+                subnet: IPv4Subnet(cidr: "192.168.127.0/24")!,
+                reassemblyTimeout: .seconds(30),
+                maintenanceInterval: .seconds(10)
+            ),
+            clock: clock,
+            allocator: ByteBufferAllocator()
+        )
+        stack.start()
+        reassembler = stack.reassembler
+
+        var header = IPv4Header(
+            source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+            protocolNumber: .udp, payloadLength: 8)
+        header.identification = 91
+        header.flags = [.moreFragments]
+        _ = reassembler.process(header: header, payload: ByteBuffer(bytes: Array(repeating: UInt8(0), count: 8)))
+        #expect(reassembler.pendingCount == 1)
+
+        // Positive control that the timer really is live while the stack is:
+        // one maintenance interval with the clock not yet past the reassembly
+        // timeout sweeps nothing, but proves the loop has a task to run.
+        loop.advanceTime(by: .seconds(10))
+        #expect(reassembler.pendingCount == 1)
+        withExtendedLifetime(stack) {}
+    }
+
+    clock.advance(by: .seconds(31))
+    loop.advanceTime(by: .seconds(60))
+    // Nothing swept it, because nothing is left to sweep with.
+    #expect(reassembler.pendingCount == 1)
 }

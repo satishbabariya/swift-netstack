@@ -1,6 +1,7 @@
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
+import NIOPosix
 import Testing
 
 @testable import Netstack
@@ -204,4 +205,50 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
     var body = ipPacket.frame
     frame.writeBuffer(&body)
     link.inject(frame)
+}
+
+@Test func bindMarshalsOntoTheStackLoopWhenCalledOffLoop() async throws {
+    // `StackBootstrap.bind` is, with `Stack.shutdown()`, one of only two
+    // entry points in this package documented as safe to call from any
+    // thread; everything else is loop-confined with no locks behind it. It
+    // earns that by marshaling onto `stack.eventLoop` before the channel
+    // initializer, `register0` and `bind0` touch anything.
+    //
+    // Nothing about the returned `Channel` differs between a marshaled and
+    // an unmarshaled bind, so no assertion on the result can detect the
+    // marshal's removal — which is why `bindOnLoop` now opens with
+    // `eventLoop.preconditionInEventLoop()`. This test is what puts a
+    // genuinely off-loop call in front of it. An `EmbeddedEventLoop` cannot:
+    // its `inEventLoop` is hardcoded to `true`, so it can never observe the
+    // difference. A real, threaded loop can.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let eventLoop = group.next()
+
+    // `RecordingEndpoint.attach` (from `NIC.init`) preconditions that it is
+    // on `eventLoop`, so building the stack has to happen there; off-loop is
+    // the scenario under test for `bind` specifically, not for construction.
+    let stack = try await eventLoop.submit {
+        let link = RecordingEndpoint(eventLoop: eventLoop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: IPv4Address("192.168.127.1")!,
+                subnet: IPv4Subnet(cidr: "192.168.127.0/24")!
+            ),
+            clock: ManualClock())
+        stack.start()
+        return stack
+    }.get()
+
+    // Resumed on Swift concurrency's executor after the `await` above, not on
+    // `eventLoop`'s own thread — a genuinely off-loop call.
+    let channel = try await StackBootstrap(stack: stack).bind(host: IPv4Address("192.168.127.1")!, port: 5300).get()
+    // Positive control: the bind really happened and produced a live,
+    // correctly-addressed channel, so passing is not the absence of work.
+    #expect(channel.isActive)
+    #expect(channel.localAddress?.port == 5300)
+
+    try await channel.close()
+    _ = try await eventLoop.submit { stack.shutdown() }.get().get()
+    try await group.shutdownGracefully()
 }

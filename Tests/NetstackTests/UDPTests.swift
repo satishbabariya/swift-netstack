@@ -52,7 +52,8 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     let ipHeader = IPv4Header(
         source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
-    #expect(UDPHeader.parse(&packet, header: ipHeader) == nil)
+    let parsed = UDPHeader.parse(&packet, header: ipHeader)
+    #expect(parsed == nil)
 }
 
 @Test func acceptsAZeroChecksum() {
@@ -63,7 +64,8 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     let ipHeader = IPv4Header(
         source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
-    #expect(UDPHeader.parse(&packet, header: ipHeader)?.sourcePort == 4000)
+    let parsed = UDPHeader.parse(&packet, header: ipHeader)
+    #expect(parsed?.sourcePort == 4000)
 }
 
 // `UDPHeader.serialize`'s `let total = UInt16(length + payload.readableBytes)`
@@ -165,14 +167,16 @@ private func udpDatagram(from source: String, to destination: String, sourcePort
     var runt = PacketBuffer(received: ByteBuffer(bytes: [0x00, 0x35, 0x00]))
     let ipHeader = IPv4Header(
         source: IPv4Address("1.2.3.4")!, destination: IPv4Address("5.6.7.8")!, protocolNumber: .udp, payloadLength: 3)
-    #expect(UDPHeader.parse(&runt, header: ipHeader) == nil)
+    let parsedRunt = UDPHeader.parse(&runt, header: ipHeader)
+    #expect(parsedRunt == nil)
 
     // Length field claiming more than is present.
     var datagram = udpDatagram(from: "1.2.3.4", to: "5.6.7.8", sourcePort: 1, destinationPort: 2, payload: [0x01])
     datagram.setInteger(UInt16(500), at: 4, endianness: .big)
     datagram.setInteger(UInt16(0), at: 6, endianness: .big)  // disable checksum so length is the only fault
     var packet = PacketBuffer(received: datagram)
-    #expect(UDPHeader.parse(&packet, header: ipHeader) == nil)
+    let parsedBadLength = UDPHeader.parse(&packet, header: ipHeader)
+    #expect(parsedBadLength == nil)
 }
 
 @Test func aBoundEndpointReceivesDatagrams() throws {
@@ -457,4 +461,50 @@ private func injectRawUDPDatagram(_ datagram: ByteBuffer, into link: RecordingEn
     var body = ipPacket.frame
     frame.writeBuffer(&body)
     link.inject(frame)
+}
+
+@Test func aDroppedUdpEndpointReclaimsItsSlotInTheDemuxer() throws {
+    // `UDPEndpoint.deinit`'s own comment already says what it does and does not
+    // buy -- "the demuxer holds delegates weakly, so a dropped endpoint stops
+    // receiving on its own; this only reclaims the table slot" -- and nothing
+    // was checking the half it does buy. Deleting that `unregister` left the
+    // whole suite green; this is the assertion that now fails alone.
+    //
+    // The identical hole was found first in `TCPEndpoint.deinit` and is the
+    // same shape for the same reason: `register` refuses a key only when its
+    // weak delegate is still alive, so a REBIND succeeds either way and cannot
+    // be the thing under test. What is left is the slot, one dictionary entry
+    // per dropped endpoint, held for the life of the stack on any port never
+    // touched again.
+    let loop = EmbeddedEventLoop()
+    let link = RecordingEndpoint(eventLoop: loop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let stack = Stack(
+        link: link,
+        configuration: Stack.Configuration(gatewayAddress: IPv4Address("192.168.127.1")!, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!),
+        clock: ManualClock())
+    stack.start()
+
+    weak var weakEndpoint: UDPEndpoint?
+    do {
+        let endpoint = UDPEndpoint(stack: stack)
+        try endpoint.bind(address: IPv4Address("192.168.127.1")!, port: 53)
+        weakEndpoint = endpoint
+        // Positive controls: the endpoint is alive, its slot is occupied, and
+        // the port really is taken while it lives.
+        #expect(weakEndpoint != nil)
+        #expect(stack.transportDemuxer.registrationCountForTesting == 1)
+
+        let rival = UDPEndpoint(stack: stack)
+        #expect(throws: StackError.portInUse) {
+            try rival.bind(address: IPv4Address("192.168.127.1")!, port: 53)
+        }
+        withExtendedLifetime(rival) {}
+        withExtendedLifetime(endpoint) {}
+    }
+    #expect(weakEndpoint == nil)
+    #expect(
+        stack.transportDemuxer.registrationCountForTesting == 0,
+        "a dropped endpoint must not leave its table slot behind")
+
+    withExtendedLifetime(stack) {}
 }

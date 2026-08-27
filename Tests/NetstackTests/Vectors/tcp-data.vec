@@ -1,0 +1,461 @@
+# TCP data-transfer vectors: what this stack must put on the wire while bytes
+# are moving in either direction, and when it must put them there again.
+#
+# These lines are the SPECIFICATION. Where the implementation disagrees with a
+# line here, the implementation is what changes. A line is only edited if it
+# can be shown to be wrong, and then the reason is written down next to it --
+# there are three such edits in `sequence-wrap` and six more (all PSH, all made
+# by Task 17 after the differential found a real defect), all marked.
+#
+# The conventions are `tcp-handshake.vec`'s and are not restated: scenarios
+# separated by `# scenario:` markers because `VectorFrames` pins every TCP
+# line's four-tuple; absolute sequence numbers; our ISS 1000 and the guest's 0
+# so the two sequence spaces cannot be confused; `win` stated on every expected
+# line, because an omitted one decodes to `nil` and can never match a real
+# segment.
+#
+# ## Two line forms that are not frames: `write <n>` and `close`
+#
+# A packetdrill script interleaves system calls with packets, and this file is
+# the reason: half of what follows is the SEND side, and "the application wrote
+# 300 bytes" is not something any sequence of packets can say. A retransmission
+# vector, a zero-window vector and a local close all begin with an application
+# call, and hiding it in the harness would put the one event that starts the
+# scenario outside the file that claims to specify it -- at no stated time, so
+# a reader could not tell whether the write came before or after the segment on
+# the line above. Both forms are `<` lines: something entering the stack, from
+# above rather than off the wire. See `VectorPacket`.
+#
+# ## The RTO floor is one second, and every connection here sits on it
+#
+# RFC 6298 section 2.4 floors the RTO at one second, and this stack keeps the
+# standard floor rather than lowering it for a host-local gateway (see
+# `RTTEstimator.minimumTimeout` for why: gVisor uses the standard floor, and a
+# different one makes every loss-recovery comparison diverge for reasons that
+# have nothing to do with correctness). Real RTT here is microseconds, so an
+# unmeasured connection retransmits at exactly +1.000s and nothing shorter.
+#
+# That would leave RFC 6298's actual arithmetic -- Jacobson's smoothed estimate
+# and variance -- pinned by unit tests alone, since every sample it could take
+# lands under the floor and is clamped away. `rtt-sample-drives-the-rto` is the
+# scenario that closes that hole: it drives two samples large enough that the
+# floor is NOT the operative bound, and pins the resulting RTO twice, on the
+# wire, by the time a retransmission appears.
+#
+# ## Nothing here runs long enough to expire an ARP entry, and that is deliberate
+#
+# An ARP cache entry lives 60 seconds, and the RTO backoff ladder (1, 2, 4, 8,
+# 16, 32, 64) crosses that boundary at the sixth retransmission. Past it, the
+# correct behaviour is an ARP REQUEST and no TCP segment at all -- `IPv4Protocol
+# .send` throws `.noRoute` after asking, and `TCPEndpoint.emit` swallows that
+# deliberately because the retransmission timer will bring the segment back.
+# That is right in production and it reads as a vector failure. Every scenario
+# in this file is therefore kept well inside one ARP lifetime (the longest is
+# 2.220s), so no line here is quietly a statement about ARP. `tcp-close.vec`
+# does cross 60 seconds, and says there how it handles it.
+#
+# ## PSH, and our advertised window barely moving
+#
+# 1. Our data segments DO carry PSH, on the last segment of each write. This
+#    note used to say the opposite -- "`Sender` cuts segments with the ACK bit
+#    and nothing else... PSH is advisory, so this is legal" -- and it was
+#    wrong: RFC 1122 section 4.2.2.2 clause (2), carried forward by RFC 9293
+#    section 3.9.1, makes it a MUST for a stack whose send call has no push
+#    argument, and `TCPEndpoint.send` has none. The Task 17 differential found
+#    it; `push-on-the-last-segment-of-a-write`, `write-under-a-small-window`
+#    and `a-retransmission-keeps-the-push-bit` pin the rule; four `>` lines in
+#    the three scenarios above them were edited and are marked.
+#
+#    Note what this cost: the note was written from the implementation, called
+#    a defect a design decision, and made every vector line that depended on it
+#    agree with the defect. That is exactly the failure mode a differential
+#    against a stack nobody here wrote exists to catch.
+# 2. Our advertised window is 65535 on essentially every line below. In-order
+#    bytes are handed to the application synchronously and never retained, and
+#    out-of-order bytes are held in a queue four times larger than the window,
+#    so `min(free space, configured window)` is the configured window until
+#    roughly 192 KiB is queued out of order. The figure is not a constant --
+#    `Receiver.advertisedWindow` can drop it, and the never-retract floor
+#    governs how fast -- but no scenario of this size can move it.
+
+
+# scenario: in-order-data
+#
+# The base case, and the one every other scenario in this file is a deviation
+# from. Bytes arrive in order; each segment is acknowledged with the sequence
+# number one past its last byte; the acknowledgement is immediate and there is
+# exactly one per segment.
+#
+# Immediate rather than delayed is a real choice and this is where it is
+# written down. RFC 9293 section 3.8.6.3 permits delaying an ACK up to 500 ms,
+# and this stack does not: `Receiver.accept` reports `shouldAck` for every
+# segment that occupies sequence space, and `TCPEndpoint` sends it in the same
+# pass. Two ACKs for two segments, at the two segments' own times, is what the
+# last four lines say.
+0.000 < S  0:0(0) win 65535 <mss 1460>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .  1:1(0) ack 1001 win 65535
+0.020 < P. 1:101(100) ack 1001 win 65535
+0.020 > .  1001:1001(0) ack 101 win 65535
+0.030 < P. 101:201(100) ack 1001 win 65535
+0.030 > .  1001:1001(0) ack 201 win 65535
+
+
+# scenario: out-of-order-data
+#
+# A gap in the stream. The second hundred bytes arrive first; the first hundred
+# arrive after.
+#
+# The out-of-order segment draws an acknowledgement that has NOT moved --
+# `ack 1`, the same number the handshake left RCV.NXT at. That is RFC 5681
+# section 3.2's duplicate ACK, and it is the loss signal the peer's fast
+# retransmit counts: acknowledging 201 here instead would tell the peer the
+# missing hundred bytes had arrived, and they would never be sent again.
+#
+# The gap-filling segment is then acknowledged CUMULATIVELY, with 201 rather
+# than 101 -- one ACK covering both segments, because RCV.NXT has run over the
+# queued bytes the moment the hole in front of them closed. A stack that
+# acknowledged only what the arriving segment itself carried would leave the
+# peer holding data it has already delivered.
+0.000 < S  0:0(0) win 65535 <mss 1460>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .  1:1(0) ack 1001 win 65535
+0.020 < P. 101:201(100) ack 1001 win 65535
+0.020 > .  1001:1001(0) ack 1 win 65535
+0.030 < P. 1:101(100) ack 1001 win 65535
+0.030 > .  1001:1001(0) ack 201 win 65535
+
+
+# scenario: retransmission-after-rto
+#
+# The application writes a hundred bytes; the peer never acknowledges them; the
+# retransmission timer expires and the SAME segment goes out again.
+#
+# "The same" is the whole content of this vector, and every field of the second
+# `>` line below is identical to the first by construction rather than by
+# coincidence: same sequence number, same length, same acknowledgement, same
+# window. A retransmission that moved the sequence number would present to the
+# peer as new data at a position it never asked for; one that re-cut the
+# segment from a different offset would leave a hole that no acknowledgement
+# could ever fill.
+#
+# +1.000s exactly. Nothing has been measured on this connection, so RFC 6298
+# section 2.1's initial RTO of one second stands, and the floor would hold it
+# there in any case (see the header). The runner compares emission time
+# exactly, with no tolerance, so a stack that fired early -- or that emitted
+# the right bytes at some other moment -- fails this line rather than passing
+# on content alone.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+# `P.`, not `.`. EDITED by Task 17 after the differential found this stack
+# setting no PSH at all; see `push-on-the-last-segment-of-a-write` below for
+# the RFC 1122 section 4.2.2.2 MUST and the rule. A hundred bytes is one
+# segment and it empties the write, so it pushes -- and so does the
+# retransmission, which reproduces the segment rather than re-deriving it.
+0.020 > P.    1001:1101(100) ack 1 win 65535
+1.020 > P.    1001:1101(100) ack 1 win 65535
+# Acknowledged at last: the retransmit timer is cancelled and the scenario ends
+# with nothing further on the wire. The runner reports any frame this file does
+# not account for, so a stack that retransmitted a third time -- or that failed
+# to cancel and fired again at +2.000s -- would be caught by the file ENDING
+# here rather than by any line in it.
+1.030 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: zero-window
+#
+# The peer closes its receive window in the handshake's third leg. The
+# application writes anyway, and NOTHING goes on the wire: `Sender
+# .segmentsToTransmit` sends `min(cwnd, SND.WND)` bytes and SND.WND is zero.
+# There is no expected frame between the write and the window update below, and
+# that silence is checked -- the runner fails on any frame the script does not
+# account for.
+#
+# The window then reopens on a bare acknowledgement that advances nothing. RFC
+# 9293 section 3.10.7.4 admits SEG.ACK == SND.UNA into the acceptable-ACK
+# window for exactly this reason: it retires no data, but it carries a window
+# update, and a sender with no way to act on one can never leave a zero window.
+#
+# What this stack does NOT have, stated here because this is the scenario where
+# its absence lives: a persist timer. RFC 9293 section 3.8.6.1 requires a
+# zero-window probe, and `Sender` has none, so a window update that is lost on
+# the way here wedges the connection until the peer sends something else. The
+# vector pins what the stack does; it is not a claim that nothing is missing.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 0
+0.020 < write 100
+0.100 < .     1:1(0) ack 1001 win 1000
+# `P.` for the same reason as `retransmission-after-rto` above: one segment,
+# and it empties the write. EDITED by Task 17.
+0.100 > P.    1001:1101(100) ack 1 win 65535
+0.110 < .     1:1(0) ack 1101 win 1000
+
+
+# scenario: sequence-wrap
+#
+# Sequence numbers that wrap during the connection. Everything here is correct
+# only if comparison is SERIAL arithmetic (RFC 1982) rather than integer order:
+# 4294967201 + 95 is 2^32, which is 0, and every test in the receive path --
+# acceptability, in-window, the reassembler's offsets -- has to agree that 0 is
+# ninety-five AHEAD of 4294967201 and not four billion behind it.
+#
+# ## Three edits to the version this scenario was drafted as
+#
+# 1. The 95-byte segment is written `4294967201:0(95)`, not
+#    `4294967201:4294967296(95)`. 2^32 is not expressible in the 32-bit field
+#    the DSL parses into, and `VectorScript` checks `end - start == length`
+#    with WRAPPING arithmetic -- so `0` is not a shorthand here, it is the
+#    number that is actually on the wire, and writing it out is the same claim
+#    the line is about.
+#
+# 2. The acknowledgements below advertise `win 65535`, not the 65440 and 65340
+#    they were drafted with. Those figures assume a receiver that holds
+#    delivered bytes in a socket buffer until the application reads them, and
+#    this stack has no such buffer and no `read`: `TCPEndpoint` hands in-order
+#    bytes to `onData` synchronously and `TCPReassembler` never queues them at
+#    all, so the space available after 95 bytes have been delivered is exactly
+#    the space available before. Advertising 65440 would be advertising less
+#    than the connection is genuinely prepared to accept. The consequence of
+#    that interface is worth stating plainly rather than only implying: there
+#    is no receive-side backpressure in this stack, and an application that
+#    ignores `onData` is acknowledged and dropped rather than throttled.
+#
+# 3. A segment arrives OUT OF ORDER from the far side of the wrap, and this is
+#    the edit that gives the scenario its teeth. The drafted block moved only
+#    in order, and every comparison it made was between two numbers on the same
+#    side of the boundary -- RCV.NXT crossed 2^32 by ADDITION, which wraps
+#    whether or not comparison is serial. Replacing the serial `-` with an
+#    integer difference left every line of it passing. A wrap vector has to
+#    make the stack COMPARE across the boundary, not merely add across it.
+0.000 < S  4294967200:4294967200(0) win 65535
+0.000 > S. 1000:1000(0) ack 4294967201 win 65535 <mss 1460>
+0.010 < .  4294967201:4294967201(0) ack 1001 win 512
+# Fifty bytes at 0, out of order: RCV.NXT is 4294967201, so these sit 95 ahead
+# of it. Under integer order they read as four billion BEHIND, the segment is
+# rejected as unacceptable, and the reply is the same duplicate ACK either way
+# -- an unacceptable segment and an out-of-order one both draw an ACK at
+# RCV.NXT. This line alone therefore proves nothing, and the next pair is where
+# the difference surfaces.
+0.020 < P. 0:50(50) ack 1001 win 512
+0.020 > .  1001:1001(0) ack 4294967201 win 65535
+# Ninety-five bytes ending exactly at 2^32. In order, so it is delivered, and
+# it closes the gap in front of the fifty already queued -- so RCV.NXT runs
+# over both and lands at 50. A stack that refused the queued run above has only
+# ninety-five bytes to deliver here and acknowledges 0 instead of 50, which is
+# the wrap arithmetic failing where it can be seen.
+0.030 < P. 4294967201:0(95) ack 1001 win 512
+0.030 > .  1001:1001(0) ack 50 win 65535
+
+
+# scenario: rtt-sample-drives-the-rto
+#
+# The one scenario in this plan where RFC 6298's estimator is the thing being
+# measured rather than a floor being observed. The peer's window is held at 100
+# bytes so each acknowledgement releases exactly one more segment, which makes
+# every round trip a clean, unambiguous sample under Karn's algorithm.
+#
+# Sample 1 is 500 ms (sent 0.010, acknowledged 0.510). RFC 6298 section 2.2,
+# the first-sample rule: SRTT = R = 500 ms, RTTVAR = R/2 = 250 ms, and
+# RTO = SRTT + max(G, 4*RTTVAR) = 500 ms + 1000 ms = 1.500 s. Above the floor,
+# so the floor is not what decides it.
+#
+# Sample 2 is 100 ms (sent 0.510, acknowledged 0.610). RFC 6298 section 2.3 in
+# Jacobson's fixed-point form, which is what `RTTEstimator` implements and what
+# every stack this one is compared against implements:
+#
+#   RTTVAR = RTTVAR - (RTTVAR >> 2) + (|SRTT - R| >> 2)
+#          = 250 - 62.5 + 100 = 287.5 ms
+#   SRTT   = SRTT - (SRTT >> 3) + (R >> 3)
+#          = 500 - 62.5 + 12.5 = 450 ms
+#   RTO    = 450 + max(1, 4 * 287.5) = 1.600 s
+#
+# The third segment goes out at 0.610 and is never acknowledged, so the RTO is
+# read off the wire as the gap to its retransmission: 0.610 + 1.600 = 2.210.
+# One millisecond either side is a different SRTT or a different RTTVAR, and
+# `3/4 * RTTVAR` computed with integer division instead of the shift form
+# differs in the low bits -- which is exactly the divergence the shift form was
+# chosen to avoid, made visible here as a retransmission at the wrong time.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 100
+0.010 < write 300
+# `P.` on all three pieces, EDITED by Task 17. Three hundred bytes is less than
+# one MSS, so this write is split by the peer's hundred-byte WINDOW and not by
+# the MSS -- and a window split does not defer the push. This is the same rule
+# `write-under-a-small-window` below exists to pin, met here by accident, which
+# is why that scenario states it deliberately rather than relying on this one.
+0.010 > P.    1001:1101(100) ack 1 win 65535
+0.510 < .     1:1(0) ack 1101 win 100
+0.510 > P.    1101:1201(100) ack 1 win 65535
+0.610 < .     1:1(0) ack 1201 win 100
+0.610 > P.    1201:1301(100) ack 1 win 65535
+# 0.610 + 1.600. Not 0.610 + 1.000: the floor has been left behind, and a stack
+# that ignored its own measurements would retransmit at 1.610 instead.
+2.210 > P.    1201:1301(100) ack 1 win 65535
+2.220 < .     1:1(0) ack 1301 win 100
+
+
+# scenario: push-on-the-last-segment-of-a-write
+#
+# FOUND BY THE DIFFERENTIAL (Task 17), seed 6840123409045651459, step 4. This
+# stack cut every data segment with the ACK bit and nothing else; gVisor set
+# PSH on the last segment of each write. That is not a matter of taste:
+#
+#   RFC 1122 section 4.2.2.2, carried forward by RFC 9293 section 3.9.1 --
+#   "A TCP MAY implement PUSH flags on SEND calls. If PUSH flags are not
+#   implemented, then the sending TCP: (1) must not buffer data indefinitely,
+#   and (2) MUST set the PSH bit in the last buffered segment (i.e., when there
+#   is no more queued data to be sent)."
+#
+# `TCPEndpoint.send` has no push argument, so clause (2) applies unconditionally
+# and this stack was violating a MUST on every write it ever made. gVisor is
+# right and we were wrong; the header note that used to say "our data lines are
+# `.` and never `P.`" was recording a defect as a design decision.
+#
+# The rule implemented, which is Linux's and gVisor's: a segment carries PSH
+# exactly when the bytes remaining in the WRITE it is cut from, counted from
+# that segment's first byte, are no more than one MSS -- that is, when nothing
+# more of that write will follow it as a full segment. A write is split at the
+# MSS and at the peer's window, and the two splits behave differently on
+# purpose (gVisor `snd.go`'s `splitSeg`, Linux `tcp_write_xmit`).
+#
+# Three lines pin the three cases at once. The MSS here is 1460 (the guest
+# offered `mss 1460` and the link carries 1500), and the write is 2941 bytes:
+# 1460 + 1460 + 21. The first two segments have more than an MSS of their write
+# still to come, so they carry no PSH; the last one empties the write and does.
+# A stack that set PSH on every segment fails the first line; one that set it
+# on none fails the third; one that set it only when the whole send queue
+# drained would pass here and fail `write-under-a-small-window` below.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 2941
+0.020 > .     1001:2461(1460) ack 1 win 65535
+0.020 > .     2461:3921(1460) ack 1 win 65535
+0.020 > P.    3921:3942(21) ack 1 win 65535
+0.030 < .     1:1(0) ack 3942 win 65535
+
+
+# scenario: write-under-a-small-window
+#
+# The other half of the PSH rule, and the reason it is stated in terms of the
+# write rather than of the send queue. The write is 1000 bytes -- less than one
+# MSS -- and the peer's window admits only 400 at a time, so it goes out in
+# three pieces. Every one of them carries PSH, because at each cut the whole
+# remainder of the write was already inside one segment's worth: the split is
+# the window's doing, not the MSS's, and a window split does not defer the
+# push.
+#
+# This is the line that separates the rule from the simpler "PSH when the send
+# queue empties": that rule would put PSH on the third segment alone.
+0.000 < S     0:0(0) win 400 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 400
+0.020 < write 1000
+0.020 > P.    1001:1401(400) ack 1 win 65535
+0.030 < .     1:1(0) ack 1401 win 400
+0.030 > P.    1401:1801(400) ack 1 win 65535
+0.040 < .     1:1(0) ack 1801 win 400
+0.040 > P.    1801:2001(200) ack 1 win 65535
+0.050 < .     1:1(0) ack 2001 win 400
+
+
+# scenario: a-retransmission-keeps-the-push-bit
+#
+# A retransmission reproduces the segment it lost, and PSH is part of that
+# segment. gVisor re-sends the segment object with its flags intact; a stack
+# that rebuilt the segment from the byte queue and re-derived the flags would
+# get this right only by accident, and `Sender.retransmitOldest` did exactly
+# that -- it hardcoded `.ack`.
+#
+# The write is 100 bytes, so its one segment carries PSH. At +1.000s, so does
+# the retransmission.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+0.020 > P.    1001:1101(100) ack 1 win 65535
+1.020 > P.    1001:1101(100) ack 1 win 65535
+1.030 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: window-updates-are-not-duplicate-acknowledgements
+#
+# FOUND BY THE DIFFERENTIAL (Task 17), seed 6840123409045651459, step 12. This
+# stack fast-retransmitted a segment nothing had been lost of, because it read
+# RFC 5681 section 3.2's condition (e) off the wrong variable.
+#
+# (e) is "the advertised window in the incoming acknowledgment equals the
+# advertised window in the LAST INCOMING ACKNOWLEDGMENT" -- a comparison
+# between two numbers that arrived on the wire. `Sender.acknowledged` compared
+# `tcb.sndWnd` before and after instead, which is the window AFTER RFC 9293
+# section 3.10.7.4's update rule has decided whether to take it. Those two are
+# not the same thing, and the gap between them is reachable by the peer:
+#
+#   the update rule refuses a window carried by a segment whose SND.WL1 is not
+#   newer, so once ONE out-of-order segment has pushed SND.WL1 forward, every
+#   later acknowledgement at a lower sequence number leaves SND.WND frozen --
+#   and a frozen SND.WND reads as "the window did not change" no matter what
+#   the peer actually advertised.
+#
+# So a guest that sends one segment out of order and then three bare
+# acknowledgements with three DIFFERENT windows makes this stack halve its
+# congestion window and retransmit. Nothing was lost. gVisor gets this right
+# (`snd.go`'s `isDupAck` compares `s.SndWnd` against `seg.window`, and stashes
+# `s.SndWnd = rcvdSeg.window` only afterwards, so its stored value is exactly
+# "the window in the last incoming acknowledgement").
+#
+# The out-of-order segment at 5001 is not decoration: it is what makes SND.WL1
+# unreachable and is the only reason the three window updates can be mistaken
+# for duplicates at all. The file ENDING after the last of them is what pins
+# the absence of the retransmission -- the runner fails on any frame a script
+# does not account for.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+0.020 > P.    1001:1101(100) ack 1 win 65535
+# Out of order: queued, not delivered, and acknowledged with a duplicate ACK
+# naming RCV.NXT. SND.WL1 is now 5001.
+0.030 < .     5001:5101(100) ack 1001 win 65535
+0.030 > .     1101:1101(0) ack 1 win 65535
+# Three window updates, three different windows, all naming SND.UNA. Not one
+# of them is a duplicate acknowledgement.
+0.040 < .     1:1(0) ack 1001 win 40000
+0.050 < .     1:1(0) ack 1001 win 30000
+0.060 < .     1:1(0) ack 1001 win 20000
+
+
+# scenario: three-identical-duplicate-acknowledgements-still-fast-retransmit
+#
+# The positive control for the scenario above, and the reason it is a separate
+# vector rather than a comment: a stack that fixed the window test by never
+# counting duplicates at all would pass `window-updates-are-not-duplicate-
+# acknowledgements` perfectly.
+#
+# Same shape, same out-of-order segment, same three bare acknowledgements --
+# but all four advertise the SAME window -- the out-of-order segment included,
+# because RFC 5681 section 3.2 condition (e) compares against "the last
+# incoming acknowledgment" and a data segment carrying an ACK is one. So all
+# three bare acknowledgements are duplicates, and the third is the loss signal
+# that retransmits the oldest unacknowledged segment (section 3.2 step 3). At
+# 0.060, on the third, not the second and not the fourth.
+#
+# Note what changing ONE number does: give the first bare acknowledgement a
+# different window from the out-of-order segment and the count restarts, so
+# only two duplicates accrue and nothing is retransmitted. That is the whole
+# difference between this scenario and the one above it.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 100
+0.020 > P.    1001:1101(100) ack 1 win 65535
+0.030 < .     5001:5101(100) ack 1001 win 65535
+0.030 > .     1101:1101(0) ack 1 win 65535
+0.040 < .     1:1(0) ack 1001 win 65535
+0.050 < .     1:1(0) ack 1001 win 65535
+0.060 < .     1:1(0) ack 1001 win 65535
+0.060 > P.    1001:1101(100) ack 1 win 65535

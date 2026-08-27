@@ -1,0 +1,364 @@
+# TCP connection-close vectors: what this stack must put on the wire while a
+# connection is being torn down, how long it must hold the four-tuple
+# afterwards, and what it must REFUSE to treat as an end of stream.
+#
+# These lines are the SPECIFICATION. Where the implementation disagrees with a
+# line here, the implementation is what changes. A line is only edited if it
+# can be shown to be wrong, and then the reason is written down next to it.
+#
+# The conventions are `tcp-handshake.vec`'s and are not restated: scenarios
+# separated by `# scenario:` markers because `VectorFrames` pins every TCP
+# line's four-tuple; absolute sequence numbers; our ISS 1000 and the guest's 0;
+# `win` stated on every expected line. `close` and `write <n>` lines are the
+# application acting rather than a frame arriving -- see `tcp-data.vec`'s header
+# and `VectorPacket` for why the DSL needs them at all.
+#
+# ## Five of these scenarios pin defects this plan fought for
+#
+# `fin-ahead-of-rcv-nxt`, `fin-retransmission-restarts-time-wait`,
+# `bare-ack-does-not-restart-time-wait`, `right-edge-trim` and
+# `data-past-the-fin` are not shapes chosen for coverage. Each one is a
+# behaviour the implementation got wrong at least once, in a way no unit test
+# of any single component could see, and each is written here so that getting
+# it wrong again fails from the outside. Their comments say what the wrong
+# behaviour was, because "this line is correct" is not information a reader can
+# act on and "this line was 52 before it was 101" is.
+#
+# ## Three scenarios run past sixty seconds, and that is the ARP boundary
+#
+# An ARP cache entry lives 60 seconds. Past it, `IPv4Protocol.send` emits an ARP
+# REQUEST and throws, `TCPEndpoint.emit` swallows the throw deliberately, and
+# the correct behaviour on the wire is an ARP request and NO TCP segment --
+# which reads as a vector failure. TIME-WAIT is 2*MSL = 60 seconds, so the three
+# scenarios that wait it out sit exactly on that boundary.
+#
+# They are safe for a stated reason rather than by luck:
+# `IPv4Protocol.handleInbound` records the sender's link address from every
+# accepted packet BEFORE dispatching it, so each probe below refreshes the entry
+# in the same call that provokes the reply it expects. Every `>` line in this
+# file is therefore emitted from an entry that was refreshed microseconds
+# earlier in logical time, and no line here is quietly a statement about ARP.
+# A scenario that expected a reply with no inbound packet to provoke it would
+# NOT be safe past 60 seconds, and there is none.
+
+
+# scenario: four-way-close
+#
+# The ordinary close, initiated locally: FIN, ACK, FIN, ACK, in four segments
+# and three states. We send the first FIN, so we hold TIME-WAIT at the end --
+# which is the whole reason `close()` releases the listening key immediately and
+# keeps this connection's four-tuple (see `TCPEndpoint.close`).
+#
+# The FIN occupies SND.NXT - 1: `TCPStateMachine.close` bumps SND.NXT to reserve
+# the sequence number the FIN consumes, so the segment carrying it sits at 1001
+# while SND.NXT is already 1002. The peer's acknowledgement of it is therefore
+# 1002, and the ACK we send after its FIN comes from 1002 -- one past the last
+# byte we will ever send.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < close
+0.020 > F.    1001:1001(0) ack 1 win 65535
+# FIN-WAIT-1 -> FIN-WAIT-2. This acknowledges our FIN and nothing else; it
+# occupies no sequence space, so it draws nothing back.
+0.030 < .     1:1(0) ack 1002 win 65535
+# The peer's own FIN. FIN-WAIT-2 -> TIME-WAIT, and the acknowledgement moves to
+# 2 because the FIN consumed sequence number 1.
+0.040 < F.    1:1(0) ack 1002 win 65535
+0.040 > .     1002:1002(0) ack 2 win 65535
+
+
+# scenario: simultaneous-close
+#
+# Both ends close at once: the peer's FIN arrives while ours is still
+# unacknowledged. This is the CLOSING state, which nothing else reaches --
+# FIN-WAIT-1 goes to CLOSING rather than to TIME-WAIT precisely when SND.UNA has
+# not caught SND.NXT, i.e. when our FIN is still outstanding.
+#
+# The peer's FIN acknowledges 1001, not 1002: it was sent before ours arrived,
+# so it cannot have acknowledged it. That is what makes this a simultaneous
+# close rather than the four-way one above, and a stack that treated `ack 1001`
+# as acknowledging our FIN would go to TIME-WAIT one segment early and stop
+# retransmitting a FIN nobody has confirmed.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < close
+0.020 > F.    1001:1001(0) ack 1 win 65535
+0.030 < F.    1:1(0) ack 1001 win 65535
+0.030 > .     1002:1002(0) ack 2 win 65535
+# CLOSING -> TIME-WAIT. The peer finally acknowledges our FIN; there is nothing
+# left to send, and the file ending here is the assertion that nothing is sent.
+0.040 < .     2:2(0) ack 1002 win 65535
+
+
+# scenario: peer-fin-in-established
+#
+# The passive close: the peer finishes first. ESTABLISHED -> CLOSE-WAIT on its
+# FIN, which is acknowledged immediately, and then -- once the application
+# closes -- CLOSE-WAIT -> LAST-ACK -> CLOSED.
+#
+# CLOSE-WAIT is the state where the peer's stream is over and ours is not, and
+# the acknowledgement below is the only thing sent for it: RFC 9293 section
+# 3.10.7.4 requires the FIN to be acknowledged, and requires nothing else. A
+# stack that sent its own FIN here would be closing on the application's behalf.
+#
+# The final ACK deletes the block outright. There is no TIME-WAIT on this path
+# and there must not be: TIME-WAIT belongs to whichever end sent the FIRST FIN,
+# and that is the peer.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < F.    1:1(0) ack 1001 win 65535
+0.020 > .     1001:1001(0) ack 2 win 65535
+0.030 < close
+0.030 > F.    1001:1001(0) ack 2 win 65535
+0.040 < .     2:2(0) ack 1002 win 65535
+
+
+# scenario: time-wait-expiry
+#
+# TIME-WAIT lasts 2*MSL -- 60 seconds here, which is also gVisor's default --
+# and then the block is gone. Both halves are pinned, two milliseconds apart.
+#
+# The connection enters TIME-WAIT at 0.040, so the deadline is 60.040. At 60.039
+# the block is still there and answers as itself. At 60.041 it is not, and the
+# same segment is answered by `Stack`'s own TCP handler with RFC 9293 section
+# 3.10.7.1's reset for a port with nothing behind it -- `<SEQ=SEG.ACK><CTL=RST>`,
+# ACK bit clear, because the arriving segment carried an acknowledgement to
+# reuse. Two DIFFERENT components produce those two lines, which is what makes
+# the pair a statement about the block's lifetime rather than about one
+# component's behaviour: nothing but the block going away can change the first
+# answer into the second.
+#
+# The probe at 60.039 is a bare ACK, so it does not restart the timer -- see
+# `bare-ack-does-not-restart-time-wait`, which pins that property on its own.
+# This scenario depends on it and does not restate it.
+0.000  < S     0:0(0) win 65535 <mss 1460>
+0.000  > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010  < .     1:1(0) ack 1001 win 65535
+0.020  < close
+0.020  > F.    1001:1001(0) ack 1 win 65535
+0.030  < .     1:1(0) ack 1002 win 65535
+0.040  < F.    1:1(0) ack 1002 win 65535
+0.040  > .     1002:1002(0) ack 2 win 65535
+60.039 < .     2:2(0) ack 1002 win 65535
+60.039 > .     1002:1002(0) ack 2 win 65535
+60.041 < .     2:2(0) ack 1002 win 65535
+60.041 > R     1002:1002(0) win 0
+
+
+# scenario: fin-retransmission-restarts-time-wait
+#
+# RFC 9293 section 3.10.7.4, TIME-WAIT: "the only thing that can arrive is a
+# retransmission of the remote FIN. Acknowledge it, and restart the 2 MSL
+# timeout."
+#
+# The original code had this exactly backwards, and the shape of the mistake is
+# why the scenario is here rather than in a unit test. A retransmitted FIN sits
+# at RCV.NXT - 1 -- reaching a FIN steps RCV.NXT one past it -- so it FAILS the
+# acceptability test and never reached the branch that restarted the timer,
+# while any acceptable segment at all did reach it. The half a peer could drive
+# for free was the one that restarted the timer, and the half the RFC asks for
+# was the one that never ran.
+#
+# The block would have died at 60.040 without the restart. The FIN retransmission
+# at 30.000 pushes the deadline to 90.000, and the probe at 61.000 -- past the
+# original deadline, and itself another FIN retransmission -- is still answered
+# by the block rather than by a reset.
+0.000  < S     0:0(0) win 65535 <mss 1460>
+0.000  > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010  < .     1:1(0) ack 1001 win 65535
+0.020  < close
+0.020  > F.    1001:1001(0) ack 1 win 65535
+0.030  < .     1:1(0) ack 1002 win 65535
+0.040  < F.    1:1(0) ack 1002 win 65535
+0.040  > .     1002:1002(0) ack 2 win 65535
+30.000 < F.    1:1(0) ack 1002 win 65535
+30.000 > .     1002:1002(0) ack 2 win 65535
+61.000 < F.    1:1(0) ack 1002 win 65535
+61.000 > .     1002:1002(0) ack 2 win 65535
+
+
+# scenario: bare-ack-does-not-restart-time-wait
+#
+# The other half of the same fix, and the half that is a defence. A bare ACK is
+# ACCEPTABLE in TIME-WAIT, and restarting the 2*MSL timer for it lets any peer
+# -- or anyone who can guess a four-tuple and a sequence number in a 64 KiB
+# window -- hold a dying block open forever by sending nothing but empty
+# acknowledgements. The bar for restarting the timer is now the same as the bar
+# for honouring a RST or a FIN: name RCV.NXT - 1 exactly, which is where the
+# peer's real FIN sat.
+#
+# So the ACK at 30.000 is answered, and the block still dies at 60.040. The
+# probe at 61.000 gets `Stack`'s reset, exactly as in `time-wait-expiry`. The
+# line-for-line contrast with the scenario above is the point: the two differ
+# only in the flag on the segment sent at 30.000, and they end differently.
+0.000  < S     0:0(0) win 65535 <mss 1460>
+0.000  > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010  < .     1:1(0) ack 1001 win 65535
+0.020  < close
+0.020  > F.    1001:1001(0) ack 1 win 65535
+0.030  < .     1:1(0) ack 1002 win 65535
+0.040  < F.    1:1(0) ack 1002 win 65535
+0.040  > .     1002:1002(0) ack 2 win 65535
+30.000 < .     2:2(0) ack 1002 win 65535
+30.000 > .     1002:1002(0) ack 2 win 65535
+61.000 < .     2:2(0) ack 1002 win 65535
+61.000 > R     1002:1002(0) win 0
+
+
+# scenario: fin-ahead-of-rcv-nxt
+#
+# A bare FIN that is in the window but NOT at RCV.NXT is refused, and the real
+# bytes behind it still arrive. Both halves are pinned, because the defect this
+# closes needed both to be true and only one of them is obvious.
+#
+# The attack: a guest sends one bare FIN naming a sequence number part way
+# through the stream -- no guess worth the name, since any number in a 64 KiB
+# window will do. `TCPReassembler` records a FIN's position on admission and
+# first-received-wins makes it authoritative forever, so the real data arriving
+# afterwards is TRUNCATED at the forged position and the application is handed a
+# clean end of stream in the middle of the file it was reading. Nothing reports
+# an error, because as far as the application is concerned the stream ended
+# normally. The other half of the same hole -- a FIN naming a position the
+# stream never reaches -- wedges teardown permanently instead.
+#
+# So a FIN is honoured only when the segment carrying it starts at exactly
+# RCV.NXT and the FIN's own sequence number is inside the window. Otherwise the
+# flag is stripped, the segment's data (if any) is processed as ordinary data,
+# and the peer is acknowledged so that its FIN retransmission arrives in the
+# right place. The attacker's job is now identical for FIN and RST: name RCV.NXT
+# exactly.
+0.000 < S  0:0(0) win 65535 <mss 1460>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .  1:1(0) ack 1001 win 65535
+# The forged FIN, at 51 -- fifty bytes into a hundred-byte stream that has not
+# arrived yet. The acknowledgement is `ack 1`: RCV.NXT has not moved, so the
+# FIN was not taken. Answering with `ack 52` here would be the truncation.
+0.020 < F. 51:51(0) ack 1001 win 65535
+0.020 > .  1001:1001(0) ack 1 win 65535
+# The real hundred bytes, all of them. `ack 101` is the second half of the
+# claim: if the forged FIN had been recorded at 51, this segment would have been
+# cut off there and answered with `ack 52`, with fifty bytes silently dropped
+# and the application told the stream had ended.
+0.030 < P. 1:101(100) ack 1001 win 65535
+0.030 > .  1001:1001(0) ack 101 win 65535
+# The peer's real FIN, at the position the stream actually reached. Honoured,
+# because it names RCV.NXT exactly.
+0.040 < F. 101:101(0) ack 1001 win 65535
+0.040 > .  1001:1001(0) ack 102 win 65535
+
+
+# scenario: right-edge-trim
+#
+# A segment that starts inside the window and runs off the end of it is TRIMMED
+# at the right edge, not accepted whole.
+#
+# RFC 9293 section 3.10.7.4's acceptability test admits a segment whose first OR
+# last byte is in the window; it bounds neither the segment's extent nor its
+# end. On its own it therefore confines nothing -- before this was fixed, 5000
+# bytes went through a 4-byte window on the strength of that test alone, with
+# `TCPReassembler`'s quarter-of-the-sequence-space domain bound as the only
+# remaining limit. RFC 9293 section 3.9 expects the excess to be dropped
+# instead, and `TCPStateMachine.receiverInput` is where that happens, between
+# the test and the receiver.
+#
+# The window is 65535 and RCV.NXT is 1, so the right edge is 65536. The segment
+# below starts at 1000 and carries 65000 bytes, ending at 66000 -- 464 bytes
+# past the edge. Those 464 are dropped on arrival, which is invisible until the
+# gap in front is filled: the cumulative acknowledgement then reads 65536, the
+# right edge exactly. An untrimmed queue would deliver 65999 bytes and answer
+# 66000, acknowledging data the connection had said it would not accept.
+0.000 < S  0:0(0) win 65535 <mss 1460>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .  1:1(0) ack 1001 win 65535
+0.020 < P. 1000:66000(65000) ack 1001 win 65535
+0.020 > .  1001:1001(0) ack 1 win 65535
+0.030 < P. 1:1000(999) ack 1001 win 65535
+0.030 > .  1001:1001(0) ack 65536 win 65535
+
+
+# scenario: data-past-the-fin
+#
+# Data already queued at or beyond the position a peer's own FIN turns out to
+# occupy is DISCARDED when that FIN lands. Without it, teardown wedges
+# permanently, and the mechanism is worth stating exactly because "wedges" reads
+# as a performance problem and it is not.
+#
+# `Receiver` reaches a FIN by testing RCV.NXT == the recorded FIN position, an
+# equality that fires once because reaching it steps RCV.NXT one past. If data
+# beyond the FIN is still queued, the segment that fills the gap delivers it
+# too, and RCV.NXT jumps STRAIGHT OVER the FIN's position -- 1 to 101 with the
+# FIN at 51. The equality is then false forever, in both directions, and no
+# retransmission by the peer can help: the connection never leaves ESTABLISHED
+# and never reports the stream as over.
+#
+# A peer that has sent a FIN has promised to send no more data, so the queued
+# bytes past it are a protocol violation and go rather than the FIN.
+0.000 < S   0:0(0) win 65535 <mss 1460>
+0.000 > S.  1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .   1:1(0) ack 1001 win 65535
+# Fifty bytes at 51, out of order: queued, and duplicate-ACKed at RCV.NXT.
+0.020 < P.  51:101(50) ack 1001 win 65535
+0.020 > .   1001:1001(0) ack 1 win 65535
+# Fifty bytes at 1, with the FIN -- which lands at 51, exactly where the queued
+# run starts. `ack 52` is the FIN acknowledged and the queued run discarded;
+# `ack 101` would be the queued run delivered and the FIN lost forever.
+0.030 < FP. 1:51(50) ack 1001 win 65535
+0.030 > .   1001:1001(0) ack 52 win 65535
+
+
+# scenario: a-reset-does-not-assassinate-time-wait
+#
+# FOUND BY THE DIFFERENTIAL (Task 17), seed 6840123409045651495, step 10. A
+# reset arriving in TIME-WAIT used to delete the block and free the four-tuple
+# on the spot. That is RFC 9293 section 3.10.7.4 as written -- "TIME-WAIT
+# STATE: if the RST bit is set, then enter the CLOSED state, delete the TCB,
+# and return" -- and it is a documented attack:
+#
+#   RFC 1337, "TIME-WAIT Assassination Hazards in TCP", section 3, fix 1:
+#   ignore RST segments in TIME-WAIT. The block is exactly the state that stops
+#   a delayed duplicate from this connection being delivered into the next one
+#   on the same four-tuple, and the peer that resets it is the peer that gains
+#   by its absence.
+#
+# gVisor implements fix 1 unconditionally and says so in `rcv.go`'s
+# `handleTimeWaitSegment` ("we do not support TIME_WAIT assassination"); Linux
+# has it behind `net.ipv4.tcp_rfc1337`, off by default, on the reasoning that
+# the peer is not usually an adversary. Here it always is -- this stack
+# terminates traffic from a sandbox whose purpose is to escape -- so the
+# default is the wrong way round and the hardening is not optional.
+#
+# This is `time-wait-expiry`'s script with one line added at 1.000, and the two
+# probes at the end are borrowed from it deliberately: they are what make the
+# absence of an effect observable.
+#
+#   - 60.039 is INSIDE the block's lifetime, and a live block answers a bare
+#     acknowledgement with `.` (see `bare-ack-does-not-restart-time-wait` for
+#     why that probe does not restart the timer). An assassinated block would
+#     be gone, the four-tuple with it, and the same probe draws `R` from RFC
+#     9293 section 3.10.7.1's port-with-nothing-behind-it path instead. So this
+#     line fails loudly on the old behaviour rather than passing on silence --
+#     and it is the line that failed before the fix.
+#   - 60.041 is past 2*MSL, where the block really is gone and `R` is right.
+#     Without it the scenario would also pass on a stack that had stopped
+#     answering anything at all.
+0.000  < S     0:0(0) win 65535 <mss 1460>
+0.000  > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010  < .     1:1(0) ack 1001 win 65535
+0.020  < close
+0.020  > F.    1001:1001(0) ack 1 win 65535
+0.030  < .     1:1(0) ack 1002 win 65535
+0.040  < F.    1:1(0) ack 1002 win 65535
+0.040  > .     1002:1002(0) ack 2 win 65535
+# The assassination attempt: a reset at exactly RCV.NXT, which is the strongest
+# form there is and the one that WOULD tear the connection down in any other
+# synchronized state (RFC 5961 section 3.2, see `TCPStateMachine`). Nothing on
+# the wire in reply, and -- the part the next two probes establish -- nothing
+# changed inside either.
+1.000  < R     2:2(0) win 0
+60.039 < .     2:2(0) ack 1002 win 65535
+60.039 > .     1002:1002(0) ack 2 win 65535
+60.041 < .     2:2(0) ack 1002 win 65535
+60.041 > R     1002:1002(0) win 0

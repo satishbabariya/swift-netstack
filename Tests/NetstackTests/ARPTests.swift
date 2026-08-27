@@ -37,10 +37,12 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
         b.setInteger(UInt16(6), at: 0, endianness: .big)  // not ethernet
         return b
     }())
-    #expect(ARPPacket.parse(&wrongHardware) == nil)
+    let parsedWrongHardware = ARPPacket.parse(&wrongHardware)
+    #expect(parsedWrongHardware == nil)
 
     var truncated = PacketBuffer(received: ByteBuffer(bytes: [0x00, 0x01, 0x08, 0x00]))
-    #expect(ARPPacket.parse(&truncated) == nil)
+    let parsedTruncated = ARPPacket.parse(&truncated)
+    #expect(parsedTruncated == nil)
 }
 
 @Test func cacheExpiresEntries() {
@@ -175,6 +177,116 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     #expect(cache.orderCountForTesting <= 4 * capacity + 1)
 }
 
+@Test func compactionKeepsEvictionWorkingSoTheTableStaysAtCapacity() {
+    // The bound in `orderStaysBoundedWhenOneAddressPinsTheHead` above is an
+    // upper bound on `order`, and an upper bound on `order` is satisfied
+    // perfectly by a compaction that throws LIVE appearances away — the
+    // smaller the array, the happier the assertion. That is not hypothetical
+    // slack: `evictLeastRecentlyUsed` reads its victim from `order`, and
+    //
+    //     guard orderHead < order.count else { return }
+    //
+    // means a compaction that drops live appearances turns eviction into a
+    // silent no-op. `record`'s capacity check calls it and then inserts
+    // regardless, so `entries` would grow without bound — the exact
+    // unbounded-growth failure this cache exists to prevent, reached through
+    // the fix for the other one.
+    //
+    // Verified reachable and unguarded: replacing `compactOrderIfNeeded`'s
+    // `order = compacted` with `order = []` left all 329 tests in the suite
+    // passing. Instrumented, that branch runs 784 times across the suite, so
+    // it is live code being executed and simply not asserted on — the two
+    // tests that drive compaction hard use only two distinct addresses and
+    // so never evict, while `cacheEvictsOldestButKeepsARecentlyTouchedEntry`
+    // uses capacity 4 and never grows `order` past the compaction threshold.
+    // This test is the missing intersection: enough distinct addresses that
+    // eviction runs continuously, and enough touches that the full pass runs
+    // underneath it.
+    // Getting the two to coexist takes care, and a plain flood of distinct
+    // addresses does NOT do it — measured. Once the table is at capacity,
+    // every insertion evicts, so `orderHead` advances in step with `order`
+    // and the cheap prefix-drop above (`orderHead > 64 && orderHead * 2 >
+    // order.count`) fires first and RETURNS on every call; instrumented,
+    // that shape hit the prefix drop 75 times and the full pass zero times.
+    // The full pass needs `orderHead` to stay LOW while `order` grows past
+    // `4 * capacity`, which means a live appearance pinning the front. So:
+    // fill the table, leave one address untouched to pin the head, re-touch
+    // the rest until the full pass has run, and only then start inserting
+    // new addresses so eviction runs against a compacted `order`.
+    let clock = ManualClock()
+    let capacity = 64
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: capacity)
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, UInt8($0 >> 8), UInt8($0 & 0xff)) }
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, UInt8($0 >> 8), UInt8($0 & 0xff)])! }
+
+    // Fill to capacity. ip(0) is never touched again and pins `order[0]`.
+    for i in 0..<capacity {
+        cache.record(ip(i), mac(i))
+    }
+    #expect(cache.count == capacity)
+
+    // Grow `order` past `4 * capacity` so the full pass fires, by re-touching
+    // ONLY the newest entry. Re-touching an existing key never evicts, and
+    // hammering just ip(63) keeps the LRU order of everything else exactly as
+    // the fill left it: ip(0) oldest, then ip(1), ip(2), ... That makes the
+    // eviction sequence below predictable from first principles rather than
+    // read back from the implementation. 250 > 4 * 64 - 64, so `order`
+    // crosses the threshold; `orderHead` stays 0 throughout because ip(0)'s
+    // appearance at the front is live, so the prefix-drop cannot pre-empt the
+    // full pass.
+    for _ in 0..<250 {
+        cache.record(ip(capacity - 1), mac(capacity - 1))
+    }
+
+    // Now insert ten new addresses. Each must evict, using an `order` the
+    // full pass has just rebuilt, and LRU says the victims are ip(0) through
+    // ip(9) in that order.
+    for i in 0..<10 {
+        cache.record(ip(1_000 + i), mac(1_000 + i))
+    }
+
+    // The assertion that matters is WHICH entry was evicted, not how many.
+    // A count bound cannot see this failure: `evictLeastRecentlyUsed` removes
+    // exactly one entry per insertion whenever `order` has any live
+    // appearance left, and an emptied `order` refills from the very next
+    // touch, so the capacity bound self-heals within one call and reads
+    // green either way — measured, `cache.count` is 64 with the full pass
+    // correct and 64 with it replaced by `order = []`. What actually breaks
+    // is eviction ORDER: ip(0) is the oldest entry and was never re-touched,
+    // so it must be the first victim once insertions resume. With its
+    // appearance destroyed it becomes un-evictable instead — immortal, while
+    // strictly more recently used entries are evicted around it. Measured
+    // both ways: `lookup(ip(0))` is nil against the real compaction and
+    // non-nil against `order = []`.
+    // Assert the whole eviction SEQUENCE, not just its first victim. A
+    // single-victim check is blind to a full pass that keeps every live
+    // appearance but reverses their order (`Array(compacted.reversed())`),
+    // which inverts LRU into MRU: the cache then evicts the most recently
+    // used entry and keeps the stalest, so a guest's own gateway entry — the
+    // one address it talks to constantly — is thrown out under any sustained
+    // traffic while junk survives. Ten victims in a known order distinguishes
+    // that from correct behaviour; one victim does not.
+    //
+    // Probing has to happen AFTER all ten insertions, never between them:
+    // `lookup` is itself a touch that appends to `order`, so interleaving the
+    // checks would rewrite the very ordering under test. A miss is free — it
+    // returns on `entries[ip] == nil` before touching anything.
+    let evicted = (0..<10).map { cache.lookup(ip($0)) == nil }
+    #expect(evicted == Array(repeating: true, count: 10), "ip(0)...ip(9) are the ten least recently used and must be the ten evicted")
+    let survived = (10..<capacity).map { cache.lookup(ip($0)) != nil }
+    #expect(survived == Array(repeating: true, count: 54), "ip(10)...ip(63) are more recently used and must all survive")
+    // A LITERAL 64, not `capacity`: this is the number the cache must not
+    // exceed, and writing it as the same variable the cache was constructed
+    // from would move the goalposts with any future change to the input.
+    #expect(cache.count == 64)
+    // And `order` is still bounded, so the fix this test protects has not
+    // been traded away for the one above.
+    #expect(cache.orderCountForTesting <= 4 * capacity + 1)
+    // The floor: an upper bound on the table is satisfied by a cache that
+    // evicted everything, so pin that the most recent insertion survived.
+    #expect(cache.lookup(ip(1_009)) == mac(1_009))
+}
+
 @Test func cacheEvictsOldestButKeepsARecentlyTouchedEntry() {
     let clock = ManualClock()
     let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: 4)
@@ -251,7 +363,7 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     let cache = ARPCache(clock: ManualClock(), ttl: .seconds(60))
     let responder = ARPResponder(nic: nic, cache: cache, allocator: ByteBufferAllocator())
 
-    var packet = PacketBuffer(received: arpFrame(
+    let packet = PacketBuffer(received: arpFrame(
         operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
         targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.99"))
     let ethernet = EthernetHeader(destination: .broadcast, source: MACAddress("0a:0b:0c:0d:0e:0f")!, etherType: .arp)
@@ -273,4 +385,61 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
 
     #expect(cache.lookup(IPv4Address("192.168.127.2")!) == MACAddress("0a:0b:0c:0d:0e:0f"))
     #expect(link.drainTransmitted().isEmpty)  // a reply is not answered
+}
+
+@Test func touchingAnExistingEntryAppendsToTheOrderLogRatherThanRewritingIt() {
+    // `refreshingAnExistingEntryDoesNotScanTheWholeCache` counts scan steps
+    // inside `compactOrderIfNeeded`, which is the wrong place to look for a
+    // reintroduced linear scan: a `touch` that goes back to
+    // `order.firstIndex(of:)` + `order.remove(at:)` does its scanning in
+    // `nextTouchSequence`, where nothing counts it. Restoring exactly that
+    // pre-fix shape — same eviction semantics, O(order.count) per touch —
+    // leaves the whole suite green, which is what this test exists to stop.
+    //
+    // What separates the two implementations without any measurement at all
+    // is structural, and it is the very thing that makes the touch O(1):
+    // the fixed path only ever APPENDS. A superseded appearance is left
+    // where it lies and recognised later by comparing its sequence number
+    // against `Entry.sequence`; it is never searched for and never removed
+    // from the middle. So one refresh of an already-present address grows
+    // `order` by exactly one element. Remove-and-reappend grows it by zero —
+    // it removes one and appends one — and that is a one-element,
+    // deterministic difference, at any scale, with nothing timed.
+    //
+    // Kept far below both compaction thresholds (`orderHead > 64` for the
+    // prefix drop, `order.count > 4 * capacity` for the full pass) so
+    // nothing but the touch itself can move the count.
+    let clock = ManualClock()
+    let capacity = 64
+    let cache = ARPCache(clock: clock, ttl: .seconds(3600), capacity: capacity)
+    let ip: (Int) -> IPv4Address = { IPv4Address(10, 0, 0, UInt8($0)) }
+    let mac: (Int) -> MACAddress = { MACAddress(bytes: [0x02, 0, 0, 0, 0, UInt8($0)])! }
+
+    for i in 0..<8 {
+        cache.record(ip(i), mac(i))
+    }
+    // Positive control: eight distinct addresses really are recorded, and
+    // each contributed exactly one appearance, so the deltas below are
+    // measured against a log that is genuinely populated.
+    #expect(cache.count == 8)
+    #expect(cache.orderCountForTesting == 8)
+
+    // One refresh of an address already in the table. The entry count must
+    // not move — this is a refresh, not an insertion — while the touch log
+    // must grow by exactly one.
+    cache.record(ip(3), mac(3))
+    #expect(cache.count == 8)
+    #expect(cache.orderCountForTesting == 9)
+
+    // And it keeps holding as refreshes accumulate: ten more touches of
+    // addresses already present add ten more appearances and no entries.
+    for i in 0..<10 {
+        cache.record(ip(i % 8), mac(i % 8))
+    }
+    #expect(cache.count == 8)
+    #expect(cache.orderCountForTesting == 19)
+
+    // A successful `lookup` touches too, by the same append-only route.
+    #expect(cache.lookup(ip(3)) == mac(3))
+    #expect(cache.orderCountForTesting == 20)
 }

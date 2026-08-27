@@ -35,13 +35,15 @@ private func echoRequest(identifier: UInt16, sequence: UInt16, payload: [UInt8])
     var buffer = echoRequest(identifier: 1, sequence: 1, payload: [0xaa])
     buffer.setInteger(UInt16(0xffff), at: 2, endianness: .big)
     var packet = PacketBuffer(received: buffer)
-    #expect(ICMPv4Header.parse(&packet) == nil)
+    let parsed = ICMPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 // Same collision as above, this time against EthernetTests.swift's `rejectsARunt`.
 @Test func icmpRejectsARunt() {
     var packet = PacketBuffer(received: ByteBuffer(bytes: [0x08, 0x00]))
-    #expect(ICMPv4Header.parse(&packet) == nil)
+    let parsed = ICMPv4Header.parse(&packet)
+    #expect(parsed == nil)
 }
 
 @Test func echoReplyMirrorsIdentifierSequenceAndPayload() {

@@ -67,6 +67,25 @@ public final class Stack {
     public let ipv4: IPv4Protocol
     public let transportDemuxer = TransportDemuxer()
 
+    /// The stack's only source of time, held so the transports built on top of
+    /// it (`TCPEndpoint`'s `Sender` and `TCPTimers`) read the same clock the
+    /// `ARPCache` and the `Reassembler` do. Nothing in this package may call
+    /// `NIODeadline.now()`, so an endpoint that could not reach this would have
+    /// no lawful way to tell the time.
+    public let clock: NetstackClock
+
+    /// The per-stack RFC 6528 initial-send-sequence generator.
+    ///
+    /// Its secret is made **once, here**, and never leaves the process — that is
+    /// the whole of what makes an ISS unguessable from another connection's.
+    /// `TCPEndpoint.init(stack:)` takes this one; the internal
+    /// `init(stack:initialSequenceNumbers:)` is the seam a test (or a
+    /// differential vector written in absolute sequence numbers) overrides.
+    /// Internal rather than public: a caller outside the module has no business
+    /// replacing it, and making it public would put "use a constant ISS" in the
+    /// package's supported surface.
+    let initialSequenceNumbers: any InitialSequenceNumbers
+
     private let allocator: ByteBufferAllocator
     private var maintenanceTask: RepeatedTask?
 
@@ -79,6 +98,8 @@ public final class Stack {
         self.eventLoop = link.eventLoop
         self.configuration = configuration
         self.allocator = allocator
+        self.clock = clock
+        self.initialSequenceNumbers = RFC6528SequenceNumbers(clock: clock)
 
         let nic = NIC(id: 1, link: link)
         nic.addAddress(configuration.gatewayAddress, prefixLength: configuration.subnet.prefixLength)
@@ -165,18 +186,82 @@ public final class Stack {
             try? ipv4.send(payload: message, to: header.source, from: header.destination, protocolNumber: .icmp)
         }
 
+        // `[weak ipv4]` for the same reason as the UDP handler just above: this
+        // closure is stored in `ipv4.handlers`, so a strong capture makes
+        // `IPv4Protocol` retain itself. This is the THIRD handler closure
+        // `start()` installs and the third chance to close one of the retain
+        // cycles the two above already produced once each; see
+        // `aStartedStackWithTcpIsReleasedWhenDroppedWithoutShutdown`, which is
+        // the test that can actually see this capture on its own.
+        //
+        // `transportDemuxer` and `allocator` are captured by value into an
+        // ordinary (non-`@Sendable`) closure, exactly as the UDP handler
+        // captures them, so this adds no new "capture of non-Sendable type in a
+        // @Sendable closure" warning to the population `Stack.swift` already
+        // carries on its `scheduleRepeatedTask` closure.
+        ipv4.setHandler(for: .tcp) { [weak ipv4, transportDemuxer, allocator] header, payload in
+            guard let ipv4 else { return }
+            var packet = PacketBuffer(received: payload)
+            // Parsed here for two things: the checksum, so a corrupt segment
+            // never reaches an endpoint or provokes a reset, and the ports the
+            // demuxer keys on. The segment is then handed on WHOLE rather than
+            // as its payload — unlike UDP, where the endpoint needs nothing from
+            // the header — because a TCP endpoint needs the flags, the sequence
+            // and acknowledgement numbers, the window and the options, and
+            // `TransportEndpointDelegate.deliver` has nowhere to put a parsed
+            // header. The endpoint parses it a second time; that cost is the
+            // price of leaving the delegate protocol alone, and it is paid on a
+            // buffer already known to be well formed.
+            guard let tcp = TCPHeader.parse(&packet, header: header) else { return }
+            let delivered = transportDemuxer.deliver(
+                protocolNumber: .tcp, header: header, payload: payload,
+                localPort: tcp.destinationPort, remotePort: tcp.sourcePort)
+            guard !delivered else { return }
+
+            // Nothing is listening. RFC 9293 §3.10.7.1: answer with a reset, so
+            // a guest's connect() fails fast instead of retrying into a void —
+            // the TCP counterpart of the ICMP port-unreachable the UDP handler
+            // above sends. `closedSegmentArrives` is the one place that chooses
+            // between the RFC's two reset forms, and it is called rather than
+            // reimplemented here.
+            let segment = TCPSegment(header: tcp, payload: packet.payload)
+            for action in TCPStateMachine.closedSegmentArrives(segment: segment) {
+                guard case .sendRst(let sequence, let ack) = action else { continue }
+                TCPWire.sendReset(
+                    sequence: sequence, ack: ack,
+                    sourcePort: tcp.destinationPort, destinationPort: tcp.sourcePort,
+                    from: header.destination, to: header.source, via: ipv4, allocator: allocator)
+            }
+        }
+
         // A second start() would overwrite the reference to a task that keeps
         // rescheduling itself, leaving it unreachable and unstoppable. Cancel
         // first so it can never be orphaned.
         assert(maintenanceTask == nil, "Stack.start() called more than once")
         maintenanceTask?.cancel()
 
+        // `scheduleRepeatedTask` wants a `@Sendable` body, and neither
+        // `Reassembler` nor `ARPCache` is `Sendable` — deliberately, since both
+        // are loop-confined and marking them `Sendable` would claim a guarantee
+        // they do not offer to any other caller. Capturing them directly
+        // therefore warns, and under Swift 6 language mode it is an error.
+        //
+        // `MaintenanceBox` carries them behind an `@unchecked Sendable`
+        // conformance scoped to one `private` type, on the same reasoning as
+        // `ShutdownBox` above: NIO runs a repeated task's body on the event loop
+        // it was scheduled on and nowhere else, so the capture never crosses a
+        // thread boundary and the confinement every other access in this package
+        // relies on still holds. The box captures the two collaborators rather
+        // than `self` for the same reason the old capture list did — capturing
+        // `self` here would close `nic.handlers -> closure -> Stack` and leak the
+        // whole graph once per sandbox.
+        let box = MaintenanceBox(reassembler: reassembler, arpCache: arpCache)
         maintenanceTask = eventLoop.scheduleRepeatedTask(
             initialDelay: configuration.maintenanceInterval,
             delay: configuration.maintenanceInterval
-        ) { [reassembler, arpCache] _ in
-            reassembler.reapExpired()
-            arpCache.reapExpired()
+        ) { _ in
+            box.reassembler.reapExpired()
+            box.arpCache.reapExpired()
         }
     }
 
@@ -220,6 +305,20 @@ public final class Stack {
     }
 
     private func shutdownOnLoop() -> EventLoopFuture<Void> {
+        // Enforce, rather than merely document, what `shutdown()`'s comment
+        // above claims. Every line below touches loop-confined state that
+        // the ingress path reads concurrently, and this package has no locks
+        // — so if `shutdown()` ever stops marshaling, that must be a loud,
+        // immediate failure on the first off-loop call rather than a data
+        // race that shows up as corruption somewhere else much later. It is
+        // also what lets a test detect the marshal's removal at all:
+        // clearing the handler tables off-loop produces exactly the same
+        // observable result as clearing them on-loop, so nothing about
+        // `shutdown()`'s return value can tell the two apart. The same
+        // `preconditionInEventLoop()` guards `LinkEndpoint`'s own
+        // loop-confined entry points for the same reason.
+        eventLoop.preconditionInEventLoop()
+
         // Defense in depth alongside the `[weak ipv4]` captures in `start()`:
         // those already keep `start()` from leaving a retain cycle, but
         // clearing the tables here also releases what the handler closures
@@ -267,4 +366,14 @@ public final class Stack {
 /// loop-confined access in this package already relies on instead of a lock.
 private struct ShutdownBox: @unchecked Sendable {
     let stack: Stack
+}
+
+/// The maintenance timer's two collaborators, carried across
+/// `scheduleRepeatedTask`'s `@Sendable` requirement. Safe for exactly the reason
+/// `ShutdownBox` is: NIO runs the body on the scheduling event loop and nowhere
+/// else, so nothing here is ever touched off-loop. Scoped to this one `private`
+/// type so the claim cannot leak to any other use of either collaborator.
+private struct MaintenanceBox: @unchecked Sendable {
+    let reassembler: Reassembler
+    let arpCache: ARPCache
 }

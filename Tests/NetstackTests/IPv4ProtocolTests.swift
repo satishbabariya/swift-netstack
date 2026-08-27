@@ -149,7 +149,8 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
 
     var packet = PacketBuffer(received: f.link.drainTransmitted()[0])
     _ = EthernetHeader.parse(&packet)
-    #expect(IPv4Header.parse(&packet)?.source == IPv4Address("93.184.216.34"))
+    let ipHeader = IPv4Header.parse(&packet)
+    #expect(ipHeader?.source == IPv4Address("93.184.216.34"))
 }
 
 @Test func sendThrowsRatherThanSubstitutingARefusedSource() throws {
@@ -233,8 +234,10 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
     let frames = f.link.drainTransmitted()
     #expect(frames.count == 1)
     var packet = PacketBuffer(received: frames[0])
-    #expect(EthernetHeader.parse(&packet)?.etherType == .arp)
-    #expect(ARPPacket.parse(&packet)?.targetIP == IPv4Address("192.168.127.55"))
+    let ethernetHeader = EthernetHeader.parse(&packet)
+    #expect(ethernetHeader?.etherType == .arp)
+    let arp = ARPPacket.parse(&packet)
+    #expect(arp?.targetIP == IPv4Address("192.168.127.55"))
 }
 
 // `IPv4Header.init(source:destination:protocolNumber:payloadLength:)` computes

@@ -11,6 +11,9 @@ import NIOCore
 /// it.
 enum TCPOption: Equatable, Sendable {
     case maximumSegmentSize(UInt16)
+    /// Shift count. When this comes from `TCPOptionCodec.parse` it is at
+    /// most 14 — see `TCPOptionCodec.maximumWindowScale` for why a peer does
+    /// not get to choose a larger one.
     case windowScale(UInt8)
     case sackPermitted
     case timestamps(value: UInt32, echo: UInt32)
@@ -29,6 +32,28 @@ enum TCPOptionCodec {
     private static let windowScaleKind: UInt8 = 3
     private static let sackPermittedKind: UInt8 = 4
     private static let timestampsKind: UInt8 = 8
+
+    /// The largest window scale this stack will honour from a peer. RFC 7323
+    /// §2.3: "If a Window Scale option is received with a shift.cnt value
+    /// larger than 14, the TCP SHOULD log the error but MUST use 14 instead
+    /// of the specified value." So a larger shift is clamped, not rejected —
+    /// the option stays present and negotiated, only its shift is bounded.
+    /// (The RFC's SHOULD-log has no receiver here: the codec is a pure
+    /// decoder with no logger, so the clamp is silent.)
+    ///
+    /// 14 is not arbitrary, and the arithmetic is worth spelling out because
+    /// the next reader will ask why not 15. Serial-number comparison —
+    /// `SequenceNumber`, and the `isInRange` family built on it — is only
+    /// meaningful over less than half the sequence space. The sender's and
+    /// receiver's windows can be out of phase by as much as a full window,
+    /// so RFC 7323 §2.3 derives its bound from *twice* the maximum window
+    /// having to stay under 2^31, i.e. a maximum window below 2^30. A shift
+    /// of 14 gives 65535 << 14 = 1,073,725,440 bytes, just under
+    /// 2^30 = 1,073,741,824. A shift of 15 gives 2,147,450,880, which is
+    /// itself just under 2^31 — the reason 15 is excluded is not that one
+    /// window overruns the half-space but that two out-of-phase ones do,
+    /// which is exactly when a comparison stops meaning anything.
+    private static let maximumWindowScale: UInt8 = 14
 
     /// Decode the options area of a TCP header. `bytes` must hold exactly
     /// the options bytes (`dataOffset * 4 - TCPHeader.minimumLength` of
@@ -62,7 +87,10 @@ enum TCPOptionCodec {
                 options.append(.maximumSegmentSize(value))
             case windowScaleKind:
                 guard valueLength == 1, let shift = bytes.readInteger(as: UInt8.self) else { return nil }
-                options.append(.windowScale(shift))
+                // Bounded per `maximumWindowScale` above. The option's shape
+                // is validated first, so a malformed one is still rejected
+                // rather than clamped into looking well-formed.
+                options.append(.windowScale(min(shift, maximumWindowScale)))
             case sackPermittedKind:
                 guard valueLength == 0 else { return nil }
                 options.append(.sackPermitted)

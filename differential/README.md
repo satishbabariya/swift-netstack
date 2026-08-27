@@ -16,23 +16,41 @@ bolted on afterward.
   gVisor `stack.Stack`, wires up a link endpoint that speaks ethernet
   (`link.go`), and drives it from a scripted list of frames.
 
-The binary reads a JSON request on stdin:
+The binary reads a JSON request on stdin — one run, or a batch of
+independent runs each played against its own freshly built stack:
 
 ```json
-{"frames": ["<base64 ethernet frame>", ...], "advanceMs": [0, 100, ...]}
+{"frames": ["<base64 ethernet frame>", "", ...],
+ "advanceMs": [0, 100, ...],
+ "actions": ["", "write:1460", "close", ...]}
+
+{"runs": [ {"frames": [...], "advanceMs": [...], "actions": [...]}, ... ]}
 ```
 
-and writes a JSON response on stdout:
+and writes a JSON response on stdout, always in the batched shape, one entry
+per run and one list of frames **per step**:
 
 ```json
-{"emitted": ["<base64 ethernet frame>", ...]}
+{"runs": [ [ ["<base64 ethernet frame>", ...], [], ... ], ... ]}
 ```
 
-`frames[i]` is injected, then the harness's manual clock is advanced by
-`advanceMs[i]` milliseconds, and whatever the stack emitted in response
-(including anything a fired retransmission timer produced) is collected
-before moving to the next frame. `emitted` is every captured frame across
-the whole run, in emission order.
+At step `i` the harness injects `frames[i]` (empty string for "nothing
+arrives"), advances its manual clock by `advanceMs[i]` milliseconds, reads
+and discards whatever the connection has received, performs `actions[i]`
+(`write:<n>` or `close`, mirroring the Swift vector DSL's application
+lines), and collects everything the stack emitted along the way. Each of
+those is followed by a `Stack.Pause`/`Stack.Resume` pair, which blocks until
+gVisor's TCP processor goroutines have finished.
+
+Per step, not one flat list per run: a flat list cannot tell "retransmitted
+after one second" from "retransmitted after eight", because both stacks emit
+the same bytes in the same order either way. The step boundary is the only
+timing information a frame-level differential has.
+
+`close` is `Shutdown(Write)`, not `Endpoint.Close`. RFC 9293 §3.10.4's CLOSE
+— and this stack's `close()` — shuts the SEND direction and goes on
+accepting the peer's data; gVisor's socket close is `shutdown(RDWR)` plus
+release, and resets everything that arrives afterwards.
 
 The harness always plays the **gateway** side of the fixed address pair
 used throughout this project's vectors: `192.168.127.1` /
@@ -97,6 +115,11 @@ configured.
 
 ## CI must build this harness
 
+**Update (M4): a `harness` job now builds this directory on every run, but
+the SWIFT job does not, so the differential still silently does not run in
+CI. See "CI must build the harness for the SWIFT job" at the end of this
+file.**
+
 CI **must** build `differential/harness` as part of every run, not just
 when someone remembers to. The Swift-side differential tests locate the
 built binary and, if it is absent, skip silently rather than failing — a
@@ -115,3 +138,299 @@ codec (`VectorFrames.encode(.arpRequest, direction: .inbound)`), not by
 hand — produces a correct ARP reply from the gateway address back to the
 requester. See `.superpowers/sdd/2026-08-26-swift-netstack-p2-tcp/task-4-report.md`
 for the exact bytes and commands.
+
+## What the differential is, after M4
+
+Everything above describes the harness. This section describes the
+comparison it now drives, what that comparison found, and — the part the
+next person needs most — which differences are expected, so a new one can
+be told from an old one.
+
+The Swift side is `Tests/NetstackTests/TCPDifferentialTests.swift` (the
+seeded generator and the gate) and
+`Tests/NetstackTests/Support/Differential.swift` (the driver). The Go side
+is `harness/main.go`.
+
+```
+swift test --filter Differential                       # 300 sequences, ~2s
+NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
+NETSTACK_DIFFERENTIAL_SEED=1 NETSTACK_DIFFERENTIAL_SEQUENCES=3000 swift test --filter Differential
+```
+
+A divergence is reproducible from its seed alone: the generator is
+SplitMix64 over `base + index`, and the failure message prints the seed, the
+whole script in order, both stacks' frames step by step, and the diff.
+
+### The harness plays a listening endpoint, not a forwarder
+
+`tcp.Forwarder`'s handler could only complete the handshake and immediately
+close, so gVisor sent a FIN one round trip after every SYN and reset
+everything that arrived afterwards — no data transfer, no retransmission and
+no teardown was comparable at all. And the forwarder dispatches on a bare
+goroutine, so every frame paid a 200 ms wall-clock wait standing in for
+scheduling latency.
+
+`main.go` now binds a real listening endpoint and settles each step with
+`Stack.Pause` / `Stack.Resume`, which block until every TCP processor
+goroutine has drained its endpoint queue (`dispatcher.go`'s
+`processor.start`). That is a **positive completion signal, not a timeout**:
+there is no sleep anywhere in the binary, and ten thousand sequences take
+about fifteen seconds.
+
+That also removes a hazard the earlier design carried. gVisor processes
+segments for an ESTABLISHED endpoint on processor goroutines, so the old
+unconditional 200 ms wait was load-bearing for far more than the handshake;
+gating it on the frame being a SYN — the obvious optimisation — would have
+made the Go collector intermittently blind to every ACK a data segment
+provoked.
+
+### What is compared, exactly
+
+Per **step**, not as one flat list of frames. A flat list cannot tell
+"retransmitted after one second" from "retransmitted after eight": both
+stacks emit the same bytes in the same order either way. Frames are compared
+by decoded content and by the step they were drained after.
+
+Spec §8.2 permits three divergences. Two of them are handled by
+normalisation rather than by masking:
+
+- **Initial sequence numbers are normalised, not discarded.** Each side's
+  gateway ISS is learned from the first SYN it emits and every sequence
+  number is expressed relative to it. An earlier version of the driver
+  masked `seqStart`/`seqEnd` to constants, which also masked "retransmitted
+  at the wrong sequence number".
+- **Acknowledgement numbers are compared exactly.** They live in the
+  *guest's* sequence space, which the generated script fixes identically for
+  both stacks, so there is nothing about them a stack may choose. The
+  earlier driver masked them to zero, which made `ack 1` and `ack 4381`
+  compare equal and the entire receive-side comparison vacuous.
+- **Timestamp option values are masked; the option's presence is not.**
+- **ACK coalescing is not masked.** Nothing the generator produces creates a
+  frame-count difference from coalescing alone. If a run ever does, it will
+  be reported as a divergence — the safe direction — and whoever meets it
+  can implement the masking against a real example rather than a hypothesis.
+
+Because the two stacks choose different ISNs, the guest cannot acknowledge
+one script against both. Both sides therefore **shift** every inbound
+acknowledgement number by their own ISS, which preserves deliberate errors
+exactly: a step that acknowledges five bytes too many still does, against
+whichever ISS the stack under test chose.
+
+### The one difference that is recognised, and why it is asserted
+
+**The SYN-ACK's advertised window: gVisor 29184, this stack 65535.**
+
+It is reported, labelled `syn-ack-initial-window`, matched against an exact
+signature (both windows, the flags, and equality of every other field), and
+the gate **asserts that exactly one appears per sequence**. It is not
+permitted, it is pinned: a SYN-ACK whose windows are 29184/65500, or whose
+option list differs as well, is not recognised and fails.
+
+Neither value is wrong — RFC 9293 mandates no initial window — and neither
+side can move:
+
+- gVisor caps the window it offers in a SYN-ACK at
+  `InitialCwnd * advertisedMSS * 2` = 10 × 1460 × 2 = 29200, rounded down to
+  a multiple of its handshake window scale, giving 29184
+  (`endpoint.go`'s `initialReceiveWindow`). At a 1500-byte MTU it *cannot*
+  offer 65535 under any configuration. Capping its receive buffer at 65535
+  yields 29200, not more.
+- Lowering this stack to 29184 was measured and is **worse**: gVisor
+  advertises 65535 on every frame after the handshake, so the divergence
+  would move from one frame per connection to all of them.
+
+### What gVisor is configured to, and why
+
+The harness pins gVisor's tuning to this stack's own documented constants,
+so the comparison is about algorithms rather than about two choices of
+number. Each constant is already pinned on its own side by unit tests and by
+the vector files.
+
+| option | gVisor default | set to | this stack's constant |
+|---|---|---|---|
+| `TCPMinRTOOption` | 200 ms (Linux) | 1 s | `RTTEstimator.minimumTimeout` (RFC 6298 §2.4) |
+| `TCPMaxRTOOption` | 120 s | 60 s | `RTTEstimator.maximumTimeout` |
+| `TCPMaxRetriesOption` | 15 | 8 | `TCPEndpoint.maximumFinTransmissions` |
+| `TCPModerateReceiveBufferOption` | on | off | no counterpart; auto-tuning is a gVisor heuristic with no RFC behind it |
+
+The harness also **reads and discards** everything an accepted endpoint
+receives, at every step. This stack has no receive socket buffer at all —
+`TCPEndpoint` hands in-order bytes straight to `onData` and frees the space
+in the same pass — so an unread gVisor buffer would make its window fall
+while ours stayed put, on every data segment, for a design reason rather
+than a defect. And it **closes** an endpoint that reaches a terminal state,
+because gVisor keeps a dead endpoint registered until the application closes
+it while this stack deletes the block at once; without that, a segment
+arriving after a reset reaches gVisor's corpse and is dropped, where here it
+falls through to the listener and is answered.
+
+### The ARP boundary: both caches are kept warm, deliberately
+
+`ARPCache` entries live 60 seconds and an RTO backoff ladder crosses that
+inside a single sequence, at which point this stack correctly emits an ARP
+request and no TCP segment at all — right in production, and
+indistinguishable from a TCP divergence in a diff.
+
+Of the two options, this run takes **keep both caches warm** rather than
+"treat an ARP exchange as a recognised difference": a recognised difference
+on every long sequence is noise, and noise is how a real divergence gets
+waved through. The Go side installs a **static** neighbour entry for the
+guest (a learned one would expire after `BaseReachableTime` scaled by a
+*random* factor, which under a manual clock is a random point at which
+gVisor stops answering with TCP); the Swift side re-asserts the guest in
+`Stack.arpCache` before every step. Neither stack emits ARP during a
+generated sequence, so an ARP frame in a diff is a real divergence.
+
+## What this run found
+
+Three defects, each frozen as a vector before the code was changed, each
+with the seed it was found from. All three were found in the first three
+hundred sequences.
+
+**1. No PSH, ever** (seed 6840123409045651459). RFC 1122 §4.2.2.2 clause (2),
+carried forward by RFC 9293 §3.9.1, makes PSH on the last buffered segment a
+**MUST** for a sender whose send call has no push argument — and
+`TCPEndpoint.send` has none. gVisor is right and this stack was wrong. Worse,
+`tcp-data.vec`'s header had recorded the omission as a design decision
+("legal; PSH is advisory"), and six expected lines in three scenarios had
+been written to agree with it. Fixed; three new scenarios pin the rule
+(MSS split defers the push, window split does not, a retransmission
+reproduces it).
+
+**2. RFC 5681 §3.2's duplicate-ACK test read off the wrong variable** (seed
+6840123409045651459). Condition (e) compares the window *in the incoming
+acknowledgement* against the one in the last incoming acknowledgement;
+`Sender` compared `tcb.sndWnd` before and after, which is what RFC 9293
+§3.10.7.4's update rule made of it. The rule refuses a window whose segment
+does not advance SND.WL1, so **one out-of-order segment freezes SND.WND** and
+every later window update then reads as "unchanged". Three bare
+acknowledgements with three different windows made this stack halve its
+congestion window and retransmit a segment nothing had been lost of — work
+the guest can provoke at will. Fixed; SEG.WND is now a required argument.
+
+**3. TIME-WAIT assassination** (seed 6840123409045651495). A reset arriving
+in TIME-WAIT deleted the block and freed the four-tuple. That is RFC 9293
+§3.10.7.4 as written, and it is the attack RFC 1337 §3 documents: the block
+is exactly the state that stops a delayed duplicate being delivered into the
+next connection on the same four-tuple. gVisor implements RFC 1337's fix 1
+unconditionally and says so; Linux hides it behind `net.ipv4.tcp_rfc1337`,
+off by default, on the reasoning that the peer is not usually an adversary.
+Here it always is. Fixed.
+
+Note the shape of all three: **two are places this stack was more lenient
+than gVisor and one is a place a normative MUST was simply not implemented.**
+None was found by the vectors, which were written by the same author as the
+code they check.
+
+## Differences that are NOT defects, and which stack is right
+
+These were investigated, ruled on, and then engineered out of the run — by
+constraining the generator, not by permitting a divergence. Each is listed
+so the next person can tell a new divergence from a known one, and so that
+anyone who widens the generator knows what will come back.
+
+| difference | which stack is right | how the run avoids it |
+|---|---|---|
+| **SND.WND update rule.** gVisor assigns `s.SndWnd = rcvdSeg.window` unconditionally; RFC 9293 §3.10.7.4 updates only when SND.WL1 < SEG.SEQ, or SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK. | **This stack.** The rule is normative and explicit. | Every guest segment carries the current window; it changes only on an update sent from the highest sequence number the guest has reached, where the rule's precondition holds on both sides. |
+| **In-window reset off RCV.NXT.** gVisor's `handleReset` accepts any reset the receive window accepts; RFC 5961 §3.2 requires a challenge ACK unless SEG.SEQ = RCV.NXT. | **This stack.** RFC 5961 exists for the blind-reset attack, and the guest here is the attacker by assumption. | Generated resets sit at exactly RCV.NXT. `tcp-handshake.vec`'s `different-iss` and `TCPStateMachineTests` pin the hardening. |
+| **Unacceptable segment.** This stack acknowledges it (RFC 9293 §3.10.7.4 step 1); gVisor drops it in silence. | **This stack**, though note it has no RFC 5961 challenge-ACK rate limit — see "known gaps". | The generator never places a zero-length segment behind RCV.NXT. |
+| **Congestion window units.** RFC 5681 §3.1 counts cwnd in bytes and this stack does; gVisor and Linux count whole segments, so `(cwnd - outstanding) * MSS` refuses what a byte count would allow. | **Both.** Conformant either way. | One application write per sequence, no larger than one initial congestion window and no larger than the offered window, so the whole write is on the wire in one pass and a second one never has to fit into what is left. |
+| **FIN behind unacknowledged data.** This stack forms the FIN and sends it as soon as preceding sends are segmentized (RFC 9293 §3.10.4); gVisor queues it behind the unacknowledged data and lets its congestion window decide, so after an RTO it holds the FIN indefinitely. | **This stack**, on the RFC's text. | `close` only once everything written has been acknowledged. |
+| **Handshake RTT sample.** gVisor takes one from the SYN-ACK/ACK round trip; `Sender` models no SYN, so this stack takes none and starts its estimator from the first data sample. RFC 6298 requires *a* sample, not which one. | **Both**, but gVisor's is what every deployed stack does, and this stack's first data RTO is up to 3× longer as a result (a 716 ms sample put its first FIN retransmission at +2.148 s against gVisor's +1.000 s). Worth revisiting in M5. | Every acknowledgement of our data arrives in the next step with **no time advance**, so every sample is zero and both estimators stay pinned to RFC 6298 §2.4's one-second floor. |
+| **NewReno `recover`.** gVisor declines fast recovery unless the cumulative acknowledgement is strictly past `FastRecovery.Last`, comparing it against `SEG.ACK - 1`; initialised to the ISS, that suppresses the *first* loss episode of a connection entirely. RFC 6582 §3.2 step 1 asks for "covers more than `recover`", which ISS+1 does. | **Probably this stack**, but it is an M5 question about NewReno and not one this run can settle. | The duplicate-acknowledgement case acknowledges one segment first, which puts the episode past the off-by-one. |
+
+## What the generator deliberately does not vary
+
+Every one of these is a scoped restriction with a reason, not an oversight.
+
+- **The SYN offers `mss` and nothing else.** gVisor mirrors its peer's
+  options — it offers `wscale` and `sackOK` exactly when the SYN did, and no
+  configuration makes it omit an option the peer offered (capping its
+  receive buffer yields `wscale 00`, not no option). This stack negotiates
+  neither, so a SYN offering them would put an option-list difference on the
+  SYN-ACK of every sequence. The case where a guest *does* offer both is
+  pinned by `tcp-handshake.vec`'s `passive-open`. **This constraint
+  disappears when window scaling lands in M5.**
+- **Every data-bearing segment is at least 628 bytes** — gVisor's
+  `tcp.SegOverheadSize` for the pinned version. A smaller in-order delivery
+  does not move gVisor's advertised right edge (`rcv.go`'s `toGrow` gate),
+  so its window falls while this stack's — which has nothing to hold — stays
+  at its ceiling. The first thing after every handshake is a full-MSS
+  in-order segment for the same reason.
+- **Out-of-order segments land less than 20000 bytes ahead of RCV.NXT.**
+  gVisor's real right edge after the first delivery sits far beyond the
+  16-bit window it advertises, so it accepts out-of-order data this stack
+  correctly refuses as outside the window it promised. The trim itself is
+  pinned by `tcp-data.vec`'s `right-edge-trim`.
+- **The offered window never goes below 4096.** A closed window puts a
+  sender into RFC 9293 §3.8.6.1's persist state; gVisor has a zero-window
+  probe timer and this stack has none — see "known gaps".
+- **No data after the peer's FIN, and the peer's FIN only with nothing
+  queued ahead of it.** Both are cases where the two stacks' handling is
+  pinned by vectors (`data-past-the-fin`, `fin-ahead-of-rcv-nxt`) and where
+  the generator's own model of RCV.NXT would otherwise drift.
+- **One application write per sequence**, bounded by the offered window and
+  by one initial congestion window. See the congestion-window row above.
+
+## What this run does NOT cover
+
+- **The RTT estimator's Jacobson arithmetic.** Every sample the generator
+  produces is zero, so both stacks sit on the one-second floor and what is
+  compared is the floor and the backoff ladder, thoroughly, and the update
+  rule not at all. `tcp-data.vec`'s `rtt-sample-drives-the-rto` is the only
+  wire-level cover it has. **Do not report the estimator as differentially
+  verified.**
+- **Window scaling, SACK and timestamps.** Not implemented here; the
+  generator does not offer them.
+- **Payload bytes.** `VectorFrames` encodes and decodes segment *lengths*,
+  not contents, so a stack that retransmitted the right length from the
+  wrong offset would be caught by the sequence number and not by the data.
+  `TCPSenderTests` and `TCPReassemblerTests` cover content.
+- **Two connections at once**, and therefore the backlog, the TIME-WAIT cap
+  and the four-tuple demultiplexing. One connection per sequence.
+- **The full FIN retransmission budget.** The ladder reaches five rungs
+  inside a sequence's virtual time; the eighth-transmission give-up is
+  pinned by unit tests.
+- **The duplicate-acknowledgement window condition (e) itself.** Closing the
+  SND.WND-update difference above also removed the traffic that exposed
+  defect 2: the differential no longer reaches it. It is pinned by
+  `tcp-data.vec`'s `window-updates-are-not-duplicate-acknowledgements` and
+  its positive control, which is where that regression protection now lives.
+
+## Known gaps in this stack, visible from here
+
+Not comparison nuisances — real limitations, recorded because the
+differential is where they became visible.
+
+- **There is no receive-side backpressure at all.** `onData` is called
+  synchronously and the space is freed in the same pass, so the advertised
+  window is honest about what this stack holds — it simply never holds
+  anything. **An application that ignores `onData` is acknowledged and its
+  data dropped.** That is an interface consequence (the specified surface
+  has no `read()`), and it is the reason the harness has to drain gVisor's
+  buffer to make the window field comparable at all. M5.
+- **There is no zero-window probe.** `Sender` has no persist timer, so a
+  window update lost on the way here wedges the connection until the peer
+  sends something else. Pinned by `tcp-data.vec`'s `zero-window`; the
+  generator stays out of persist state. M5.
+- **After a timeout, only the earliest unacknowledged segment is
+  retransmitted, once per timeout.** RFC 6298 §5.4 asks for no more, but
+  gVisor and Linux go on retransmitting the following segments as
+  acknowledgements arrive; recovering an *n*-segment loss burst here costs
+  *n* timeouts on a backing-off ladder. M5.
+- **No RFC 5961 challenge-ACK rate limit.** This stack acknowledges every
+  unacceptable segment, which is RFC 9293 §3.10.7.4 step 1 and is also an
+  amplification the guest controls.
+
+## CI must build the harness for the SWIFT job
+
+The `harness` job builds `differential/harness` on Linux, which catches a
+harness that no longer compiles. It does **not** make the differential run:
+the Swift job is a separate macOS runner with no Go step, so
+`differentialHarnessPathIfBuilt()` returns nil there and every differential
+test returns immediately, in about a millisecond, reporting green.
+
+There is still no green checkmark that distinguishes "the differential ran
+and passed" from "the differential did not run". Building the harness in the
+Swift job would fix that, and the 300-sequence default takes about two
+seconds.

@@ -34,6 +34,20 @@ jobs:
       - name: Build the library with warnings as errors
         run: swift build -Xswiftc -warnings-as-errors
 
+      # The differential tests now FAIL rather than skip when this binary is
+      # missing, because a silent skip made them indistinguishable from a pass:
+      # on a fresh checkout the M4 gate test used to succeed in a millisecond
+      # having compared nothing. Building it here is what makes the differential
+      # actually run in CI rather than merely exist.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: differential/harness/go.mod
+          cache-dependency-path: differential/harness/go.sum
+
+      - name: Build the differential harness
+        run: go build -o harness .
+        working-directory: differential/harness
+
       - name: Test
         run: swift test
 

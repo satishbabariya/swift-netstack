@@ -36,7 +36,7 @@ private func harness() -> (Stack, RecordingEndpoint, ManualClock, EmbeddedEventL
     // Neither stack is under development here — Plan 1 verified the Swift side
     // independently, and gVisor is upstream. If they disagree, the harness is
     // wrong, and that must surface before any TCP depends on it.
-    guard let harness = differentialHarnessPathIfBuilt() else {
+    guard let harness = requireDifferentialHarness() else {
         // Skip rather than fail when the Go binary is absent: contributors
         // without a Go toolchain must still be able to run `swift test`.
         return
@@ -75,7 +75,7 @@ private func harness() -> (Stack, RecordingEndpoint, ManualClock, EmbeddedEventL
 }
 
 @Test func theDifferentialDetectsADeliberateDivergence() throws {
-    guard let harnessPath = differentialHarnessPathIfBuilt() else { return }
+    guard let harnessPath = requireDifferentialHarness() else { return }
     let codec = VectorFrames(
         gateway: IPv4Address("192.168.127.1")!, gatewayMAC: MACAddress("5a:94:ef:e4:0c:ee")!,
         guest: IPv4Address("192.168.127.2")!, guestMAC: MACAddress("0a:0b:0c:0d:0e:0f")!)

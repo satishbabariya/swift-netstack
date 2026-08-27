@@ -840,7 +840,7 @@ private let differentialBaseSeed: UInt64 = {
 // MARK: - The differential itself
 
 @Test func generatedTCPSequencesAgreeWithGVisor() throws {
-    guard let harnessPath = differentialHarnessPathIfBuilt() else { return }
+    guard let harnessPath = requireDifferentialHarness() else { return }
 
     let generator = DiffGenerator(codec: diffCodec())
     let total = differentialSequenceCount()

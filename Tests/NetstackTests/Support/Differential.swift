@@ -1,3 +1,4 @@
+import Testing
 import Foundation
 import NIOCore
 import NIOEmbedded
@@ -19,7 +20,8 @@ import NIOEmbedded
 /// `cd differential/harness && GOFLAGS= go build -o harness .`, must still
 /// be able to run `swift test`. The harness is a development instrument,
 /// not a build dependency — every test that depends on it starts with
-/// `guard let harness = differentialHarnessPathIfBuilt() else { return }`.
+/// Prefer `requireDifferentialHarness()` in a test: a silent skip here is
+/// indistinguishable from a pass.
 func differentialHarnessPathIfBuilt() -> String? {
     let thisFile = URL(fileURLWithPath: #filePath)
     let packageRoot =
@@ -30,6 +32,38 @@ func differentialHarnessPathIfBuilt() -> String? {
         .deletingLastPathComponent()  // Tests/ -> package root
     let harnessPath = packageRoot.appendingPathComponent("differential/harness/harness").path
     return FileManager.default.isExecutableFile(atPath: harnessPath) ? harnessPath : nil
+}
+
+/// The harness path, or a recorded failure if it is not built.
+///
+/// **The silent-skip shape this replaces was a real hole in the M4 gate.**
+/// `generatedTCPSequencesAgreeWithGVisor` guarded on
+/// `differentialHarnessPathIfBuilt()` and plain `return`ed when the binary was
+/// absent — so on any fresh checkout, which is every CI run and every clone,
+/// the gate test passed in about a millisecond having compared nothing at all.
+/// A run of ten thousand sequences and a run of none are reported identically.
+/// That is the same defect this project has found repeatedly in its own tests,
+/// sitting in the one test that certifies a milestone.
+///
+/// So: absent harness is a failure, not a skip. `differential/harness` builds
+/// with `go build -o harness .` and takes a few seconds.
+///
+/// Set `NETSTACK_DIFFERENTIAL_OPTIONAL=1` to opt out — for a machine with no Go
+/// toolchain, where the rest of the suite is still worth running. That is a
+/// deliberate act by someone who knows what they are giving up, which is the
+/// difference between an opt-out and an accident.
+func requireDifferentialHarness(_ sourceLocation: SourceLocation = #_sourceLocation) -> String? {
+    if let path = differentialHarnessPathIfBuilt() { return path }
+    if ProcessInfo.processInfo.environment["NETSTACK_DIFFERENTIAL_OPTIONAL"] == "1" { return nil }
+    Issue.record(
+        """
+        the differential harness is not built, so this test compared nothing.
+
+        Build it:    cd differential/harness && go build -o harness .
+        Or opt out:  NETSTACK_DIFFERENTIAL_OPTIONAL=1 swift test
+        """,
+        sourceLocation: sourceLocation)
+    return nil
 }
 
 /// Everything that can go wrong running the harness subprocess itself, as

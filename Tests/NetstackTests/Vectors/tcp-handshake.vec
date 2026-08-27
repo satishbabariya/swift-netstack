@@ -1,0 +1,178 @@
+# TCP handshake vectors: what this stack must put on the wire while a
+# connection is being opened, and what it must put there when one is refused.
+#
+# These lines are the SPECIFICATION. Where the implementation disagrees with a
+# line here, the implementation is what changes. A line is only edited if it
+# can be shown to be wrong, and then the reason is written down next to it.
+#
+# ## Scenarios
+#
+# Every TCP line in this format carries the SAME four-tuple: `VectorFrames`
+# pins the ports at 50000 -> 8080 and the addresses at 192.168.127.2 ->
+# 192.168.127.1, because a packetdrill-style script describes one connection
+# already in progress and the port pair is never the thing under test. So a
+# single script cannot hold both "a listener answers" and "nothing is
+# listening": those are statements about the same tuple. The file is therefore
+# divided into scenarios by a `# scenario: <name>` marker, each replayed
+# against its own freshly built stack. `TCPHandshakeVectorTests` cross-checks
+# the set of markers here against the set of tests that run them, so a
+# scenario added below and forgotten there fails rather than sits unexecuted.
+#
+# ## Sequence numbers are ABSOLUTE, not packetdrill's relative form
+#
+# `VectorRunner` compares decoded wire numbers, so every number here is the
+# number on the wire. Our ISS is 1000 and the guest's is 0 unless a line says
+# otherwise. The plan drafted these vectors with our ISS at 0 as well; it is
+# 1000 here so that OUR sequence space and the GUEST's cannot be confused for
+# one another. With both at 0 the SYN-ACK's `ack 1` is simultaneously IRS+1 and
+# ISS+1, and a stack that acknowledged the wrong one of those would match the
+# vector exactly. That is the only reason the numbers differ from the plan's.
+#
+# ## `win` is stated on every expected line, including the resets
+#
+# `VectorFrames.decode` always reports the window field, so an expected line
+# that omits `win` is not "don't care" -- it is a claim that the field is
+# absent, which no TCP segment can satisfy. A reset carries `win 0`, and
+# saying so is what makes that a fact this file pins rather than one it leaves
+# to whatever the code happens to do.
+
+
+# scenario: passive-open
+#
+# The guest connects; the gateway accepts. The guest offers a window scale and
+# SACK; we advertise NEITHER back.
+#
+# `<mss 1460>` alone, and this is a ruling rather than an omission. Advertising
+# `wscale 7` beside `win 65535` promises the peer 8 MB against a reassembler
+# that caps at 256 KiB: it fills the pipe it was promised, we drop most of it,
+# and the connection presents as a lossy path with no error raised anywhere.
+# RFC 7323 section 2.2 makes leaving the option out the clean fix -- a scale
+# applies only if BOTH sides send it, so omitting it disables scaling in both
+# directions. `sackOK` is the same mistake one size smaller: RFC 2018 expects a
+# receiver that sent it to send SACK blocks back, and this stack discards them.
+# The guest may offer both, as the first line does; we simply do not accept.
+0.000 < S  0:0(0) win 65535 <mss 1460,wscale 7,sackOK>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+# The handshake's third leg. It acknowledges our SYN and occupies no sequence
+# space, so it draws nothing back: two peers that acknowledged each other's
+# acknowledgements would never stop. The runner reports any frame this file
+# does not account for, so "nothing" here is checked, not assumed.
+0.010 < .  1:1(0) ack 1001 win 512
+
+
+# scenario: closed-port
+#
+# A SYN for a port nothing is listening on is REFUSED, not ignored. A guest
+# that hangs until its own connect() timeout is a far worse failure than one
+# told immediately that the door is shut.
+#
+# The refusal is `R.` -- a reset with the ACK bit SET. RFC 9293 section
+# 3.10.7.1 requires <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> for an incoming
+# segment that carries no ACK of its own, and SEG.LEN counts the SYN, so a bare
+# SYN at sequence 0 is acknowledged with 1. A bare RST -- or one acknowledging
+# 0 -- is discarded by the peer as unverifiable, which the guest cannot tell
+# apart from the port never answering at all. This is the branch of that rule
+# taken when the arriving segment has NO ACK; `stray-ack` below takes the other.
+0.100 < S  0:0(0) win 65535
+0.100 > R. 0:0(0) ack 1 win 0
+
+
+# scenario: stray-ack
+#
+# An ACK for a connection that is in no state at all -- no SYN preceded it.
+# There IS a listener on this port, so this is the endpoint's own refusal path
+# rather than the one `closed-port` exercises in the stack's TCP handler.
+#
+# The OTHER branch of RFC 9293 section 3.10.7.1: the arriving segment carries
+# an ACK, so the reset reuses it -- <SEQ=SEG.ACK><CTL=RST>, with NO ACK bit of
+# its own and nothing to acknowledge. Both branches live in this file on
+# purpose: written down separately, a later edit cannot quietly collapse them
+# into one form without a vector failing.
+0.000 < .  9000:9000(0) ack 700 win 65535
+0.000 > R  700:700(0) win 0
+
+
+# scenario: syn-retransmission
+#
+# A retransmitted SYN for an existing half-open connection re-sends the SYN-ACK
+# rather than opening a second connection -- and with the SAME ISS. A peer that
+# has already recorded the first sequence number either fails to connect or
+# resets when a second, different one arrives.
+#
+# The vector is only worth writing if it can FAIL. A harness that injects a
+# constant ISS cannot make it fail: a stack that regenerated the number on
+# every SYN would draw the same constant and match these lines exactly. So the
+# generator behind these numbers answers a DIFFERENT value on every call --
+# 1000, then 1000000 higher, and so on. `1000` appearing twice below is
+# therefore a statement that the number was REUSED from the block the first SYN
+# created, not merely that some constant came back.
+0.000 < S  0:0(0) win 65535
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+# Two hundred milliseconds later, and nothing in between: a stack that
+# retransmits its own SYN-ACK on a timer would be caught by the runner as an
+# unaccounted frame.
+0.200 < S  0:0(0) win 65535
+0.200 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+
+
+# scenario: ecn-setup-syn
+#
+# A SYN with the ECN negotiation bits set (CWR and ECE, `W` and `E` here)
+# behaves EXACTLY as a plain SYN. Linux sends this shape by default in several
+# configurations, so it is not an exotic case.
+#
+# `TCPHeader.parse` carries all eight raw bits of the flags byte through,
+# including the two `TCPFlags` deliberately does not name. Any dispatch that
+# compared flags for EQUALITY -- `flags == [.syn]` -- would fail to see a SYN
+# here and drop the connection attempt on the floor. Every dispatch in the
+# state machine uses `.contains` for this reason, and this vector is what says
+# so from the outside.
+#
+# We answer with a plain SYN-ACK: no ECE, because this stack has no ECN
+# behaviour to give those bits and RFC 3168 section 6.1.1 has a non-ECN server
+# answer an ECN-setup SYN exactly this way.
+0.000 < SEW 0:0(0) win 65535 <mss 1460,sackOK>
+0.000 > S.  1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .   1:1(0) ack 1001 win 512
+
+
+# scenario: syn-with-payload
+#
+# A SYN carrying data. Legal, rare, and the sequence accounting is easy to get
+# wrong in a way nothing else notices.
+#
+# We acknowledge the SYN ALONE -- `ack 1`, not `ack 5`. The four bytes are
+# dropped rather than queued, and acknowledging bytes that were dropped would
+# black-hole them: the guest would consider them delivered and never send them
+# again. Acknowledging only what was actually taken leaves the peer to
+# retransmit, which is what the last two lines show it doing.
+0.000 < S  0:4(4) win 65535
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .  1:1(0) ack 1001 win 65535
+# The same four bytes again, now inside the established connection. They begin
+# at sequence 1 because the SYN consumed sequence 0. THIS is where they are
+# acknowledged, and the ack proves the earlier copy never advanced RCV.NXT: had
+# the SYN's payload been taken, RCV.NXT would already be 5 and this segment
+# would be a duplicate.
+0.020 < P. 1:5(4) ack 1001 win 65535
+0.020 > .  1001:1001(0) ack 5 win 65535
+
+
+# scenario: different-iss
+#
+# A second SYN on the same four-tuple carrying a DIFFERENT initial sequence
+# number is a fresh connection attempt, not a retransmission of the first, and
+# it must not be adopted into the half-open connection already there.
+#
+# 9000 sits well inside the receive window, so this segment is ACCEPTABLE by
+# RFC 9293 section 3.10.7.4's test -- it is not rejected by being out of range,
+# which is what makes it the dangerous shape. RFC 5961 section 4 answers it
+# with a challenge ACK: <SEQ=SND.NXT><ACK=RCV.NXT>. Both numbers below are
+# assertions that nothing moved. `ack 1` is still IRS+1 from the FIRST SYN, not
+# 9001; `1001` is still ISS+1 from the block that already exists, not a
+# newly generated ISS. Resetting the connection here instead would let any
+# off-path attacker who can guess a four-tuple kill it with one forged SYN.
+0.000 < S  0:0(0) win 65535
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.200 < S  9000:9000(0) win 65535
+0.200 > .  1001:1001(0) ack 1 win 65535

@@ -66,9 +66,17 @@ private func codec() -> VectorFrames {
     //
     // Literal values from RFC 9293 §3.1 (the control-bit field, low bit
     // first): FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10, URG 0x20.
+    // ECE 0x40 and CWR 0x80 are RFC 3168 §6.1.1's two ECN negotiation bits,
+    // spelled `E` and `W` after packetdrill. They are checked here for the
+    // same reason as the other six and one more: `tcp-handshake.vec`'s
+    // `ecn-setup-syn` scenario claims an ECN-setup SYN is treated as an
+    // ordinary SYN, and if `W` encoded to, say, URG's bit that vector would
+    // be quietly testing something else entirely and still passing.
     // `TCPHeaderTests.crossChecksAgainstTheVectorCodec` pins "S" against
     // `TCPHeader.parse`, an independent implementation, but only "S".
-    let expected: [(Character, UInt8)] = [("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08), (".", 0x10), ("U", 0x20)]
+    let expected: [(Character, UInt8)] = [
+        ("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08), (".", 0x10), ("U", 0x20), ("E", 0x40), ("W", 0x80),
+    ]
     for (character, bit) in expected {
         let line = TCPLine(flags: String(character), seqStart: 0, seqEnd: 0, payloadLength: 0, ack: nil, window: 65535, options: [])
         let bytes = Array(try codec().encode(.tcp(line), direction: .inbound).readableBytesView)
@@ -76,12 +84,12 @@ private func codec() -> VectorFrames {
         #expect(bytes[34 + 13] == bit, "flag '\(character)' must encode to 0x\(String(bit, radix: 16))")
     }
 
-    // All six at once, so a table that happens to be a permutation of the
+    // All eight at once, so a table that happens to be a permutation of the
     // right bits (each flag alone landing on some other flag's bit) cannot
     // pass the per-character loop by accident.
-    let all = TCPLine(flags: "FSRP.U", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 65535, options: [])
+    let all = TCPLine(flags: "FSRP.UEW", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 65535, options: [])
     let allBytes = Array(try codec().encode(.tcp(all), direction: .inbound).readableBytesView)
-    #expect(allBytes[34 + 13] == 0x3f)  // 0x01|0x02|0x04|0x08|0x10|0x20
+    #expect(allBytes[34 + 13] == 0xff)  // 0x01|0x02|0x04|0x08|0x10|0x20|0x40|0x80
 }
 
 @Test func theWholeTCPFrameLayoutIsPinnedToRFC9293ByteOffsets() throws {
@@ -188,7 +196,7 @@ private func codec() -> VectorFrames {
 }
 
 @Test func encodingATCPLineWithAnUnrecognizedFlagCharacterThrows() {
-    // Only "S.FRPU" are recognised wire flag bits (see `tcpFlagBits`); a
+    // Only "S.FRPUEW" are recognised wire flag bits (see `tcpFlagBits`); a
     // `TCPLine` built directly (bypassing `VectorScript`'s own, separate
     // flag-character check) must still be rejected by the codec itself.
     let line = TCPLine(flags: "X", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: nil, window: nil, options: [])

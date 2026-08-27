@@ -168,10 +168,16 @@ struct VectorFrames {
 
     // MARK: - TCP (hand-rolled; see the type doc comment for why)
 
-    /// FIN/SYN/RST/PSH/ACK/URG, in wire-bit order. `.` stands for ACK, to
-    /// match `TCPLine.flags`'s packetdrill-shaped notation ("S." is SYN+ACK).
+    /// FIN/SYN/RST/PSH/ACK/URG/ECE/CWR, in wire-bit order. `.` stands for ACK,
+    /// to match `TCPLine.flags`'s packetdrill-shaped notation ("S." is
+    /// SYN+ACK); `E` and `W` are packetdrill's letters for the two ECN
+    /// negotiation bits (RFC 3168 §6.1.1), which `TCPFlags` deliberately does
+    /// not name but `TCPHeader.parse` carries through regardless. They are
+    /// here so a vector can state that an ECN-setup SYN is treated as an
+    /// ordinary SYN — a claim no dispatch on flag equality would satisfy, and
+    /// one that cannot be written at all without a way to set the bits.
     private static let tcpFlagBits: [(Character, UInt8)] = [
-        ("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08), (".", 0x10), ("U", 0x20),
+        ("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08), (".", 0x10), ("U", 0x20), ("E", 0x40), ("W", 0x80),
     ]
 
     /// The sum over the IPv4 pseudo-header: source, destination, a zero

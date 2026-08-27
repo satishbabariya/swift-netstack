@@ -160,11 +160,17 @@ struct VectorScript {
         var fields = fields
         guard fields.count >= 2 else { throw VectorScriptError.malformedLine(line) }
         let flags = fields.removeFirst()
-        // Known flag characters only: S SYN, . ACK, F FIN, R RST, P PSH, U URG. This is also what
-        // stops an unrecognised first token (e.g. a typo'd protocol keyword) from falling through
-        // `parsePacket`'s default case and being accepted as a "valid" TCP packet with a garbage
-        // flags string.
-        guard !flags.isEmpty, flags.allSatisfy({ "S.FRPU".contains($0) }) else {
+        // Known flag characters only: S SYN, . ACK, F FIN, R RST, P PSH, U URG, E ECE, W CWR.
+        // This is also what stops an unrecognised first token (e.g. a typo'd protocol keyword)
+        // from falling through `parsePacket`'s default case and being accepted as a "valid" TCP
+        // packet with a garbage flags string.
+        //
+        // E and W are the two bits `TCPFlags` deliberately does not name, and they are spellable
+        // here for one reason: an ECN-setup SYN (SYN with CWR and ECE also set, which Linux sends
+        // by default in several configurations) is an ordinary SYN that any dispatch on flag
+        // EQUALITY would drop, and a vector that cannot write one cannot say so. The letters are
+        // packetdrill's.
+        guard !flags.isEmpty, flags.allSatisfy({ "S.FRPUEW".contains($0) }) else {
             throw VectorScriptError.unknownPacketForm(line)
         }
 

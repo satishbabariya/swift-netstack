@@ -873,3 +873,169 @@ private func receiveDrivingASender(segment: TCPSegment, on tcb: inout TCB, recei
         on: &beyondIt)
     #expect(beyondIt.sndWindScale == 14, "15 must have arrived clamped; the clamp is TCPOptionCodec's")
 }
+
+// MARK: - RFC 7323 Window Scale: applying Snd.Wind.Shift to SND.WND
+
+// RFC 7323 §2.3: "The window field (SEG.WND) in the header of every incoming
+// segment, with the exception of <SYN> segments, MUST be left-shifted by
+// Snd.Wind.Shift bits before updating SND.WND: SND.WND = SEG.WND <<
+// Snd.Wind.Shift."
+//
+// `TCPStateMachine` decodes the peer's window at FOUR sites and the exception
+// splits them two and two. The two reached only by a non-SYN segment (the ACK
+// that completes a passive handshake, and every later window update) shift; the
+// two that read the window out of a SYN or a SYN-ACK never do, because §2.2
+// forbids the peer from having scaled it: "The window field in a segment where
+// the SYN bit is set (i.e., a <SYN> or <SYN,ACK>) MUST NOT be scaled."
+//
+// Every connection this stack opens today negotiates a shift of zero, because
+// `TCPEndpoint.windowScaleToOffer` is nil and §2.2 scales nothing unless both
+// sides sent the option, so `<< 0` is the identity and none of this moves the
+// wire yet. These tests therefore negotiate a real shift through the fixture's
+// `windowScaleToOffer`, as the negotiation tests above do, rather than asserting
+// against the zero every live connection carries -- which would be satisfied by
+// a stack that shifts nothing and equally by one that shifts everything.
+
+/// Drives a passive open to ESTABLISHED with a genuinely negotiated shift, and
+/// returns the TCB with SND.WND set from the window in the ACK that completed
+/// the handshake -- the SYN-RECEIVED decode site.
+///
+/// `peerShift` is the peer's, and it is the one that reaches SND.WND;
+/// `windowScaleToOffer: 5` is ours and must not, which is what makes a stack
+/// that shifted by `rcvWindScale` visible here. Both are supplied through the
+/// constructor rather than written to `TCB` directly: the shifts are
+/// `private(set)` and negotiating them is the only way a connection ever
+/// acquires one.
+private func passiveOpenCompleted(peerShift: UInt8, ourShift: UInt8 = 5, windowInTheFinalAck: UInt16) -> TCB {
+    var tcb = listenTCB(iss: 1000, windowScaleToOffer: ourShift)
+    _ = stateMachineReceive(
+        segment: segment(
+            sequence: 5000, flags: [.syn], window: 4096, options: windowScaleOptionFromTheWire(shift: peerShift)),
+        on: &tcb)
+    _ = stateMachineReceive(
+        segment: segment(sequence: 5001, ack: 1001, flags: [.ack], window: windowInTheFinalAck), on: &tcb)
+    return tcb
+}
+
+@Test func theWindowThatCompletesAPassiveHandshakeIsLeftShiftedByTheNegotiatedScale() {
+    // RFC 9293 §3.10.7.4's SYN-RECEIVED arm sets SND.WND <- SEG.WND, and RFC
+    // 7323 §2.3 is what SEG.WND means once a shift has been negotiated. Nothing
+    // carrying a SYN can reach this line -- step 3 above it challenges and
+    // returns for any segment with the SYN bit -- so §2.3's <SYN> exception does
+    // not cover it.
+    let tcb = passiveOpenCompleted(peerShift: 7, windowInTheFinalAck: 65535)
+    #expect(tcb.state == .established)
+    #expect(tcb.sndWindScale == 7)
+    #expect(tcb.sndWnd == 8_388_480, "65535 << 7")
+
+    // And the shift applied is the PEER's, not ours. Asserted here rather than
+    // left to the two numbers being different: 65535 << 5 is 2,097,120, so a
+    // stack that reached for `rcvWindScale` would be caught by the line above
+    // too, but only by accident of the fixture.
+    #expect(tcb.rcvWindScale == 5)
+}
+
+@Test func aWindowUpdateOnAnEstablishedConnectionIsLeftShiftedByTheNegotiatedScale() {
+    // The decode that carries every window update for the life of the
+    // connection. `Sender.segmentsToTransmit` commits to `min(cwnd, sndWnd)` in
+    // bytes, so an unshifted update under-uses the path by up to 2^14.
+    var tcb = passiveOpenCompleted(peerShift: 7, windowInTheFinalAck: 65535)
+    #expect(tcb.sndWnd == 8_388_480)
+
+    // A second, later window from the same peer: RFC 9293's SND.WL1/SND.WL2
+    // test admits it (same SEG.SEQ, SEG.ACK at SND.WL2), and it must arrive
+    // shifted too -- a stack that shifted only the handshake's window would
+    // pass the test above and freeze at 8,388,480 here.
+    _ = stateMachineReceive(segment: segment(sequence: 5001, ack: 1001, flags: [.ack], window: 32768), on: &tcb)
+    #expect(tcb.sndWnd == 4_194_304, "32768 << 7")
+}
+
+@Test func aNegotiatedScaleOfFourteenLeftShiftsThePeersWindowToJustUnderTwoToTheThirty() {
+    // The top of the range `TCPOptionCodec.maximumWindowScale` allows, and the
+    // reason this arithmetic is safe. **This test depends on that clamp** and
+    // does no bound of its own: 14 is what keeps the largest SND.WND this line
+    // can produce at 65535 << 14 = 1,073,725,440, just under 2^30. RFC 7323
+    // §2.3 derives that bound from serial-number comparison -- "two times the
+    // maximum window size must be less than 2^31, or max window < 2^30" -- and
+    // `SequenceNumber` and every `isInRange` built on it are what would stop
+    // meaning anything if the clamp moved. Nothing here can overflow an `Int`;
+    // that is a consequence of the clamp, not an independent fact.
+    let tcb = passiveOpenCompleted(peerShift: 14, windowInTheFinalAck: 65535)
+    #expect(tcb.sndWindScale == 14)
+    #expect(tcb.sndWnd == 1_073_725_440, "65535 << 14, the largest SND.WND the clamp permits")
+    #expect(tcb.sndWnd < 1 << 30)
+}
+
+@Test func aNegotiatedScaleOfZeroLeavesThePeersWindowExactlyAsItArrived() {
+    // The positive control, and the test that gives the three above their
+    // meaning: a stack that shifts nothing satisfies nothing above it, but a
+    // stack that shifts *everything* -- by a constant, by `rcvWindScale`, by
+    // anything not the negotiated `sndWindScale` -- satisfies them all and
+    // fails here.
+    //
+    // Shift 0 on both sides is a real offer, not the absence of one: RFC 7323
+    // §2.2 calls shift.cnt = 0 "offering to scale, while applying a scale factor
+    // of 1 to the receive window". So the option is on the wire and the
+    // negotiation ran; what it negotiated is the identity.
+    var tcb = passiveOpenCompleted(peerShift: 0, ourShift: 0, windowInTheFinalAck: 65535)
+    #expect(tcb.sndWindScale == 0)
+    #expect(tcb.sndWnd == 65535)
+
+    _ = stateMachineReceive(segment: segment(sequence: 5001, ack: 1001, flags: [.ack], window: 4096), on: &tcb)
+    #expect(tcb.sndWnd == 4096)
+}
+
+@Test func theWindowInASynAckIsNotScaledEvenThoughThatSynAckNegotiatedAScale() {
+    // RFC 7323 §2.2: "The window field in a segment where the SYN bit is set
+    // (i.e., a <SYN> or <SYN,ACK>) MUST NOT be scaled." The peer chose this
+    // window before it knew whether scaling had been agreed at all, so shifting
+    // it would multiply the peer's OPENING window by up to 2^14 -- SND.WND of a
+    // gigabyte where the peer offered 64 KiB -- and this stack would transmit
+    // into a buffer that size on the first write after every active open.
+    //
+    // The scale is negotiated by this very segment, so the shift is available at
+    // the line that must not use it. That is what makes this a defect a reader
+    // can walk into and why it needs a test rather than a comment.
+    var tcb = synSentTCB(iss: 2000, windowScaleToOffer: 5)
+    let actions = stateMachineReceive(
+        segment: segment(
+            sequence: 9000, ack: 2001, flags: [.syn, .ack], window: 65535,
+            options: windowScaleOptionFromTheWire(shift: 7)),
+        on: &tcb)
+    #expect(tcb.state == .established)
+    #expect(containsSendAck(actions))
+    #expect(tcb.sndWindScale == 7, "the scale IS negotiated here -- it is simply not applied to this window")
+    #expect(tcb.sndWnd == 65535, "not 8,388,480")
+}
+
+@Test func theWindowInASimultaneousOpensSynIsNotScaledEitherRfc7323() {
+    // The second SYN-bearing decode: out of SYN-SENT by the other route, where
+    // the peer's bare SYN arrives before it has acknowledged ours. Same rule,
+    // and §2.2 names this case first -- "a <SYN> or <SYN,ACK>".
+    var tcb = synSentTCB(iss: 2000, windowScaleToOffer: 5)
+    let actions = stateMachineReceive(
+        segment: segment(sequence: 9000, flags: [.syn], window: 65535, options: windowScaleOptionFromTheWire(shift: 7)),
+        on: &tcb)
+    #expect(tcb.state == .synReceived)
+    #expect(containsSendSynAck(actions))
+    #expect(tcb.sndWindScale == 7)
+    #expect(tcb.sndWnd == 65535, "not 8,388,480")
+}
+
+@Test func theFirstWindowUpdateAfterAnActiveOpenIsShiftedThoughTheSynAckWasNot() {
+    // The two halves against each other, in the order a real active open runs
+    // them: the SYN-ACK's 65535 is 65535, and the very next segment's 65535 is
+    // 8,388,480. A stack that shifted uniformly and one that shifted nowhere
+    // each fail exactly one of these two assertions.
+    var tcb = synSentTCB(iss: 2000, windowScaleToOffer: 5)
+    _ = stateMachineReceive(
+        segment: segment(
+            sequence: 9000, ack: 2001, flags: [.syn, .ack], window: 65535,
+            options: windowScaleOptionFromTheWire(shift: 7)),
+        on: &tcb)
+    #expect(tcb.sndWnd == 65535)
+
+    _ = stateMachineReceive(segment: segment(sequence: 9001, ack: 2001, flags: [.ack], window: 65535), on: &tcb)
+    #expect(tcb.state == .established)
+    #expect(tcb.sndWnd == 8_388_480, "65535 << 7, the same 65535 that was left alone in the SYN-ACK")
+}

@@ -134,10 +134,8 @@ struct Receiver {
     /// the shift — the peer chose that window before it knew scaling had been
     /// agreed, so shifting it would inflate the peer's opening window by up to
     /// 2^14. (An earlier revision of this paragraph said all of them needed the
-    /// shift. They do not.) The two that do matter as much as this one:
-    /// `CongestionControl` already commits the send decision to
-    /// `min(cwnd, sndWnd)` in bytes, so leaving them unscaled would under-use
-    /// the path by up to 2^14 while this side looked perfectly correct.
+    /// shift. They do not.) That direction is **done**: the two shifts are
+    /// applied there, and only this side of the seam is still outstanding.
     ///
     /// On this side, the value advertised becomes the real window
     /// shifted right by the negotiated scale, and the shift is **lossy** — the

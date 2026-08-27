@@ -332,15 +332,18 @@ struct TCPStateMachine {
                 // below (both SYN-bearing, both stay unscaled forever), and the
                 // SYN-RECEIVED and ESTABLISHED window updates in
                 // `generalSegmentArrives` (both reached only by a non-SYN
-                // segment, both of which take `<< tcb.sndWindScale`). A previous
+                // segment, and both now take `<< tcb.sndWindScale`). A previous
                 // revision of these comments said "each of the three needs
                 // `<< Snd.Wind.Scale`", which is wrong twice over: there are four,
                 // and two of them must not be shifted.
                 //
-                // `tcb.sndWindScale` is recorded as of this task (see
-                // `TCB.negotiateWindowScale(fromSynOptions:)`) and is zero on
-                // every connection until this stack advertises the option, which
-                // is deliberately the last of the four window-scaling steps.
+                // The absence of a shift on this line is therefore a decision,
+                // not an omission left for a later task — the shift is recorded
+                // (`TCB.negotiateWindowScale(fromSynOptions:)`), is available on
+                // this line, and is applied at both of the other two sites in
+                // `generalSegmentArrives`. Both SYN-bearing sites
+                // have a test of their own saying so; see
+                // `theWindowInASynAckIsNotScaledEvenThoughThatSynAckNegotiatedAScale`.
                 tcb.sndWnd = Int(header.window)
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
@@ -353,7 +356,8 @@ struct TCPStateMachine {
             tcb.state = .synReceived
             // Snd.Wind.Scale: the second of the two SYN-bearing peer-window
             // decodes -- this is the peer's own SYN -- so it stays unscaled for
-            // the same reason as the one above. See there.
+            // the same reason as the one above. See there, and
+            // `theWindowInASimultaneousOpensSynIsNotScaledEitherRfc7323`.
             tcb.sndWnd = Int(header.window)
             tcb.sndWl1 = header.sequence
             tcb.sndWl2 = header.acknowledgement
@@ -584,12 +588,15 @@ struct TCPStateMachine {
                 // could see it until an endpoint drove the two together; see
                 // `dataWrittenByTheApplicationIsSegmentedAndSent`.
                 // Snd.Wind.Scale: one of the two peer-window decodes that DOES
-                // take `<< tcb.sndWindScale` once a scale is applied. Step 3
-                // above has already returned for anything carrying a SYN, so
-                // whatever reaches here is a non-SYN segment and RFC 7323 §2.3's
-                // exception does not cover it. See the synSent site above for
-                // the full list of four.
-                tcb.sndWnd = Int(header.window)
+                // take `<< tcb.sndWindScale`. Step 3 above has already returned
+                // for anything carrying a SYN, so whatever reaches here is a
+                // non-SYN segment and RFC 7323 §2.3's `<SYN>` exception does not
+                // cover it: "The window field (SEG.WND) in the header of every
+                // incoming segment, with the exception of <SYN> segments, MUST
+                // be left-shifted by Snd.Wind.Shift bits before updating
+                // SND.WND". See the synSent site above for the full list of four
+                // and for why the other two must never take the shift.
+                tcb.sndWnd = Int(header.window) << tcb.sndWindScale
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
             } else if header.acknowledgement.lessThan(tcb.sndUna) {
@@ -642,7 +649,29 @@ struct TCPStateMachine {
                 // `CongestionControl` commits the send decision to
                 // `min(cwnd, sndWnd)` in bytes, so leaving this unscaled once a
                 // scale is negotiated under-uses the path by up to 2^14.
-                tcb.sndWnd = Int(header.window)
+                //
+                // ## Both shifts here rely on `TCPOptionCodec`'s clamp
+                //
+                // Neither this site nor the SYN-RECEIVED one bounds
+                // `tcb.sndWindScale`, because `TCPOptionCodec.parse` has already
+                // clamped a peer's shift.cnt to RFC 7323 §2.3's maximum of 14
+                // (see `TCPOptionCodec.maximumWindowScale`, and
+                // `TCB.negotiateWindowScale(fromSynOptions:)`, which records it
+                // and re-checks nothing either). The largest SND.WND these two
+                // lines can produce is therefore 65535 << 14 = 1,073,725,440,
+                // just under 2^30, and nothing here can overflow an `Int`.
+                //
+                // That ceiling is not a comfort margin: it is what keeps the
+                // serial arithmetic meaningful. RFC 7323 §2.3: "two times the
+                // maximum window size must be less than 2^31, or max window <
+                // 2^30", because a sender and receiver can be out of phase by a
+                // full window and `SequenceNumber`'s comparisons — and every
+                // `isInRange` built on them — are only defined over less than
+                // half the sequence space. A shift of 15 would still fit an
+                // `Int`; what it would break is every window test in this file.
+                // Anything that moves or relaxes the clamp is changing what
+                // these two lines can be made to compute.
+                tcb.sndWnd = Int(header.window) << tcb.sndWindScale
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
             }

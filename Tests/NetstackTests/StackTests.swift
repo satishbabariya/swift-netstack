@@ -97,8 +97,7 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         let header = IPv4Header(
             source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
             protocolNumber: .icmp, payloadLength: echo.readableBytes)
-        var mutableHeader = header
-        mutableHeader.prepend(to: &ipPacket)
+        header.prepend(to: &ipPacket)
 
         var frame = ByteBuffer()
         frame.writeBytes(MACAddress("5a:94:ef:e4:0c:ee")!.bytes)

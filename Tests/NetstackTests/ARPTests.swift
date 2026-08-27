@@ -363,7 +363,7 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     let cache = ARPCache(clock: ManualClock(), ttl: .seconds(60))
     let responder = ARPResponder(nic: nic, cache: cache, allocator: ByteBufferAllocator())
 
-    var packet = PacketBuffer(received: arpFrame(
+    let packet = PacketBuffer(received: arpFrame(
         operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
         targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.99"))
     let ethernet = EthernetHeader(destination: .broadcast, source: MACAddress("0a:0b:0c:0d:0e:0f")!, etherType: .arp)

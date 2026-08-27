@@ -459,3 +459,60 @@
 0.050 < .     1:1(0) ack 1001 win 65535
 0.060 < .     1:1(0) ack 1001 win 65535
 0.060 > P.    1001:1101(100) ack 1 win 65535
+
+
+# scenario: a-timeout-keeps-retransmitting
+#
+# FOUND BY THE DIFFERENTIAL against gVisor. After a retransmission timeout this
+# stack sent the earliest unacknowledged segment and then NOTHING more until the
+# next expiry. RFC 6298 section 5.4 asks for no more than that, so the stack was
+# conformant and unusable at once: 5.4 does not say to STOP there, and gVisor and
+# Linux go on retransmitting the following segments as acknowledgements arrive.
+# On the 1, 2, 4, 8, 16 s ladder this five-segment burst cost 31 seconds here
+# against roughly one anywhere else.
+#
+# Five 1460-byte segments go out and every one of them is lost -- the guest
+# acknowledges none of them, which is why nothing follows the write until the
+# timer expires at +1.000s.
+#
+# What each line after the expiry is: the expiry itself sends 1001:2461 and
+# presumes the other four lost, so cwnd (RFC 5681 section 3.1: one segment, 1460)
+# is exactly full and nothing else may go. Every acknowledgement after that
+# retires a segment, grows cwnd by one segment in slow start, and the room that
+# opens is spent on the segments still missing, IN SEQUENCE, before any new data:
+#
+#   1.030  cwnd 2920  ->  two segments, 2461:3921 and 3921:5381
+#   1.040  cwnd 4380  ->  two segments, 5381:6841 and 6841:8301
+#
+# So the whole burst is back on the wire 20ms after the first acknowledgement,
+# on ONE expiry. The old behaviour needed four more -- at 3.020, 7.020, 15.020
+# and 31.020 -- and this file ending where it does is what says none of them
+# happened: the runner reports any frame the script does not account for.
+#
+# The lines are also the vacuity check the unit tests state directly. A sender
+# that answered the timeout by putting all five segments back at 1.020, ignoring
+# the congestion window, would recover in one round trip and fail this scenario
+# on its very first line after the expiry.
+#
+# PSH sits on 6841:8301 and nowhere else, by `push-on-the-last-segment-of-a-
+# write` above: the write is exactly five segments, so only the fifth empties it.
+# The retransmissions reproduce the segments they lost, PSH included.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 7300
+0.020 > .     1001:2461(1460) ack 1 win 65535
+0.020 > .     2461:3921(1460) ack 1 win 65535
+0.020 > .     3921:5381(1460) ack 1 win 65535
+0.020 > .     5381:6841(1460) ack 1 win 65535
+0.020 > P.    6841:8301(1460) ack 1 win 65535
+1.020 > .     1001:2461(1460) ack 1 win 65535
+1.030 < .     1:1(0) ack 2461 win 65535
+1.030 > .     2461:3921(1460) ack 1 win 65535
+1.030 > .     3921:5381(1460) ack 1 win 65535
+1.040 < .     1:1(0) ack 3921 win 65535
+1.040 > .     5381:6841(1460) ack 1 win 65535
+1.040 > P.    6841:8301(1460) ack 1 win 65535
+1.050 < .     1:1(0) ack 5381 win 65535
+1.060 < .     1:1(0) ack 6841 win 65535
+1.070 < .     1:1(0) ack 8301 win 65535

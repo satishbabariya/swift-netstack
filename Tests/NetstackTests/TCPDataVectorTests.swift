@@ -231,6 +231,7 @@ private let closeVectors = "tcp-close"
         "a-retransmission-keeps-the-push-bit",
         "window-updates-are-not-duplicate-acknowledgements",
         "three-identical-duplicate-acknowledgements-still-fast-retransmit",
+        "a-timeout-keeps-retransmitting",
     ]
     #expect(try transferScenarioNames(dataVectors) == run)
 }
@@ -373,6 +374,25 @@ private let closeVectors = "tcp-close"
 @Test func threeDuplicateAcknowledgementsWithAnUnchangedWindowStillFastRetransmit() throws {
     let harness = try runTransferScenario(dataVectors, "three-identical-duplicate-acknowledgements-still-fast-retransmit")
     #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aTimeoutRecoversTheWholeBurstOnOneExpiryWithoutInflatingTheWindow() throws {
+    let harness = try runTransferScenario(dataVectors, "a-timeout-keeps-retransmitting")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+    // The window the connection LEAVES the episode holding, which no `>` line
+    // can say and which is the half of this change most easily got wrong. The
+    // timeout collapsed cwnd to one segment and set ssthresh to
+    // max(7300 / 2, 2 * 1460) = 3650; the five acknowledgements then grew it
+    // and nothing else did. 1460 -> 2920 -> 4380 in slow start, then RFC 5681
+    // 3.1's congestion-avoidance form SMSS * SMSS / cwnd three times:
+    // 2131600 / 4380 = 486, 2131600 / 4866 = 438, 2131600 / 5304 = 401.
+    //
+    // Every byte of that was paid for by an acknowledgement. A stack that
+    // called `timeout(flightSize:)` again per retransmission would be at 1460
+    // here, and one that grew cwnd per retransmitted segment would be far above
+    // 5705 -- and both would satisfy every line of the vector, because the
+    // window is not on the wire.
+    #expect(harness.endpoint.congestionWindowForTesting == 5705)
 }
 
 // MARK: - tcp-close.vec

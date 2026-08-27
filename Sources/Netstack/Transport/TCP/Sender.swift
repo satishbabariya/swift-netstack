@@ -138,6 +138,19 @@ struct Sender {
         /// may have more bytes queued behind it -- which would re-derive a
         /// different answer for a segment that is already on the peer's wire.
         var pushes: Bool
+        /// Presumed lost by the retransmission timer, and not yet retransmitted
+        /// since it fired. Set on every outstanding record when the timer
+        /// expires and cleared, one record at a time, as each goes out again.
+        ///
+        /// This is what makes "at most once per episode" a property of the
+        /// record rather than of a counter: a second acknowledgement cannot
+        /// resend a segment the first one already resent, because the first one
+        /// cleared this. Only another timeout sets it again.
+        ///
+        /// Deliberately NOT `transmissions > 1`. That is Karn's flag, it is
+        /// never cleared, and keying eligibility on it would make a segment
+        /// retransmitted in an earlier episode ineligible in this one.
+        var presumedLost: Bool
     }
 
     /// The congestion-control algorithm, readable so a caller (and the tests)
@@ -159,6 +172,35 @@ struct Sender {
     /// contiguous, covering exactly `[SND.UNA, SND.NXT)`.
     private var inFlight: [InFlight] = []
     private var outstanding = 0
+
+    /// Bytes of `inFlight` that the retransmission timer has presumed lost and
+    /// that have not been retransmitted since it fired.
+    ///
+    /// This is the ENTIRE state of a timeout episode: an episode is running
+    /// exactly while this is non-zero. There is no separate flag and no
+    /// recovery point, on purpose -- either would have to be kept in step with
+    /// the queue by hand, and this cannot drift because it is maintained at the
+    /// same two places the queue is, and only there: a segment goes out again
+    /// (`retransmit`), or it is acknowledged (`retire`).
+    ///
+    /// Subtracting it from `flightSize` gives `pipeSize`, and that subtraction
+    /// is the whole answer to "one retransmission per timeout". A timeout means
+    /// nothing is known about the pipe, so the sender stops counting the
+    /// un-retransmitted remainder as being IN the pipe. Without it, `flightSize`
+    /// straight after a timeout is the full outstanding window while `cwnd` is
+    /// one segment, so the send decision has room for nothing at all and the
+    /// only thing that can ever move again is the next timer expiry -- which is
+    /// exactly the shape the differential recorded against gVisor.
+    ///
+    /// This is Linux's `tcp_packets_in_flight` (`packets_out - lost_out +
+    /// retrans_out`) and RFC 6675 §4's `pipe`, in bytes rather than packets.
+    ///
+    /// It is NOT a NewReno `recover` (RFC 6582): there is no highest-sequence
+    /// watermark here, so a segment that is presumed lost, retransmitted, and
+    /// then lost AGAIN waits for the next timeout rather than being re-marked by
+    /// a partial acknowledgement. That is the conservative direction, and it is
+    /// what RFC 6298 §5.4 on its own guarantees.
+    private var lostBytes = 0
 
     private var estimator: RTTEstimator
     private var timerDeadline: NIODeadline?
@@ -201,6 +243,21 @@ struct Sender {
     /// Bytes transmitted and not yet acknowledged: RFC 5681's FlightSize, and
     /// what every loss signal has to be measured against.
     var flightSize: Int { outstanding }
+
+    /// What the sender believes is actually **in the network**: `flightSize`
+    /// less the bytes a timeout has presumed lost. Equal to `flightSize`
+    /// whenever no timeout episode is running, which is almost always.
+    ///
+    /// This, not `flightSize`, is what `min(cwnd, SND.WND)` bounds. The two
+    /// differ only between a timer expiry and the moment the last segment it
+    /// presumed lost has gone out again, and in that interval counting the
+    /// presumed-lost bytes as in flight would leave a window of one segment
+    /// with no room in it for the very retransmissions it exists to carry.
+    var pipeSize: Int { outstanding - lostBytes }
+
+    /// Bytes presumed lost by the retransmission timer and still awaiting their
+    /// retransmission. Non-zero exactly while a timeout episode is running.
+    var presumedLostBytes: Int { lostBytes }
 
     /// Transmitted, unacknowledged **segments**. Distinct from `flightSize`,
     /// which counts their bytes.
@@ -280,14 +337,18 @@ struct Sender {
 
     // MARK: - Transmitting
 
-    /// The segments to put on the wire now: a pending fast retransmission if
-    /// there is one, then as much new data as `min(cwnd, SND.WND)` allows.
+    /// The segments to put on the wire now, in the order they must go out: a
+    /// pending fast retransmission, then whatever a running timeout episode
+    /// still owes, then as much new data as `min(cwnd, SND.WND)` allows.
+    ///
+    /// The middle stage is what makes a timeout cost one recovery instead of
+    /// one segment per expiry. It is emitted from here rather than from
+    /// `acknowledged` for the same reason the fast retransmission is: the
+    /// ordinary loop acknowledges and then transmits, so a caller that never
+    /// changed gets it in the same pass.
     ///
     /// SND.NXT is advanced over the new data before returning, so the caller
-    /// must send everything returned. The fast retransmission is emitted here
-    /// rather than from `acknowledged` because that method returns whether the
-    /// ACK was acceptable, and a caller that acknowledges and then transmits
-    /// -- the ordinary loop -- sends it in the same pass either way.
+    /// must send everything returned.
     mutating func segmentsToTransmit(tcb: inout TCB, mss: Int) -> [Segment] {
         var out: [Segment] = []
 
@@ -300,16 +361,39 @@ struct Sender {
             if let segment = retransmitOldest(tcb: &tcb) { out.append(segment) }
         }
 
+        // `min(cwnd, SND.WND)`, and it bounds everything below -- the episode's
+        // retransmissions as well as the new data. Read once: nothing in this
+        // method moves the congestion window, which is the point (see
+        // `drainPresumedLost`).
+        let window = max(0, min(congestionControl.congestionWindow, tcb.sndWnd))
+
+        out.append(contentsOf: drainPresumedLost(tcb: &tcb, window: window))
+
         // SND.NXT must be exactly where this type left it. If it is not,
         // something else has taken sequence space -- a FIN, most likely -- and
         // every offset below would be wrong by that amount. Fail closed rather
-        // than sending bytes from the wrong place in the stream.
+        // than sending bytes from the wrong place in the stream. The drain
+        // above is deliberately ahead of this guard: it works from each
+        // record's own sequence number rather than from an offset off SND.NXT,
+        // so a FIN in the sequence space stops new data without also stopping
+        // the recovery of the data underneath it.
         let sent = tcb.sndNxt - tcb.sndUna
         guard sent == outstanding, sent <= queuedBytes else { return out }
 
+        // New data waits for the hole. Sending it while a segment is still
+        // presumed lost puts bytes into a path that has just dropped some, and
+        // fills the window the collapse to one segment opened up for the
+        // retransmissions -- so the hole would then wait for the next timer
+        // expiry after all, which is the defect this file is fixing.
+        //
+        // Load-bearing, not belt-and-braces: `usable` below is measured against
+        // `pipeSize`, which by construction EXCLUDES the presumed-lost bytes,
+        // so without this guard the room the drain could not use for a whole
+        // segment would be spent on a short new one instead.
+        guard lostBytes == 0 else { return out }
+
         let segmentSize = max(1, mss)
-        let window = max(0, min(congestionControl.congestionWindow, tcb.sndWnd))
-        var usable = window - sent
+        var usable = window - pipeSize
         var unsent = queuedBytes - sent
         var offset = sent
 
@@ -321,7 +405,8 @@ struct Sender {
                 Segment(
                     sequence: sequence, flags: pushes ? [.ack, .psh] : .ack,
                     payload: gather(offset: offset, length: length)))
-            inFlight.append(InFlight(sequence: sequence, length: length, transmissions: 1, sentAt: clock.now(), pushes: pushes))
+            inFlight.append(
+                InFlight(sequence: sequence, length: length, transmissions: 1, sentAt: clock.now(), pushes: pushes, presumedLost: false))
             tcb.sndNxt = sequence + length
             outstanding += length
             offset += length
@@ -388,7 +473,22 @@ struct Sender {
                 duplicates += 1
                 // RFC 5681 §3.2: the THIRD duplicate is the loss signal. The
                 // first two are ordinary reordering.
-                if duplicates == 3 {
+                //
+                // `lostBytes == 0` is the answer to "what happens when a
+                // timeout episode and a duplicate-acknowledgement episode
+                // overlap": the TIMEOUT WINS, and the duplicates are counted
+                // but do not act. Two reasons, and the second is the one that
+                // bites. First, they carry no news -- the timer has already
+                // declared every outstanding byte lost and the retransmissions
+                // are already scheduled, so there is nothing for a loss signal
+                // to discover. Second, §3.2's response is `cwnd = ssthresh +
+                // 3*SMSS`, an INFLATION, and applying it here would undo the
+                // collapse to one segment that §3.1 just made for a much
+                // stronger signal: the connection would leave a timeout with a
+                // window four segments wide. `retransmitTimerFired` already
+                // clears the run in the other direction; this is the same rule
+                // seen from the other side.
+                if duplicates == 3, lostBytes == 0 {
                     congestionControl.lossDetected(flightSize: flightBefore)
                     fastRetransmitPending = true
                 }
@@ -430,6 +530,15 @@ struct Sender {
     /// discarded -- it stays queued until the peer acknowledges it, which is
     /// what makes a second expiry able to send it a third time.
     ///
+    /// §5.4 asks for *the earliest* segment and no more, and for a long time
+    /// this stack sent exactly that and nothing else -- conformant, and
+    /// unusable at the same time. §5.4 does not say to stop there, and gVisor
+    /// and Linux do not: an *n*-segment loss burst recovered here in *n*
+    /// expiries on the 1, 2, 4, 8, 16 s ladder, about 31 seconds for five
+    /// segments against roughly one anywhere else. So this method also presumes
+    /// every outstanding byte lost, and `segmentsToTransmit` goes on
+    /// retransmitting the rest of them as acknowledgements open the window.
+    ///
     /// The backed-off RTO is not left doubled forever: `RTTEstimator.measure`
     /// recomputes the RTO from scratch, so the first unambiguous sample after
     /// the loss episode discards the accumulated backoff (RFC 6298 §5.7).
@@ -444,27 +553,136 @@ struct Sender {
 
         guard !inFlight.isEmpty else {
             timerDeadline = nil
+            // Nothing is outstanding, so nothing can be owed, and `retire`'s
+            // accounting should already have said so. Cleared here anyway
+            // because the cost of the two disagreeing is not a wrong number:
+            // a non-zero `lostBytes` with an empty queue holds `guard
+            // lostBytes == 0` shut and no new data ever leaves this connection
+            // again. This is the one place that is reachable with the queue
+            // known to be empty.
+            lostBytes = 0
             return nil
         }
 
         congestionControl.timeout(flightSize: outstanding)
         estimator.backOff()
         armTimer()
+
+        // Everything outstanding is presumed lost, which is the same judgement
+        // RFC 5681 §3.1 makes one line above when it collapses cwnd to a single
+        // segment: after a timeout nothing is known about the pipe, so the
+        // sender stops claiming any of it is still in there. That is what
+        // leaves room under the collapsed window for the retransmissions.
+        //
+        // `where !presumedLost` rather than a blanket assignment, so a second
+        // expiry inside an episode re-marks only what the first one's drain has
+        // already sent and does not double-count what it has not.
+        for index in inFlight.indices where !inFlight[index].presumedLost {
+            inFlight[index].presumedLost = true
+            lostBytes += inFlight[index].length
+        }
+
+        // §5.4's retransmission is unconditional -- it is not gated on the
+        // window, the way `fastRetransmitPending`'s is not. It is also the only
+        // one that is: everything the drain sends afterwards is under
+        // `min(cwnd, SND.WND)`, and this one is what guarantees forward
+        // progress when that window has no room for even a single segment.
         return retransmitOldest(tcb: &tcb)
+    }
+
+    /// Retransmit as many presumed-lost segments as the window has room for,
+    /// oldest first, **at most one transmission each per timeout episode**.
+    ///
+    /// ## What happens to `cwnd` on the second and later retransmissions
+    ///
+    /// Nothing. This method never touches the congestion window, and that is
+    /// the design rather than an omission.
+    ///
+    /// `congestionControl.timeout(flightSize:)` is called EXACTLY ONCE per
+    /// episode, by `retransmitTimerFired`. Every retransmission after it rides
+    /// the window that one call left behind -- `cwnd = SMSS`, `ssthresh =
+    /// max(FlightSize/2, 2*SMSS)` -- and the only thing that grows that window
+    /// is `Reno.acked`, one segment per acknowledgement of new data. That is
+    /// slow start doing exactly what slow start is for: the episode drains at
+    /// 1, 2, 4, ... segments per round trip, and the connection leaves it
+    /// holding a window every byte of which an acknowledgement paid for.
+    ///
+    /// The two edits that suggest themselves both disable slow start silently:
+    ///
+    /// - **`timeout(flightSize:)` per retransmission.** cwnd is then pinned at
+    ///   one segment for the whole episode, so the drain never accelerates --
+    ///   one segment per round trip rather than one per expiry, better but
+    ///   still linear in the burst. Worse, each call recomputes `ssthresh` from
+    ///   a FlightSize that is by then smaller, ratcheting it down: the
+    ///   connection exits believing the path carries less than the ONE
+    ///   congestion event it actually suffered says, and stays in congestion
+    ///   avoidance at that floor for the rest of its life.
+    /// - **Growing cwnd per retransmitted segment.** The window then opens on
+    ///   transmissions instead of on acknowledgements, which is not slow start;
+    ///   it is no congestion control at all. Nothing has left the network just
+    ///   because this sender put something into it, so the connection would
+    ///   leave the episode with a window the path never agreed to and a queue
+    ///   of new data ready to spend it in one burst.
+    ///
+    /// `theWindowGrowsOnlyOnAcknowledgementsWhileTheBurstRecovers` pins the
+    /// exact cwnd and ssthresh at every step of an episode, so both of those
+    /// are test failures and not matters of taste.
+    private mutating func drainPresumedLost(tcb: inout TCB, window: Int) -> [Segment] {
+        var out: [Segment] = []
+        var index = 0
+
+        while lostBytes > 0, index < inFlight.count {
+            guard inFlight[index].presumedLost else {
+                index += 1
+                continue
+            }
+            // Whole segments only, hence `>= length` and not `> 0`. A
+            // retransmission has to reproduce the segment that was lost byte
+            // for byte -- its boundaries and its PSH are already on the peer's
+            // wire -- so unlike new data there is no short one to cut, and
+            // admitting it on `> 0` would put up to a segment more than
+            // `min(cwnd, SND.WND)` into the network. Under a window too small
+            // for one segment the drain stops and the timer's own unconditional
+            // retransmission is what keeps the connection moving.
+            guard window - pipeSize >= inFlight[index].length else { break }
+            guard let segment = retransmit(index, tcb: &tcb) else { break }
+            out.append(segment)
+            index += 1
+        }
+        return out
     }
 
     /// Rebuild and re-send the oldest unacknowledged segment, leaving it
     /// queued and marking it ambiguous for Karn's algorithm.
     private mutating func retransmitOldest(tcb: inout TCB) -> Segment? {
-        guard let first = inFlight.first else { return nil }
-        let offset = first.sequence - tcb.sndUna
-        guard offset >= 0, offset + first.length <= queuedBytes else { return nil }
+        retransmit(0, tcb: &tcb)
+    }
 
-        inFlight[0].transmissions += 1
-        inFlight[0].sentAt = clock.now()
+    /// Rebuild and re-send `inFlight[index]`, leaving it queued, clearing its
+    /// presumed-lost mark, and marking it ambiguous for Karn's algorithm.
+    ///
+    /// Karn is untouched by everything above: the ambiguity flag is
+    /// `transmissions`, it lives on the record, it is only ever incremented,
+    /// and `retire` still refuses a sample from any record above one. So the
+    /// SECOND and later retransmissions of an episode suppress their samples
+    /// exactly as the first does -- and, because the marking above moves no
+    /// record and renumbers nothing, there is no bookkeeping for Karn's flag to
+    /// have been keyed on and lost.
+    private mutating func retransmit(_ index: Int, tcb: inout TCB) -> Segment? {
+        guard index >= 0, index < inFlight.count else { return nil }
+        let entry = inFlight[index]
+        let offset = entry.sequence - tcb.sndUna
+        guard offset >= 0, offset + entry.length <= queuedBytes else { return nil }
+
+        inFlight[index].transmissions += 1
+        inFlight[index].sentAt = clock.now()
+        if inFlight[index].presumedLost {
+            inFlight[index].presumedLost = false
+            lostBytes -= entry.length
+        }
         return Segment(
-            sequence: first.sequence, flags: first.pushes ? [.ack, .psh] : .ack,
-            payload: gather(offset: offset, length: first.length))
+            sequence: entry.sequence, flags: entry.pushes ? [.ack, .psh] : .ack,
+            payload: gather(offset: offset, length: entry.length))
     }
 
     /// How many bytes of the WRITE containing the byte at `offset` (counted
@@ -523,6 +741,12 @@ struct Sender {
                 sample = clock.now() - entry.sentAt
             }
             outstanding -= entry.length
+            // A presumed-lost segment can be acknowledged without ever being
+            // retransmitted -- the timeout was spurious and it was in the
+            // network all along, or a later retransmission's cumulative
+            // acknowledgement covered it. Either way it stops being owed, and
+            // `lostBytes` has to lose it here or the episode never ends.
+            if entry.presumedLost { lostBytes -= entry.length }
             retired += 1
         }
         if retired > 0 { inFlight.removeFirst(retired) }
@@ -536,6 +760,7 @@ struct Sender {
                 partial.sequence = partial.sequence + consumed
                 partial.length -= consumed
                 outstanding -= consumed
+                if partial.presumedLost { lostBytes -= consumed }
                 inFlight[0] = partial
             }
         }

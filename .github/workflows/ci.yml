@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      # `Sources/Netstack` is warning-free and this keeps it that way. The gate
+      # is deliberately on the library alone: the test target still carries
+      # warnings from earlier work, and failing on those would mean the useful
+      # half of this check never gets enabled.
+      #
+      # It also has to be a fresh checkout to mean anything. An incremental
+      # `swift build` reuses an already-compiled module and prints nothing at
+      # all, which is how twelve warnings went unnoticed locally for several
+      # weeks of work.
+      - name: Build the library with warnings as errors
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test
+
+  harness:
+    name: Build the differential harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: differential/harness/go.mod
+          cache-dependency-path: differential/harness/go.sum
+
+      # Built, not run. The harness drives gVisor's real stack from the same
+      # frames the Swift suite uses; a full seeded differential run is far too
+      # slow for every push, but a harness that no longer compiles would
+      # silently stop being available to anyone who did want to run one.
+      - name: Build
+        run: go build ./...
+        working-directory: differential/harness
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: differential/harness

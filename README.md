@@ -13,7 +13,7 @@ spawned as a separate Go binary.
 
 ## Status
 
-**Plan 2 of 3 complete.** The stack core and TCP exist and are under test: a
+**Plan 2 of 3 complete; Plan 3 in progress.** The stack core and TCP exist and are under test: a
 guest can ARP for the gateway and get a ping answered, DNS-shaped traffic
 round-trips through a real NIO pipeline, and a TCP connection opens, carries
 data, retransmits what is lost, and closes from either side.
@@ -27,8 +27,12 @@ data, retransmits what is lost, and closes from either side.
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn, RFC 5681 Reno, RFC 6528 initial sequence numbers, retransmit and TIME-WAIT timers, endpoint wired into the stack |
 | **Bridge** | `NetstackDatagramChannel` conforming to NIO's `Channel` and `ChannelCore`, `StackBootstrap` |
 
-Not yet implemented: window scaling, timestamps/PAWS, SACK, delayed ACK, Nagle,
-zero-window probes, keepalives and CUBIC (all parse-only or absent); the
+Window scaling is negotiated and applied in both directions but **not yet
+advertised**, so it is inert on every real connection — deliberately, because a
+scale advertised before it is applied claims a window the queue cannot hold.
+
+Not yet implemented: timestamps/PAWS, SACK, delayed ACK, Nagle, keepalives and
+CUBIC (parse-only or absent); the
 TCP/UDP/ICMP forwarders and receive-side backpressure; any wire a real VM can
 attach to; and the DHCP/DNS services.
 
@@ -60,7 +64,7 @@ Swift 6.2 toolchain, macOS 14+. CI builds the library with warnings as errors.
 swift test
 ```
 
-434 tests, plus a differential harness in `differential/` that drives gVisor's
+511 tests, plus a differential harness in `differential/` that drives gVisor's
 real stack from the same frames.
 
 Many of these tests exist because falsification proved an earlier one could not

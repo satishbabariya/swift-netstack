@@ -38,6 +38,18 @@ enum TCPAction: Equatable, Sendable {
     /// with the challenges. `TCPStateMachine` spends the budget before it
     /// forms this case; by the time one exists, it has already been paid for.
     case sendAck
+
+    /// Acknowledge, but not necessarily now: RFC 9293 §3.8.6.3 permits holding
+    /// this for up to 500 ms, and the caller is what holds it.
+    ///
+    /// A separate action rather than a flag on `sendAck` so the decision is
+    /// visible at every site that produces one. The state machine emits a plain
+    /// `sendAck` for everything it decides itself — challenge acknowledgements,
+    /// refused FINs, the RFC 5961 answers — and those must never be delayed:
+    /// they are answers to something wrong, and their whole value is being
+    /// prompt. Only the receiver's ordinary in-order acknowledgement is eligible,
+    /// and only the receiver knows that.
+    case sendAckMayDelay
     /// Send a RST at the given sequence number, optionally with the ACK bit
     /// set and acknowledging `ack`.
     ///

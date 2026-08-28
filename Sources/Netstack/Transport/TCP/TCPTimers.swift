@@ -47,6 +47,7 @@ final class TCPTimers {
     private var retransmitTask: Scheduled<Void>?
     private var persistTask: Scheduled<Void>?
     private var timeWaitTask: Scheduled<Void>?
+    private var delayedAckTask: Scheduled<Void>?
 
     init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
         self.eventLoop = eventLoop
@@ -114,6 +115,23 @@ final class TCPTimers {
     }
 
     /// Arm TIME_WAIT for `timeWaitDuration` from *the clock's* now.
+    /// RFC 9293 §3.8.6.3's delayed acknowledgement.
+    ///
+    /// A slot of its own, like the persist timer and for the same reason: it has
+    /// a different lifetime and a different cancellation rule from the retransmit
+    /// timer, and sharing one handle means a future edit to either silently
+    /// changes the other.
+    func scheduleDelayedAck(after delay: TimeAmount, _ body: @escaping () -> Void) {
+        delayedAckTask?.cancel()
+        let box = TimerBody(run: body)
+        delayedAckTask = eventLoop.scheduleTask(deadline: clock.now() + delay) { box.run() }
+    }
+
+    func cancelDelayedAck() {
+        delayedAckTask?.cancel()
+        delayedAckTask = nil
+    }
+
     func startTimeWait(_ body: @escaping () -> Void) {
         timeWaitTask?.cancel()
         timeWaitTask = nil
@@ -126,6 +144,7 @@ final class TCPTimers {
     func cancelAll() {
         cancelRetransmit()
         cancelPersist()
+        cancelDelayedAck()
         timeWaitTask?.cancel()
         timeWaitTask = nil
     }

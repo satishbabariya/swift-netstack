@@ -840,7 +840,11 @@ struct TCPStateMachine {
         // FIN occupies no sequence space once stripped, so without this it
         // would draw no ACK at all and the peer would wait out its RTO.
         if outcome?.shouldAck == true || outcome?.finReached == true || finRefused {
-            actions.append(.sendAck)
+            // Delayable only when the receiver said so AND nothing else here
+            // wanted an acknowledgement of its own. A refused FIN or a reached
+            // FIN is an answer the peer is waiting on, not routine data flow.
+            let delayable = outcome?.ackMayBeDelayed == true && outcome?.finReached != true && !finRefused
+            actions.append(delayable ? .sendAckMayDelay : .sendAck)
         }
 
         // Step 6: the FIN bit. The *transition* is a state change and stays

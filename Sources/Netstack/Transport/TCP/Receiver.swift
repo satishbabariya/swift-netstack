@@ -16,6 +16,22 @@ struct ReceiveOutcome: Sendable {
     /// Whether the peer is owed an acknowledgement for this segment.
     let shouldAck: Bool
 
+    /// Whether the acknowledgement may be delayed, or must go out at once.
+    ///
+    /// RFC 9293 §3.8.6.3 permits delaying an acknowledgement "for a period of
+    /// time" — at most 500 ms, and never for more than one full-sized segment in
+    /// a row. Two cases must never be delayed and this flag is what distinguishes
+    /// them:
+    ///
+    /// - **Out-of-order data.** The acknowledgement it draws is a *duplicate*
+    ///   acknowledgement, and RFC 5681 §3.2's fast retransmit counts those. Delay
+    ///   one and the peer's loss detection is delayed with it — the segment sits
+    ///   unretransmitted until an RTO that fast retransmit exists to avoid.
+    /// - **A segment that fills a gap.** The peer has been receiving duplicate
+    ///   acknowledgements and is waiting to learn the hole is closed. Making it
+    ///   wait 500 ms more is the worst possible moment to economise on a frame.
+    let ackMayBeDelayed: Bool
+
     /// The window field to put on the wire, already written into the TCB.
     ///
     /// **A wire field, not RCV.WND.** With a window scale negotiated the two
@@ -241,6 +257,22 @@ struct Receiver {
             finReached = true
         }
 
+        // RFC 9293 §3.8.6.3's two exceptions, decided here because this is the
+        // only place that knows which of them applies.
+        //
+        // `consumed == 0` on a segment that occupied sequence space means it did
+        // not advance RCV.NXT: it was out of order, and the acknowledgement it
+        // draws is a duplicate acknowledgement that RFC 5681 §3.2's fast
+        // retransmit counts. Delaying it delays the peer's loss detection.
+        //
+        // `delivered.count > 1` means this segment closed a gap and released
+        // what was queued behind it. The peer has been collecting duplicate
+        // acknowledgements and is waiting to hear the hole is filled; 500 ms is
+        // the worst possible moment to save a frame.
+        let outOfOrder = segment.length > 0 && consumed == 0
+        let filledAGap = delivered.count > 1
+        let ackMayBeDelayed = !outOfOrder && !filledAGap && !finReached
+
         let window = advertisedWindow(offered: offered, consumed: consumed, maximum: tcb.rcvWndMax, scale: tcb.rcvWindScale)
         tcb.rcvWnd = Int(window) << Int(tcb.rcvWindScale)
 
@@ -251,7 +283,8 @@ struct Receiver {
         // because two peers that acknowledge each other's acknowledgements
         // never stop.
         return ReceiveOutcome(
-            delivered: delivered, shouldAck: segment.length > 0, advertisedWindow: window, finReached: finReached)
+            delivered: delivered, shouldAck: segment.length > 0, ackMayBeDelayed: ackMayBeDelayed,
+            advertisedWindow: window, finReached: finReached)
     }
 
     /// The window to advertise: as much of the reassembly queue as is free,

@@ -182,6 +182,12 @@ private struct DiffSequence {
     var seed: UInt64
     /// Whether the guest's sequence space crosses 2^32 during this sequence.
     var crossesWrap = false
+    /// Whether this sequence closed the offered window to zero with data still
+    /// unacknowledged — RFC 9293 §3.8.6.1's persist condition. Tracked because
+    /// the case that produces it is gated on unacknowledged data, and a gate
+    /// that never opens is a case that never runs: the coverage floor below is
+    /// what stops this path passing by never happening.
+    var entersPersist = false
     var steps: [DifferentialStep]
     /// A human-readable line per step. A divergence names a step index, and
     /// without this a reader has raw base64 and nothing else.
@@ -208,6 +214,7 @@ private struct DiffGenerator {
         // compares sequence numbers as integers rather than serially gets
         // wrong (RFC 9293 §3.4).
         let crossesWrap = rng.next() % 4 == 0
+        var entersPersist = false
         let guestISS: UInt32 = crossesWrap ? UInt32.max - UInt32(rng.next() % 3000) : UInt32(truncatingIfNeeded: rng.next())
 
         // A model of the receiver's reassembly, kept in OFFSETS from the byte
@@ -417,7 +424,51 @@ private struct DiffGenerator {
                     tcp(".", seq: wire(windowUpdatePoint()), ack: UInt32(1 + acknowledged), window: offered),
                     advanceMs: advance, note: "window update to \(offered) from offset \(windowUpdatePoint())")
 
-            case 62..<72:
+            case 62..<68 where !finSent:
+                // An UNACCEPTABLE segment: zero-length, behind RCV.NXT.
+                //
+                // RFC 9293 §3.10.7.4's acceptability test admits a zero-length
+                // segment only when `RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND`, so
+                // this one fails it and step 1 requires an acknowledgement and a
+                // drop. That acknowledgement is a challenge ACK, and it is the
+                // only thing in this generator that reaches the token bucket
+                // Plan 3 built — until this case existed, the throttle was
+                // verified by unit tests alone and the differential said nothing
+                // about it at all.
+                //
+                // Zero-length deliberately: a segment with a payload behind
+                // RCV.NXT is the duplicate case above, which is acceptable and
+                // must be acknowledged for a different reason. This one carries
+                // no sequence space, so nothing about the stream moves and the
+                // only observable is the answer.
+                // Preceded by half a second of quiet, deliberately, and this
+                // is a generator constraint rather than a permitted divergence.
+                //
+                // Both stacks throttle challenge ACKs and they do it
+                // differently: this one spends from a stack-wide bucket of 100
+                // per second, gVisor enforces a per-endpoint 500 ms minimum
+                // interval. Measured with no spacing: we answer an unacceptable
+                // segment gVisor stays silent for, which reports as "Swift
+                // emitted a frame with no matching Go frame" — a real
+                // difference, and a policy one rather than a defect, since
+                // RFC 5961 §7 mandates no particular rate. Recognising it would
+                // mean recognising "we emitted a frame and gVisor did not",
+                // which is exactly the class of difference this instrument
+                // exists to catch.
+                //
+                // Spacing them past gVisor's interval puts BOTH stacks in the
+                // answer-every-one regime, so what gets compared is RFC 9293
+                // §3.10.7.4 step 1's requirement to acknowledge — which is
+                // normative — rather than the throttle rate, which is not.
+                // **The rates themselves stay covered by unit tests alone.**
+                let behind = min(rcvNxt, 1 + Int(rng.next() % 4000))
+                guard behind > 0 else { continue }
+                try emit(nil, advanceMs: 500, note: "quiet, so both throttles are open")
+                try emit(
+                    tcp(".", seq: wire(rcvNxt - behind), ack: UInt32(1 + acknowledged)), advanceMs: advance,
+                    note: "unacceptable zero-length segment \(behind)B behind RCV.NXT")
+
+            case 68..<72:
                 // Nothing arrives; time simply passes. This is the only way a
                 // retransmission is ever observed, and the frame it produces
                 // comes out of a TIMER BODY rather than inline — the emission
@@ -466,8 +517,36 @@ private struct DiffGenerator {
                 // instead; see `differential/README.md`.
                 switch rng.next() % 3 {
                 case 0:
-                    // Acknowledged in full.
+                    // Acknowledged in full, after a round trip long enough that
+                    // the RTO it produces CLEARS THE ONE-SECOND FLOOR.
+                    //
+                    // 700 ms is not enough and that matters: seeded from the
+                    // handshake, a 700 ms sample is a *subsequent* measurement,
+                    // so `SRTT ≈ R/8` and `RTTVAR ≈ R/4` give an RTO of about
+                    // 788 ms — still floored, and a run at that value proves
+                    // only that both stacks floor, not that their estimators
+                    // agree. The floor clears at roughly `1.125R > 1000`, i.e.
+                    // R above ~889 ms.
+                    //
+                    // **It is set BELOW that on purpose, and the reason is
+                    // measured rather than assumed.** At 2000 ms the RTO is
+                    // about 2250 ms and the two stacks disagree: a FIN
+                    // retransmission lands one step apart (gVisor at step 12,
+                    // this stack at step 13 on seed base +0). Which is right is
+                    // unresolved — both seed from the handshake now, so the
+                    // difference is in the update itself or in the clock
+                    // granularity `G`, not in whether a sample is taken.
+                    //
+                    // At 700 ms the Jacobson update still RUNS — SRTT and RTTVAR
+                    // both move — and only the RTO output is clamped, so this is
+                    // strictly more coverage than the zero-sample constraint it
+                    // replaces. What it does not compare is the RTO the update
+                    // produces once it escapes the floor.
+                    //
+                    // **To reproduce the disagreement, change 700 to 2000.**
+                    // That is the whole reproduction; see `differential/README.md`.
                     acknowledged = bytes
+                    try emit(nil, advanceMs: 700, note: "round trip, deliberately under the RTO floor")
                     try emit(
                         tcp(".", seq: wire(windowUpdatePoint()), ack: UInt32(1 + acknowledged)),
                         advanceMs: 0, note: "guest acknowledges our \(bytes)B")
@@ -618,7 +697,7 @@ private struct DiffGenerator {
         try emit(nil, advanceMs: 900, note: "trailing idle")
         try emit(nil, advanceMs: 900, note: "trailing idle")
 
-        return DiffSequence(seed: seed, crossesWrap: crossesWrap, steps: steps, trace: trace)
+        return DiffSequence(seed: seed, crossesWrap: crossesWrap, entersPersist: entersPersist, steps: steps, trace: trace)
     }
 }
 
@@ -698,10 +777,12 @@ private struct DiffCoverage {
     var withFin = 0
     var withReset = 0
     var acrossTheWrap = 0
+    var enteredPersist = 0
 
     mutating func record(_ outcome: DiffOutcome, codec: VectorFrames) {
         sequences += 1
         if outcome.sequence.crossesWrap { acrossTheWrap += 1 }
+        if outcome.sequence.entersPersist { enteredPersist += 1 }
 
         var seen: Set<String> = []
         var data = false

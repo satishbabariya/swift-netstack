@@ -434,12 +434,29 @@ Every one of these is a scoped restriction with a reason, not an oversight.
 
 ## What this run does NOT cover
 
-- **The RTT estimator's Jacobson arithmetic.** Every sample the generator
-  produces is zero, so both stacks sit on the one-second floor and what is
-  compared is the floor and the backoff ladder, thoroughly, and the update
-  rule not at all. `tcp-data.vec`'s `rtt-sample-drives-the-rto` is the only
-  wire-level cover it has. **Do not report the estimator as differentially
-  verified.**
+- **The RTO the Jacobson update produces once it escapes the floor.** Samples
+  are now 700 ms rather than zero, so the update itself runs — SRTT and RTTVAR
+  both move on every acknowledged write — but at that size the resulting RTO is
+  about 788 ms and RFC 6298 §2.4's one-second floor clamps it, so the number
+  that reaches the wire is the floor either way.
+
+  **This constraint used to have a different reason, and that reason is dead.**
+  It read: this stack takes no RTT sample from the handshake while gVisor does,
+  so the two estimators start from different state. Plan 3 added the handshake
+  sample, so they now start from the same place — and the constraint survives for
+  a new reason, found by removing it.
+
+  Raising the round trip to 2000 ms puts the RTO at about 2250 ms, clear of the
+  floor, and **the two stacks then disagree**: a FIN retransmission lands one step
+  apart, gVisor at step 12 and this stack at step 13 on the first seed. Both seed
+  from the handshake, so the difference is in the update arithmetic or in the
+  clock granularity `G`, not in whether a sample is taken. Which stack is right is
+  **unresolved**, and it is the most concrete open question this instrument has.
+
+  **To reproduce: change the `advanceMs: 700` in the write follow-up to 2000.**
+  One number, one run. `tcp-data.vec`'s `rtt-sample-drives-the-rto` remains the
+  only wire-level cover of the estimator on this side. **Do not report the
+  estimator as differentially verified.**
 - **Window scaling, SACK and timestamps.** Not implemented here; the
   generator does not offer them.
 - **Payload bytes.** `VectorFrames` encodes and decodes segment *lengths*,
@@ -466,6 +483,38 @@ Every one of these is a scoped restriction with a reason, not an oversight.
   defect 2: the differential no longer reaches it. It is pinned by
   `tcp-data.vec`'s `window-updates-are-not-duplicate-acknowledgements` and
   its positive control, which is where that regression protection now lives.
+
+## Persist: widened, and withdrawn again with a reason
+
+The generator holds the offered window at or above
+`DiffLimits.minimumOfferedWindow`, so no sequence enters RFC 9293 §3.8.6.1's
+persist state. That was widened and then withdrawn, and both halves are worth
+recording because the attempt found two things.
+
+**First, the widening was silently doing nothing.** A case that closes the window
+with data unacknowledged was added at `58..<62` — inside the `52..<62` range of
+the case above it. Swift takes the first matching case, so it was dead code, and
+`enteredPersist` was exactly 0 across 300 sequences. **Only a coverage floor
+caught it**: the run was green and the new path had never once executed. That is
+why the `entersPersist` flag and its counter are still here despite the case being
+withdrawn — the next attempt should assert the floor *before* trusting a pass.
+
+**Second, once it actually fired, the two stacks disagreed** — and not about
+window arithmetic. The same segment is retransmitted on different schedules
+(this stack at steps 8 and 10, gVisor at step 9), which is the third place a
+retransmission has landed one step apart, after the FIN case in the RTT section
+above. The open question is the same one, and this widens its reach: it is not
+confined to a FIN, and it appears here even with samples under the RTO floor.
+
+There is also a behavioural question underneath the timing one, unresolved:
+**when the window closes with unacknowledged data in flight, which timer owns the
+connection?** This stack switches to persist; gVisor appears to go on
+retransmitting. Both readings have RFC support and they produce different wire
+behaviour, so this needs settling before persist can be compared frame for frame.
+
+**To reproduce:** re-add a case that emits `window: 0` with unacknowledged data,
+in a range that does not overlap the one above it, and assert
+`coverage.enteredPersist` is non-zero before reading anything else into the result.
 
 ## Known gaps in this stack, visible from here
 
@@ -510,10 +559,12 @@ differential is where they became visible.
   what lets a peer make progress, and throttling either turns a flood on one
   connection into a refusal to open another.
 
-  The generator still never places a zero-length segment behind RCV.NXT, so the
-  differential does not exercise the throttle. **If it is ever widened to, the two
-  stacks will diverge, and here is the shape of it**, because gVisor throttles as
-  well and does it differently in both dimensions
+  **The generator now does place a zero-length segment behind RCV.NXT**, so the
+  acknowledge-and-drop path is exercised — and the divergence predicted here duly
+  appeared on the first run: a step where this stack answered and gVisor stayed
+  silent, reported as "Swift emitted a frame with no matching Go frame".
+  Both stacks are conformant. RFC 5961 §7 mandates no rate, and the two throttle
+  differently in both dimensions
   (`transport/tcp/endpoint.go`'s `allowOutOfWindowAck`, called from
   `connect.go`'s handshake and from `snd.go`'s `maybeSendOutOfWindowAck`):
 
@@ -529,6 +580,23 @@ differential is where they became visible.
   here is amplification, and a one-byte payload would turn the exemption into a
   bypass of the whole budget for the price of one byte per segment. Pinned by
   `aFloodOfUnacceptableSegmentsCarryingDataIsBoundedToo`.
+
+  **How the run avoids it, and what that costs.** Each unacceptable segment is
+  preceded by 500 ms of quiet, which puts both stacks in the answer-every-one
+  regime. What is then compared is RFC 9293 §3.10.7.4 step 1's requirement to
+  acknowledge — normative, and now exercised on both sides — rather than the
+  throttle rate, which is not mandated by anything.
+
+  A generator constraint again, not a permitted divergence, and for a sharper
+  reason than usual: recognising this one would mean recognising *"we emitted a
+  frame and gVisor did not"*, which is precisely the class of difference the
+  instrument exists to catch. A recogniser that broad would mask a genuinely
+  missing frame anywhere else in the run.
+
+  **So the rates themselves remain covered by unit tests alone.** Widening this
+  further — to compare what happens when a throttle actually engages — would need
+  the two policies reconciled first, and they are not reconcilable: 100 per second
+  with bursts against 2 per second with none is a difference in kind.
 
   That also explains part of a row in the table above: "gVisor drops an
   unacceptable segment in silence" is not only a policy difference, it is this

@@ -321,19 +321,6 @@ struct Sender {
     /// The current RTO, including any accumulated backoff.
     var retransmissionTimeout: TimeAmount { estimator.retransmissionTimeout }
 
-    /// The estimate itself, separately from the RTO computed out of it.
-    ///
-    /// Karn's algorithm is a claim about *these two numbers* — an ambiguous
-    /// acknowledgement contributes no sample — and the RTO is a poor proxy for
-    /// it. It stopped being any proxy at all once an acknowledgement of new data
-    /// began discarding the backoff: sampling a 10 ms ambiguous ACK and merely
-    /// clearing a doubled RTO can land on the same number, so a test reading only
-    /// `retransmissionTimeout` cannot tell "Karn held" from "Karn was violated
-    /// and the arithmetic happened to agree". These exist so that test can assert
-    /// the claim rather than a consequence of it.
-    var smoothedRoundTrip: TimeAmount { estimator.smoothed }
-    var roundTripVariation: TimeAmount { estimator.variance }
-
     /// When the next zero-window probe should go out, or `nil` when this sender
     /// is not in RFC 9293 §3.8.6.1's persist condition. The caller owns the
     /// actual timer; this type only says when.
@@ -617,20 +604,6 @@ struct Sender {
         probeOutstanding = false
         let previousUna = tcb.sndUna
         tcb.sndUna = ack
-        // An acknowledgement of new data discards RFC 6298 §5.5's accumulated
-        // backoff, even when Karn forbids taking a sample from it.
-        //
-        // The RFC does not say when the doubling ends, and read literally only a
-        // fresh measurement undoes it — which Karn withholds after exactly the
-        // retransmission that caused the doubling. So a connection that recovers
-        // from one loss would carry a doubled RTO into the next and detect it
-        // twice as slowly, on a path that has just demonstrated it delivers.
-        // gVisor and Linux both clear it here; the differential is what showed
-        // that we did not, across three sightings traced to this one rule.
-        //
-        // `clearBackoff` leaves SRTT and RTTVAR alone: the acknowledgement said
-        // nothing new about the path — Karn is why — so only the penalty goes.
-        estimator.clearBackoff()
         retire(previousUna: previousUna, advanced: advanced)
         congestionControl.acked(bytes: advanced, flightSize: flightBefore)
 

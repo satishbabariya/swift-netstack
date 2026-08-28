@@ -1089,3 +1089,67 @@ private func passiveOpenCompleted(peerShift: UInt8, ourShift: UInt8 = 5, windowI
     #expect(tcb.tsRecent == 0)
     #expect(tcb.hasTSRecent, "a zero timestamp was still a timestamp")
 }
+
+// MARK: - RFC 7323 §4.3 TS.Recent
+
+private func timestampTCB(rcvNxt: UInt32 = 1000, tsRecent: UInt32, lastAckSent: UInt32) -> TCB {
+    var tcb = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(rcvNxt), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: tsRecent, echo: 0)])
+    tcb.recordAckSent(SequenceNumber(lastAckSent))
+    return tcb
+}
+
+private func timestampedSegment(sequence: UInt32, tsval: UInt32) -> TCPHeader {
+    segment(sequence: sequence, flags: [.ack], options: [.timestamps(value: tsval, echo: 0)]).header
+}
+
+@Test func tsRecentAdvancesOnlyForASegmentAtOrBelowTheLastAcknowledgementSent() {
+    var tcb = timestampTCB(tsRecent: 100, lastAckSent: 1000)
+
+    // At Last.ACK.sent: adopted.
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 1000, tsval: 200))
+    #expect(tcb.tsRecent == 200)
+
+    // Beyond it: refused, even though the timestamp is newer. A peer must not
+    // drive TS.Recent forward with data we have not acknowledged in sequence.
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 5000, tsval: 300))
+    #expect(tcb.tsRecent == 200, "a segment past Last.ACK.sent must not touch TS.Recent")
+}
+
+@Test func tsRecentNeverMovesBackwards() {
+    // The half PAWS is built on. An older timestamp adopted here would let a
+    // replayed segment make itself look current to every later check.
+    var tcb = timestampTCB(tsRecent: 500, lastAckSent: 1000)
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 400))
+    #expect(tcb.tsRecent == 500, "an older timestamp must not replace TS.Recent")
+
+    // Positive control: a newer one on the same segment shape is adopted, so
+    // the refusal above is about the value and not about the segment.
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 600))
+    #expect(tcb.tsRecent == 600)
+}
+
+@Test func aTimestampClockThatWrapsDoesNotFreezeTsRecent() {
+    // Serial arithmetic, not integer order. A timestamp clock wraps at 2^32,
+    // and `>=` on UInt32 would read every value after the wrap as a step
+    // backwards — freezing TS.Recent permanently and, once PAWS reads it,
+    // discarding every subsequent segment on the connection.
+    var tcb = timestampTCB(tsRecent: UInt32.max - 10, lastAckSent: 1000)
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 5))
+    #expect(tcb.tsRecent == 5, "a wrapped timestamp is newer, not older")
+}
+
+@Test func tsRecentIsUntouchedWhenTimestampsWereNotNegotiated() {
+    var tcb = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(1000), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: false)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: 100, echo: 0)])
+    tcb.recordAckSent(SequenceNumber(1000))
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 999))
+    #expect(!tcb.timestampsEnabled)
+    #expect(tcb.tsRecent == 0, "a connection not using timestamps records none")
+}

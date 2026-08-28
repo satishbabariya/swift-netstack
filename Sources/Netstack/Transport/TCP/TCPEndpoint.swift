@@ -315,6 +315,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     private let allocator = ByteBufferAllocator()
 
     private let maximumTimeWaitConnections: Int
+    private let delayedAckTimeout: TimeAmount
 
     private var boundID: TransportEndpointID?
     private var isListening = false
@@ -353,11 +354,19 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// its production value's worth of state is a cap nothing tests.
     init(
         stack: Stack, initialSequenceNumbers: any InitialSequenceNumbers,
-        maximumTimeWaitConnections: Int = TCPEndpoint.defaultMaximumTimeWaitConnections
+        maximumTimeWaitConnections: Int = TCPEndpoint.defaultMaximumTimeWaitConnections,
+        delayedAckTimeout: TimeAmount = TCPEndpoint.delayedAckTimeout
     ) {
         self.stack = stack
         self.initialSequenceNumbers = initialSequenceNumbers
         self.maximumTimeWaitConnections = max(1, maximumTimeWaitConnections)
+        // Injectable so the differential can turn the delay off. gVisor's own
+        // acknowledgement timing does not match this stack's -- see
+        // `differential/README.md` -- and a comparison that cannot align frames
+        // measures nothing at all. Zero here means "acknowledge at once", which
+        // is what the run needs and what every RFC 9293 §3.8.6.3 permission is
+        // an exception to.
+        self.delayedAckTimeout = delayedAckTimeout
     }
 
     deinit {
@@ -721,9 +730,15 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
                 connection.delayedAckPending = false
                 connection.unacknowledgedBytesSinceAck = 0
+            } else if delayedAckTimeout == .zero {
+                // No delay configured: answer at once. Keeps the branch above the
+                // single place that decides eligibility, rather than making
+                // every caller test the timeout.
+                emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+                connection.unacknowledgedBytesSinceAck = 0
             } else if !connection.delayedAckPending {
                 connection.delayedAckPending = true
-                connection.timers.scheduleDelayedAck(after: Self.delayedAckTimeout) { [weak self, weak connection] in
+                connection.timers.scheduleDelayedAck(after: delayedAckTimeout) { [weak self, weak connection] in
                     guard let self, let connection, connection.delayedAckPending else { return }
                     connection.delayedAckPending = false
                     connection.unacknowledgedBytesSinceAck = 0

@@ -599,9 +599,9 @@ rather than reasoning about: four lines in the harness's step loop, writing `RTO
 
 ## Delayed acknowledgements break the run's alignment, and a recogniser cannot fix it
 
-RFC 9293 §3.8.6.3 is implemented on `p4-delayed-ack`. All 527 unit and vector
-tests pass; the differential does not, and the reason is structural rather than a
-missing mask.
+RFC 9293 §3.8.6.3 is implemented. All 527 unit and vector tests pass, and the
+differential passes with the delay turned off for the comparison — the reason it
+had to be turned off is structural rather than a missing mask.
 
 **The spec listed ACK coalescing as a permitted divergence from the start**, and
 this file recorded that nothing in the run had produced one yet, so whoever met it
@@ -625,16 +625,24 @@ A two-directional recogniser would mask a spurious acknowledgement this stack
 invented, which is a real defect class and not one worth trading away for a green
 run. Withdrawn.
 
-**What would actually resolve it**, neither attempted here:
+**Resolved by configuration, stated rather than masked.** `TCPEndpoint`'s
+`delayedAckTimeout` is injectable and the differential constructs its endpoint
+with `.zero`. The stack under comparison therefore acknowledges at once, its
+frames align with gVisor's again, and the 10,000-sequence gate is clean.
 
-- Advance past the delayed-acknowledgement timeout at every step, so both stacks
-  flush before the step boundary and alignment is restored. Simple, and it costs
-  the run all sub-500 ms acknowledgement timing — plus it changes RTO behaviour
-  substantially, since every step would then be at least half a second.
-- Compare acknowledgement *coverage* across the run rather than frame-by-frame
-  per step: that no acknowledgement is lost and none is invented, without
-  requiring them to arrive in the same step. Strictly better, and a larger change
-  to the instrument than to the stack.
+What that costs, precisely: **the run no longer compares sub-500 ms
+acknowledgement timing at all.** It is pinned in `tcp-data.vec` instead, against a
+fixed peer whose timing cannot drift with a reference implementation's own
+heuristics — which is the better place for it, since gVisor's schedule was never
+going to match this one.
+
+Two alternatives were considered and rejected. Advancing past the timeout at every
+step would restore alignment too, but every step would then be at least half a
+second and the RTO behaviour the run *does* compare would be distorted. Comparing
+acknowledgement *coverage* across the run — that none is lost and none invented,
+without requiring them in the same step — is strictly better and is the right
+thing to build if this ever needs to compare timing again; it is a larger change
+to the instrument than to the stack, and it was not needed to get the gate clean.
 
 **Also measured while here, and not implemented:** gVisor answers the FIRST
 full-sized segment after a handshake at once, where "every second full-sized

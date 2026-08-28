@@ -523,10 +523,46 @@ counter-argument is real but weaker: the acknowledgement is ambiguous precisely
 because we cannot tell which transmission it answers, and if it answers the
 original then the path is slow rather than lossy.
 
-**Not changed here.** It alters loss-recovery latency on every connection and
-belongs in a task with its own falsification, not as a note at the end of an
-instrument change. Recorded so the next session starts from a cause rather than
-from three symptoms.
+**Tried, and reverted, because the premise was wrong — and measuring is what
+showed it.**
+
+The change made `Sender.acknowledged` discard the backoff when SND.UNA advances,
+justified as "gVisor and Linux both do this". It moved the FIN retransmission from
+one step *late* to one step *early*, which was the first sign something was off:
+converging on the reference should close a gap, not cross it.
+
+So the harness was instrumented to report gVisor's own estimator through
+`tcpip.TCPInfoOption`, and the answer is unambiguous:
+
+```
+step=7  rto=1s  rtt=10ms  rttvar=5ms
+step=8  rto=2s  rtt=10ms  rttvar=5ms
+step=11 rto=2s  rtt=10ms  rttvar=5ms
+step=12 rto=4s  rtt=10ms  rttvar=5ms
+```
+
+**gVisor accumulates the doublings across acknowledgements** — 1 s, then 2 s held
+across four steps, then 4 s — and its `rtt`/`rttvar` never leave the handshake
+sample, so Karn holds there too. It does **not** clear the backoff on an
+acknowledgement of new data. That claim was carried over from Linux's
+`icsk_backoff` behaviour and never checked against the reference this project
+actually compares against.
+
+Reverted. What this stack already had — the backoff surviving until a fresh
+unambiguous sample — is both the literal RFC 6298 reading and what gVisor does.
+
+**Linux's behaviour may still be the better engineering.** Keeping a doubled RTO
+after the path has demonstrably delivered detects the next loss twice as slowly.
+But it would have to be argued on its merits, as a deliberate divergence from the
+reference, rather than on "everyone does it" — which turned out to be false.
+
+**The residual disagreement is still open, and reverting does not close it.**
+Before the change this stack retransmitted the FIN one step *after* gVisor, and
+both stacks keep their backoffs, so the difference is in when a doubling happens
+or what the timer is armed against — not in whether the backoff survives. The
+`TCPInfoOption` diagnostic is the tool for it and is worth re-adding temporarily
+rather than reasoning about: four lines in the harness's step loop, writing `RTO`,
+`RTT` and `RTTVar` out per step.
 
 ## Persist: widened, and withdrawn again with a reason
 

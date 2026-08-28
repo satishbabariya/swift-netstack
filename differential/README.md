@@ -523,10 +523,29 @@ counter-argument is real but weaker: the acknowledgement is ambiguous precisely
 because we cannot tell which transmission it answers, and if it answers the
 original then the path is slow rather than lossy.
 
-**Not changed here.** It alters loss-recovery latency on every connection and
-belongs in a task with its own falsification, not as a note at the end of an
-instrument change. Recorded so the next session starts from a cause rather than
-from three symptoms.
+**Changed, in its own commit with its own falsification.** `Sender.acknowledged`
+now calls `RTTEstimator.clearBackoff()` when SND.UNA advances. Both halves are
+pinned separately, because they are what is easy to conflate: removing the call
+fails four tests, and making `clearBackoff` also wipe SRTT/RTTVAR fails five
+different ones including this differential. Karn still holds — the estimate is
+untouched — and
+`anAcknowledgementOfNewDataDiscardsTheBackoffWithoutTakingASample` asserts both at
+once.
+
+Two Karn tests had to be re-derived rather than adjusted, and the reason is worth
+keeping: they asserted `retransmissionTimeout`, using the RTO as a *proxy* for "no
+sample was taken". That proxy died with this change — sampling a 10 ms ambiguous
+acknowledgement and merely discarding a doubled RTO can land on the same number.
+They now assert `smoothedRoundTrip` and `roundTripVariation`, which is Karn's
+actual claim rather than a consequence of it.
+
+**The disagreement is reduced, not eliminated, and saying so precisely matters.**
+Before: gVisor retransmitted the FIN at step 12 and this stack at step 13 —
+roughly 2× late, exactly the surviving doubling. After: this stack at step 11 and
+gVisor at step 12. So the 2× penalty is gone and what remains is a single step in
+the other direction, which is a different and smaller effect — the base RTO or
+when the FIN's timer is armed, not an accumulated backoff. **Still open**, and the
+reproduction is unchanged: set the write follow-up's `advanceMs` to 2000.
 
 ## Persist: widened, and withdrawn again with a reason
 

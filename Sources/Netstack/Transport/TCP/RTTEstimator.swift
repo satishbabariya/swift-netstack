@@ -113,6 +113,36 @@ struct RTTEstimator: Sendable, Equatable {
         rto = Self.clamped(rto.multipliedSaturating(by: 2))
     }
 
+    /// Discard an accumulated `backOff()` without touching the estimate.
+    ///
+    /// RFC 6298 §5.5 doubles the RTO on expiry and does not say when the
+    /// doubling ends. Read literally, only a fresh measurement undoes it — and
+    /// Karn's algorithm forbids a measurement from the acknowledgement of a
+    /// retransmitted segment, which is precisely the acknowledgement that
+    /// usually arrives next. A connection that recovers from one loss therefore
+    /// carries a doubled RTO into the next one and detects it twice as slowly,
+    /// for no benefit: the path has just demonstrated that it delivers.
+    ///
+    /// gVisor and Linux both clear the backoff on any acknowledgement of new
+    /// data (Linux zeroes `icsk_backoff` on `FLAG_ACKED`). This stack does the
+    /// same, from `Sender.acknowledged`. The differential is what made the
+    /// difference visible — three separate sightings of a retransmission
+    /// landing one step apart, traced to this one rule; see
+    /// `differential/README.md`.
+    ///
+    /// **`srtt` and `rttvar` are deliberately untouched.** They are the
+    /// estimate of the path and the acknowledgement said nothing new about it —
+    /// Karn is why. What is discarded is only the penalty, which had a job and
+    /// has finished it. Recomputing the RTO from the existing estimate is the
+    /// whole operation.
+    mutating func clearBackoff() {
+        guard hasSample else {
+            rto = Self.minimumTimeout.nanoseconds
+            return
+        }
+        rto = Self.clamped(srtt.addingSaturating(max(granularity, rttvar.multipliedSaturating(by: 4))))
+    }
+
     /// Return to the no-measurement state, so the next `measure` takes the
     /// first-sample path again.
     ///

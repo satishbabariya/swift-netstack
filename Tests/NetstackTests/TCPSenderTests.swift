@@ -469,7 +469,12 @@ private func establishedSender(
     // 8 + 16, another thirty seconds -- and the RTO is what says none of them
     // happened: it doubled once, so the timer fired once.
     #expect(sender.presumedLostBytes == 0, "nothing is owed, so the episode is over")
-    #expect(sender.retransmissionTimeout == .seconds(2), "RFC 6298 5.5 doubled the RTO exactly once")
+    // Back at the base RTO, not the doubled 2 s. §5.5 did double it once — the
+    // timer fired once and that is what the byte counts above show — and the
+    // acknowledgements that drained the episode then discarded the doubling,
+    // because an acknowledgement of new data is evidence the path delivers.
+    // Reading 2 s here would mean the penalty outlived the loss it answered.
+    #expect(sender.retransmissionTimeout == .seconds(1), "the drain's acknowledgements discarded §5.5's doubling")
 
     clock.advance(by: .milliseconds(10))
     let last = sender.acknowledged(upTo: SequenceNumber(5100), tcb: &tcb, advertisedWindow: 65535)
@@ -693,7 +698,12 @@ private func establishedSender(
     }
 
     #expect(sender.flightSize == 0, "positive control: all five segments really were acknowledged")
-    #expect(sender.retransmissionTimeout == .seconds(2), "every one of them was ambiguous, so not one produced a sample")
+    // On the estimate again, for the reason given in
+    // `aRetransmittedSegmentDoesNotProduceAnRTTSample`: the RTO stopped being a
+    // proxy for Karn once an acknowledgement of new data began clearing the
+    // backoff. Five ambiguous acknowledgements, not one sample between them.
+    #expect(sender.smoothedRoundTrip == .zero, "every one of them was ambiguous, so not one produced a sample")
+    #expect(sender.roundTripVariation == .zero, "every one of them was ambiguous, so not one produced a sample")
 
     // And the estimator is not simply stuck: data sent AFTER the episode has
     // been transmitted once, so its acknowledgement is unambiguous and RFC 6298
@@ -738,7 +748,9 @@ private func establishedSender(
     // of a sender whose timer never moves and which never retransmits again.
     let advancing = sender.acknowledged(upTo: SequenceNumber(1100), tcb: &tcb, advertisedWindow: 65535)
     #expect(advancing)
-    #expect(sender.retransmitDeadline == senderStart + .milliseconds(3010), "restarted at now, 1.010s, for the two-second RTO")
+    // One second, not two: this acknowledgement advanced SND.UNA, so it cleared
+    // the backoff before the timer was restarted against it.
+    #expect(sender.retransmitDeadline == senderStart + .milliseconds(2010), "restarted at now, 1.010s, for the base RTO the ACK restored")
     let afterTheAdvance = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
     #expect(afterTheAdvance.map(\.sequence) == [SequenceNumber(1100), SequenceNumber(2100)])
 }
@@ -810,11 +822,18 @@ private func establishedSender(
     #expect(sender.flightSize == 4000)
     #expect(sender.presumedLostBytes == 3000, "the whole remainder is owed again, less the one just sent -- 4000 bytes, not 6000")
     #expect(sender.pipeSize == 1000)
-    // FlightSize is 4000 now, so max(4000 / 2, 2000) = 2000, and the RTO has
-    // doubled twice.
+    // FlightSize is 4000 now, so max(4000 / 2, 2000) = 2000.
+    //
+    // The RTO is 2 s rather than 4 s, and the difference is the point of this
+    // test rather than an inconvenience: the doublings do not accumulate across
+    // an acknowledgement. The first expiry doubled to 2 s, the acknowledgement
+    // between the two expiries discarded that, and this expiry doubled the base
+    // again. Two expiries, one doubling each, no compounding — which is what
+    // stops a connection that recovers between losses from carrying a penalty it
+    // has already worked off.
     #expect(sender.congestionControl.congestionWindow == 1000)
     #expect(sender.congestionControl.slowStartThreshold == 2000)
-    #expect(sender.retransmissionTimeout == .seconds(4))
+    #expect(sender.retransmissionTimeout == .seconds(2))
 
     clock.advance(by: .milliseconds(10))
     let third = sender.acknowledged(upTo: SequenceNumber(2100), tcb: &tcb, advertisedWindow: 65535)
@@ -841,9 +860,58 @@ private func establishedSender(
     let accepted = sender.acknowledged(upTo: tcb.sndNxt, tcb: &tcb, advertisedWindow: 65535)
     #expect(accepted)
 
-    // Sampling the ambiguous ACK would give R = 10ms, hence
-    // RTO = clamp(10ms + max(1ms, 20ms)) = 1s -- a visibly different number.
-    #expect(sender.retransmissionTimeout == .seconds(2), "an ambiguous ACK must not update the RTO")
+    // Asserted on the ESTIMATE, not on the RTO.
+    //
+    // Karn's claim is that an ambiguous acknowledgement contributes no sample,
+    // which is a statement about SRTT and RTTVAR. The RTO used to be a usable
+    // proxy for it — a sample would have moved the RTO to 1s and the backed-off
+    // value was 2s. It is not one any more: an acknowledgement of new data now
+    // discards RFC 6298 §5.5's backoff, which ALSO lands on 1s here, so reading
+    // the RTO alone cannot tell "Karn held" from "Karn was violated and the two
+    // arithmetics agreed". Sampling R = 10 ms would move `smoothedRoundTrip` off
+    // zero; nothing else does.
+    #expect(sender.smoothedRoundTrip == .zero, "an ambiguous ACK must not contribute a sample")
+    #expect(sender.roundTripVariation == .zero, "an ambiguous ACK must not contribute a sample")
+}
+
+@Test func anAcknowledgementOfNewDataDiscardsTheBackoffWithoutTakingASample() {
+    // The rule this whole change is about, asserted on both halves at once
+    // because they are exactly what is easy to conflate.
+    //
+    // RFC 6298 §5.5 doubles the RTO on expiry and never says when the doubling
+    // ends. Read literally, only a fresh measurement undoes it — and Karn
+    // withholds a measurement from the acknowledgement of a retransmitted
+    // segment, which is precisely the acknowledgement that arrives next. So a
+    // connection that recovers from one loss would carry a doubled RTO into the
+    // next and detect it twice as slowly, on a path that has just demonstrated
+    // that it delivers. gVisor and Linux both clear it here.
+    //
+    // Found by the differential, across three sightings of a retransmission
+    // landing one step apart; see `differential/README.md`.
+    let clock = ManualClock()
+    var sender = Sender(
+        congestionControl: Reno(maximumSegmentSize: 1000), clock: clock, maximumBufferedBytes: 1 << 20)
+    var tcb = senderTCB()
+
+    _ = sender.write(ByteBuffer(bytes: Array(repeating: 0xaa, count: 1000)))
+    _ = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(sender.retransmissionTimeout == .seconds(1), "positive control: the base RTO before anything goes wrong")
+
+    clock.advance(by: .seconds(1))
+    _ = sender.retransmitTimerFired(tcb: &tcb)
+    #expect(sender.retransmissionTimeout == .seconds(2), "positive control: §5.5 doubled it")
+
+    clock.advance(by: .milliseconds(10))
+    let accepted = sender.acknowledged(upTo: tcb.sndNxt, tcb: &tcb, advertisedWindow: 65535)
+    #expect(accepted)
+
+    // The backoff is gone...
+    #expect(sender.retransmissionTimeout == .seconds(1), "an acknowledgement of new data discards §5.5's doubling")
+    // ...and Karn still held, which is the half a test reading only the RTO
+    // cannot see. Sampling this 10 ms acknowledgement would have moved the
+    // estimate; discarding a penalty does not touch it.
+    #expect(sender.smoothedRoundTrip == .zero, "the ambiguous acknowledgement must still contribute no sample")
+    #expect(sender.roundTripVariation == .zero, "the ambiguous acknowledgement must still contribute no sample")
 }
 
 @Test func anUnambiguousAcknowledgementDoesProduceAnRTTSample() {

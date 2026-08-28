@@ -339,6 +339,39 @@ anyone who widens the generator knows what will come back.
 | **Handshake RTT sample.** gVisor takes one from the SYN-ACK/ACK round trip; `Sender` models no SYN, so this stack takes none and starts its estimator from the first data sample. RFC 6298 requires *a* sample, not which one. | **Both**, but gVisor's is what every deployed stack does, and this stack's first data RTO is up to 3× longer as a result (a 716 ms sample put its first FIN retransmission at +2.148 s against gVisor's +1.000 s). Worth revisiting in M5. | Every acknowledgement of our data arrives in the next step with **no time advance**, so every sample is zero and both estimators stay pinned to RFC 6298 §2.4's one-second floor. |
 | **NewReno `recover`.** gVisor declines fast recovery unless the cumulative acknowledgement is strictly past `FastRecovery.Last`, comparing it against `SEG.ACK - 1`; initialised to the ISS, that suppresses the *first* loss episode of a connection entirely. RFC 6582 §3.2 step 1 asks for "covers more than `recover`", which ISS+1 does. | **Probably this stack**, but it is an M5 question about NewReno and not one this run can settle. | The duplicate-acknowledgement case acknowledges one segment first, which puts the episode past the off-by-one. |
 
+## Timestamps: the third generator constraint lifted
+
+The generated SYN now offers `mss`, `wscale` and `timestamp`. Only `sackOK`
+remains withheld, and it stays withheld for the original reason: nothing here
+acts on a SACK block, so gVisor would send blocks into a stack that ignores them.
+
+Three things had to change with it, and each was a real finding rather than a
+formality.
+
+**Every generated segment carries the option, not just the SYN.** RFC 7323 §3
+requires it once negotiated, and a generator that stamped only the SYN would be
+modelling a peer that negotiates the option and then stops using it. gVisor
+refuses such a connection outright — the third-leg ACK arrives unstamped and the
+handshake never completes — which surfaced as `close has no accepted connection
+to act on` rather than as anything mentioning timestamps.
+
+**Option order is now normalised in the comparison.** This stack emits
+`mss, wscale, timestamp` in a SYN-ACK; gVisor emits `mss, timestamp, wscale`.
+RFC 9293 requires no order and no receiver depends on one. Sorting removes
+*ordering only*: a missing option, an extra one or a changed value still fails,
+because the sorted lists differ the moment their contents do. It is neither a
+permitted divergence nor a recogniser — it is putting both sides in the same form
+before comparing, as this run already does for sequence numbers.
+
+**The write cap had to shrink, and the reason is a difference that timestamps made
+reachable.** The initial congestion window is ten segments, and a timestamped
+segment carries twelve fewer bytes. A write sized against 1460-byte segments needs
+eleven 1448-byte ones — which this stack's byte-counted window admits and gVisor's
+segment-counted window does not, so gVisor withholds the eleventh. That units
+difference is recorded below as one the run deliberately stays away from; enabling
+timestamps moved the boundary, and the cap had to follow. It appeared only at
+10,000 sequences, not at 300.
+
 ## Window scaling: what changed when the constraint was lifted
 
 The generator used to offer `mss` alone. It now offers `mss` and `wscale`, and

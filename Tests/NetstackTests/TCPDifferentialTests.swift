@@ -417,7 +417,51 @@ private struct DiffGenerator {
                     tcp(".", seq: wire(windowUpdatePoint()), ack: UInt32(1 + acknowledged), window: offered),
                     advanceMs: advance, note: "window update to \(offered) from offset \(windowUpdatePoint())")
 
-            case 62..<72:
+            case 62..<68 where !finSent:
+                // An UNACCEPTABLE segment: zero-length, behind RCV.NXT.
+                //
+                // RFC 9293 §3.10.7.4's acceptability test admits a zero-length
+                // segment only when `RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND`, so
+                // this one fails it and step 1 requires an acknowledgement and a
+                // drop. That acknowledgement is a challenge ACK, and it is the
+                // only thing in this generator that reaches the token bucket
+                // Plan 3 built — until this case existed, the throttle was
+                // verified by unit tests alone and the differential said nothing
+                // about it at all.
+                //
+                // Zero-length deliberately: a segment with a payload behind
+                // RCV.NXT is the duplicate case above, which is acceptable and
+                // must be acknowledged for a different reason. This one carries
+                // no sequence space, so nothing about the stream moves and the
+                // only observable is the answer.
+                // Preceded by half a second of quiet, deliberately, and this
+                // is a generator constraint rather than a permitted divergence.
+                //
+                // Both stacks throttle challenge ACKs and they do it
+                // differently: this one spends from a stack-wide bucket of 100
+                // per second, gVisor enforces a per-endpoint 500 ms minimum
+                // interval. Measured with no spacing: we answer an unacceptable
+                // segment gVisor stays silent for, which reports as "Swift
+                // emitted a frame with no matching Go frame" — a real
+                // difference, and a policy one rather than a defect, since
+                // RFC 5961 §7 mandates no particular rate. Recognising it would
+                // mean recognising "we emitted a frame and gVisor did not",
+                // which is exactly the class of difference this instrument
+                // exists to catch.
+                //
+                // Spacing them past gVisor's interval puts BOTH stacks in the
+                // answer-every-one regime, so what gets compared is RFC 9293
+                // §3.10.7.4 step 1's requirement to acknowledge — which is
+                // normative — rather than the throttle rate, which is not.
+                // **The rates themselves stay covered by unit tests alone.**
+                let behind = min(rcvNxt, 1 + Int(rng.next() % 4000))
+                guard behind > 0 else { continue }
+                try emit(nil, advanceMs: 500, note: "quiet, so both throttles are open")
+                try emit(
+                    tcp(".", seq: wire(rcvNxt - behind), ack: UInt32(1 + acknowledged)), advanceMs: advance,
+                    note: "unacceptable zero-length segment \(behind)B behind RCV.NXT")
+
+            case 68..<72:
                 // Nothing arrives; time simply passes. This is the only way a
                 // retransmission is ever observed, and the frame it produces
                 // comes out of a TIMER BODY rather than inline — the emission

@@ -510,10 +510,12 @@ differential is where they became visible.
   what lets a peer make progress, and throttling either turns a flood on one
   connection into a refusal to open another.
 
-  The generator still never places a zero-length segment behind RCV.NXT, so the
-  differential does not exercise the throttle. **If it is ever widened to, the two
-  stacks will diverge, and here is the shape of it**, because gVisor throttles as
-  well and does it differently in both dimensions
+  **The generator now does place a zero-length segment behind RCV.NXT**, so the
+  acknowledge-and-drop path is exercised — and the divergence predicted here duly
+  appeared on the first run: a step where this stack answered and gVisor stayed
+  silent, reported as "Swift emitted a frame with no matching Go frame".
+  Both stacks are conformant. RFC 5961 §7 mandates no rate, and the two throttle
+  differently in both dimensions
   (`transport/tcp/endpoint.go`'s `allowOutOfWindowAck`, called from
   `connect.go`'s handshake and from `snd.go`'s `maybeSendOutOfWindowAck`):
 
@@ -529,6 +531,23 @@ differential is where they became visible.
   here is amplification, and a one-byte payload would turn the exemption into a
   bypass of the whole budget for the price of one byte per segment. Pinned by
   `aFloodOfUnacceptableSegmentsCarryingDataIsBoundedToo`.
+
+  **How the run avoids it, and what that costs.** Each unacceptable segment is
+  preceded by 500 ms of quiet, which puts both stacks in the answer-every-one
+  regime. What is then compared is RFC 9293 §3.10.7.4 step 1's requirement to
+  acknowledge — normative, and now exercised on both sides — rather than the
+  throttle rate, which is not mandated by anything.
+
+  A generator constraint again, not a permitted divergence, and for a sharper
+  reason than usual: recognising this one would mean recognising *"we emitted a
+  frame and gVisor did not"*, which is precisely the class of difference the
+  instrument exists to catch. A recogniser that broad would mask a genuinely
+  missing frame anywhere else in the run.
+
+  **So the rates themselves remain covered by unit tests alone.** Widening this
+  further — to compare what happens when a throttle actually engages — would need
+  the two policies reconciled first, and they are not reconcilable: 100 per second
+  with bursts against 2 per second with none is a difference in kind.
 
   That also explains part of a row in the table above: "gVisor drops an
   unacceptable segment in silence" is not only a policy difference, it is this

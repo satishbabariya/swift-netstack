@@ -434,12 +434,29 @@ Every one of these is a scoped restriction with a reason, not an oversight.
 
 ## What this run does NOT cover
 
-- **The RTT estimator's Jacobson arithmetic.** Every sample the generator
-  produces is zero, so both stacks sit on the one-second floor and what is
-  compared is the floor and the backoff ladder, thoroughly, and the update
-  rule not at all. `tcp-data.vec`'s `rtt-sample-drives-the-rto` is the only
-  wire-level cover it has. **Do not report the estimator as differentially
-  verified.**
+- **The RTO the Jacobson update produces once it escapes the floor.** Samples
+  are now 700 ms rather than zero, so the update itself runs — SRTT and RTTVAR
+  both move on every acknowledged write — but at that size the resulting RTO is
+  about 788 ms and RFC 6298 §2.4's one-second floor clamps it, so the number
+  that reaches the wire is the floor either way.
+
+  **This constraint used to have a different reason, and that reason is dead.**
+  It read: this stack takes no RTT sample from the handshake while gVisor does,
+  so the two estimators start from different state. Plan 3 added the handshake
+  sample, so they now start from the same place — and the constraint survives for
+  a new reason, found by removing it.
+
+  Raising the round trip to 2000 ms puts the RTO at about 2250 ms, clear of the
+  floor, and **the two stacks then disagree**: a FIN retransmission lands one step
+  apart, gVisor at step 12 and this stack at step 13 on the first seed. Both seed
+  from the handshake, so the difference is in the update arithmetic or in the
+  clock granularity `G`, not in whether a sample is taken. Which stack is right is
+  **unresolved**, and it is the most concrete open question this instrument has.
+
+  **To reproduce: change the `advanceMs: 700` in the write follow-up to 2000.**
+  One number, one run. `tcp-data.vec`'s `rtt-sample-drives-the-rto` remains the
+  only wire-level cover of the estimator on this side. **Do not report the
+  estimator as differentially verified.**
 - **Window scaling, SACK and timestamps.** Not implemented here; the
   generator does not offer them.
 - **Payload bytes.** `VectorFrames` encodes and decodes segment *lengths*,

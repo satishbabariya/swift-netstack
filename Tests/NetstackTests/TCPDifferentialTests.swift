@@ -510,8 +510,36 @@ private struct DiffGenerator {
                 // instead; see `differential/README.md`.
                 switch rng.next() % 3 {
                 case 0:
-                    // Acknowledged in full.
+                    // Acknowledged in full, after a round trip long enough that
+                    // the RTO it produces CLEARS THE ONE-SECOND FLOOR.
+                    //
+                    // 700 ms is not enough and that matters: seeded from the
+                    // handshake, a 700 ms sample is a *subsequent* measurement,
+                    // so `SRTT ≈ R/8` and `RTTVAR ≈ R/4` give an RTO of about
+                    // 788 ms — still floored, and a run at that value proves
+                    // only that both stacks floor, not that their estimators
+                    // agree. The floor clears at roughly `1.125R > 1000`, i.e.
+                    // R above ~889 ms.
+                    //
+                    // **It is set BELOW that on purpose, and the reason is
+                    // measured rather than assumed.** At 2000 ms the RTO is
+                    // about 2250 ms and the two stacks disagree: a FIN
+                    // retransmission lands one step apart (gVisor at step 12,
+                    // this stack at step 13 on seed base +0). Which is right is
+                    // unresolved — both seed from the handshake now, so the
+                    // difference is in the update itself or in the clock
+                    // granularity `G`, not in whether a sample is taken.
+                    //
+                    // At 700 ms the Jacobson update still RUNS — SRTT and RTTVAR
+                    // both move — and only the RTO output is clamped, so this is
+                    // strictly more coverage than the zero-sample constraint it
+                    // replaces. What it does not compare is the RTO the update
+                    // produces once it escapes the floor.
+                    //
+                    // **To reproduce the disagreement, change 700 to 2000.**
+                    // That is the whole reproduction; see `differential/README.md`.
                     acknowledged = bytes
+                    try emit(nil, advanceMs: 700, note: "round trip, deliberately under the RTO floor")
                     try emit(
                         tcp(".", seq: wire(windowUpdatePoint()), ack: UInt32(1 + acknowledged)),
                         advanceMs: 0, note: "guest acknowledges our \(bytes)B")

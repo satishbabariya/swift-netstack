@@ -90,7 +90,33 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// advertise (`TCB.rcvWndMax`). 65535 is the largest a 16-bit window field
     /// can carry, and nothing here negotiates a window scale -- see the SYN-ACK
     /// option list in `emitSynAck` for why not.
+    /// The window advertised in the handshake, and the widest one expressible
+    /// there. RFC 7323 §2.2 forbids scaling the window in a SYN or SYN-ACK, so
+    /// whatever scale is negotiated *on* the handshake cannot be used *by* it —
+    /// 65535 is the ceiling for those two segments no matter what.
     static let receiveWindowBytes = 65535
+
+    /// The widest window this connection may grow to once scaling is in effect.
+    ///
+    /// Bounded by what the reassembler can actually hold, not by what the field
+    /// can express. Advertising more than the queue can take is the same defect
+    /// the four-step ordering below exists to prevent, arriving by another route:
+    /// the peer fills the pipe it was promised and most of it is dropped.
+    static let maximumReceiveWindowBytes = TCPReassembler.defaultMaximumBytes
+
+    /// The smallest shift that lets `maximumReceiveWindowBytes` fit the header's
+    /// 16-bit field. **Derived, not written down**: a literal would drift the
+    /// moment someone changed the cap, and the two silently disagreeing is how
+    /// a stack ends up advertising a window it cannot honour.
+    ///
+    /// At the current 256 KiB cap this is 3. Note how close the boundary is —
+    /// `65535 << 2` is 262,140, four bytes short of 262,144 — which is the other
+    /// reason not to hardcode it.
+    static let derivedWindowScale: UInt8 = {
+        var shift: UInt8 = 0
+        while maximumReceiveWindowBytes >> Int(shift) > Int(UInt16.max) { shift += 1 }
+        return shift
+    }()
 
     /// The Window Scale shift this stack puts in its own SYN and SYN-ACK, or
     /// `nil` for "send no Window Scale option". **`nil`, deliberately, and this
@@ -118,7 +144,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// 7323 §2.2: "If a Window Scale option was received in the initial `<SYN>`
     /// segment, then this option MAY be sent in the `<SYN,ACK>` segment." See
     /// `TCB.peerOfferedWindowScale` for how exactly to read that clause.
-    static let windowScaleToOffer: UInt8? = nil
+    static let windowScaleToOffer: UInt8? = derivedWindowScale
 
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
@@ -353,8 +379,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn], sequence: connection.tcb.iss, on: connection,
-            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))],
-            acknowledgement: SequenceNumber(0))
+            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
+                + windowScaleOption(for: connection, answeringPeerSyn: false),
+            acknowledgement: SequenceNumber(0),
+            window: unscaledAdvertisedWindow(of: connection))
     }
 
     /// Queue bytes for transmission.
@@ -726,7 +754,9 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn, .ack], sequence: connection.tcb.iss, on: connection,
-            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))])
+            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
+                + windowScaleOption(for: connection, answeringPeerSyn: true),
+            window: unscaledAdvertisedWindow(of: connection))
     }
 
     /// Our FIN. `TCPStateMachine.close(on:)` has already bumped SND.NXT to
@@ -1028,7 +1058,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 rcvNxt: SequenceNumber(0),
                 rcvWnd: Self.receiveWindowBytes,
                 irs: SequenceNumber(0),
-                windowScaleToOffer: Self.windowScaleToOffer),
+                windowScaleToOffer: Self.windowScaleToOffer,
+                rcvWndMax: Self.maximumReceiveWindowBytes),
             receiver: Receiver(reassembler: TCPReassembler()),
             sender: Sender(
                 congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,
@@ -1099,7 +1130,36 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// ceiling of `65535 << rcvWindScale`, and must round the shift *downwards*
     /// (see `Receiver.advertisedWindow`, which owns that arithmetic).
     private func advertisedWindow(of connection: Connection) -> UInt16 {
+        let scaled = max(0, connection.tcb.rcvWnd) >> Int(connection.tcb.rcvWindScale)
+        return UInt16(min(scaled, Int(UInt16.max)))
+    }
+
+    /// The window for a segment that carries SYN, which RFC 7323 §2.2 says
+    /// **must not be scaled**: "The window field in a segment where the SYN bit
+    /// is set (i.e., a `<SYN>` or `<SYN,ACK>`) MUST NOT be scaled."
+    ///
+    /// A second window-building site rather than a condition inside the first,
+    /// deliberately, and for the same reason `TCPStateMachine` labels its four
+    /// peer-window decodes individually: the asymmetry is the thing a reader
+    /// needs to see, and a branch hides it. `emit` defaults to the scaled one,
+    /// so the two SYN-bearing callers pass this explicitly — which also means a
+    /// new SYN-bearing emission that forgets to is visibly wrong at the call
+    /// site rather than silently scaled.
+    private func unscaledAdvertisedWindow(of connection: Connection) -> UInt16 {
         UInt16(min(max(0, connection.tcb.rcvWnd), Int(UInt16.max)))
+    }
+
+    /// The Window Scale option to put in an outgoing SYN, or `nil`.
+    ///
+    /// On a SYN-ACK this is gated on the peer having offered one first: RFC 7323
+    /// §2.2 permits the option in a `<SYN,ACK>` only "if a Window Scale option
+    /// was received in the initial `<SYN>` segment". `TCB.peerOfferedWindowScale`
+    /// is the flag rather than a non-zero shift, because a `shift.cnt` of 0 is a
+    /// legal offer and a recorded 0 cannot tell the two apart.
+    private func windowScaleOption(for connection: Connection, answeringPeerSyn: Bool) -> [TCPOption] {
+        guard let shift = Self.windowScaleToOffer else { return [] }
+        if answeringPeerSyn && !connection.tcb.peerOfferedWindowScale { return [] }
+        return [.windowScale(shift)]
     }
 }
 

@@ -191,7 +191,8 @@ struct TCB: Equatable, Sendable {
         rcvNxt: SequenceNumber,
         rcvWnd: Int,
         irs: SequenceNumber,
-        windowScaleToOffer: UInt8? = nil
+        windowScaleToOffer: UInt8? = nil,
+        rcvWndMax: Int? = nil
     ) {
         self.state = state
         self.sndUna = sndUna
@@ -202,7 +203,15 @@ struct TCB: Equatable, Sendable {
         self.iss = iss
         self.rcvNxt = rcvNxt
         self.rcvWnd = rcvWnd
-        self.rcvWndMax = rcvWnd
+        // Separate from `rcvWnd` because the two are not the same number once a
+        // window scale is in play. The *initial* window has to fit the header's
+        // 16-bit field unscaled -- RFC 7323 §2.2 forbids scaling the window in a
+        // SYN or SYN-ACK, so the handshake cannot express more than 65535
+        // however large a scale is negotiated on it. The *cap* is what the
+        // connection may grow to once scaling is in effect, and it is bounded by
+        // what the reassembler can actually hold rather than by the field.
+        // Defaults to `rcvWnd`, so every existing caller keeps the old meaning.
+        self.rcvWndMax = rcvWndMax ?? rcvWnd
         self.irs = irs
         self.windowScaleToOffer = windowScaleToOffer
     }

@@ -256,7 +256,7 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
     fixture.drain()
 }
 
-@Test func aGuestSynOfferingAWindowScaleStillGetsAnMssOnlySynAckAndATrueWindow() throws {
+@Test func aGuestSynOfferingAWindowScaleGetsOneBackAndAnUnscaledHandshakeWindow() throws {
     // The ordering guard for window scaling, at the one place it is observable:
     // on the wire.
     //
@@ -289,11 +289,90 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
             let synAck = try #require(emitted.first).header
             #expect(synAck.flags.contains(.syn))
             #expect(synAck.flags.contains(.ack))
-            #expect(synAck.options == [.maximumSegmentSize(1460)])
+            #expect(synAck.options == [.maximumSegmentSize(1460), .windowScale(TCPEndpoint.derivedWindowScale)])
+            // Still 65535, and still meaning 65535: RFC 7323 §2.2 forbids
+            // scaling the window in a SYN or SYN-ACK, so the shift this very
+            // segment negotiates does not apply to the segment negotiating it.
             #expect(synAck.window == UInt16(TCPEndpoint.receiveWindowBytes))
         }
     }
     fixture.drain()
+}
+
+@Test func theWindowWeAdvertiseGrowsPastTheHandshakeCeilingOnceScalingIsInEffect() throws {
+    // The point of the whole four-step sequence. Until a scale is negotiated
+    // *and* applied, `RCV.WND` cannot exceed 65535, because that is all the
+    // header field holds. With a scale in effect the field carries
+    // `RCV.WND >> scale`, so the real window this connection offers is larger
+    // than any unscaled connection could express -- which is the only reason to
+    // have built any of it.
+    //
+    // Asserted on the REAL window rather than the wire field. The wire field
+    // legitimately *falls* as the scale rises, so a test watching it would read
+    // a growing window as a shrinking one.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .windowScale(7)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+
+            // The handshake itself is unscaled, so it is stuck at the ceiling.
+            #expect(synAck.window == UInt16(TCPEndpoint.receiveWindowBytes))
+
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh]),
+                payload: ByteBuffer(bytes: [0xaa]))
+            let ack = try #require(fixture.drainSegments().last).header
+
+            let scale = TCPEndpoint.derivedWindowScale
+            let realWindow = Int(ack.window) << Int(scale)
+            #expect(scale > 0, "a scale of zero would make this test vacuous")
+            #expect(realWindow > TCPEndpoint.receiveWindowBytes, "real window \(realWindow) did not clear the unscaled ceiling")
+
+            // The honesty half: we may not promise more than the queue holds.
+            //
+            // Against `TCPReassembler.defaultMaximumBytes`, NOT against
+            // `TCPEndpoint.maximumReceiveWindowBytes`. Falsifying this task by
+            // raising the endpoint's cap past the queue's capacity left the
+            // second form green, because the bound moved with the thing it was
+            // bounding -- the self-referential assertion this project has found
+            // three times now. The queue's own constant is the fixed point.
+            //
+            // Being exact about what this does and does not catch: raising
+            // `maximumReceiveWindowBytes` past the queue's capacity still does
+            // not fail here, because `Receiver.advertisedWindow` derives its
+            // ceiling from `reassembler.availableBytes` and the queue forecloses
+            // the overrun on its own. The honesty is structural, not enforced by
+            // this line. What this line pins is that nothing later introduces a
+            // path around the queue -- and the vector
+            // `aPassiveOpenCompletesTheThreeWayHandshakeOnTheWire` is what
+            // actually fails on that mutation today.
+            #expect(realWindow <= TCPReassembler.defaultMaximumBytes)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theScaleWeOfferIsTheSmallestThatExpressesOurCapacity() {
+    // Derived rather than written down, because a literal and the cap drift
+    // apart silently and the failure is a window we cannot honour. The boundary
+    // is closer than it looks: at a 256 KiB cap, `65535 << 2` is 262,140 --
+    // four bytes short -- so an off-by-one here is not academic.
+    let scale = Int(TCPEndpoint.derivedWindowScale)
+    let cap = TCPEndpoint.maximumReceiveWindowBytes
+    #expect(Int(UInt16.max) << scale >= cap, "scale \(scale) cannot express the \(cap)-byte cap")
+    // And that the derived value is the one actually offered. Without this,
+    // replacing the offer with a literal leaves every assertion above green:
+    // falsifying `windowScaleToOffer` alone did not fail this test until here.
+    #expect(TCPEndpoint.windowScaleToOffer == TCPEndpoint.derivedWindowScale)
+    if scale > 0 {
+        #expect(Int(UInt16.max) << (scale - 1) < cap, "scale \(scale) is larger than it needs to be")
+    }
 }
 
 @Test func aRetransmittedSynReproducesTheSameSynAck() throws {
@@ -1035,7 +1114,7 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
             #expect(syn.flags.contains(.syn))
             #expect(!syn.flags.contains(.ack))
             #expect(syn.sequence == SequenceNumber(gatewayISS))
-            #expect(syn.options == [.maximumSegmentSize(1460)])
+            #expect(syn.options == [.maximumSegmentSize(1460), .windowScale(TCPEndpoint.derivedWindowScale)])
             #expect(recorder.establishedCount == 0, "positive control: not established until the SYN-ACK arrives")
 
             fixture.inject(

@@ -42,7 +42,7 @@
 # The guest connects; the gateway accepts. The guest offers a window scale and
 # SACK; we advertise NEITHER back.
 #
-# `<mss 1460>` alone, and this is a ruling rather than an omission. Advertising
+# `<mss 1460,wscale 3>` alone, and this is a ruling rather than an omission. Advertising
 # `wscale 7` beside `win 65535` promises the peer 8 MB against a reassembler
 # that caps at 256 KiB: it fills the pipe it was promised, we drop most of it,
 # and the connection presents as a lossy path with no error raised anywhere.
@@ -52,7 +52,7 @@
 # receiver that sent it to send SACK blocks back, and this stack discards them.
 # The guest may offer both, as the first line does; we simply do not accept.
 0.000 < S  0:0(0) win 65535 <mss 1460,wscale 7,sackOK>
-0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460,wscale 3>
 # The handshake's third leg. It acknowledges our SYN and occupies no sequence
 # space, so it draws nothing back: two peers that acknowledged each other's
 # acknowledgements would never stop. The runner reports any frame this file

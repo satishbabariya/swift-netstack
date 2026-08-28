@@ -484,6 +484,38 @@ Every one of these is a scoped restriction with a reason, not an oversight.
   `tcp-data.vec`'s `window-updates-are-not-duplicate-acknowledgements` and
   its positive control, which is where that regression protection now lives.
 
+## Persist: widened, and withdrawn again with a reason
+
+The generator holds the offered window at or above
+`DiffLimits.minimumOfferedWindow`, so no sequence enters RFC 9293 §3.8.6.1's
+persist state. That was widened and then withdrawn, and both halves are worth
+recording because the attempt found two things.
+
+**First, the widening was silently doing nothing.** A case that closes the window
+with data unacknowledged was added at `58..<62` — inside the `52..<62` range of
+the case above it. Swift takes the first matching case, so it was dead code, and
+`enteredPersist` was exactly 0 across 300 sequences. **Only a coverage floor
+caught it**: the run was green and the new path had never once executed. That is
+why the `entersPersist` flag and its counter are still here despite the case being
+withdrawn — the next attempt should assert the floor *before* trusting a pass.
+
+**Second, once it actually fired, the two stacks disagreed** — and not about
+window arithmetic. The same segment is retransmitted on different schedules
+(this stack at steps 8 and 10, gVisor at step 9), which is the third place a
+retransmission has landed one step apart, after the FIN case in the RTT section
+above. The open question is the same one, and this widens its reach: it is not
+confined to a FIN, and it appears here even with samples under the RTO floor.
+
+There is also a behavioural question underneath the timing one, unresolved:
+**when the window closes with unacknowledged data in flight, which timer owns the
+connection?** This stack switches to persist; gVisor appears to go on
+retransmitting. Both readings have RFC support and they produce different wire
+behaviour, so this needs settling before persist can be compared frame for frame.
+
+**To reproduce:** re-add a case that emits `window: 0` with unacknowledged data,
+in a range that does not overlap the one above it, and assert
+`coverage.enteredPersist` is non-zero before reading anything else into the result.
+
 ## Known gaps in this stack, visible from here
 
 Not comparison nuisances — real limitations, recorded because the

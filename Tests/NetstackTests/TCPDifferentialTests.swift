@@ -182,6 +182,12 @@ private struct DiffSequence {
     var seed: UInt64
     /// Whether the guest's sequence space crosses 2^32 during this sequence.
     var crossesWrap = false
+    /// Whether this sequence closed the offered window to zero with data still
+    /// unacknowledged — RFC 9293 §3.8.6.1's persist condition. Tracked because
+    /// the case that produces it is gated on unacknowledged data, and a gate
+    /// that never opens is a case that never runs: the coverage floor below is
+    /// what stops this path passing by never happening.
+    var entersPersist = false
     var steps: [DifferentialStep]
     /// A human-readable line per step. A divergence names a step index, and
     /// without this a reader has raw base64 and nothing else.
@@ -208,6 +214,7 @@ private struct DiffGenerator {
         // compares sequence numbers as integers rather than serially gets
         // wrong (RFC 9293 §3.4).
         let crossesWrap = rng.next() % 4 == 0
+        var entersPersist = false
         let guestISS: UInt32 = crossesWrap ? UInt32.max - UInt32(rng.next() % 3000) : UInt32(truncatingIfNeeded: rng.next())
 
         // A model of the receiver's reassembly, kept in OFFSETS from the byte
@@ -690,7 +697,7 @@ private struct DiffGenerator {
         try emit(nil, advanceMs: 900, note: "trailing idle")
         try emit(nil, advanceMs: 900, note: "trailing idle")
 
-        return DiffSequence(seed: seed, crossesWrap: crossesWrap, steps: steps, trace: trace)
+        return DiffSequence(seed: seed, crossesWrap: crossesWrap, entersPersist: entersPersist, steps: steps, trace: trace)
     }
 }
 
@@ -770,10 +777,12 @@ private struct DiffCoverage {
     var withFin = 0
     var withReset = 0
     var acrossTheWrap = 0
+    var enteredPersist = 0
 
     mutating func record(_ outcome: DiffOutcome, codec: VectorFrames) {
         sequences += 1
         if outcome.sequence.crossesWrap { acrossTheWrap += 1 }
+        if outcome.sequence.entersPersist { enteredPersist += 1 }
 
         var seen: Set<String> = []
         var data = false

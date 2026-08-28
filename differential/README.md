@@ -479,11 +479,18 @@ differential is where they became visible.
   data dropped.** That is an interface consequence (the specified surface
   has no `read()`), and it is the reason the harness has to drain gVisor's
   buffer to make the window field comparable at all. M5.
-- **After a timeout, only the earliest unacknowledged segment is
-  retransmitted, once per timeout.** RFC 6298 §5.4 asks for no more, but
-  gVisor and Linux go on retransmitting the following segments as
-  acknowledgements arrive; recovering an *n*-segment loss burst here costs
-  *n* timeouts on a backing-off ladder. M5.
+- **~~After a timeout, only the earliest unacknowledged segment is
+  retransmitted, once per timeout.~~ Closed in M5.** RFC 6298 §5.4 asks for no
+  more, so this stack was conformant and unusable at the same time: recovering an
+  *n*-segment loss burst cost *n* timeouts on a backing-off ladder, about 31
+  seconds for five segments against roughly one on any deployed stack.
+  The expiry now presumes every outstanding byte lost — the same judgement
+  RFC 5681 §3.1 makes one line above when it collapses the window to a single
+  segment — which is what leaves room under the collapsed window for anything to
+  go out at all. `drainPresumedLost` then retransmits the remaining holes
+  oldest-first as acknowledgements arrive, at most once each per episode, and
+  `timeout(flightSize:)` is called exactly once so slow start is not quietly
+  disabled. Pinned by `tcp-data.vec`'s `a-timeout-keeps-retransmitting`.
 - **~~No RFC 5961 challenge-ACK rate limit.~~ Closed in M5.** This stack used to
   acknowledge every unacceptable segment, which is RFC 9293 §3.10.7.4 step 1 and
   is also an amplification the guest controls. There is now a stack-wide token

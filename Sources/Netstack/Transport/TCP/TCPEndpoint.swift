@@ -146,6 +146,24 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// `TCB.peerOfferedWindowScale` for how exactly to read that clause.
     static let windowScaleToOffer: UInt8? = derivedWindowScale
 
+    /// Whether this stack offers RFC 7323 Timestamps.
+    ///
+    /// Turned on only once the echo exists: a peer that sees the option in our
+    /// SYN will stamp every segment it sends and expect its own values back, and
+    /// a stack that offered without echoing would break the peer's RTTM while
+    /// looking, on the wire, like it had agreed to support it. Same ordering as
+    /// the window scale, for the same reason.
+    static let offersTimestamps = true
+
+    /// What the Timestamps option costs a data segment, in bytes.
+    ///
+    /// Ten bytes of option plus two of padding to a four-byte boundary. It comes
+    /// out of the payload, not out of thin air: a segment built to the
+    /// unadjusted MSS and then given twelve more bytes of options exceeds the
+    /// path MTU the MSS was derived from, and the result is either fragmentation
+    /// or a drop. Charged in `negotiatedSegmentSize`.
+    static let timestampOptionBytes = 12
+
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
     /// says nothing has told us nothing about the path.
@@ -380,7 +398,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         emit(
             [.syn], sequence: connection.tcb.iss, on: connection,
             options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
-                + windowScaleOption(for: connection, answeringPeerSyn: false),
+                + windowScaleOption(for: connection, answeringPeerSyn: false)
+                + handshakeTimestampOption(for: connection, answeringPeerSyn: false),
             acknowledgement: SequenceNumber(0),
             window: unscaledAdvertisedWindow(of: connection))
     }
@@ -702,18 +721,70 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         payload: ByteBuffer = ByteBuffer(), options: [TCPOption] = [],
         acknowledgement: SequenceNumber? = nil, window: UInt16? = nil
     ) {
+        let ack = acknowledgement ?? connection.tcb.rcvNxt
         let header = TCPHeader(
             sourcePort: connection.localPort,
             destinationPort: connection.peer.port,
             sequence: sequence,
-            acknowledgement: acknowledgement ?? connection.tcb.rcvNxt,
+            acknowledgement: ack,
             dataOffset: 5,
             flags: flags,
             window: window ?? advertisedWindow(of: connection),
             checksum: 0,
             urgentPointer: 0,
-            options: options)
+            options: options + timestampOption(for: connection, alreadyCarrying: options))
+        // RFC 7323 §4.3's Last.ACK.sent, recorded at the single point every
+        // segment leaves by so it cannot drift from what the peer actually saw.
+        // Only segments that carry the ACK bit count: a bare SYN acknowledges
+        // nothing, and letting it move Last.ACK.sent would widen the window
+        // TS.Recent may be adopted from.
+        if flags.contains(.ack) {
+            connection.tcb.recordAckSent(ack)
+        }
         emit(header, payload: payload, from: connection.localAddress, to: connection.peer.address)
+    }
+
+    /// The Timestamps option for an outgoing segment, or none.
+    ///
+    /// RFC 7323 §3: once negotiated the option goes on **every** segment, not
+    /// only on data. A peer computing RTTM from the echo needs the echo on the
+    /// acknowledgements too, and PAWS on the far side reads TSval from whatever
+    /// arrives — a stack that stopped stamping bare ACKs would have them
+    /// discarded by a conforming peer.
+    ///
+    /// `alreadyCarrying` exists because the handshake builds its own option list
+    /// and must not end up with two: a SYN or SYN-ACK offers the option itself,
+    /// and this would otherwise append a second copy.
+    private func timestampOption(for connection: Connection, alreadyCarrying options: [TCPOption]) -> [TCPOption] {
+        guard connection.tcb.timestampsEnabled else { return [] }
+        for option in options {
+            if case .timestamps = option { return [] }
+        }
+        return [.timestamps(value: timestampClock(), echo: connection.tcb.tsRecent)]
+    }
+
+    /// The Timestamps option for a SYN or SYN-ACK.
+    ///
+    /// Separate from `timestampOption` because the handshake's copy cannot be
+    /// gated on `timestampsEnabled` — that flag is the *result* of the exchange
+    /// this segment is half of. A SYN offers unconditionally; a SYN-ACK answers
+    /// only an offer, per RFC 7323 §3's "if the option was received in the
+    /// initial `<SYN>`", which `TCB.timestampsEnabled` records by then.
+    private func handshakeTimestampOption(for connection: Connection, answeringPeerSyn: Bool) -> [TCPOption] {
+        guard Self.offersTimestamps else { return [] }
+        if answeringPeerSyn && !connection.tcb.timestampsEnabled { return [] }
+        return [.timestamps(value: timestampClock(), echo: answeringPeerSyn ? connection.tcb.tsRecent : 0)]
+    }
+
+    /// TSval, in milliseconds off the injected clock.
+    ///
+    /// RFC 7323 §4.4 wants a tick between 1 ms and 1 s; milliseconds sit at the
+    /// fast end, which is what makes the value useful for RTTM on a host-local
+    /// path where a round trip is microseconds. It is a `UInt32` and it wraps,
+    /// which is why every comparison against it is serial arithmetic — see
+    /// `TCB.updateTSRecent`.
+    private func timestampClock() -> UInt32 {
+        UInt32(truncatingIfNeeded: stack.clock.now().uptimeNanoseconds / 1_000_000)
     }
 
     /// The SYN-ACK, and the one place this stack decides which options it
@@ -755,7 +826,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         emit(
             [.syn, .ack], sequence: connection.tcb.iss, on: connection,
             options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
-                + windowScaleOption(for: connection, answeringPeerSyn: true),
+                + windowScaleOption(for: connection, answeringPeerSyn: true)
+                + handshakeTimestampOption(for: connection, answeringPeerSyn: true),
             window: unscaledAdvertisedWindow(of: connection))
     }
 
@@ -789,7 +861,23 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// everything it returns must be sent.
     @discardableResult
     private func transmit(on connection: Connection) -> Int {
-        let segments = connection.sender.segmentsToTransmit(tcb: &connection.tcb, mss: connection.mss)
+        // Options come out of the PAYLOAD, not out of the advertised MSS.
+        //
+        // RFC 6691 is explicit about this and it is the opposite of the obvious
+        // reading: the MSS option "should not be decreased to account for any
+        // possible IP or TCP options", because it describes what fits the path
+        // for the peer's own segments. It is the *sender* that must shrink its
+        // data by the size of the options it adds. Charging the option against
+        // the advertised MSS instead would cut every segment on every
+        // connection short by twelve bytes, including connections that never
+        // negotiated timestamps.
+        //
+        // Conditional on the option actually being in use, which it can be here
+        // — unlike during the handshake, where the MSS is fixed before the
+        // negotiation settles.
+        let optionBytes = connection.tcb.timestampsEnabled ? Self.timestampOptionBytes : 0
+        let segments = connection.sender.segmentsToTransmit(
+            tcb: &connection.tcb, mss: max(1, connection.mss - optionBytes))
         for segment in segments {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
         }
@@ -1059,7 +1147,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 rcvWnd: Self.receiveWindowBytes,
                 irs: SequenceNumber(0),
                 windowScaleToOffer: Self.windowScaleToOffer,
-                rcvWndMax: Self.maximumReceiveWindowBytes),
+                rcvWndMax: Self.maximumReceiveWindowBytes,
+                offersTimestamps: Self.offersTimestamps),
             receiver: Receiver(reassembler: TCPReassembler()),
             sender: Sender(
                 congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,

@@ -545,6 +545,13 @@ struct TCPStateMachine {
             return challengeACK(&challengeACKs)
         }
 
+        // RFC 7323 §4.3's TS.Recent update, on an ACCEPTABLE segment and only
+        // there. §4.3 is written against segments that pass the window test, and
+        // running it earlier would let a segment the connection is about to
+        // discard set the timestamp every later echo carries — and, once PAWS
+        // reads TS.Recent, the value every later segment is judged against.
+        tcb.updateTSRecent(from: header)
+
         // Step 3 (RFC 5961 §4): the SYN bit. A SYN this late in the
         // connection is either a very old duplicate or a blind injection
         // attempt; resetting the connection because of it would let any

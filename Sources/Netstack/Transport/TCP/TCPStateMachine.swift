@@ -420,6 +420,35 @@ struct TCPStateMachine {
         challengeACKs: inout ChallengeACKBudget
     ) -> [TCPAction] {
         let header = segment.header
+
+        // RFC 7323 §5.3 R1: PAWS, and it runs FIRST — before RFC 5961's reset
+        // handling, before the window test, before everything.
+        //
+        // §5.3 places R1 first and the ordering is the whole defence. A replayed
+        // segment's point is to land inside the window, where nothing else
+        // distinguishes it from a real one; checking the window first would admit
+        // it to every step in between. The reset path is the one that matters
+        // most: a replayed RST that PAWS would have caught tears the connection
+        // down, and putting PAWS after the reset step means the one segment an
+        // attacker most wants to replay is the one PAWS never sees. That is not
+        // hypothetical — it is what this code did until a test asked for it.
+        //
+        // **A RST is exempt from the acknowledgement, not from the drop.** §5.3
+        // says acknowledge and drop; RFC 9293 says never acknowledge a RST,
+        // because two peers answering each other's resets never stop. The drop
+        // survives, the acknowledgement does not — which is also the safer
+        // reading, since the alternative has PAWS admit a reset it just judged
+        // stale.
+        //
+        // The acknowledgement spends from RFC 5961 §7's budget like every other
+        // one this file emits: a peer that can make us answer a replayed segment
+        // is the same amplification as one that can make us answer an
+        // out-of-window segment, and it chooses the rate either way.
+        if tcb.pawsRejects(header) {
+            if header.flags.contains(.rst) { return [.none] }
+            return challengeACKs.consume() ? [.sendAck] : [.none]
+        }
+
         var actions: [TCPAction] = []
 
         // Step 1 (RFC 5961 §3.2): the RST bit, checked and gated on its own

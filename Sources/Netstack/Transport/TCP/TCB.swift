@@ -209,6 +209,38 @@ struct TCB: Equatable, Sendable {
         lastAckSent = ack
     }
 
+    /// RFC 7323 §5.3's PAWS test: does this segment's timestamp place it before
+    /// everything we have already accepted?
+    ///
+    /// **This is a security property here, not a performance one.** §5's framing
+    /// is protection against a sequence number that wrapped, which matters on a
+    /// fast path — but the same test is one of the few defences a stack has
+    /// against a peer *replaying* an old segment into a live connection. The
+    /// guest on the other side of this stack is assumed to be trying to escape,
+    /// and a replayed segment that lands inside the receive window is otherwise
+    /// indistinguishable from a real one.
+    ///
+    /// Serial arithmetic again, for the reason `updateTSRecent` gives: a
+    /// timestamp clock wraps, and integer order would reject every segment for
+    /// the rest of the connection's life after the first wrap. That failure mode
+    /// is worth naming precisely because it is *silent and total* — a connection
+    /// that discards everything looks like a dead peer, not like a bug here.
+    ///
+    /// Returns false when timestamps are not in use, when the peer sent no
+    /// option on this segment, or when nothing has been recorded to compare
+    /// against. RFC 7323 §5.3 R1 requires all three: "if there is a Timestamps
+    /// option in the arriving segment, SEG.TSval < TS.Recent, and TS.Recent is
+    /// valid".
+    func pawsRejects(_ header: TCPHeader) -> Bool {
+        guard timestampsEnabled, hasTSRecent else { return false }
+        var value: UInt32?
+        for option in header.options {
+            if case .timestamps(let tsval, _) = option { value = tsval }
+        }
+        guard let tsval = value else { return false }
+        return SequenceNumber(tsval).lessThan(SequenceNumber(tsRecent))
+    }
+
     /// RFC 7323 §4.3's TS.Recent update: adopt the segment's timestamp when it
     /// does not move backwards and the segment is at or below Last.ACK.sent.
     ///

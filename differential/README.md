@@ -597,6 +597,54 @@ or what the timer is armed against — not in whether the backoff survives. The
 rather than reasoning about: four lines in the harness's step loop, writing `RTO`,
 `RTT` and `RTTVar` out per step.
 
+## Delayed acknowledgements break the run's alignment, and a recogniser cannot fix it
+
+RFC 9293 §3.8.6.3 is implemented on `p4-delayed-ack`. All 527 unit and vector
+tests pass; the differential does not, and the reason is structural rather than a
+missing mask.
+
+**The spec listed ACK coalescing as a permitted divergence from the start**, and
+this file recorded that nothing in the run had produced one yet, so whoever met it
+should "implement the masking against a real example rather than a hypothesis".
+Delaying acknowledgements produced the example. Masking it turned out not to be
+possible in the shape that was planned.
+
+**First attempt: recognise a bare acknowledgement gVisor sent that this stack did
+not.** One-directional on purpose, reasoned as "coalescing can only ever remove
+one of our frames, never add one". That reasoning is **wrong**, and the run said
+so on the next comparison: the divergence flipped to *this stack* emitting a bare
+acknowledgement gVisor did not, at a later step.
+
+Coalescing does not only remove frames — **it moves them between steps.** A held
+acknowledgement is released by its own timer during whichever step advance covers
+the deadline, and that is not the step the peer's segment arrived in. So the two
+stacks flush on different schedules and their per-step frame lists no longer line
+up, in both directions.
+
+A two-directional recogniser would mask a spurious acknowledgement this stack
+invented, which is a real defect class and not one worth trading away for a green
+run. Withdrawn.
+
+**What would actually resolve it**, neither attempted here:
+
+- Advance past the delayed-acknowledgement timeout at every step, so both stacks
+  flush before the step boundary and alignment is restored. Simple, and it costs
+  the run all sub-500 ms acknowledgement timing — plus it changes RTO behaviour
+  substantially, since every step would then be at least half a second.
+- Compare acknowledgement *coverage* across the run rather than frame-by-frame
+  per step: that no acknowledgement is lost and none is invented, without
+  requiring them to arrive in the same step. Strictly better, and a larger change
+  to the instrument than to the stack.
+
+**Also measured while here, and not implemented:** gVisor answers the FIRST
+full-sized segment after a handshake at once, where "every second full-sized
+segment" alone would hold it — Linux's quick-ACK mode. RFC 9293 neither requires
+nor forbids it, and the argument for it is real: delaying the first
+acknowledgement of a connection delays the sender's congestion window opening,
+and slow start is when the window most needs to move. Adding it here was tried and
+reverted, because it invalidated five expectations that had just been re-derived
+for the delay — one justified change turning into churn that obscures both.
+
 ## Persist: widened, and withdrawn again with a reason
 
 The generator holds the offered window at or above

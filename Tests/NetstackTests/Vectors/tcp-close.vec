@@ -243,9 +243,13 @@
 # cut off there and answered with `ack 52`, with fifty bytes silently dropped
 # and the application told the stream had ended.
 0.030 < P. 1:101(100) ack 1001 win 65535
-0.030 > .  1001:1001(0) ack 101 win 65535
+# No acknowledgement here: a hundred bytes is under 2*RMSS, so RFC 9293 3.8.6.3
+# holds it. The claim this scenario makes is about the ack NUMBER, and the FIN
+# below collects it — `ack 102` covers all hundred bytes plus the FIN, which is
+# what says the forged FIN at 51 never truncated the stream.
 # The peer's real FIN, at the position the stream actually reached. Honoured,
-# because it names RCV.NXT exactly.
+# because it names RCV.NXT exactly — and a FIN is never delayed, because the
+# peer is waiting on it to finish closing.
 0.040 < F. 101:101(0) ack 1001 win 65535
 0.040 > .  1001:1001(0) ack 102 win 65535
 

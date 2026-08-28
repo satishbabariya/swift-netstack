@@ -171,6 +171,20 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// for a flow the every-second-segment rule never fires on.
     static let delayedAckTimeout = TimeAmount.milliseconds(500)
 
+    // Not implemented here, and recorded because it was measured rather than
+    // guessed: gVisor answers the FIRST full-sized segment after a handshake at
+    // once, where "every second full-sized segment" alone would hold it. Linux
+    // calls that quick-ACK mode; RFC 9293 neither requires nor forbids it, and
+    // the argument for it is real — a delayed acknowledgement at the start of a
+    // connection delays the sender's congestion window opening, and slow start
+    // is when the window most needs to move.
+    //
+    // It belongs in its own change. Adding it here was tried and reverted: it
+    // invalidated five expectations that had just been re-derived for the delay,
+    // which is how one justified change turns into churn that obscures both. See
+    // `differential/README.md`.
+
+
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
     /// says nothing has told us nothing about the path.
@@ -254,13 +268,20 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// and then the timer must not send a second one saying the same thing.
         var delayedAckPending = false
 
-        /// Full-sized segments received since the last acknowledgement went out.
+        /// New in-order bytes received since the last acknowledgement went out.
         ///
-        /// §3.8.6.3's "every second segment" rule. Reset by every
-        /// acknowledgement, however it was triggered, so the count is always
-        /// "since the peer last heard from us" rather than "since the last
-        /// timer".
-        var fullSegmentsSinceAck = 0
+        /// RFC 9293 §3.8.6.3 asks for an acknowledgement "for at least every
+        /// second full-sized segment **or 2*RMSS bytes** of new data", and the
+        /// byte form is the one to implement: counting *segments* would answer
+        /// two one-byte segments as eagerly as two full ones, which is exactly
+        /// the interactive traffic delayed acknowledgements exist to coalesce.
+        /// Bytes make the trigger proportional to what the peer actually sent.
+        ///
+        /// Reset by every acknowledgement however it was triggered, so the count
+        /// is always "since the peer last heard from us" rather than "since the
+        /// last timer".
+        var unacknowledgedBytesSinceAck = 0
+
         /// When the FIN should next be retransmitted. An **absolute** deadline
         /// rather than a delay, so that re-arming the timer on every arriving
         /// segment cannot push it further out -- a peer that sends anything at
@@ -683,7 +704,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         if wantsAck, transmitted == 0 {
             emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
             connection.delayedAckPending = false
-            connection.fullSegmentsSinceAck = 0
+            connection.unacknowledgedBytesSinceAck = 0
         } else if wantsDelayableAck, transmitted == 0 {
             // RFC 9293 §3.8.6.3: acknowledge every SECOND full-sized segment,
             // and never hold one longer than 500 ms.
@@ -695,17 +716,17 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             // would open in 500 ms steps. The timer is what bounds the wait when
             // the second segment never comes, which is the whole of an
             // interactive flow.
-            connection.fullSegmentsSinceAck += 1
-            if connection.fullSegmentsSinceAck >= 2 {
+            connection.unacknowledgedBytesSinceAck += segment.payload.readableBytes
+            if connection.unacknowledgedBytesSinceAck >= 2 * connection.mss {
                 emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
                 connection.delayedAckPending = false
-                connection.fullSegmentsSinceAck = 0
+                connection.unacknowledgedBytesSinceAck = 0
             } else if !connection.delayedAckPending {
                 connection.delayedAckPending = true
                 connection.timers.scheduleDelayedAck(after: Self.delayedAckTimeout) { [weak self, weak connection] in
                     guard let self, let connection, connection.delayedAckPending else { return }
                     connection.delayedAckPending = false
-                    connection.fullSegmentsSinceAck = 0
+                    connection.unacknowledgedBytesSinceAck = 0
                     self.emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
                 }
             }

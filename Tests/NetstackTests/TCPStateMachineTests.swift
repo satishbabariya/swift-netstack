@@ -199,8 +199,21 @@ private func containsSendSynAck(_ actions: [TCPAction]) -> Bool {
     actions.contains { if case .sendSynAck = $0 { return true }; return false }
 }
 
+/// Whether the state machine asked for an acknowledgement, promptly or not.
+///
+/// Both cases count, and the distinction is deliberately NOT made here. Every
+/// caller of this helper is asserting *that* the peer gets acknowledged, which is
+/// a property of the state machine; *when* it goes out is RFC 9293 §3.8.6.3's
+/// question and belongs to the endpoint, which owns the timer. A test that cares
+/// about the timing says so by matching the action itself — see
+/// `theStateMachineMarksOrdinaryInOrderDataAsDelayable`.
 private func containsSendAck(_ actions: [TCPAction]) -> Bool {
-    actions.contains { if case .sendAck = $0 { return true }; return false }
+    actions.contains {
+        switch $0 {
+        case .sendAck, .sendAckMayDelay: return true
+        default: return false
+        }
+    }
 }
 
 private func containsDeliver(_ actions: [TCPAction]) -> Bool {

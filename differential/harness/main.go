@@ -41,6 +41,9 @@ import (
 const (
 	nicID = tcpip.NICID(1)
 
+	// TCPReassembler.defaultMaximumBytes on the Swift side.
+	swiftReceiveCapacity = 256 * 1024
+
 	gatewayIP  = "192.168.127.1"
 	gatewayMAC = "\x5a\x94\xef\xe4\x0c\xee"
 
@@ -157,6 +160,38 @@ func play(r run) ([][]string, error) {
 		Clock:              clock,
 	})
 	defer s.Close()
+
+	// Give gVisor the same receive capacity the Swift stack has, so the two
+	// derive the same window scale and advertise comparable windows.
+	//
+	// Without this they diverge on every frame for a reason that is not a
+	// defect in either: each side picks its shift from its own buffer size, so
+	// gVisor's 1 MiB default gives `wscale 5` against the Swift stack's
+	// `wscale 3`, and every window field afterwards is scaled by a different
+	// factor. Matching the capacities makes the comparison about behaviour
+	// again rather than about configuration.
+	//
+	// 256 KiB is `TCPReassembler.defaultMaximumBytes` on the Swift side. Both
+	// stacks pick the smallest shift that fits their capacity into the 16-bit
+	// field, so both should land on 3 — and if gVisor ever stops doing that,
+	// the SYN-ACK's option list is where it will show.
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     4096,
+		Default: swiftReceiveCapacity,
+		Max:     swiftReceiveCapacity,
+	}
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf); err != nil {
+		return nil, fmt.Errorf("set receive buffer: %s", err)
+	}
+
+	// And turn off gVisor's receive-buffer auto-tuning. This stack does not
+	// auto-tune -- its window is a function of what the reassembler holds and
+	// nothing else -- so leaving moderation on compares two different policies
+	// and calls the difference a divergence.
+	moderate := tcpip.TCPModerateReceiveBufferOption(false)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &moderate); err != nil {
+		return nil, fmt.Errorf("disable receive buffer moderation: %s", err)
+	}
 
 	if err := s.CreateNIC(nicID, link); err != nil {
 		return nil, fmt.Errorf("create NIC: %s", err)

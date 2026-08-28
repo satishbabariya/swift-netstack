@@ -68,7 +68,20 @@ private final class DiffTarget {
         stack.start()
         stack.arpCache.record(diffGuest, diffGuestMAC)
 
-        let endpoint = TCPEndpoint(stack: stack, initialSequenceNumbers: FixedInitialSequenceNumbers(diffISS))
+        // Delayed acknowledgements OFF for the comparison, and this is a stated
+        // configuration difference rather than a mask.
+        //
+        // The two stacks flush held acknowledgements on different schedules, so
+        // their per-step frame lists stop lining up in BOTH directions — a held
+        // acknowledgement is released by whichever step advance covers its
+        // deadline, not by the step its segment arrived in. No recogniser fixes
+        // that without also masking a spurious acknowledgement this stack
+        // invented. Turning the delay off restores alignment and costs the run
+        // exactly one thing: sub-500 ms acknowledgement timing, which is pinned
+        // in `tcp-data.vec` against a fixed peer instead.
+        let endpoint = TCPEndpoint(
+            stack: stack, initialSequenceNumbers: FixedInitialSequenceNumbers(diffISS),
+            delayedAckTimeout: .zero)
         try endpoint.bind(address: diffGateway, port: diffLocalPort)
         try endpoint.listen(backlog: 64)
         self.endpoint = endpoint

@@ -164,6 +164,27 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// or a drop. Charged in `negotiatedSegmentSize`.
     static let timestampOptionBytes = 12
 
+    /// RFC 9293 §3.8.6.3's ceiling on a delayed acknowledgement: "an ACK should
+    /// not be excessively delayed; in particular, the delay MUST be less than
+    /// 0.5 seconds". Taken at the limit rather than under it, because the only
+    /// thing a shorter delay buys is more frames — and the timer is the fallback
+    /// for a flow the every-second-segment rule never fires on.
+    static let delayedAckTimeout = TimeAmount.milliseconds(500)
+
+    // Not implemented here, and recorded because it was measured rather than
+    // guessed: gVisor answers the FIRST full-sized segment after a handshake at
+    // once, where "every second full-sized segment" alone would hold it. Linux
+    // calls that quick-ACK mode; RFC 9293 neither requires nor forbids it, and
+    // the argument for it is real — a delayed acknowledgement at the start of a
+    // connection delays the sender's congestion window opening, and slow start
+    // is when the window most needs to move.
+    //
+    // It belongs in its own change. Adding it here was tried and reverted: it
+    // invalidated five expectations that had just been re-derived for the delay,
+    // which is how one justified change turns into churn that obscures both. See
+    // `differential/README.md`.
+
+
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
     /// says nothing has told us nothing about the path.
@@ -239,6 +260,28 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// retransmission is this endpoint's to drive; see
         /// `finNeedsRetransmission`.
         var finSequence: SequenceNumber?
+
+        /// Whether an acknowledgement is being held under RFC 9293 §3.8.6.3.
+        ///
+        /// Checked inside the timer body as well as here, because a segment that
+        /// arrives before the timer fires can send the acknowledgement early —
+        /// and then the timer must not send a second one saying the same thing.
+        var delayedAckPending = false
+
+        /// New in-order bytes received since the last acknowledgement went out.
+        ///
+        /// RFC 9293 §3.8.6.3 asks for an acknowledgement "for at least every
+        /// second full-sized segment **or 2*RMSS bytes** of new data", and the
+        /// byte form is the one to implement: counting *segments* would answer
+        /// two one-byte segments as eagerly as two full ones, which is exactly
+        /// the interactive traffic delayed acknowledgements exist to coalesce.
+        /// Bytes make the trigger proportional to what the peer actually sent.
+        ///
+        /// Reset by every acknowledgement however it was triggered, so the count
+        /// is always "since the peer last heard from us" rather than "since the
+        /// last timer".
+        var unacknowledgedBytesSinceAck = 0
+
         /// When the FIN should next be retransmitted. An **absolute** deadline
         /// rather than a delay, so that re-arming the timer on every arriving
         /// segment cannot push it further out -- a peer that sends anything at
@@ -272,6 +315,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     private let allocator = ByteBufferAllocator()
 
     private let maximumTimeWaitConnections: Int
+    private let delayedAckTimeout: TimeAmount
 
     private var boundID: TransportEndpointID?
     private var isListening = false
@@ -310,11 +354,19 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// its production value's worth of state is a cap nothing tests.
     init(
         stack: Stack, initialSequenceNumbers: any InitialSequenceNumbers,
-        maximumTimeWaitConnections: Int = TCPEndpoint.defaultMaximumTimeWaitConnections
+        maximumTimeWaitConnections: Int = TCPEndpoint.defaultMaximumTimeWaitConnections,
+        delayedAckTimeout: TimeAmount = TCPEndpoint.delayedAckTimeout
     ) {
         self.stack = stack
         self.initialSequenceNumbers = initialSequenceNumbers
         self.maximumTimeWaitConnections = max(1, maximumTimeWaitConnections)
+        // Injectable so the differential can turn the delay off. gVisor's own
+        // acknowledgement timing does not match this stack's -- see
+        // `differential/README.md` -- and a comparison that cannot align frames
+        // measures nothing at all. Zero here means "acknowledge at once", which
+        // is what the run needs and what every RFC 9293 §3.8.6.3 permission is
+        // an exception to.
+        self.delayedAckTimeout = delayedAckTimeout
     }
 
     deinit {
@@ -610,6 +662,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             challengeACKs: &stack.tcpChallengeACKs)
 
         var wantsAck = false
+        var wantsDelayableAck = false
         var deleted = false
         for action in actions {
             switch action {
@@ -617,6 +670,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 emitSynAck(on: connection)
             case .sendAck:
                 wantsAck = true
+            case .sendAckMayDelay:
+                wantsDelayableAck = true
             case .sendRst(let sequence, let ack):
                 emit(
                     ack == nil ? [.rst] : [.rst, .ack], sequence: sequence, on: connection,
@@ -657,6 +712,39 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         let transmitted = transmit(on: connection)
         if wantsAck, transmitted == 0 {
             emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+            connection.delayedAckPending = false
+            connection.unacknowledgedBytesSinceAck = 0
+        } else if wantsDelayableAck, transmitted == 0 {
+            // RFC 9293 §3.8.6.3: acknowledge every SECOND full-sized segment,
+            // and never hold one longer than 500 ms.
+            //
+            // Both halves are required and they answer different failures. The
+            // every-second-segment rule is what keeps a bulk transfer's
+            // acknowledgement clock running — a receiver that only ever waited
+            // out the timer would ACK twice a second, and the sender's window
+            // would open in 500 ms steps. The timer is what bounds the wait when
+            // the second segment never comes, which is the whole of an
+            // interactive flow.
+            connection.unacknowledgedBytesSinceAck += segment.payload.readableBytes
+            if connection.unacknowledgedBytesSinceAck >= 2 * connection.mss {
+                emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+                connection.delayedAckPending = false
+                connection.unacknowledgedBytesSinceAck = 0
+            } else if delayedAckTimeout == .zero {
+                // No delay configured: answer at once. Keeps the branch above the
+                // single place that decides eligibility, rather than making
+                // every caller test the timeout.
+                emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+                connection.unacknowledgedBytesSinceAck = 0
+            } else if !connection.delayedAckPending {
+                connection.delayedAckPending = true
+                connection.timers.scheduleDelayedAck(after: delayedAckTimeout) { [weak self, weak connection] in
+                    guard let self, let connection, connection.delayedAckPending else { return }
+                    connection.delayedAckPending = false
+                    connection.unacknowledgedBytesSinceAck = 0
+                    self.emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+                }
+            }
         }
         armRetransmitTimer(on: connection)
         armPersistTimer(on: connection)

@@ -327,6 +327,11 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
             fixture.inject(
                 guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh]),
                 payload: ByteBuffer(bytes: [0xaa]))
+            // A single one-byte segment does not reach RFC 9293 §3.8.6.3's
+            // 2*RMSS trigger, so its acknowledgement is held. Waiting the timer
+            // out is the faithful way to see it: the alternative — sending
+            // 2*MSS of data to force it — would change what this test is about.
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
             let ack = try #require(fixture.drainSegments().last).header
 
             let scale = TCPEndpoint.derivedWindowScale
@@ -1376,15 +1381,28 @@ private func lateSegment(peerPort: UInt16 = tcpPeerPort) -> TCPHeader {
             fixture.advance(by: .milliseconds(500))
             fixture.inject(
                 guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]), payload: tcpPayload(1))
-            let answered = fixture.drainSegments()
-            #expect(answered.count == 1)
-            #expect(answered.first?.header.flags.contains(.fin) == false)
+            // Nothing comes back yet, and that is RFC 9293 §3.8.6.3 rather than
+            // the segment being ignored: one byte is nowhere near 2*RMSS, so its
+            // acknowledgement is held. The positive control moves below.
+            #expect(fixture.drainSegments().isEmpty, "the acknowledgement is delayed, not skipped")
 
             // The rest of the original RTO. The FIN is due now, not half a
             // second from now.
             fixture.advance(by: .milliseconds(500))
-            let retransmitted = fixture.drainSegments().filter { $0.header.flags.contains(.fin) }
+            let atTheDeadline = fixture.drainSegments()
+            let retransmitted = atTheDeadline.filter { $0.header.flags.contains(.fin) }
             #expect(retransmitted.count == 1, "an arriving segment must not push our FIN's deadline out")
+
+            // The positive control, and it is the same one moved: the delayed
+            // acknowledgement arrives here too, which proves the peer's segment
+            // really was processed and really did re-arm nothing. Without it,
+            // "the FIN came back on time" is equally true of a stack that
+            // dropped the segment on the floor.
+            let acknowledged = atTheDeadline.filter { !$0.header.flags.contains(.fin) }
+            #expect(acknowledged.count == 1, "the held acknowledgement, released by its own timer")
+            #expect(
+                acknowledged.first?.header.acknowledgement == SequenceNumber(guestISS + 2),
+                "and it covers the byte that arrived")
             #expect(retransmitted.first?.header.sequence == SequenceNumber(gatewayISS + 1))
         }
     }
@@ -1518,7 +1536,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        withExtendedLifetime(endpoint) {
+        try withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -1596,7 +1614,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        withExtendedLifetime(endpoint) {
+        try withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -1702,7 +1720,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     do {
         let endpoint = try listeningEndpoint(fixture)
         recorder.attach(to: endpoint)
-        withExtendedLifetime(endpoint) {
+        try withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -1715,7 +1733,24 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
                     payload: tcpPayload(10))
             }
 
-            #expect(challengeAcks(fixture) == 20, "every in-order segment is acknowledged, budget or no budget")
+            // Re-derived for RFC 9293 §3.8.6.3, and the shape of the assertion
+            // matters more than the number.
+            //
+            // Twenty ten-byte segments are 200 bytes — nowhere near 2*RMSS — so
+            // they are coalesced into one delayed acknowledgement rather than
+            // drawing twenty. Asserting a smaller count would be the wrong fix:
+            // "fewer than twenty" is equally true of an acknowledgement the
+            // budget swallowed, which is the failure this test exists to catch.
+            // What distinguishes them is that the acknowledgement ARRIVES, on an
+            // empty budget, and covers every byte.
+            #expect(challengeAcks(fixture) == 0, "held by the delay timer, not sent yet")
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            let afterTimer = fixture.drainSegments()
+            #expect(afterTimer.count == 1, "one coalesced acknowledgement, on a budget that is still empty")
+            let ack = try #require(afterTimer.first).header
+            #expect(
+                ack.acknowledgement == SequenceNumber(guestISS + 1 + 200),
+                "and it covers all 200 bytes, so nothing was dropped rather than delayed")
             #expect(recorder.bytes.count == 200)
         }
     }
@@ -1803,6 +1838,11 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
                     sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh],
                     options: [.timestamps(value: 9000, echo: 0)]),
                 payload: ByteBuffer(bytes: [0xaa]))
+            // A single one-byte segment does not reach RFC 9293 §3.8.6.3's
+            // 2*RMSS trigger, so its acknowledgement is held. Waiting the timer
+            // out is the faithful way to see it: the alternative — sending
+            // 2*MSS of data to force it — would change what this test is about.
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
             let ack = try #require(fixture.drainSegments().last).header
             guard case .timestamps(_, let echo)? = ack.options.first(where: {
                 if case .timestamps = $0 { return true } else { return false }
@@ -1834,6 +1874,11 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             fixture.inject(
                 guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh]),
                 payload: ByteBuffer(bytes: [0xaa]))
+            // A single one-byte segment does not reach RFC 9293 §3.8.6.3's
+            // 2*RMSS trigger, so its acknowledgement is held. Waiting the timer
+            // out is the faithful way to see it: the alternative — sending
+            // 2*MSS of data to force it — would change what this test is about.
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
             let ack = try #require(fixture.drainSegments().last).header
             #expect(ack.options.isEmpty, "no option was negotiated, so none is sent: \(ack.options)")
         }

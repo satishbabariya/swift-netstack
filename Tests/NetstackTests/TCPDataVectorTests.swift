@@ -298,7 +298,7 @@ private let closeVectors = "tcp-close"
 
 // MARK: - tcp-data.vec
 
-@Test func inOrderDataIsAcknowledgedSegmentBySegment() throws {
+@Test func inOrderDataIsAcknowledgedOnceForBothSegments() throws {
     let harness = try runTransferScenario(dataVectors, "in-order-data")
     // Two segments in, two deliveries out, and nothing merged or lost. The wire
     // lines pin the acknowledgements; this pins that the bytes reached the

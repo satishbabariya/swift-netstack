@@ -484,6 +484,50 @@ Every one of these is a scoped restriction with a reason, not an oversight.
   `tcp-data.vec`'s `window-updates-are-not-duplicate-acknowledgements` and
   its positive control, which is where that regression protection now lives.
 
+## The RTO disagreement, traced to a cause
+
+Three sightings — a FIN above the floor, persist below it, and the run below —
+all had the same shape: a retransmission landing one step apart. It is one cause,
+and it is **not** the estimator arithmetic.
+
+**Reproduction:** seed `6840123409045651477`, with the write follow-up's
+`advanceMs` at 2000 instead of 700. Both stacks agree on every frame up to the
+FIN and disagree only on when it is retransmitted.
+
+**The trace.** The application writes 304 B at t≈821 ms. The RTO is at RFC 6298
+§2.4's one-second floor, so it expires at t≈1821 ms and **both stacks retransmit**
+— that step is identical. §5.5 then doubles the RTO to 2000 ms on both sides. The
+guest's acknowledgement arrives at t≈2821 ms, and Karn's algorithm applies: the
+segment was retransmitted, so the acknowledgement is ambiguous and **neither stack
+may take a sample from it**. The FIN goes out at t≈3936 ms. gVisor retransmits it
+within (4975, 5875]; this stack within (5875, 6775] — roughly 2× later, which is
+exactly the doubling.
+
+**So the difference is whether an acknowledgement of new data clears the RTO
+backoff when Karn has forbidden a new measurement.**
+
+- **This stack keeps it.** The backoff is discarded only by
+  `RTTEstimator.measure`, so the first *unambiguous* sample clears it and an
+  ambiguous acknowledgement does not (`Sender.swift`, `retransmitTimerFired`'s
+  doc comment). That is RFC 6298 read literally: §5.5 doubles the RTO, and nothing
+  in §5 undoes it except recomputation from a measurement Karn has just forbidden.
+- **gVisor and Linux clear it** on any acknowledgement of new data
+  (Linux zeroes `icsk_backoff` on `FLAG_ACKED`), on the reasoning that a delivered
+  segment is evidence the path works, and the backoff exists to respond to loss.
+
+**Neither is an RFC violation, and the practical case favours changing.** Keeping
+a doubled RTO after the path has demonstrably delivered means the *next* loss is
+detected twice as slowly, for no benefit — and "every deployed stack does it" was
+the argument that settled the handshake-sample question earlier in this plan. The
+counter-argument is real but weaker: the acknowledgement is ambiguous precisely
+because we cannot tell which transmission it answers, and if it answers the
+original then the path is slow rather than lossy.
+
+**Not changed here.** It alters loss-recovery latency on every connection and
+belongs in a task with its own falsification, not as a note at the end of an
+instrument change. Recorded so the next session starts from a cause rather than
+from three symptoms.
+
 ## Persist: widened, and withdrawn again with a reason
 
 The generator holds the offered window at or above

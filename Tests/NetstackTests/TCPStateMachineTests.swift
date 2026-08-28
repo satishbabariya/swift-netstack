@@ -1039,3 +1039,235 @@ private func passiveOpenCompleted(peerShift: UInt8, ourShift: UInt8 = 5, windowI
     #expect(tcb.state == .established)
     #expect(tcb.sndWnd == 8_388_480, "65535 << 7, the same 65535 that was left alone in the SYN-ACK")
 }
+
+// MARK: - RFC 7323 §3 Timestamps negotiation
+
+@Test func timestampsAreInUseOnlyWhenBothSidesSentTheOption() {
+    // The same rule as the window scale, and it is stated separately because
+    // the two are negotiated from the same segment and it would be easy to make
+    // one depend on the other. They are independent: a peer may offer both,
+    // either, or neither, and each is settled on its own.
+    var both = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    both.negotiateTimestamps(fromSynOptions: [.timestamps(value: 4242, echo: 0)])
+    #expect(both.timestampsEnabled)
+    #expect(both.tsRecent == 4242, "TS.Recent is seeded from the SYN that negotiated it")
+    #expect(both.hasTSRecent)
+
+    // The peer offered and we did not.
+    var weDeclined = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: false)
+    weDeclined.negotiateTimestamps(fromSynOptions: [.timestamps(value: 4242, echo: 0)])
+    #expect(!weDeclined.timestampsEnabled)
+    #expect(!weDeclined.hasTSRecent, "nothing may be echoed, so nothing is recorded")
+
+    // We offered and the peer did not.
+    var peerDeclined = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    peerDeclined.negotiateTimestamps(fromSynOptions: [.maximumSegmentSize(1460)])
+    #expect(!peerDeclined.timestampsEnabled)
+}
+
+@Test func aTimestampOfZeroIsAnOfferAndNotAnAbsence() {
+    // Zero is a legal TSval — a peer whose clock starts there sends it — so
+    // `tsRecent == 0` cannot mean "no timestamp yet". `hasTSRecent` is what
+    // distinguishes them, and without it a first echo would be indistinguishable
+    // from never having heard from the peer. The same trap
+    // `peerOfferedWindowScale` exists for, one option over.
+    var tcb = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: 0, echo: 0)])
+    #expect(tcb.timestampsEnabled)
+    #expect(tcb.tsRecent == 0)
+    #expect(tcb.hasTSRecent, "a zero timestamp was still a timestamp")
+}
+
+// MARK: - RFC 7323 §4.3 TS.Recent
+
+private func timestampTCB(rcvNxt: UInt32 = 1000, tsRecent: UInt32, lastAckSent: UInt32) -> TCB {
+    var tcb = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(rcvNxt), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: tsRecent, echo: 0)])
+    tcb.recordAckSent(SequenceNumber(lastAckSent))
+    return tcb
+}
+
+private func timestampedSegment(sequence: UInt32, tsval: UInt32) -> TCPHeader {
+    segment(sequence: sequence, flags: [.ack], options: [.timestamps(value: tsval, echo: 0)]).header
+}
+
+@Test func tsRecentAdvancesOnlyForASegmentAtOrBelowTheLastAcknowledgementSent() {
+    var tcb = timestampTCB(tsRecent: 100, lastAckSent: 1000)
+
+    // At Last.ACK.sent: adopted.
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 1000, tsval: 200))
+    #expect(tcb.tsRecent == 200)
+
+    // Beyond it: refused, even though the timestamp is newer. A peer must not
+    // drive TS.Recent forward with data we have not acknowledged in sequence.
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 5000, tsval: 300))
+    #expect(tcb.tsRecent == 200, "a segment past Last.ACK.sent must not touch TS.Recent")
+}
+
+@Test func tsRecentNeverMovesBackwards() {
+    // The half PAWS is built on. An older timestamp adopted here would let a
+    // replayed segment make itself look current to every later check.
+    var tcb = timestampTCB(tsRecent: 500, lastAckSent: 1000)
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 400))
+    #expect(tcb.tsRecent == 500, "an older timestamp must not replace TS.Recent")
+
+    // Positive control: a newer one on the same segment shape is adopted, so
+    // the refusal above is about the value and not about the segment.
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 600))
+    #expect(tcb.tsRecent == 600)
+}
+
+@Test func aTimestampClockThatWrapsDoesNotFreezeTsRecent() {
+    // Serial arithmetic, not integer order. A timestamp clock wraps at 2^32,
+    // and `>=` on UInt32 would read every value after the wrap as a step
+    // backwards — freezing TS.Recent permanently and, once PAWS reads it,
+    // discarding every subsequent segment on the connection.
+    var tcb = timestampTCB(tsRecent: UInt32.max - 10, lastAckSent: 1000)
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 5))
+    #expect(tcb.tsRecent == 5, "a wrapped timestamp is newer, not older")
+}
+
+@Test func tsRecentIsUntouchedWhenTimestampsWereNotNegotiated() {
+    var tcb = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(1000), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: false)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: 100, echo: 0)])
+    tcb.recordAckSent(SequenceNumber(1000))
+    tcb.updateTSRecent(from: timestampedSegment(sequence: 900, tsval: 999))
+    #expect(!tcb.timestampsEnabled)
+    #expect(tcb.tsRecent == 0, "a connection not using timestamps records none")
+}
+
+// MARK: - RFC 7323 §5.3 PAWS
+
+private func pawsTCB(tsRecent: UInt32) -> TCB {
+    var tcb = TCB(
+        state: .established, sndUna: SequenceNumber(100), sndNxt: SequenceNumber(100), sndWnd: 65535,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(99),
+        rcvNxt: SequenceNumber(1000), rcvWnd: 4096, irs: SequenceNumber(999), offersTimestamps: true)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: tsRecent, echo: 0)])
+    tcb.recordAckSent(SequenceNumber(1000))
+    return tcb
+}
+
+@Test func aReplayedSegmentWithAStaleTimestampIsRefusedEvenInsideTheWindow() {
+    // The security property. A replayed segment's whole point is to land inside
+    // the receive window, where nothing else distinguishes it from a real one.
+    var tcb = pawsTCB(tsRecent: 5000)
+    var receiver = Receiver(reassembler: TCPReassembler())
+    var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 1 << 20)
+    var budget = ChallengeACKBudget(clock: ManualClock())
+
+    let stale = segment(
+        sequence: 1000, ack: 100, flags: [.ack], payload: 10,
+        options: [.timestamps(value: 4000, echo: 0)])
+    let actions = TCPStateMachine.receive(
+        segment: stale, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
+
+    #expect(actions == [.sendAck], "RFC 7323 5.3 R1: acknowledge and drop")
+    #expect(tcb.rcvNxt == SequenceNumber(1000), "the replayed bytes were not accepted")
+
+    // The positive control, and it is what makes the refusal about the timestamp
+    // rather than about the segment: the identical segment with a current
+    // timestamp is accepted and advances RCV.NXT.
+    let current = segment(
+        sequence: 1000, ack: 100, flags: [.ack], payload: 10,
+        options: [.timestamps(value: 6000, echo: 0)])
+    _ = TCPStateMachine.receive(
+        segment: current, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
+    #expect(tcb.rcvNxt == SequenceNumber(1010), "a current timestamp on the same segment is accepted")
+}
+
+@Test func aStaleTimestampedResetIsDroppedWithoutAnAcknowledgement() {
+    // Two rules meet here and both have to hold. RFC 7323 5.3 says acknowledge
+    // and drop; RFC 9293 says never acknowledge a RST, because two peers that
+    // answer each other's resets never stop. The drop survives, the
+    // acknowledgement does not -- which is also the safer half, since the
+    // alternative reading would have PAWS admit a reset it had just judged stale.
+    var tcb = pawsTCB(tsRecent: 5000)
+    var receiver = Receiver(reassembler: TCPReassembler())
+    var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 1 << 20)
+    var budget = ChallengeACKBudget(clock: ManualClock())
+
+    let staleReset = segment(
+        sequence: 1000, ack: 100, flags: [.rst], options: [.timestamps(value: 4000, echo: 0)])
+    let actions = TCPStateMachine.receive(
+        segment: staleReset, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
+
+    #expect(actions == [.none], "a stale reset is discarded in silence")
+    #expect(tcb.state == .established, "and it does not tear the connection down")
+}
+
+@Test func pawsSpendsFromTheChallengeAckBudgetLikeEveryOtherAnswer() {
+    // A peer that can make us answer a replayed segment is the same amplification
+    // as one that can make us answer an out-of-window segment, and it picks the
+    // rate either way. An exemption here would be a bypass of the whole budget.
+    var tcb = pawsTCB(tsRecent: 5000)
+    var receiver = Receiver(reassembler: TCPReassembler())
+    var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 1 << 20)
+    var budget = ChallengeACKBudget(clock: ManualClock())
+
+    var answered = 0
+    for _ in 0..<400 {
+        let stale = segment(
+            sequence: 1000, ack: 100, flags: [.ack], payload: 10,
+            options: [.timestamps(value: 4000, echo: 0)])
+        let actions = TCPStateMachine.receive(
+            segment: stale, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
+        if actions.contains(.sendAck) { answered += 1 }
+    }
+    #expect(answered == 100, "bounded by the budget, and not by nothing")
+    #expect(answered > 0, "positive control: the budget does not suppress everything")
+}
+
+@Test func aTimestampClockThatWrapsDoesNotMakePawsRefuseEverything() {
+    // The failure mode worth naming because it is silent AND total: with integer
+    // order instead of serial arithmetic, the first wrap of the peer's timestamp
+    // clock makes every later segment look stale, and the connection discards
+    // everything for the rest of its life while looking like a dead peer.
+    var tcb = pawsTCB(tsRecent: UInt32.max - 10)
+    var receiver = Receiver(reassembler: TCPReassembler())
+    var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 1 << 20)
+    var budget = ChallengeACKBudget(clock: ManualClock())
+
+    let wrapped = segment(
+        sequence: 1000, ack: 100, flags: [.ack], payload: 10,
+        options: [.timestamps(value: 5, echo: 0)])
+    _ = TCPStateMachine.receive(
+        segment: wrapped, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
+    #expect(tcb.rcvNxt == SequenceNumber(1010), "a wrapped timestamp is newer, not stale")
+}
+
+@Test func pawsIsInertOnAConnectionThatNegotiatedNoTimestamps() {
+    var tcb = TCB(
+        state: .established, sndUna: SequenceNumber(100), sndNxt: SequenceNumber(100), sndWnd: 65535,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(99),
+        rcvNxt: SequenceNumber(1000), rcvWnd: 4096, irs: SequenceNumber(999), offersTimestamps: false)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: 5000, echo: 0)])
+    var receiver = Receiver(reassembler: TCPReassembler())
+    var sender = Sender(congestionControl: Reno(maximumSegmentSize: 1460), clock: ManualClock(), maximumBufferedBytes: 1 << 20)
+    var budget = ChallengeACKBudget(clock: ManualClock())
+
+    let stale = segment(
+        sequence: 1000, ack: 100, flags: [.ack], payload: 10,
+        options: [.timestamps(value: 1, echo: 0)])
+    _ = TCPStateMachine.receive(
+        segment: stale, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
+    #expect(tcb.rcvNxt == SequenceNumber(1010), "no negotiation, no PAWS, and the data is accepted")
+}

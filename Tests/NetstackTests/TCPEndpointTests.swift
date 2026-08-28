@@ -1114,7 +1114,19 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
             #expect(syn.flags.contains(.syn))
             #expect(!syn.flags.contains(.ack))
             #expect(syn.sequence == SequenceNumber(gatewayISS))
-            #expect(syn.options == [.maximumSegmentSize(1460), .windowScale(TCPEndpoint.derivedWindowScale)])
+            // The SYN offers timestamps too, and the assertion names the option
+            // rather than matching the list loosely: TSval is a clock reading
+            // and cannot be written down, but everything about the option that
+            // is a decision — that it is present, and that its echo is zero on a
+            // segment answering nothing — can be.
+            #expect(syn.options.count == 3)
+            #expect(syn.options[0] == .maximumSegmentSize(1460))
+            #expect(syn.options[1] == .windowScale(TCPEndpoint.derivedWindowScale))
+            if case .timestamps(_, let echo) = syn.options[2] {
+                #expect(echo == 0, "a SYN echoes nothing, because it has heard nothing")
+            } else {
+                Issue.record("the SYN did not carry a Timestamps option: \(syn.options)")
+            }
             #expect(recorder.establishedCount == 0, "positive control: not established until the SYN-ACK arrives")
 
             fixture.inject(
@@ -1758,6 +1770,108 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             // never fires.
             fixture.advance(by: .seconds(31))
             #expect(endpoint.timeWaitCountForTesting == 0)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aGuestOfferingTimestampsGetsThemBackAndEveryLaterSegmentCarriesAnEcho() throws {
+    // RFC 7323 §3: once negotiated the option goes on EVERY segment, not only
+    // on data. A peer computing RTTM from the echo needs it on acknowledgements
+    // too, and a conforming peer running PAWS discards a segment that arrives
+    // without one.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .timestamps(value: 7000, echo: 0)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+            guard case .timestamps(_, let synAckEcho)? = synAck.options.first(where: {
+                if case .timestamps = $0 { return true } else { return false }
+            }) else {
+                Issue.record("the SYN-ACK did not answer the offer: \(synAck.options)")
+                return
+            }
+            #expect(synAckEcho == 7000, "the SYN-ACK echoes the SYN's timestamp")
+
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh],
+                    options: [.timestamps(value: 9000, echo: 0)]),
+                payload: ByteBuffer(bytes: [0xaa]))
+            let ack = try #require(fixture.drainSegments().last).header
+            guard case .timestamps(_, let echo)? = ack.options.first(where: {
+                if case .timestamps = $0 { return true } else { return false }
+            }) else {
+                Issue.record("a bare acknowledgement dropped the option: \(ack.options)")
+                return
+            }
+            #expect(echo == 9000, "the echo tracks the most recent acceptable timestamp")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aGuestThatOffersNoTimestampGetsNoneBackAndNoneOnAnyLaterSegment() throws {
+    // The negative half, and the one that keeps the option from appearing on a
+    // connection that never agreed to it — which would cost twelve bytes of
+    // every segment and, on a peer that does not expect it, an option it must
+    // parse and discard.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+            #expect(synAck.options == [.maximumSegmentSize(1460)])
+
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh]),
+                payload: ByteBuffer(bytes: [0xaa]))
+            let ack = try #require(fixture.drainSegments().last).header
+            #expect(ack.options.isEmpty, "no option was negotiated, so none is sent: \(ack.options)")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aTimestampedSegmentGivesUpTwelveBytesOfPayloadForTheOption() throws {
+    // RFC 6691: options come out of the payload, not out of the advertised MSS.
+    // The MSS describes what fits the path for the PEER's segments and "should
+    // not be decreased to account for any possible IP or TCP options"; it is the
+    // sender that must shrink its data by the options it adds. A segment cut to
+    // the full MSS and then given twelve more bytes of Timestamps exceeds the
+    // MTU the MSS came from, and the result is fragmentation or a drop —
+    // presenting as loss on a path that dropped nothing.
+    //
+    // This test exists because falsifying the charge did not fail anything:
+    // every other timestamp test asserts option lists, and none of them looks at
+    // how much data a segment carries.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .timestamps(value: 7000, echo: 0)]))
+            _ = fixture.drainSegments()
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xaa, count: 4000)))
+            let sent = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            let full = try #require(sent.first).payload.readableBytes
+            #expect(full == 1460 - TCPEndpoint.timestampOptionBytes, "a full segment pays for its own option")
+            // The positive control: it is 1448 because of the option, not because
+            // the connection cut everything short. The MSS itself is unchanged.
+            #expect(full > 1000, "a full segment is still nearly a full segment")
         }
     }
     fixture.drain()

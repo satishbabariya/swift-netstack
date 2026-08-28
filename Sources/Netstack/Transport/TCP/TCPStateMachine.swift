@@ -237,6 +237,7 @@ struct TCPStateMachine {
             // `TCB.negotiateWindowScale(fromSynOptions:)` for why there are no
             // others and why the result is still zero on every connection.
             tcb.negotiateWindowScale(fromSynOptions: header.options)
+            tcb.negotiateTimestamps(fromSynOptions: header.options)
             tcb.state = .synReceived
             return [.sendSynAck]
         }
@@ -298,6 +299,7 @@ struct TCPStateMachine {
             // by any segment with the SYN bit set, and in a simultaneous open
             // both sides have already sent theirs.
             tcb.negotiateWindowScale(fromSynOptions: header.options)
+            tcb.negotiateTimestamps(fromSynOptions: header.options)
             if header.flags.contains(.ack), ackAcceptable {
                 // Handshake retirement of our own SYN, which is the one
                 // sequence number `Sender` does not model. The acceptable range
@@ -418,6 +420,35 @@ struct TCPStateMachine {
         challengeACKs: inout ChallengeACKBudget
     ) -> [TCPAction] {
         let header = segment.header
+
+        // RFC 7323 §5.3 R1: PAWS, and it runs FIRST — before RFC 5961's reset
+        // handling, before the window test, before everything.
+        //
+        // §5.3 places R1 first and the ordering is the whole defence. A replayed
+        // segment's point is to land inside the window, where nothing else
+        // distinguishes it from a real one; checking the window first would admit
+        // it to every step in between. The reset path is the one that matters
+        // most: a replayed RST that PAWS would have caught tears the connection
+        // down, and putting PAWS after the reset step means the one segment an
+        // attacker most wants to replay is the one PAWS never sees. That is not
+        // hypothetical — it is what this code did until a test asked for it.
+        //
+        // **A RST is exempt from the acknowledgement, not from the drop.** §5.3
+        // says acknowledge and drop; RFC 9293 says never acknowledge a RST,
+        // because two peers answering each other's resets never stop. The drop
+        // survives, the acknowledgement does not — which is also the safer
+        // reading, since the alternative has PAWS admit a reset it just judged
+        // stale.
+        //
+        // The acknowledgement spends from RFC 5961 §7's budget like every other
+        // one this file emits: a peer that can make us answer a replayed segment
+        // is the same amplification as one that can make us answer an
+        // out-of-window segment, and it chooses the rate either way.
+        if tcb.pawsRejects(header) {
+            if header.flags.contains(.rst) { return [.none] }
+            return challengeACKs.consume() ? [.sendAck] : [.none]
+        }
+
         var actions: [TCPAction] = []
 
         // Step 1 (RFC 5961 §3.2): the RST bit, checked and gated on its own
@@ -542,6 +573,13 @@ struct TCPStateMachine {
             }
             return challengeACK(&challengeACKs)
         }
+
+        // RFC 7323 §4.3's TS.Recent update, on an ACCEPTABLE segment and only
+        // there. §4.3 is written against segments that pass the window test, and
+        // running it earlier would let a segment the connection is about to
+        // discard set the timestamp every later echo carries — and, once PAWS
+        // reads TS.Recent, the value every later segment is judged against.
+        tcb.updateTSRecent(from: header)
 
         // Step 3 (RFC 5961 §4): the SYN bit. A SYN this late in the
         // connection is either a very old duplicate or a blind injection

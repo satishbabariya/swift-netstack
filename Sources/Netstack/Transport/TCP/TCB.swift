@@ -164,6 +164,110 @@ struct TCB: Equatable, Sendable {
     /// nothing later in the connection can reconstruct it.
     private(set) var peerOfferedWindowScale = false
 
+    /// RFC 7323 §3. Timestamps are in use only when **both** sides carried the
+    /// option in the handshake, exactly as with the window scale, and for the
+    /// same reason: the option in a SYN is an offer, and a SYN-ACK that omits it
+    /// declines. Written once, by `negotiateTimestamps(fromSynOptions:offering:)`.
+    private(set) var timestampsEnabled = false
+
+    /// Whether this stack puts the Timestamps option in its own SYN and
+    /// SYN-ACK. Carried on the TCB for the same reason `windowScaleToOffer` is:
+    /// the endpoint decides it, the state machine must not have to be told, and
+    /// negotiation happens deep inside a segment handler that has no other route
+    /// to the endpoint's configuration.
+    let offersTimestamps: Bool
+
+    /// TS.Recent (RFC 7323 §4.3): the most recent timestamp the peer sent that
+    /// was acceptable to echo back. Zero until the first one arrives.
+    ///
+    /// Not merely "the last TSval seen". §4.3's update rule is deliberately
+    /// narrow — a segment's timestamp replaces TS.Recent only when the segment
+    /// is *in sequence*, so a peer cannot poison the echo with a segment from
+    /// out of the past. PAWS is built on that narrowness; this field is where it
+    /// will live.
+    private(set) var tsRecent: UInt32 = 0
+
+    /// Whether `tsRecent` has ever been set. Distinct from `tsRecent == 0`
+    /// because zero is a legal timestamp value, and a peer whose clock starts
+    /// there would otherwise be indistinguishable from a peer that has not
+    /// spoken yet — the same trap `peerOfferedWindowScale` exists for.
+    private(set) var hasTSRecent = false
+
+    /// Last.ACK.sent (RFC 7323 §4.3): the acknowledgement number in the most
+    /// recent segment this stack sent with the ACK bit set.
+    ///
+    /// Recorded because §4.3's update rule is bounded by it, not by RCV.NXT: a
+    /// timestamp is only adopted from a segment at or below the sequence number
+    /// we have already told the peer we were expecting. That is what keeps a
+    /// segment from the far side of the window out of TS.Recent, and PAWS is
+    /// built on TS.Recent being narrow.
+    private(set) var lastAckSent = SequenceNumber(0)
+
+    /// Called by the endpoint at its single egress point for every segment it
+    /// sends with the ACK bit set.
+    mutating func recordAckSent(_ ack: SequenceNumber) {
+        lastAckSent = ack
+    }
+
+    /// RFC 7323 §5.3's PAWS test: does this segment's timestamp place it before
+    /// everything we have already accepted?
+    ///
+    /// **This is a security property here, not a performance one.** §5's framing
+    /// is protection against a sequence number that wrapped, which matters on a
+    /// fast path — but the same test is one of the few defences a stack has
+    /// against a peer *replaying* an old segment into a live connection. The
+    /// guest on the other side of this stack is assumed to be trying to escape,
+    /// and a replayed segment that lands inside the receive window is otherwise
+    /// indistinguishable from a real one.
+    ///
+    /// Serial arithmetic again, for the reason `updateTSRecent` gives: a
+    /// timestamp clock wraps, and integer order would reject every segment for
+    /// the rest of the connection's life after the first wrap. That failure mode
+    /// is worth naming precisely because it is *silent and total* — a connection
+    /// that discards everything looks like a dead peer, not like a bug here.
+    ///
+    /// Returns false when timestamps are not in use, when the peer sent no
+    /// option on this segment, or when nothing has been recorded to compare
+    /// against. RFC 7323 §5.3 R1 requires all three: "if there is a Timestamps
+    /// option in the arriving segment, SEG.TSval < TS.Recent, and TS.Recent is
+    /// valid".
+    func pawsRejects(_ header: TCPHeader) -> Bool {
+        guard timestampsEnabled, hasTSRecent else { return false }
+        var value: UInt32?
+        for option in header.options {
+            if case .timestamps(let tsval, _) = option { value = tsval }
+        }
+        guard let tsval = value else { return false }
+        return SequenceNumber(tsval).lessThan(SequenceNumber(tsRecent))
+    }
+
+    /// RFC 7323 §4.3's TS.Recent update: adopt the segment's timestamp when it
+    /// does not move backwards and the segment is at or below Last.ACK.sent.
+    ///
+    /// Both halves matter and neither is decoration. **Not moving backwards** is
+    /// what PAWS will read; adopting an older timestamp would hand a replayed
+    /// segment the means to make itself look current. **At or below
+    /// Last.ACK.sent** is what keeps a segment from beyond what we have
+    /// acknowledged out of the echo, so a peer cannot drive TS.Recent forward
+    /// with data we have not yet accepted in sequence.
+    ///
+    /// Comparison is RFC 1982 serial arithmetic, not integer order: a timestamp
+    /// clock wraps, and `>=` on `UInt32` would call every value after a wrap a
+    /// step backwards and freeze TS.Recent for good.
+    mutating func updateTSRecent(from header: TCPHeader) {
+        guard timestampsEnabled else { return }
+        var value: UInt32?
+        for option in header.options {
+            if case .timestamps(let tsval, _) = option { value = tsval }
+        }
+        guard let tsval = value else { return }
+        let notBackwards = !hasTSRecent || !SequenceNumber(tsval).lessThan(SequenceNumber(tsRecent))
+        let withinWhatWeAcknowledged = !lastAckSent.lessThan(header.sequence)
+        guard notBackwards, withinWhatWeAcknowledged else { return }
+        tsRecent = tsval
+        hasTSRecent = true
+    }
+
     /// The shift this stack puts in its **own** SYN and SYN-ACK, or `nil` for
     /// "we send no Window Scale option at all".
     ///
@@ -192,7 +296,8 @@ struct TCB: Equatable, Sendable {
         rcvWnd: Int,
         irs: SequenceNumber,
         windowScaleToOffer: UInt8? = nil,
-        rcvWndMax: Int? = nil
+        rcvWndMax: Int? = nil,
+        offersTimestamps: Bool = false
     ) {
         self.state = state
         self.sndUna = sndUna
@@ -214,6 +319,32 @@ struct TCB: Equatable, Sendable {
         self.rcvWndMax = rcvWndMax ?? rcvWnd
         self.irs = irs
         self.windowScaleToOffer = windowScaleToOffer
+        self.offersTimestamps = offersTimestamps
+    }
+
+    /// RFC 7323 §3's Timestamps negotiation, run from the same segment and at
+    /// the same moment as the window scale's, and subject to the same rule:
+    /// both sides must have sent the option or neither uses it.
+    ///
+    /// Reads `offersTimestamps` for this stack's half of the agreement, the way
+    /// the window scale's negotiation reads `windowScaleToOffer`.
+    mutating func negotiateTimestamps(fromSynOptions options: [TCPOption]) {
+        var peerSent = false
+        var peerValue: UInt32 = 0
+        for option in options {
+            if case .timestamps(let value, _) = option {
+                peerSent = true
+                peerValue = value
+            }
+        }
+        timestampsEnabled = peerSent && offersTimestamps
+        // TS.Recent is seeded from the SYN's own timestamp, per RFC 7323 §4.3's
+        // initialisation, and only when the option is actually in use: recording
+        // it otherwise would leave a value nothing may echo.
+        if timestampsEnabled {
+            tsRecent = peerValue
+            hasTSRecent = true
+        }
     }
 
     /// RFC 7323's Window Scale negotiation, run **once** per connection, from

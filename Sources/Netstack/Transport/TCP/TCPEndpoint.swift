@@ -316,6 +316,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     private let maximumTimeWaitConnections: Int
     private let delayedAckTimeout: TimeAmount
+    private let nagleDisabled: Bool
 
     private var boundID: TransportEndpointID?
     private var isListening = false
@@ -355,7 +356,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     init(
         stack: Stack, initialSequenceNumbers: any InitialSequenceNumbers,
         maximumTimeWaitConnections: Int = TCPEndpoint.defaultMaximumTimeWaitConnections,
-        delayedAckTimeout: TimeAmount = TCPEndpoint.delayedAckTimeout
+        delayedAckTimeout: TimeAmount = TCPEndpoint.delayedAckTimeout,
+        nagleDisabled: Bool = false
     ) {
         self.stack = stack
         self.initialSequenceNumbers = initialSequenceNumbers
@@ -367,6 +369,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // is what the run needs and what every RFC 9293 §3.8.6.3 permission is
         // an exception to.
         self.delayedAckTimeout = delayedAckTimeout
+        self.nagleDisabled = nagleDisabled
     }
 
     deinit {
@@ -1238,9 +1241,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 rcvWndMax: Self.maximumReceiveWindowBytes,
                 offersTimestamps: Self.offersTimestamps),
             receiver: Receiver(reassembler: TCPReassembler()),
-            sender: Sender(
-                congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,
-                maximumBufferedBytes: Self.sendBufferBytes),
+            sender: {
+                var sender = Sender(
+                    congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,
+                    maximumBufferedBytes: Self.sendBufferBytes)
+                sender.nagleDisabled = nagleDisabled
+                return sender
+            }(),
             mss: mss)
     }
 

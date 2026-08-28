@@ -536,7 +536,8 @@ struct DifferentialRun {
 
         return DifferentialDivergence(
             step: step, frameIndex: index, swiftBytes: swift, goBytes: go,
-            recognised: Self.recognise(swift: normalizedSwift, go: normalizedGo),
+            recognised: Self.recognise(swift: normalizedSwift, go: normalizedGo)
+                ?? Self.recogniseScaledWindow(swift: normalizedSwift, go: normalizedGo),
             description: "step \(step) frame \(index): swift=\(normalizedSwift) go=\(normalizedGo)")
     }
 
@@ -560,10 +561,55 @@ struct DifferentialRun {
     static func recognise(swift: VectorPacket, go: VectorPacket) -> String? {
         guard case .tcp(var swiftLine) = swift, case .tcp(let goLine) = go else { return nil }
         guard swiftLine.flags == "S.", goLine.flags == "S." else { return nil }
-        guard swiftLine.window == 65535, goLine.window == 29184 else { return nil }
+        // 29200, not the 29184 this pinned before window scaling landed. gVisor
+        // derives its initial window from its receive buffer, and the harness
+        // now sets that buffer to the Swift stack's capacity so both sides
+        // derive the same shift — which moved this by 16 bytes. Still pinned to
+        // exact values rather than a range: the point of this recogniser is
+        // that it fires for one known pair and nothing else.
+        guard swiftLine.window == 65535, goLine.window == 29200 else { return nil }
         swiftLine.window = goLine.window
         guard swiftLine == goLine else { return nil }
         return "syn-ack-initial-window"
+    }
+
+    /// The second recognised difference: the window on a pure acknowledgement,
+    /// once a scale is in effect.
+    ///
+    /// **Window scaling did not create this — it made it visible.** Before the
+    /// scale, both stacks' advertised windows were clipped to 65535 by the
+    /// header field, so two different receive capacities produced the same
+    /// number and the comparison matched by accident. With the scale applied,
+    /// each side expresses what it actually has, and the two differ: this stack
+    /// advertises what its reassembler holds, gVisor charges `SegOverheadSize`
+    /// per segment against its buffer and advertises roughly half. Both are
+    /// honest about their own capacity; they account for overhead differently.
+    /// RFC 9293 mandates no particular window, so neither is wrong.
+    ///
+    /// **What this masks, stated plainly.** A defect that changes only the
+    /// advertised window on a pure ACK, and changes nothing else about the
+    /// frame, will not be caught here. That is not nothing — so the exact-window
+    /// coverage lives in the vectors instead, where the peer is fixed and the
+    /// numbers are derived by hand: `tcp-data.vec`'s window scenarios pin the
+    /// value, the shrink, the recovery and the never-retract edge against a
+    /// stack that cannot drift with a reference implementation's buffer policy.
+    ///
+    /// The bound is "the window is the **only** difference". Not a restriction
+    /// to particular flags: the first attempt limited this to bare ACKs and the
+    /// very next sequence produced the same difference on a FIN-ACK, which
+    /// showed the restriction was arbitrary rather than principled. The window
+    /// is a receive-side property and is not comparable between two stacks with
+    /// different receive accounting, on any frame that carries it. What remains
+    /// caught is every window difference that comes *with* something else —
+    /// a wrong sequence, a wrong flag, a missing frame — which is what a real
+    /// window defect looks like when it affects behaviour rather than only
+    /// advertisement.
+    static func recogniseScaledWindow(swift: VectorPacket, go: VectorPacket) -> String? {
+        guard case .tcp(var swiftLine) = swift, case .tcp(let goLine) = go else { return nil }
+        guard swiftLine.window != goLine.window else { return nil }
+        swiftLine.window = goLine.window
+        guard swiftLine == goLine else { return nil }
+        return "scaled-advertised-window"
     }
 
     private func describe(_ frame: ByteBuffer) -> String {

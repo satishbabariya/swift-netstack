@@ -339,6 +339,62 @@ anyone who widens the generator knows what will come back.
 | **Handshake RTT sample.** gVisor takes one from the SYN-ACK/ACK round trip; `Sender` models no SYN, so this stack takes none and starts its estimator from the first data sample. RFC 6298 requires *a* sample, not which one. | **Both**, but gVisor's is what every deployed stack does, and this stack's first data RTO is up to 3× longer as a result (a 716 ms sample put its first FIN retransmission at +2.148 s against gVisor's +1.000 s). Worth revisiting in M5. | Every acknowledgement of our data arrives in the next step with **no time advance**, so every sample is zero and both estimators stay pinned to RFC 6298 §2.4's one-second floor. |
 | **NewReno `recover`.** gVisor declines fast recovery unless the cumulative acknowledgement is strictly past `FastRecovery.Last`, comparing it against `SEG.ACK - 1`; initialised to the ISS, that suppresses the *first* loss episode of a connection entirely. RFC 6582 §3.2 step 1 asks for "covers more than `recover`", which ISS+1 does. | **Probably this stack**, but it is an M5 question about NewReno and not one this run can settle. | The duplicate-acknowledgement case acknowledges one segment first, which puts the episode past the off-by-one. |
 
+## Window scaling: what changed when the constraint was lifted
+
+The generator used to offer `mss` alone. It now offers `mss` and `wscale`, and
+still not `sackOK`.
+
+That was always the plan. The restriction was scoped as a **generator
+constraint** rather than a permitted divergence precisely so that lifting it
+would be a task someone has to do, one option at a time, by whoever implements
+the option — rather than a hole someone has to remember. `wscale`'s lift belongs
+to the window-scaling work; `sackOK`'s belongs to whoever implements SACK,
+because nothing here acts on a SACK block and gVisor would send blocks into a
+stack that ignores them.
+
+**Two configuration changes were needed on the Go side, and both are about
+comparing behaviour rather than configuration.**
+
+`TCPReceiveBufferSizeRangeOption` now sets gVisor's receive buffer to 256 KiB,
+the Swift reassembler's capacity. Without it each side derives its shift from its
+own buffer — gVisor's 1 MiB default gives `wscale 5` against this stack's
+`wscale 3` — and every window afterwards is scaled by a different factor. With
+the capacities matched, both stacks independently pick **3**, which is worth
+noting: they use the same rule (the smallest shift that fits the capacity into
+the 16-bit field) without having been made to.
+
+`TCPModerateReceiveBufferOption(false)` turns off gVisor's receive-buffer
+auto-tuning. This stack does not auto-tune — its window is a function of what the
+reassembler holds and nothing else — so leaving moderation on compares two
+policies and calls the difference a divergence. (Measured: it changed none of the
+numbers here, but it removes a reason for them to move later.)
+
+### A second recognised difference, and what it costs
+
+**Window scaling did not create the window difference. It made it visible.**
+Before the scale, both stacks' advertised windows were clipped to 65535 by the
+header field, so two different receive capacities produced the same number and
+the comparison matched by accident. With the scale applied each side expresses
+what it actually has: this stack advertises what its reassembler holds, gVisor
+charges `SegOverheadSize` per segment against its buffer and advertises roughly
+half. Both are honest about their own capacity; they account for overhead
+differently, and RFC 9293 mandates no particular window.
+
+So `scaled-advertised-window` joins `syn-ack-initial-window` as a *recognised*
+difference — asserted, not permitted. It is bounded by "the window is the **only**
+difference", on any frame. The first attempt restricted it to bare ACKs and the
+very next sequence produced the same difference on a FIN-ACK, which showed the
+restriction was arbitrary rather than principled.
+
+**What that masks:** a defect changing only the advertised window, and nothing
+else about the frame, is not caught here. Exact-window coverage lives in
+`tcp-data.vec` instead, where the peer is fixed and the numbers are derived by
+hand, so it cannot drift with a reference implementation's buffer policy.
+
+Both labels are counted and asserted — the SYN-ACK's exactly once per sequence,
+the scaled window at least once — and a third label appearing without anyone
+adding one fails the run.
+
 ## What the generator deliberately does not vary
 
 Every one of these is a scoped restriction with a reason, not an oversight.
@@ -363,8 +419,12 @@ Every one of these is a scoped restriction with a reason, not an oversight.
   correctly refuses as outside the window it promised. The trim itself is
   pinned by `tcp-data.vec`'s `right-edge-trim`.
 - **The offered window never goes below 4096.** A closed window puts a
-  sender into RFC 9293 §3.8.6.1's persist state; gVisor has a zero-window
-  probe timer and this stack has none — see "known gaps".
+  sender into RFC 9293 §3.8.6.1's persist state. Both stacks probe one; what
+  they are not required to agree on is *when*. The probe's timing is a SHOULD
+  in both documents that specify it (RFC 9293 SHLD-29, SHLD-30) and the
+  interval ceiling is explicitly left open — RFC 1122 §4.2.2.17: "possibly
+  with some maximum interval not specified here" — so a divergence there would
+  be a report about nothing. See "what this run does NOT cover".
 - **No data after the peer's FIN, and the peer's FIN only with nothing
   queued ahead of it.** Both are cases where the two stacks' handling is
   pinned by vectors (`data-past-the-fin`, `fin-ahead-of-rcv-nxt`) and where
@@ -391,6 +451,16 @@ Every one of these is a scoped restriction with a reason, not an oversight.
 - **The full FIN retransmission budget.** The ladder reaches five rungs
   inside a sequence's virtual time; the eighth-transmission give-up is
   pinned by unit tests.
+- **Zero-window probing, in its entirety.** The generator floors the offered
+  window at 4096 (see the row above), so no sequence ever reaches the persist
+  condition and the harness exercises none of it: not the probe, not its one
+  byte, not the backoff ladder, not the absence of a give-up budget. **A green
+  differential run says nothing whatever about persist.** It is pinned by
+  `tcp-data.vec`'s `a-lost-window-update-is-recovered-by-a-zero-window-probe`
+  and `zero-window-probes-back-off-and-do-not-give-up`, and by the persist
+  section of `TCPSenderTests` — which is where the thousand-probe check that
+  actually falsifies a give-up budget lives, since no vector of a runnable
+  length can reach that far up the ladder.
 - **The duplicate-acknowledgement window condition (e) itself.** Closing the
   SND.WND-update difference above also removed the traffic that exposed
   defect 2: the differential no longer reaches it. It is pinned by
@@ -409,18 +479,56 @@ differential is where they became visible.
   data dropped.** That is an interface consequence (the specified surface
   has no `read()`), and it is the reason the harness has to drain gVisor's
   buffer to make the window field comparable at all. M5.
-- **There is no zero-window probe.** `Sender` has no persist timer, so a
-  window update lost on the way here wedges the connection until the peer
-  sends something else. Pinned by `tcp-data.vec`'s `zero-window`; the
-  generator stays out of persist state. M5.
 - **After a timeout, only the earliest unacknowledged segment is
   retransmitted, once per timeout.** RFC 6298 §5.4 asks for no more, but
   gVisor and Linux go on retransmitting the following segments as
   acknowledgements arrive; recovering an *n*-segment loss burst here costs
   *n* timeouts on a backing-off ladder. M5.
-- **No RFC 5961 challenge-ACK rate limit.** This stack acknowledges every
-  unacceptable segment, which is RFC 9293 §3.10.7.4 step 1 and is also an
-  amplification the guest controls.
+- **~~No RFC 5961 challenge-ACK rate limit.~~ Closed in M5.** This stack used to
+  acknowledge every unacceptable segment, which is RFC 9293 §3.10.7.4 step 1 and
+  is also an amplification the guest controls. There is now a stack-wide token
+  bucket (`ChallengeACKBudget`, 100 per second, refilled from the injected
+  `NetstackClock`) that **all six** challenge-ACK sites in `TCPStateMachine`
+  spend from — RFC 5961 §3.2's blind reset, §4's SYN on a synchronized
+  connection, §5's acknowledgement of data never sent, and RFC 9293 §3.10.7.4
+  step 1's acknowledge-and-drop in each of its three arms. It is a limit on the
+  ACK only: the 2·MSL restart that travels with a TIME-WAIT FIN retransmission is
+  unconditional, or a guest could expire a TIME-WAIT block by emptying the budget
+  elsewhere. See `TCPEndpointTests`' challenge-ACK section.
+
+  Two adjacent 1:1 emitters are deliberately **not** throttled, and both are worth
+  knowing about before someone reports them as the same gap: the SYN-ACK
+  reproduced for a retransmitted SYN in SYN-RECEIVED, and the reset `Stack`'s TCP
+  handler sends for a port with no endpoint. Neither is a challenge ACK, both are
+  what lets a peer make progress, and throttling either turns a flood on one
+  connection into a refusal to open another.
+
+  The generator still never places a zero-length segment behind RCV.NXT, so the
+  differential does not exercise the throttle. **If it is ever widened to, the two
+  stacks will diverge, and here is the shape of it**, because gVisor throttles as
+  well and does it differently in both dimensions
+  (`transport/tcp/endpoint.go`'s `allowOutOfWindowAck`, called from
+  `connect.go`'s handshake and from `snd.go`'s `maybeSendOutOfWindowAck`):
+
+  | | this stack | gVisor at the pinned version |
+  |---|---|---|
+  | shape | token bucket, 100 tokens, one second to refill | minimum *interval* between two out-of-window ACKs, no bucket |
+  | rate | 100 per second, burstable to 100 at once | `defaultTCPInvalidRateLimit` = 500 ms, so 2 per second and never two together |
+  | scope | one budget per `Stack` | `lastOutOfWindowAckTime` per **endpoint**; only the interval is a stack option |
+  | data-bearing segments | throttled like any other | **exempt** — `maybeSendOutOfWindowAck` always ACKs a segment with a payload |
+
+  That last row is a deliberate disagreement, not an oversight. gVisor's exemption
+  is aimed at ACK loops, where a data segment is unlikely to be one; the threat
+  here is amplification, and a one-byte payload would turn the exemption into a
+  bypass of the whole budget for the price of one byte per segment. Pinned by
+  `aFloodOfUnacceptableSegmentsCarryingDataIsBoundedToo`.
+
+  That also explains part of a row in the table above: "gVisor drops an
+  unacceptable segment in silence" is not only a policy difference, it is this
+  limiter, which at 500 ms suppresses everything a generated sequence sends after
+  the first. A widened generator would see gVisor answer roughly one challenge and
+  this stack answer a hundred, both conformant — RFC 5961 §7 fixes no number and
+  offers "no more than 10 in any 5 second window" only as an example.
 
 ## CI must build the harness for the SWIFT job
 

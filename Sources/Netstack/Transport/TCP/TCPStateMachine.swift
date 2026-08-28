@@ -142,7 +142,24 @@ struct TCPStateMachine {
     /// the one site that has just decided the acknowledgement is acceptable, so
     /// that no caller is in a position to acknowledge separately — see the
     /// type's doc comment on the SND.UNA split.
-    static func receive(segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver, sender: inout Sender) -> [TCPAction] {
+    ///
+    /// `challengeACKs` is RFC 5961 §7's throttle, and it is `inout` because it is
+    /// **not** this connection's: it belongs to the whole stack (`Stack.tcpChallengeACKs`)
+    /// and every connection on it spends from the same bucket. See
+    /// `ChallengeACKBudget` for why it is shared and what that costs.
+    ///
+    /// It is drawn on here, inside the machine, for the same reason `receiver`
+    /// and `sender` are driven here: this is the only place that knows *why* an
+    /// ACK is being sent. `TCPAction.sendAck` covers both an acknowledgement of
+    /// received data and a challenge, and on the wire they are the same frame, so
+    /// a caller that tried to throttle the returned actions could only throttle
+    /// both — which would stop a guest's data transfer dead for as long as it
+    /// kept the bucket empty, an attack on the connection delivered by the
+    /// defence.
+    static func receive(
+        segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver, sender: inout Sender,
+        challengeACKs: inout ChallengeACKBudget
+    ) -> [TCPAction] {
         switch tcb.state {
         case .closed:
             return closedStateSegmentArrives(segment: segment)
@@ -151,7 +168,8 @@ struct TCPStateMachine {
         case .synSent:
             return synSentStateSegmentArrives(segment: segment, tcb: &tcb)
         case .synReceived, .established, .finWait1, .finWait2, .closeWait, .closing, .lastAck, .timeWait:
-            return generalSegmentArrives(segment: segment, tcb: &tcb, receiver: &receiver, sender: &sender)
+            return generalSegmentArrives(
+                segment: segment, tcb: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &challengeACKs)
         }
     }
 
@@ -213,6 +231,12 @@ struct TCPStateMachine {
             tcb.rcvNxt = header.sequence + 1
             tcb.sndUna = tcb.iss
             tcb.sndNxt = tcb.iss + 1
+            // RFC 7323's Window Scale negotiation, passive-open half: the
+            // peer's shift is in this SYN, ours is whatever the SYN-ACK about
+            // to be sent will carry. One of exactly two call sites; see
+            // `TCB.negotiateWindowScale(fromSynOptions:)` for why there are no
+            // others and why the result is still zero on every connection.
+            tcb.negotiateWindowScale(fromSynOptions: header.options)
             tcb.state = .synReceived
             return [.sendSynAck]
         }
@@ -267,6 +291,13 @@ struct TCPStateMachine {
         if header.flags.contains(.syn) {
             tcb.irs = header.sequence
             tcb.rcvNxt = header.sequence + 1
+            // The other of the two Window Scale call sites, covering both ways
+            // out of SYN-SENT: the SYN-ACK of an active open and the peer's
+            // bare SYN in a simultaneous open. It runs before the branch below
+            // because RFC 7323 treats them identically -- the option is carried
+            // by any segment with the SYN bit set, and in a simultaneous open
+            // both sides have already sent theirs.
+            tcb.negotiateWindowScale(fromSynOptions: header.options)
             if header.flags.contains(.ack), ackAcceptable {
                 // Handshake retirement of our own SYN, which is the one
                 // sequence number `Sender` does not model. The acceptable range
@@ -280,14 +311,39 @@ struct TCPStateMachine {
             if tcb.iss.lessThan(tcb.sndUna) {
                 // Our SYN has been acknowledged: the handshake is complete.
                 tcb.state = .established
-                // Snd.Wind.Scale (RFC 7323 §2.3): one of three sites that decode
-                // the PEER's window. Unscaled today because nothing negotiates a
-                // scale; when Task 13 does, each of the three needs
-                // `<< Snd.Wind.Scale` here. This is not the same change as the
-                // one `Receiver.advertisedWindow` owns -- that is our direction,
-                // this is theirs, and RFC 7323 negotiates the two separately.
-                // `CongestionControl` sends `min(cwnd, sndWnd)` bytes, so an
-                // unscaled decode under-uses the path by up to 2^14.
+                // Snd.Wind.Scale (RFC 7323 §2.3): one of FOUR sites in this file
+                // that decode the PEER's window, and one of the two that must
+                // NEVER be shifted.
+                //
+                // `header` here is the peer's SYN-ACK. RFC 7323 §2.3: "The window
+                // field (SEG.WND) in the header of every incoming segment, with
+                // the exception of <SYN> segments, MUST be left-shifted by
+                // Snd.Wind.Shift bits before updating SND.WND". §2.2 says the
+                // same thing from the sender's side: "The window field in a
+                // segment where the SYN bit is set (i.e., a <SYN> or <SYN,ACK>)
+                // MUST NOT be scaled." It cannot be -- the peer chose that
+                // window before it knew whether scaling had been agreed at all.
+                // Shifting it would multiply the peer's opening window by up to
+                // 2^14 and have this stack transmit a megabyte into a 64 KiB
+                // buffer on the first write, which is the same defect as
+                // advertising a scale we do not apply, pointed the other way.
+                //
+                // The four sites are: this one and the simultaneous-open one
+                // below (both SYN-bearing, both stay unscaled forever), and the
+                // SYN-RECEIVED and ESTABLISHED window updates in
+                // `generalSegmentArrives` (both reached only by a non-SYN
+                // segment, and both now take `<< tcb.sndWindScale`). A previous
+                // revision of these comments said "each of the three needs
+                // `<< Snd.Wind.Scale`", which is wrong twice over: there are four,
+                // and two of them must not be shifted.
+                //
+                // The absence of a shift on this line is therefore a decision,
+                // not an omission left for a later task — the shift is recorded
+                // (`TCB.negotiateWindowScale(fromSynOptions:)`), is available on
+                // this line, and is applied at both of the other two sites in
+                // `generalSegmentArrives`. Both SYN-bearing sites
+                // have a test of their own saying so; see
+                // `theWindowInASynAckIsNotScaledEvenThoughThatSynAckNegotiatedAScale`.
                 tcb.sndWnd = Int(header.window)
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
@@ -298,7 +354,11 @@ struct TCPStateMachine {
             // acknowledged ours. Answer with our own SYN|ACK and wait in
             // SYN-RECEIVED for it to be acknowledged in turn.
             tcb.state = .synReceived
-            tcb.sndWnd = Int(header.window)  // Snd.Wind.Scale: second of three peer-window decodes; see above.
+            // Snd.Wind.Scale: the second of the two SYN-bearing peer-window
+            // decodes -- this is the peer's own SYN -- so it stays unscaled for
+            // the same reason as the one above. See there, and
+            // `theWindowInASimultaneousOpensSynIsNotScaledEitherRfc7323`.
+            tcb.sndWnd = Int(header.window)
             tcb.sndWl1 = header.sequence
             tcb.sndWl2 = header.acknowledgement
             return [.sendSynAck]
@@ -315,8 +375,47 @@ struct TCPStateMachine {
     /// depend on earlier ones having already run (in particular, the RST
     /// and SYN checks assume the segment has already passed the sequence
     /// acceptability test).
+    ///
+    /// ## Every challenge ACK below is gated on one budget
+    ///
+    /// There are six sites and they are deliberately not distinguished from each
+    /// other:
+    ///
+    /// 1. RFC 5961 §3.2's answer to a blind reset that is in the window but not
+    ///    at RCV.NXT (step 1).
+    /// 2. RFC 9293 §3.10.7.4 step 1's acknowledge-and-drop for an unacceptable
+    ///    segment (step 2).
+    /// 3. The same, for the TIME-WAIT arm that also restarts the 2·MSL timer —
+    ///    the ACK is gated, the timer is not; see there.
+    /// 4. RFC 5961 §4's answer to a SYN on a synchronized connection (step 3).
+    /// 5. RFC 5961 §5's answer to an acknowledgement of data never sent (step 4).
+    /// 6. TIME-WAIT's answer to any other acceptable segment (step 4).
+    ///
+    /// An attacker does not care which branch it provokes, so a budget any one
+    /// of them could bypass would not be a budget — it would read as protection
+    /// while the guest picked another branch. `everyChallengeAckPathDrawsOnOneBudget`
+    /// is what holds this: it empties the bucket through one path and requires
+    /// the others to fall silent with it.
+    ///
+    /// What does *not* draw on it, and why:
+    ///
+    /// - **Step 5's acknowledgement of received data.** That is the connection's
+    ///   flow control, not a challenge. Throttling it would wedge a guest's data
+    ///   transfer for as long as a flood kept the bucket empty.
+    /// - **Step 2's SYN-ACK retransmission in SYN-RECEIVED.** It is not an ACK
+    ///   and it is not a challenge: it is a handshake frame this connection
+    ///   already sent, reproduced for a peer whose copy was lost. Throttling it
+    ///   would let a flood on one connection stop another from ever being
+    ///   established, which is a denial of service inflicted by the defence. It
+    ///   is 1:1 in frames and in bytes, and a guest that wants the same work from
+    ///   us can get it for the same price by opening connections — see the report
+    ///   for this task.
+    /// - **Every RST.** RFC 9293 §3.10.7.1's refusal is a different mechanism with
+    ///   a different purpose, and suppressing one leaves a peer hanging on
+    ///   `connect()` rather than told it was refused.
     private static func generalSegmentArrives(
-        segment: TCPSegment, tcb: inout TCB, receiver: inout Receiver, sender: inout Sender
+        segment: TCPSegment, tcb: inout TCB, receiver: inout Receiver, sender: inout Sender,
+        challengeACKs: inout ChallengeACKBudget
     ) -> [TCPAction] {
         let header = segment.header
         var actions: [TCPAction] = []
@@ -381,7 +480,7 @@ struct TCPStateMachine {
                 tcb.state = .closed
                 return [.deleteTCB]
             }
-            return [.sendAck]
+            return challengeACK(&challengeACKs)
         }
 
         // Step 2 (RFC 9293 §3.10.7.4): sequence number acceptability for
@@ -405,8 +504,16 @@ struct TCPStateMachine {
             // honouring a RST in step 1 or a FIN in step 5: name RCV.NXT
             // exactly. A blind sender cannot hold a TIME-WAIT block open
             // without it.
+            //
+            // The ACK draws on the budget like every other answer to an
+            // unacceptable segment; the timer restart does not, and is
+            // unconditional. Making the restart contingent on a token would hand
+            // a guest a way to expire a TIME-WAIT block early — flood the budget
+            // flat on one connection and the FIN retransmissions that keep
+            // another's block alive stop refreshing it — and the block is exactly
+            // the protection RFC 1337 §3 says must not be removable by the peer.
             if tcb.state == .timeWait, isRetransmissionOfProcessedFin(segment, tcb: tcb) {
-                return [.sendAck, .startTimeWait]
+                return challengeACKs.consume() ? [.sendAck, .startTimeWait] : [.startTimeWait]
             }
 
             // The second place an *unacceptable* segment must do more than draw
@@ -433,7 +540,7 @@ struct TCPStateMachine {
             if tcb.state == .synReceived, isRetransmissionOfTheSynWeAnswered(segment, tcb: tcb) {
                 return [.sendSynAck]
             }
-            return [.sendAck]
+            return challengeACK(&challengeACKs)
         }
 
         // Step 3 (RFC 5961 §4): the SYN bit. A SYN this late in the
@@ -442,7 +549,7 @@ struct TCPStateMachine {
         // off-path attacker who can guess the four-tuple kill it. Send a
         // challenge ACK instead and drop the segment.
         if header.flags.contains(.syn) {
-            return [.sendAck]
+            return challengeACK(&challengeACKs)
         }
 
         // Step 4: the ACK bit. RFC 9293 drops any segment with the ACK bit
@@ -480,7 +587,16 @@ struct TCPStateMachine {
                 // every accepted handshake silently emitted nothing. Nothing
                 // could see it until an endpoint drove the two together; see
                 // `dataWrittenByTheApplicationIsSegmentedAndSent`.
-                tcb.sndWnd = Int(header.window)  // Snd.Wind.Scale: a fourth peer-window decode; see synSent above.
+                // Snd.Wind.Scale: one of the two peer-window decodes that DOES
+                // take `<< tcb.sndWindScale`. Step 3 above has already returned
+                // for anything carrying a SYN, so whatever reaches here is a
+                // non-SYN segment and RFC 7323 §2.3's `<SYN>` exception does not
+                // cover it: "The window field (SEG.WND) in the header of every
+                // incoming segment, with the exception of <SYN> segments, MUST
+                // be left-shifted by Snd.Wind.Shift bits before updating
+                // SND.WND". See the synSent site above for the full list of four
+                // and for why the other two must never take the shift.
+                tcb.sndWnd = Int(header.window) << tcb.sndWindScale
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
             } else if header.acknowledgement.lessThan(tcb.sndUna) {
@@ -511,7 +627,9 @@ struct TCPStateMachine {
                 if header.acknowledgement.lessThan(tcb.sndUna) {
                     break
                 }
-                return [.sendAck]
+                // RFC 5961 §5's challenge: an acknowledgement of data this
+                // connection never sent. Same budget as the other five.
+                return challengeACK(&challengeACKs)
             }
 
             // The window update runs FIRST, before the acknowledgement is
@@ -524,7 +642,36 @@ struct TCPStateMachine {
             if tcb.sndWl1.lessThan(header.sequence)
                 || (tcb.sndWl1 == header.sequence && header.acknowledgement.isAtOrAfter(tcb.sndWl2))
             {
-                tcb.sndWnd = Int(header.window)  // Snd.Wind.Scale: third of three peer-window decodes; see synSent above.
+                // Snd.Wind.Scale: the other decode that DOES take
+                // `<< tcb.sndWindScale`, and the one that carries every window
+                // update for the life of the connection. Non-SYN by the same
+                // step-3 argument as the SYN-RECEIVED site above.
+                // `CongestionControl` commits the send decision to
+                // `min(cwnd, sndWnd)` in bytes, so leaving this unscaled once a
+                // scale is negotiated under-uses the path by up to 2^14.
+                //
+                // ## Both shifts here rely on `TCPOptionCodec`'s clamp
+                //
+                // Neither this site nor the SYN-RECEIVED one bounds
+                // `tcb.sndWindScale`, because `TCPOptionCodec.parse` has already
+                // clamped a peer's shift.cnt to RFC 7323 §2.3's maximum of 14
+                // (see `TCPOptionCodec.maximumWindowScale`, and
+                // `TCB.negotiateWindowScale(fromSynOptions:)`, which records it
+                // and re-checks nothing either). The largest SND.WND these two
+                // lines can produce is therefore 65535 << 14 = 1,073,725,440,
+                // just under 2^30, and nothing here can overflow an `Int`.
+                //
+                // That ceiling is not a comfort margin: it is what keeps the
+                // serial arithmetic meaningful. RFC 7323 §2.3: "two times the
+                // maximum window size must be less than 2^31, or max window <
+                // 2^30", because a sender and receiver can be out of phase by a
+                // full window and `SequenceNumber`'s comparisons — and every
+                // `isInRange` built on them — are only defined over less than
+                // half the sequence space. A shift of 15 would still fit an
+                // `Int`; what it would break is every window test in this file.
+                // Anything that moves or relaxes the clamp is changing what
+                // these two lines can be made to compute.
+                tcb.sndWnd = Int(header.window) << tcb.sndWindScale
                 tcb.sndWl1 = header.sequence
                 tcb.sndWl2 = header.acknowledgement
             }
@@ -579,7 +726,17 @@ struct TCPStateMachine {
                 // indefinitely by sending anything at all -- the very threat
                 // `ReceiveOutcome.finReached` was made edge-triggered to close,
                 // reachable by another route.
-                actions.append(.sendAck)
+                //
+                // It is also a challenge ACK by the definition this file uses --
+                // an ACK for a segment that is being dropped -- so it draws on
+                // the budget too. Nothing in TIME-WAIT needs it: a retransmitted
+                // FIN never reaches here (it is unacceptable, and step 2 answers
+                // it), so what this acknowledges is a bare ACK or a duplicate,
+                // for which the peer has no use. Leaving it ungated would have
+                // been a bypass with a state to reach it from.
+                if challengeACKs.consume() {
+                    actions.append(.sendAck)
+                }
             case .established, .finWait2, .closeWait:
                 break
             case .closed, .listen, .synSent, .synReceived:
@@ -700,6 +857,22 @@ struct TCPStateMachine {
         }
 
         return actions.isEmpty ? [.none] : actions
+    }
+
+    // MARK: - RFC 5961 §7
+
+    /// One challenge ACK, if the stack-wide budget has a token for it.
+    ///
+    /// `[.none]` and not `[]` when it does not: every early return in
+    /// `generalSegmentArrives` hands back a non-empty list, and an empty one
+    /// would be a second spelling of "nothing to do" for `TCPEndpoint.process`
+    /// to get right.
+    ///
+    /// Dropped, never deferred. A challenge ACK queued behind the budget would
+    /// arrive answering a segment the peer has long since moved past, and one
+    /// held per suppressed segment is exactly the memory the flood was after.
+    private static func challengeACK(_ budget: inout ChallengeACKBudget) -> [TCPAction] {
+        budget.consume() ? [.sendAck] : [.none]
     }
 
     // MARK: - What the receiver is allowed to see

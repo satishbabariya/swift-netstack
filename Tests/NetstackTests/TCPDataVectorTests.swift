@@ -231,6 +231,12 @@ private let closeVectors = "tcp-close"
         "a-retransmission-keeps-the-push-bit",
         "window-updates-are-not-duplicate-acknowledgements",
         "three-identical-duplicate-acknowledgements-still-fast-retransmit",
+        "a-timeout-keeps-retransmitting",
+        "the-handshake-seeds-the-retransmission-timeout",
+        "a-handshake-sample-makes-the-first-data-sample-a-subsequent-one",
+        "an-ambiguous-handshake-is-not-sampled",
+        "a-lost-window-update-is-recovered-by-a-zero-window-probe",
+        "zero-window-probes-back-off-and-do-not-give-up",
     ]
     #expect(try transferScenarioNames(dataVectors) == run)
 }
@@ -373,6 +379,79 @@ private let closeVectors = "tcp-close"
 @Test func threeDuplicateAcknowledgementsWithAnUnchangedWindowStillFastRetransmit() throws {
     let harness = try runTransferScenario(dataVectors, "three-identical-duplicate-acknowledgements-still-fast-retransmit")
     #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aTimeoutRecoversTheWholeBurstOnOneExpiryWithoutInflatingTheWindow() throws {
+    let harness = try runTransferScenario(dataVectors, "a-timeout-keeps-retransmitting")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+    // The window the connection LEAVES the episode holding, which no `>` line
+    // can say and which is the half of this change most easily got wrong. The
+    // timeout collapsed cwnd to one segment and set ssthresh to
+    // max(7300 / 2, 2 * 1460) = 3650; the five acknowledgements then grew it
+    // and nothing else did. 1460 -> 2920 -> 4380 in slow start, then RFC 5681
+    // 3.1's congestion-avoidance form SMSS * SMSS / cwnd three times:
+    // 2131600 / 4380 = 486, 2131600 / 4866 = 438, 2131600 / 5304 = 401.
+    //
+    // Every byte of that was paid for by an acknowledgement. A stack that
+    // called `timeout(flightSize:)` again per retransmission would be at 1460
+    // here, and one that grew cwnd per retransmitted segment would be far above
+    // 5705 -- and both would satisfy every line of the vector, because the
+    // window is not on the wire.
+    #expect(harness.endpoint.congestionWindowForTesting == 5705)
+}
+
+// The three handshake-RTT scenarios below. All three read the RTO off WHEN a
+// retransmission appears rather than off `Sender.retransmissionTimeout`, which
+// is the bar `rtt-sample-drives-the-rto` set: an estimator field can hold the
+// right number while the timer that was armed from it holds the wrong one, and
+// only the second of those is on the wire.
+
+@Test func theHandshakeRoundTripSeedsTheEstimatorBeforeAnyDataIsSent() throws {
+    let harness = try runTransferScenario(dataVectors, "the-handshake-seeds-the-retransmission-timeout")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aSeededEstimatorGivesTheFirstDataSampleALowerRtoThanAnUnseededOne() throws {
+    let harness = try runTransferScenario(
+        dataVectors, "a-handshake-sample-makes-the-first-data-sample-a-subsequent-one")
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+@Test func aHandshakeWhoseSynAckWentOutTwiceIsNotSampled() throws {
+    let harness = try runTransferScenario(dataVectors, "an-ambiguous-handshake-is-not-sampled")
+    // One connection, not two. The second SYN is a RETRANSMISSION of the first
+    // and must be answered from the block that already exists -- a stack that
+    // built a second block would draw a second ISS, and `runTransferScenario`
+    // already checks `sequenceNumbers.calls == 1`. Stated again here because
+    // this is the one scenario in the file that sends the same SYN twice, so it
+    // is the only one where that check is doing real work rather than
+    // restating something no line could violate.
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+}
+
+// The two zero-window-probe scenarios. Neither is covered by the differential
+// harness and neither ever will be: the generator floors its offered window at
+// `DiffLimits.minimumOfferedWindow` on purpose, so a green differential run says
+// nothing whatever about persist. See `differential/README.md`.
+
+@Test func aWindowUpdateLostInFlightIsRecoveredByAZeroWindowProbe() throws {
+    let harness = try runTransferScenario(dataVectors, "a-lost-window-update-is-recovered-by-a-zero-window-probe")
+    // The wire lines pin the probe and the recovery; this pins the half no `>`
+    // line can state, which is that the connection was not merely noisy but
+    // actually delivered. Without a persist timer nothing at all is emitted
+    // after 0.020 and the scenario fails on the missing frame at 1.020.
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+    #expect(harness.endpoint.hasPersistScheduledForTesting == false, "persist ended when the window reopened")
+}
+
+@Test func aReceiverThatStaysFullIsProbedRepeatedlyAndTheConnectionIsNotGivenUp() throws {
+    let harness = try runTransferScenario(dataVectors, "zero-window-probes-back-off-and-do-not-give-up")
+    // Still here after five unanswered probes: RFC 1122 §4.2.5's "Sender
+    // timeout OK conn with zero wind" is a MUST NOT, so no ladder in this stack
+    // may count this connection down. A stack with a give-up budget would have
+    // removed the block and reported it closed.
+    #expect(harness.endpoint.connectionCountForTesting == 1)
+    #expect(harness.application.closedReports == 0)
 }
 
 // MARK: - tcp-close.vec

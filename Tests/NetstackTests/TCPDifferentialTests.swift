@@ -157,10 +157,19 @@ private enum DiffLimits {
     /// is pinned by `tcp-data.vec`'s `right-edge-trim` scenario.
     static let maximumGapAhead = 20000
     /// The smallest window the guest ever advertises. Above zero-window
-    /// territory by a wide margin: a sender whose window closes enters RFC
-    /// 9293 §3.8.6.1's persist state, gVisor has a probe timer for it and this
-    /// stack has none, and that gap is an M5 item pinned by a vector rather
-    /// than a thing to rediscover on every second generated sequence.
+    /// territory by a wide margin, so no generated sequence ever enters RFC
+    /// 9293 §3.8.6.1's persist state.
+    ///
+    /// This floor predates the persist timer, and it stays now that there is
+    /// one — for a different and better reason than "this stack has no probe to
+    /// compare". Probe *timing* is a SHOULD in both documents that specify it
+    /// (RFC 9293 SHLD-29 and SHLD-30) and the interval ceiling is explicitly
+    /// left open: RFC 1122 §4.2.2.17 says "possibly with some maximum interval
+    /// not specified here". Two conformant stacks may therefore probe on
+    /// different ladders, and a divergence between them would be a report about
+    /// nothing. Persist is pinned by `tcp-data.vec`'s two probe scenarios and by
+    /// `TCPSenderTests`, and **is not differentially verified** — see
+    /// `differential/README.md`.
     static let minimumOfferedWindow = 4096
     /// The largest advance a single step may make, in milliseconds. Long
     /// enough to walk the whole RTO ladder across a sequence, short enough
@@ -288,6 +297,12 @@ private struct DiffGenerator {
         // where the rule does not.
         var offered = UInt16(DiffLimits.minimumOfferedWindow + Int(rng.next() % UInt64(65536 - DiffLimits.minimumOfferedWindow)))
         let guestWindow = offered
+        // The shift the generated guest offers. 7 is what Linux sends by
+        // default, so it is the value a real peer most often presents; the
+        // exact number matters less than that it is non-zero, since a zero
+        // shift is a legal offer that leaves every window unscaled and would
+        // make this lift look like it was exercising a path it was not.
+        let guestWindowScale = 7
 
         func tcp(_ flags: String, seq: UInt32, ack: UInt32?, payload: Int = 0, options: [String] = [], window: UInt16? = nil) -> VectorPacket {
             .tcp(
@@ -298,14 +313,26 @@ private struct DiffGenerator {
 
         // --- Prologue: a handshake, then one in-order full segment.
         //
-        // The SYN offers `mss` and NOTHING ELSE. gVisor mirrors its peer's
-        // options: it offers wscale and sackOK exactly when the SYN did, and
-        // no configuration makes it omit an option the peer offered. This
-        // stack negotiates neither (M5), so a SYN that offered them would put
-        // an option-list difference on the SYN-ACK of every single sequence.
-        // The case where a guest DOES offer both is pinned by
-        // `tcp-handshake.vec`'s `passive-open`.
-        try emit(tcp("S", seq: guestISS, ack: nil, options: ["mss 1460"]), advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow)")
+        // The SYN offers `mss` and `wscale`, and deliberately NOT `sackOK`.
+        //
+        // gVisor mirrors its peer's options — it offers back exactly what the
+        // SYN offered, and no configuration makes it omit one — so an option
+        // this stack does not implement would put a difference on the SYN-ACK
+        // of every single sequence. `wscale` used to be such an option and is
+        // not any more: both stacks now negotiate and apply it, so offering it
+        // is what puts scaled windows under comparison rather than leaving that
+        // path untested. `sackOK` still is one: nothing here acts on a SACK
+        // block, so gVisor would send blocks into a stack that ignores them.
+        //
+        // That asymmetry is the point of having made this a *generator*
+        // constraint rather than a permitted divergence. A permitted divergence
+        // is a hole in the instrument that stays open; a generator constraint
+        // is lifted, one option at a time, by the task that implements the
+        // option. This is `wscale`'s lift. `sackOK`'s belongs to whoever
+        // implements SACK.
+        try emit(
+            tcp("S", seq: guestISS, ack: nil, options: ["mss 1460", "wscale \(guestWindowScale)"]),
+            advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow) wscale=\(guestWindowScale)")
         try emit(tcp(".", seq: wire(rcvNxt), ack: 1), advanceMs: 10, note: "third-leg ACK")
 
         // The priming segment. gVisor's advertised right edge only leaves its
@@ -380,15 +407,11 @@ private struct DiffGenerator {
                 // A bare ACK. Occupies no sequence space, so neither stack may
                 // answer it — two peers that acknowledge acknowledgements
                 // never stop.
-                // The window never goes below `DiffLimits.minimumOfferedWindow`.
-                //
-                // A zero or very small window puts a sender into RFC 9293
-                // §3.8.6.1's persist state, and gVisor has a zero-window
-                // probe timer while this stack has none at all — `Sender`'s
-                // omission is deliberate, stated, and pinned by
-                // `tcp-data.vec`'s `zero-window` scenario, and it is an M5 gap
-                // rather than something a fuzzer should rediscover on every
-                // second sequence. See `differential/README.md`.
+                // The window never goes below `DiffLimits.minimumOfferedWindow`,
+                // so no sequence enters RFC 9293 §3.8.6.1's persist state. Both
+                // stacks now probe a zero window; what they are not required to
+                // agree on is WHEN, so the comparison is kept away from it
+                // deliberately. See that constant, and `differential/README.md`.
                 offered = UInt16(DiffLimits.minimumOfferedWindow + Int(rng.next() % UInt64(65536 - DiffLimits.minimumOfferedWindow)))
                 try emit(
                     tcp(".", seq: wire(windowUpdatePoint()), ack: UInt32(1 + acknowledged), window: offered),
@@ -889,14 +912,32 @@ private let differentialBaseSeed: UInt64 = {
     #expect(coverage.withReset >= total / 50, "too few sequences drew a reset: \(coverage.withReset)")
     #expect(coverage.acrossTheWrap >= total / 10, "too few sequences crossed the sequence-number wrap: \(coverage.acrossTheWrap)")
 
-    // The recognised difference is ASSERTED, not permitted: every sequence
-    // opens exactly one connection and therefore draws exactly one SYN-ACK, so
-    // the count is known in advance. A run in which it stopped appearing would
-    // mean gVisor's initial window changed, or ours did, and either is
-    // something the next reader must be told rather than something this
-    // instrument should quietly absorb.
+    // Recognised differences are ASSERTED, not permitted. A run in which one
+    // stopped appearing would mean gVisor's behaviour changed, or ours did, and
+    // either is something the next reader must be told rather than something
+    // this instrument should quietly absorb.
+    //
+    // The SYN-ACK's initial window is exact: every sequence opens exactly one
+    // connection and therefore draws exactly one SYN-ACK, so the count is known
+    // in advance.
     #expect(
-        recognisedCounts == ["syn-ack-initial-window": total],
+        recognisedCounts["syn-ack-initial-window"] == total,
         "expected exactly one recognised SYN-ACK window difference per sequence, got \(recognisedCounts)")
+
+    // The scaled advertised window cannot be counted exactly — how many frames
+    // a sequence emits depends on what the generator chose — so it is bounded
+    // below instead. At least one per sequence, because every connection
+    // advertises a window after the handshake and the two stacks' receive
+    // accounting always differs once a scale is in effect. Zero would mean the
+    // windows had started matching, which would be a real change worth
+    // investigating rather than a quiet improvement.
+    let scaledWindow = recognisedCounts["scaled-advertised-window"] ?? 0
+    #expect(scaledWindow >= total, "the scaled-window difference stopped appearing: \(scaledWindow) over \(total) sequences")
+
+    // And nothing else is recognised. A third label appearing without anyone
+    // deciding to add one is the failure this whole mechanism exists to prevent.
+    #expect(
+        Set(recognisedCounts.keys) == ["syn-ack-initial-window", "scaled-advertised-window"],
+        "an unexpected recognised difference appeared: \(recognisedCounts)")
 }
 

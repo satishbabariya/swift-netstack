@@ -50,9 +50,16 @@
 # .send` throws `.noRoute` after asking, and `TCPEndpoint.emit` swallows that
 # deliberately because the retransmission timer will bring the segment back.
 # That is right in production and it reads as a vector failure. Every scenario
-# in this file is therefore kept well inside one ARP lifetime (the longest is
-# 2.220s), so no line here is quietly a statement about ARP. `tcp-close.vec`
-# does cross 60 seconds, and says there how it handles it.
+# in this file is therefore kept well inside one ARP lifetime, so no line here
+# is quietly a statement about ARP. `tcp-close.vec` does cross 60 seconds, and
+# says there how it handles it.
+#
+# Most scenarios here are under 2.5 seconds and the question does not arise.
+# `zero-window-probes-back-off-and-do-not-give-up` runs to 31.040 and is the one
+# that has to do the arithmetic; it does, at its own head, including why its
+# ladder stops where it does. It is also the only scenario in either file whose
+# `>` lines are NOT provoked by an inbound packet, which is the condition
+# `tcp-close.vec`'s ARP note relies on.
 #
 # ## PSH, and our advertised window barely moving
 #
@@ -178,11 +185,19 @@
 # window for exactly this reason: it retires no data, but it carries a window
 # update, and a sender with no way to act on one can never leave a zero window.
 #
-# What this stack does NOT have, stated here because this is the scenario where
-# its absence lives: a persist timer. RFC 9293 section 3.8.6.1 requires a
-# zero-window probe, and `Sender` has none, so a window update that is lost on
-# the way here wedges the connection until the peer sends something else. The
-# vector pins what the stack does; it is not a claim that nothing is missing.
+# This scenario is the case where the update ARRIVES, and nothing is on the
+# wire between the write and it. That silence is now a statement about TIMING
+# rather than about a missing feature: the persist timer is armed the moment the
+# write finds a shut window, and its first probe is due at 1.020 (0.020 plus the
+# RTO). The update at 0.100 ends persist with 920 ms to spare, so no probe is
+# due and none appears. The two scenarios at the end of this file are the other
+# side of it -- what happens when that update never comes.
+#
+# This comment used to record the absence of a persist timer as a known gap. It
+# is worth leaving the shape of that note visible: the vector was correct then
+# and is correct now, unchanged, because it only ever pinned what goes on the
+# wire in this scenario. A vector written to agree with the implementation would
+# have had to change.
 0.000 < S     0:0(0) win 65535 <mss 1460>
 0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
 0.010 < .     1:1(0) ack 1001 win 0
@@ -257,45 +272,74 @@
 # bytes so each acknowledgement releases exactly one more segment, which makes
 # every round trip a clean, unambiguous sample under Karn's algorithm.
 #
-# Sample 1 is 500 ms (sent 0.010, acknowledged 0.510). RFC 6298 section 2.2,
-# the first-sample rule: SRTT = R = 500 ms, RTTVAR = R/2 = 250 ms, and
-# RTO = SRTT + max(G, 4*RTTVAR) = 500 ms + 1000 ms = 1.500 s. Above the floor,
-# so the floor is not what decides it.
+# ## Every number below was re-derived when the handshake began to be sampled
 #
-# Sample 2 is 100 ms (sent 0.510, acknowledged 0.610). RFC 6298 section 2.3 in
-# Jacobson's fixed-point form, which is what `RTTEstimator` implements and what
-# every stack this one is compared against implements:
+# This scenario used to open at 0.010 and read 500 ms and 100 ms as its two
+# samples, with the FIRST of them taking RFC 6298 section 2.2's first-measurement
+# path. That is no longer what happens, and the old numbers were not merely
+# stale -- they had stopped describing this stack. `TCPEndpoint` now takes a
+# sample from the handshake itself, so the first-measurement path belongs to the
+# HANDSHAKE and every data sample after it is a subsequent one.
+#
+# The old lines could not simply be kept: a 10 ms handshake sample starts SRTT
+# near zero, and a subsequent sample only moves SRTT by R/8, so both of the old
+# samples then produced an RTO UNDER the one-second floor (576 ms and 482 ms).
+# The scenario would still have passed -- at 1.610, the exact time its own last
+# comment named as the signature of a stack that ignores its measurements -- and
+# it would have been pinning the floor while claiming to pin the estimator. So
+# the handshake here is deliberately slow, and the samples are chosen so that
+# all three round trips stay above the floor.
+#
+# Measurement 1 is the HANDSHAKE: 500 ms, from the SYN-ACK at 0.000 to the ACK
+# at 0.500, and our SYN-ACK went out exactly once so Karn permits it. RFC 6298
+# section 2.2, the first-measurement rule: SRTT = R = 500 ms, RTTVAR = R/2 =
+# 250 ms, RTO = 500 + max(G, 4*250) = 1.500 s. Above the floor, so the floor is
+# not what decides it.
+#
+# Measurement 2 is 1300 ms (sent 0.500, acknowledged 1.800). RFC 6298 section
+# 2.3 in Jacobson's fixed-point form, which is what `RTTEstimator` implements
+# and what every stack this one is compared against implements:
 #
 #   RTTVAR = RTTVAR - (RTTVAR >> 2) + (|SRTT - R| >> 2)
-#          = 250 - 62.5 + 100 = 287.5 ms
+#          = 250 - 62.5 + 200 = 387.5 ms
 #   SRTT   = SRTT - (SRTT >> 3) + (R >> 3)
-#          = 500 - 62.5 + 12.5 = 450 ms
-#   RTO    = 450 + max(1, 4 * 287.5) = 1.600 s
+#          = 500 - 62.5 + 162.5 = 600 ms
+#   RTO    = 600 + max(1, 4 * 387.5) = 2.150 s
 #
-# The third segment goes out at 0.610 and is never acknowledged, so the RTO is
-# read off the wire as the gap to its retransmission: 0.610 + 1.600 = 2.210.
+# Measurement 3 is 100 ms (sent 1.800, acknowledged 1.900) -- a sample BELOW
+# SRTT, kept from the original scenario because `>>` on a negative `Int64`
+# rounds toward negative infinity and `measure` takes the absolute difference
+# first precisely so that this case follows the same path as every other:
+#
+#   RTTVAR = 387.5 - 96.875 + 125 = 415.625 ms
+#   SRTT   = 600 - 75 + 12.5 = 537.5 ms
+#   RTO    = 537.5 + max(1, 4 * 415.625) = 2.200 s
+#
+# The third segment goes out at 1.900 and is never acknowledged, so the RTO is
+# read off the wire as the gap to its retransmission: 1.900 + 2.200 = 4.100.
 # One millisecond either side is a different SRTT or a different RTTVAR, and
 # `3/4 * RTTVAR` computed with integer division instead of the shift form
 # differs in the low bits -- which is exactly the divergence the shift form was
 # chosen to avoid, made visible here as a retransmission at the wrong time.
 0.000 < S     0:0(0) win 65535 <mss 1460>
 0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
-0.010 < .     1:1(0) ack 1001 win 100
-0.010 < write 300
+# The third leg at 0.500, not 0.010. This line IS measurement 1.
+0.500 < .     1:1(0) ack 1001 win 100
+0.500 < write 300
 # `P.` on all three pieces, EDITED by Task 17. Three hundred bytes is less than
 # one MSS, so this write is split by the peer's hundred-byte WINDOW and not by
 # the MSS -- and a window split does not defer the push. This is the same rule
 # `write-under-a-small-window` below exists to pin, met here by accident, which
 # is why that scenario states it deliberately rather than relying on this one.
-0.010 > P.    1001:1101(100) ack 1 win 65535
-0.510 < .     1:1(0) ack 1101 win 100
-0.510 > P.    1101:1201(100) ack 1 win 65535
-0.610 < .     1:1(0) ack 1201 win 100
-0.610 > P.    1201:1301(100) ack 1 win 65535
-# 0.610 + 1.600. Not 0.610 + 1.000: the floor has been left behind, and a stack
-# that ignored its own measurements would retransmit at 1.610 instead.
-2.210 > P.    1201:1301(100) ack 1 win 65535
-2.220 < .     1:1(0) ack 1301 win 100
+0.500 > P.    1001:1101(100) ack 1 win 65535
+1.800 < .     1:1(0) ack 1101 win 100
+1.800 > P.    1101:1201(100) ack 1 win 65535
+1.900 < .     1:1(0) ack 1201 win 100
+1.900 > P.    1201:1301(100) ack 1 win 65535
+# 1.900 + 2.200. Not 1.900 + 1.000: the floor has been left behind, and a stack
+# that ignored its own measurements would retransmit at 2.900 instead.
+4.100 > P.    1201:1301(100) ack 1 win 65535
+4.110 < .     1:1(0) ack 1301 win 100
 
 
 # scenario: push-on-the-last-segment-of-a-write
@@ -459,3 +503,302 @@
 0.050 < .     1:1(0) ack 1001 win 65535
 0.060 < .     1:1(0) ack 1001 win 65535
 0.060 > P.    1001:1101(100) ack 1 win 65535
+
+
+# scenario: a-timeout-keeps-retransmitting
+#
+# FOUND BY THE DIFFERENTIAL against gVisor. After a retransmission timeout this
+# stack sent the earliest unacknowledged segment and then NOTHING more until the
+# next expiry. RFC 6298 section 5.4 asks for no more than that, so the stack was
+# conformant and unusable at once: 5.4 does not say to STOP there, and gVisor and
+# Linux go on retransmitting the following segments as acknowledgements arrive.
+# On the 1, 2, 4, 8, 16 s ladder this five-segment burst cost 31 seconds here
+# against roughly one anywhere else.
+#
+# Five 1460-byte segments go out and every one of them is lost -- the guest
+# acknowledges none of them, which is why nothing follows the write until the
+# timer expires at +1.000s.
+#
+# What each line after the expiry is: the expiry itself sends 1001:2461 and
+# presumes the other four lost, so cwnd (RFC 5681 section 3.1: one segment, 1460)
+# is exactly full and nothing else may go. Every acknowledgement after that
+# retires a segment, grows cwnd by one segment in slow start, and the room that
+# opens is spent on the segments still missing, IN SEQUENCE, before any new data:
+#
+#   1.030  cwnd 2920  ->  two segments, 2461:3921 and 3921:5381
+#   1.040  cwnd 4380  ->  two segments, 5381:6841 and 6841:8301
+#
+# So the whole burst is back on the wire 20ms after the first acknowledgement,
+# on ONE expiry. The old behaviour needed four more -- at 3.020, 7.020, 15.020
+# and 31.020 -- and this file ending where it does is what says none of them
+# happened: the runner reports any frame the script does not account for.
+#
+# The lines are also the vacuity check the unit tests state directly. A sender
+# that answered the timeout by putting all five segments back at 1.020, ignoring
+# the congestion window, would recover in one round trip and fail this scenario
+# on its very first line after the expiry.
+#
+# PSH sits on 6841:8301 and nowhere else, by `push-on-the-last-segment-of-a-
+# write` above: the write is exactly five segments, so only the fifth empties it.
+# The retransmissions reproduce the segments they lost, PSH included.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 65535
+0.020 < write 7300
+0.020 > .     1001:2461(1460) ack 1 win 65535
+0.020 > .     2461:3921(1460) ack 1 win 65535
+0.020 > .     3921:5381(1460) ack 1 win 65535
+0.020 > .     5381:6841(1460) ack 1 win 65535
+0.020 > P.    6841:8301(1460) ack 1 win 65535
+1.020 > .     1001:2461(1460) ack 1 win 65535
+1.030 < .     1:1(0) ack 2461 win 65535
+1.030 > .     2461:3921(1460) ack 1 win 65535
+1.030 > .     3921:5381(1460) ack 1 win 65535
+1.040 < .     1:1(0) ack 3921 win 65535
+1.040 > .     5381:6841(1460) ack 1 win 65535
+1.040 > P.    6841:8301(1460) ack 1 win 65535
+1.050 < .     1:1(0) ack 5381 win 65535
+1.060 < .     1:1(0) ack 6841 win 65535
+1.070 < .     1:1(0) ack 8301 win 65535
+
+
+# scenario: the-handshake-seeds-the-retransmission-timeout
+#
+# FOUND BY THE DIFFERENTIAL. gVisor takes an RTT sample from the SYN-ACK/ACK
+# round trip and this stack took none, so its first data sample was a FIRST
+# measurement rather than a subsequent one -- and RFC 6298 section 2.2 makes a
+# first measurement deliberately conservative (RTTVAR = R/2, so RTO = 3R). A
+# 716 ms sample put this stack's first FIN retransmission at +2.148 s against
+# gVisor's +1.000 s.
+#
+# This scenario pins the sample itself, one line, before any data has been
+# acknowledged. The handshake takes 400 ms -- SYN-ACK at 0.000, ACK at
+# 0.400 -- and our SYN-ACK went out exactly once, so the sample is unambiguous
+# under Karn:
+#
+#   SRTT = 400 ms, RTTVAR = 200 ms, RTO = 400 + max(G, 4*200) = 1.200 s
+#
+# 400 ms is chosen so the result clears the one-second floor. Under it the
+# scenario would read 1.000 s whether or not the sample was ever taken, and
+# would be satisfied by a stack that samples nothing at all.
+#
+# The one segment is never acknowledged, so its retransmission times the RTO the
+# HANDSHAKE alone produced. Three implementations give three different answers
+# on the line below, which is what makes it worth a scenario:
+#
+#   +1.200s  this stack: the handshake was sampled, before the data went out
+#   +1.000s  no handshake sample at all -- RFC 6298 section 2.1's initial RTO
+#   +1.000s  the sample taken, but fed to the estimator AFTER the first data
+#            send: the timer was already armed off the unseeded RTO, so the
+#            measurement arrives too late to be worth anything
+#
+# That third line is the ordering bug this scenario exists for. It is invisible
+# in the estimator's own fields -- which by then hold exactly the right
+# numbers -- and visible here as a frame 200 ms early.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.400 < .     1:1(0) ack 1001 win 65535
+0.400 < write 100
+0.400 > P.    1001:1101(100) ack 1 win 65535
+# 0.400 + 1.200, and not 0.400 + 1.000.
+1.600 > P.    1001:1101(100) ack 1 win 65535
+1.610 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: a-handshake-sample-makes-the-first-data-sample-a-subsequent-one
+#
+# The other half of the finding, and the half that is actually worth the code.
+# The handshake sample matters far less for its own value than for what it does
+# to the sample AFTER it: with one already in hand, the first data sample takes
+# RFC 6298 section 2.3's Jacobson update instead of section 2.2's
+# first-measurement rule, and section 2.2 is deliberately the conservative one.
+#
+# Same 400 ms handshake as above, then one data round trip of 800 ms (sent
+# 0.400, acknowledged 1.200). Two derivations from the SAME 800 ms sample:
+#
+#   seeded (this stack)   RTTVAR = 200 - 50 + 100 = 250 ms
+#                         SRTT   = 400 - 50 + 100 = 450 ms
+#                         RTO    = 450 + 4*250     = 1.450 s
+#
+#   unseeded              SRTT = R = 800 ms, RTTVAR = R/2 = 400 ms
+#                         RTO  = 800 + 4*400       = 2.400 s
+#
+# So the second segment's retransmission lands at 1.200 + 1.450 = 2.650 here and
+# at 1.200 + 2.400 = 3.600 on a stack that took no handshake sample. Both are
+# above the floor, on purpose: a scenario whose two answers are 1.000 and 1.000
+# proves nothing, and this is the pairing that makes "the estimator has a
+# sample" mean "the RTO it produces is lower", rather than a flag being set
+# somewhere nobody reads.
+#
+# The first data segment is acknowledged at 1.200, which is inside BOTH the
+# seeded RTO (0.400 + 1.200 = 1.600) and the unseeded one (0.400 + 1.000 =
+# 1.400), so removing the handshake sample changes exactly one line here -- the
+# last retransmission -- rather than cascading into an early retransmission that
+# would then suppress the data sample under Karn and fail for a second reason.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.400 < .     1:1(0) ack 1001 win 65535
+0.400 < write 100
+0.400 > P.    1001:1101(100) ack 1 win 65535
+1.200 < .     1:1(0) ack 1101 win 65535
+1.200 < write 100
+1.200 > P.    1101:1201(100) ack 1 win 65535
+# 1.200 + 1.450. A stack that started its estimator from this 800 ms sample
+# would put this frame at 3.600 instead.
+2.650 > P.    1101:1201(100) ack 1 win 65535
+2.660 < .     1:1(0) ack 1201 win 65535
+
+
+# scenario: an-ambiguous-handshake-is-not-sampled
+#
+# Karn's algorithm, on the handshake. The peer never saw our first SYN-ACK and
+# retransmits its SYN; `TCPStateMachine` reproduces the SYN-ACK from the TCB
+# (`isRetransmissionOfTheSynWeAnswered`), so the same frame goes out twice. The
+# ACK that eventually arrives may be answering EITHER of them, and RFC 6298
+# section 3 forbids computing a sample from it -- a sample measured against the
+# wrong transmission corrupts the RTO for the whole connection, not just for the
+# handshake.
+#
+# This is the path an implementation quietly gets wrong, because the happy path
+# never exercises it: nothing here fails, no frame is missing, and the only
+# symptom is an RTO built on a number that was never measured.
+#
+# The times are chosen so that all three possible implementations are
+# distinguishable on the last line, which is the whole difficulty of testing
+# this. A naive stack that recorded the LATEST SYN-ACK rather than the first
+# would sample 1000 ms and land at 4.400; one that recorded the FIRST and
+# ignored the retransmission would sample 1400 ms and land at 5.600; the correct
+# one takes no sample at all, keeps RFC 6298 section 2.1's initial 1.000 s, and
+# lands at 2.400. Compressing the handshake would collapse the first of those
+# onto the floor and make the scenario pass against a stack with no Karn check
+# in it at all.
+#
+#   sample from the 1st SYN-ACK  1400 ms -> RTO 4.200 s -> +5.600
+#   sample from the 2nd SYN-ACK  1000 ms -> RTO 3.000 s -> +4.400
+#   no sample (correct)                  -> RTO 1.000 s -> +2.400
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+# The peer's SYN again: our SYN-ACK was lost. The reply is the same frame, from
+# the same TCB, and it is what makes the handshake ambiguous.
+0.400 < S     0:0(0) win 65535 <mss 1460>
+0.400 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+1.400 < .     1:1(0) ack 1001 win 65535
+1.400 < write 100
+1.400 > P.    1001:1101(100) ack 1 win 65535
+# 1.400 + 1.000: the initial RTO, because nothing on this connection has been
+# measured. A stack that sampled the ambiguous handshake retransmits later.
+2.400 > P.    1001:1101(100) ack 1 win 65535
+2.410 < .     1:1(0) ack 1101 win 65535
+
+
+# scenario: a-lost-window-update-is-recovered-by-a-zero-window-probe
+#
+# The scenario RFC 1122 section 4.2.2.17's DISCUSSION names: "It is extremely
+# important to remember that ACK segments that contain no data are not reliably
+# transmitted by TCP. If zero window probing is not supported, a connection may
+# hang forever when an ACK segment that re-opens the window is lost."
+#
+# The peer closes its window in the handshake's third leg, the application
+# writes, and the peer's window update is LOST on the way here -- which is
+# expressed by the ABSENCE of a `<` line for it, and is the whole scenario.
+# Compare `zero-window` above, which is the same opening with the update
+# arriving: there, nothing is on the wire between the write and the update.
+# Here there is no update, and the connection has to break the deadlock itself.
+#
+# The probe is ONE byte, at SND.NXT, and it goes out at 0.020 + the RTO. The
+# handshake's 10 ms round trip is folded into the estimator (see
+# `the-handshake-seeds-the-retransmission-timeout`) and lands under RFC 6298
+# section 2.4's one-second floor, so the RTO is 1.000 s exactly: RFC 9293
+# SHLD-29, "the first zero-window probe when a zero window has existed for the
+# retransmission timeout period".
+#
+# No PSH on the probe: 99 bytes of that write are still queued behind it, and
+# RFC 1122 section 4.2.2.2's rule is per-write (see `Sender
+# .bytesRemainingInWrite`).
+#
+# The peer's window had in fact reopened, so it ACCEPTS the probe's byte and
+# acknowledges 1002 -- which is the case that makes the probe's byte have to be
+# real, sequence-consuming data. A probe emitted without advancing SND.NXT
+# would find `ack 1002` outside RFC 9293 section 3.10.7.4's acceptable-ACK
+# window and answer its own recovery with a challenge ACK.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 0
+0.020 < write 100
+1.020 > .     1001:1002(1) ack 1 win 65535
+1.030 < .     1:1(0) ack 1002 win 1000
+1.030 > P.    1002:1101(99) ack 1 win 65535
+1.040 < .     1:1(0) ack 1101 win 1000
+
+
+# scenario: zero-window-probes-back-off-and-do-not-give-up
+#
+# The receiver stays full. It answers every probe -- RFC 9293 section 3.8.6.1
+# requires it to: "When the receiving TCP peer has a zero window and a segment
+# arrives, it must still send an acknowledgment showing its next expected
+# sequence number and current window (zero)" -- and the sender keeps probing.
+#
+# ## Two properties, and they pull in opposite directions
+#
+# 1. The INTERVAL grows: 1, 2, 4, 8, 16 seconds, measured from each probe's own
+#    transmission and not from the answer to it. RFC 9293 SHLD-30 / RFC 1122
+#    section 4.2.2.17: "SHOULD increase exponentially the interval between
+#    successive probes". The ceiling is 60 s (`RTTEstimator.maximumTimeout`),
+#    which this file cannot reach -- see the ARP note below -- and which
+#    `theProbeIntervalBacksOffToSixtySecondsAndTheProbeCountIsNotBoundedAtAll`
+#    pins instead.
+# 2. The COUNT does not grow into a budget. RFC 1122 section 4.2.5's summary
+#    table makes "Sender timeout OK conn with zero wind" a MUST NOT, so there is
+#    no N after which this stops -- which is the opposite of the retransmission
+#    ladder's R2 and is the whole point of the persist timer being a separate
+#    timer. Five probes here is not "indefinitely"; the unit test named above
+#    runs a thousand, which is what actually falsifies a give-up budget.
+#
+# ## Every probe is the SAME byte
+#
+# 1001:1002 five times, never 1002:1003. A receiver with RCV.WND == 0 finds any
+# SEG.LEN > 0 unacceptable (RFC 9293 section 3.10.7.4's acceptability table) and
+# discards the byte, so it stays unacknowledged and `ack 1001` never moves. A
+# probe that walked forward instead would leave a hole the peer could not close
+# and widen it once per probe -- RFC 9293 section 3.8.6.1's "or retransmit".
+#
+# ## Five identical answers and no fast retransmit
+#
+# Each `ack 1001 win 0` line meets every one of RFC 5681 section 3.2's five
+# conditions for a duplicate acknowledgement, INCLUDING (a) "the receiver of the
+# ACK has outstanding data", which the probe's own byte makes true. Three of
+# them would fast-retransmit and halve ssthresh on a path that has dropped
+# nothing; there is no such frame here, and the absence is checked -- the runner
+# fails on any frame the script does not account for.
+#
+# ## The ARP boundary, since this scenario is the first here to go near it
+#
+# `tcp-close.vec`'s header states the rule: past 60 seconds an entry expires and
+# the correct behaviour is an ARP request and no TCP segment, which reads as a
+# vector failure, and a scenario is safe only if every `>` line is emitted from
+# an entry refreshed more recently than that. The probes here are NOT provoked
+# by an inbound packet, so that argument does not cover them -- what does is the
+# arithmetic: the longest gap between an inbound packet and a probe is 15.030 to
+# 31.020, just under 16 seconds. The next rung would be 31.030 to 63.020, still
+# inside; the rung after that would be a full 60 seconds and would NOT be, which
+# is why the ladder stops where it does rather than at the ceiling.
+0.000 < S     0:0(0) win 65535 <mss 1460>
+0.000 > S.    1000:1000(0) ack 1 win 65535 <mss 1460>
+0.010 < .     1:1(0) ack 1001 win 0
+0.020 < write 100
+1.020 > .     1001:1002(1) ack 1 win 65535
+1.030 < .     1:1(0) ack 1001 win 0
+3.020 > .     1001:1002(1) ack 1 win 65535
+3.030 < .     1:1(0) ack 1001 win 0
+7.020 > .     1001:1002(1) ack 1 win 65535
+7.030 < .     1:1(0) ack 1001 win 0
+15.020 > .    1001:1002(1) ack 1 win 65535
+15.030 < .    1:1(0) ack 1001 win 0
+31.020 > .    1001:1002(1) ack 1 win 65535
+# The peer's application drains just before this probe lands, so the fifth probe
+# finds an open window and its byte is accepted -- `ack 1002`, not `ack 1001`.
+# Five probes were sent and one round trip after the receiver recovered the
+# connection was moving again.
+31.030 < .    1:1(0) ack 1002 win 1000
+31.030 > P.   1002:1101(99) ack 1 win 65535
+31.040 < .    1:1(0) ack 1101 win 1000

@@ -256,6 +256,125 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
     fixture.drain()
 }
 
+@Test func aGuestSynOfferingAWindowScaleGetsOneBackAndAnUnscaledHandshakeWindow() throws {
+    // The ordering guard for window scaling, at the one place it is observable:
+    // on the wire.
+    //
+    // `TCB.negotiateWindowScale(fromSynOptions:)` now runs on this SYN and
+    // records the negotiation, so "nothing in this stack records a scale" has
+    // stopped being the reason the SYN-ACK carries no `wscale`. The reason is
+    // `TCPEndpoint.windowScaleToOffer`, which is nil — and RFC 7323 §2.2 scales
+    // nothing unless both sides sent the option, so both of this connection's
+    // shifts are zero however generous the guest's offer.
+    //
+    // Answering the offer before the shifts are applied is the defect this
+    // ordering exists to prevent: `wscale 7` alongside a 65535 window promises
+    // the guest 8 MB — at the maximum shift of 14, 1 GB — against a reassembler
+    // that caps at 256 KiB. The guest fills the pipe it was promised, most of it
+    // is dropped, and it presents as packet loss with no error raised anywhere.
+    //
+    // So this asserts both halves: no option, and a window that still means
+    // exactly the number of bytes it says.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .windowScale(7)]))
+
+            let emitted = fixture.drainSegments()
+            #expect(emitted.count == 1)
+            let synAck = try #require(emitted.first).header
+            #expect(synAck.flags.contains(.syn))
+            #expect(synAck.flags.contains(.ack))
+            #expect(synAck.options == [.maximumSegmentSize(1460), .windowScale(TCPEndpoint.derivedWindowScale)])
+            // Still 65535, and still meaning 65535: RFC 7323 §2.2 forbids
+            // scaling the window in a SYN or SYN-ACK, so the shift this very
+            // segment negotiates does not apply to the segment negotiating it.
+            #expect(synAck.window == UInt16(TCPEndpoint.receiveWindowBytes))
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theWindowWeAdvertiseGrowsPastTheHandshakeCeilingOnceScalingIsInEffect() throws {
+    // The point of the whole four-step sequence. Until a scale is negotiated
+    // *and* applied, `RCV.WND` cannot exceed 65535, because that is all the
+    // header field holds. With a scale in effect the field carries
+    // `RCV.WND >> scale`, so the real window this connection offers is larger
+    // than any unscaled connection could express -- which is the only reason to
+    // have built any of it.
+    //
+    // Asserted on the REAL window rather than the wire field. The wire field
+    // legitimately *falls* as the scale rises, so a test watching it would read
+    // a growing window as a shrinking one.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .windowScale(7)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+
+            // The handshake itself is unscaled, so it is stuck at the ceiling.
+            #expect(synAck.window == UInt16(TCPEndpoint.receiveWindowBytes))
+
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack, .psh]),
+                payload: ByteBuffer(bytes: [0xaa]))
+            let ack = try #require(fixture.drainSegments().last).header
+
+            let scale = TCPEndpoint.derivedWindowScale
+            let realWindow = Int(ack.window) << Int(scale)
+            #expect(scale > 0, "a scale of zero would make this test vacuous")
+            #expect(realWindow > TCPEndpoint.receiveWindowBytes, "real window \(realWindow) did not clear the unscaled ceiling")
+
+            // The honesty half: we may not promise more than the queue holds.
+            //
+            // Against `TCPReassembler.defaultMaximumBytes`, NOT against
+            // `TCPEndpoint.maximumReceiveWindowBytes`. Falsifying this task by
+            // raising the endpoint's cap past the queue's capacity left the
+            // second form green, because the bound moved with the thing it was
+            // bounding -- the self-referential assertion this project has found
+            // three times now. The queue's own constant is the fixed point.
+            //
+            // Being exact about what this does and does not catch: raising
+            // `maximumReceiveWindowBytes` past the queue's capacity still does
+            // not fail here, because `Receiver.advertisedWindow` derives its
+            // ceiling from `reassembler.availableBytes` and the queue forecloses
+            // the overrun on its own. The honesty is structural, not enforced by
+            // this line. What this line pins is that nothing later introduces a
+            // path around the queue -- and the vector
+            // `aPassiveOpenCompletesTheThreeWayHandshakeOnTheWire` is what
+            // actually fails on that mutation today.
+            #expect(realWindow <= TCPReassembler.defaultMaximumBytes)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theScaleWeOfferIsTheSmallestThatExpressesOurCapacity() {
+    // Derived rather than written down, because a literal and the cap drift
+    // apart silently and the failure is a window we cannot honour. The boundary
+    // is closer than it looks: at a 256 KiB cap, `65535 << 2` is 262,140 --
+    // four bytes short -- so an off-by-one here is not academic.
+    let scale = Int(TCPEndpoint.derivedWindowScale)
+    let cap = TCPEndpoint.maximumReceiveWindowBytes
+    #expect(Int(UInt16.max) << scale >= cap, "scale \(scale) cannot express the \(cap)-byte cap")
+    // And that the derived value is the one actually offered. Without this,
+    // replacing the offer with a literal leaves every assertion above green:
+    // falsifying `windowScaleToOffer` alone did not fail this test until here.
+    #expect(TCPEndpoint.windowScaleToOffer == TCPEndpoint.derivedWindowScale)
+    if scale > 0 {
+        #expect(Int(UInt16.max) << (scale - 1) < cap, "scale \(scale) is larger than it needs to be")
+    }
+}
+
 @Test func aRetransmittedSynReproducesTheSameSynAck() throws {
     // Task 15's vector sends the same SYN twice and requires the same SYN-ACK
     // both times. RFC 6528's function is deterministic in the four-tuple, but
@@ -995,7 +1114,7 @@ private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UIn
             #expect(syn.flags.contains(.syn))
             #expect(!syn.flags.contains(.ack))
             #expect(syn.sequence == SequenceNumber(gatewayISS))
-            #expect(syn.options == [.maximumSegmentSize(1460)])
+            #expect(syn.options == [.maximumSegmentSize(1460), .windowScale(TCPEndpoint.derivedWindowScale)])
             #expect(recorder.establishedCount == 0, "positive control: not established until the SYN-ACK arrives")
 
             fixture.inject(
@@ -1321,5 +1440,325 @@ private func lateSegment(peerPort: UInt16 = tcpPeerPort) -> TCPHeader {
         "and `deinit` must release the four-tuple it was holding")
     fixture.advance(by: .seconds(120))
     #expect(fixture.drainSegments().isEmpty)
+    fixture.drain()
+}
+
+// MARK: - RFC 5961 §7: the challenge-ACK budget
+
+// Every count below is the literal 100, never `ChallengeACKBudget.defaultPerSecond`.
+// An assertion derived from the code under test goes vacuous exactly when the
+// constant it reads is the thing that broke: a budget silently retuned to five,
+// or to five million, would keep every one of these green. 100 is
+// `ChallengeACKBudget.defaultPerSecond`, and changing that constant is meant to
+// break this file loudly.
+
+/// A zero-length segment sitting far behind RCV.NXT, carrying nothing that any
+/// of this stack's exact-position exceptions recognise: no FIN (so it is not a
+/// TIME-WAIT FIN retransmission) and no SYN (so it is not the SYN-RECEIVED
+/// handshake retransmission). It fails RFC 9293 §3.10.7.4's acceptability test
+/// and therefore draws step 1's acknowledge-and-drop — the cheapest
+/// challenge-ACK provocation a guest has, and the one the differential recorded
+/// as an amplification the guest controls.
+private func unacceptableSegment() -> TCPHeader {
+    guestSegment(sequence: guestISS &- 20_000, ack: gatewayISS + 1, flags: [.ack])
+}
+
+/// An in-window RST that is not at RCV.NXT: RFC 5961 §3.2's challenge, not a
+/// reset this stack will honour.
+private func blindResetInTheWindow() -> TCPHeader {
+    guestSegment(sequence: guestISS + 2, flags: [.rst])
+}
+
+/// A SYN on a synchronized connection: RFC 5961 §4's challenge. At RCV.NXT, so
+/// it passes the acceptability test and reaches step 3 rather than step 2.
+private func synOnASynchronizedConnection() -> TCPHeader {
+    guestSegment(sequence: guestISS + 1, flags: [.syn])
+}
+
+/// An acceptable segment acknowledging data that was never sent: RFC 5961 §5's
+/// challenge, reached at step 4.
+private func acknowledgementOfDataNeverSent() -> TCPHeader {
+    guestSegment(sequence: guestISS + 1, ack: gatewayISS + 5000, flags: [.ack])
+}
+
+/// Bare acknowledgements only. A challenge ACK carries no payload and no
+/// SYN/FIN/RST, so counting every drained frame would also count a SYN-ACK or a
+/// retransmission and make an exhausted budget look busy.
+private func challengeAcks(_ fixture: TCPFixture) -> Int {
+    fixture.drainSegments().filter { emitted in
+        emitted.payload.readableBytes == 0
+            && emitted.header.flags.contains(.ack)
+            && !emitted.header.flags.contains(.syn)
+            && !emitted.header.flags.contains(.fin)
+            && !emitted.header.flags.contains(.rst)
+    }.count
+}
+
+private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
+    for _ in 0..<times {
+        fixture.inject(header)
+    }
+}
+
+@Test func aFloodOfUnacceptableSegmentsIsBoundedByTheChallengeAckBudget() throws {
+    // The gap the differential recorded: N unacceptable segments drew N ACKs,
+    // and the guest chose N. RFC 5961 §7 bounds it.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            flood(fixture, unacceptableSegment(), times: 2000)
+
+            // No clock advance anywhere above, so nothing has been earned back:
+            // this is the whole of one bucket and not a token more.
+            #expect(challengeAcks(fixture) == 100)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aFloodOfUnacceptableSegmentsCarryingDataIsBoundedToo() throws {
+    // gVisor exempts a data-bearing segment from its own out-of-window ACK
+    // throttle (`maybeSendOutOfWindowAck`: "Data packets are unlikely to be part
+    // of an ACK loop"). This stack deliberately does not, and the difference is
+    // recorded in `differential/README.md`. gVisor is guarding against ACK loops,
+    // where the reasoning holds; the threat here is amplification, and an
+    // exemption keyed on "carries a payload" is a bypass of the entire budget for
+    // the price of one byte per segment.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            for _ in 0..<2000 {
+                fixture.inject(unacceptableSegment(), payload: tcpPayload(1))
+            }
+
+            #expect(challengeAcks(fixture) == 100)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func oneIsolatedUnacceptableSegmentStillDrawsItsChallengeAck() throws {
+    // The floor the flood test above cannot supply. "Bounded by 100" is
+    // satisfied perfectly by a stack that answers nothing at all, and answering
+    // nothing breaks RFC 9293 §3.10.7.4 step 1: the ACK is how a peer whose
+    // idea of RCV.NXT has drifted is told where this connection actually is.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            fixture.inject(unacceptableSegment())
+
+            let emitted = fixture.drainSegments()
+            #expect(emitted.count == 1)
+            let challenge = try #require(emitted.first).header
+            // Assert what it IS. A count of one is also true of a stack that
+            // answered with something else entirely.
+            #expect(challenge.flags.contains(.ack))
+            #expect(!challenge.flags.contains(.rst))
+            #expect(challenge.acknowledgement == SequenceNumber(guestISS + 1), "RCV.NXT, which is the point of sending it")
+            #expect(challenge.sequence == SequenceNumber(gatewayISS + 1))
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theChallengeAckBudgetRefillsAsTheClockAdvances() throws {
+    // The second floor, and the one a test that only floods will never notice:
+    // a limiter that latches shut on first exhaustion is a denial of service
+    // this stack inflicts on itself, and it passes the flood test above.
+    //
+    // The refill is also asserted at a rate rather than as "unlatched by any
+    // clock movement at all" — a hundred milliseconds must buy ten challenge
+    // ACKs and not a fresh hundred.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            flood(fixture, unacceptableSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 100)
+
+            // Exhausted, and still exhausted while the clock stands still.
+            fixture.inject(unacceptableSegment())
+            #expect(challengeAcks(fixture) == 0)
+
+            fixture.advance(by: .milliseconds(100))
+            flood(fixture, unacceptableSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 10, "a tenth of a second earns a tenth of a bucket")
+
+            fixture.advance(by: .seconds(1))
+            flood(fixture, unacceptableSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 100, "and a second earns the whole of one, never more")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func everyChallengeAckPathDrawsOnOneBudget() throws {
+    // The attacker does not care which branch it provokes, so a limit that
+    // binds one path and not the others is not a limit. Exhaust the budget
+    // through RFC 9293 §3.10.7.4 step 1 and every other challenge must fall
+    // silent with it: RFC 5961 §3.2's blind reset, §4's SYN, and §5's
+    // acknowledgement of data never sent.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            flood(fixture, unacceptableSegment(), times: 100)
+            #expect(challengeAcks(fixture) == 100)
+
+            fixture.inject(blindResetInTheWindow())
+            #expect(challengeAcks(fixture) == 0, "RFC 5961 §3.2's challenge draws on the same budget")
+            fixture.inject(synOnASynchronizedConnection())
+            #expect(challengeAcks(fixture) == 0, "RFC 5961 §4's challenge draws on the same budget")
+            fixture.inject(acknowledgementOfDataNeverSent())
+            #expect(challengeAcks(fixture) == 0, "RFC 5961 §5's challenge draws on the same budget")
+
+            // The positive control, without which every assertion above is
+            // equally true of a stack that never challenges these three at all
+            // — which is the state this whole task is guarding against.
+            fixture.advance(by: .seconds(1))
+            fixture.inject(blindResetInTheWindow())
+            #expect(challengeAcks(fixture) == 1)
+            fixture.inject(synOnASynchronizedConnection())
+            #expect(challengeAcks(fixture) == 1)
+            fixture.inject(acknowledgementOfDataNeverSent())
+            #expect(challengeAcks(fixture) == 1)
+
+            // And none of the three disturbed the connection, which is the
+            // other half of what RFC 5961 asks: challenge, do not honour.
+            #expect(endpoint.connectionCountForTesting == 1)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theChallengeAckBudgetIsSharedAcrossConnections() throws {
+    // The budget is per-stack, not per-connection. A guest that could earn a
+    // fresh hundred per connection would still choose the multiplier — it would
+    // only have to pay a SYN for each hundred.
+    let secondPeerPort: UInt16 = tcpPeerPort + 1
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            completeHandshake(fixture, peerPort: secondPeerPort)
+            _ = fixture.drainSegments()
+            #expect(endpoint.connectionCountForTesting == 2)
+
+            flood(fixture, unacceptableSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 100)
+
+            let onTheOtherConnection = guestSegment(
+                sequence: guestISS &- 20_000, ack: gatewayISS + 1, flags: [.ack], peerPort: secondPeerPort)
+            fixture.inject(onTheOtherConnection)
+            #expect(challengeAcks(fixture) == 0, "a second connection does not come with a second budget")
+
+            fixture.advance(by: .seconds(1))
+            fixture.inject(onTheOtherConnection)
+            #expect(challengeAcks(fixture) == 1, "and the second connection is challenged again once the budget refills")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func anAcknowledgementOfRealDataIsNeverRateLimited() throws {
+    // The line between the two kinds of ACK. RFC 5961 §7 throttles the ACK sent
+    // for a segment being DROPPED; the ACK that acknowledges received data is
+    // the connection's flow control, and a limiter that swallowed it would stop
+    // a guest's data transfer dead for every second it kept the budget empty —
+    // an attack on the connection, delivered by the defence.
+    let fixture = TCPFixture()
+    let recorder = DataRecorder()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        recorder.attach(to: endpoint)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            flood(fixture, unacceptableSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 100)
+
+            for index in 0..<20 {
+                fixture.inject(
+                    guestSegment(sequence: guestISS + 1 + UInt32(index * 10), ack: gatewayISS + 1, flags: [.ack]),
+                    payload: tcpPayload(10))
+            }
+
+            #expect(challengeAcks(fixture) == 20, "every in-order segment is acknowledged, budget or no budget")
+            #expect(recorder.bytes.count == 200)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theChallengeAckBudgetBindsInTimeWaitWhileTheTwoMslRestartDoesNot() throws {
+    // TIME-WAIT answers unacceptable and acceptable segments alike, from two
+    // sites of its own, and both are gated. Without this the two arms would be
+    // gated code nothing could fail on: every other test here works on an
+    // ESTABLISHED connection, which reaches neither.
+    //
+    // The second half is the more important one. The ACK is throttled; the 2*MSL
+    // restart that travels with it is NOT. Gating the restart would hand a guest
+    // a way to expire a TIME-WAIT block early -- empty the budget through any
+    // path at all and the FIN retransmissions keeping the block alive stop
+    // refreshing it -- and that block is exactly the protection RFC 1337 §3 says
+    // a peer must not be able to remove.
+    let finRetransmission = guestSegment(sequence: guestISS + 1, ack: gatewayISS + 2, flags: [.fin, .ack])
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            endpoint.close()
+            driveToTimeWait(fixture)
+            _ = fixture.drainSegments()
+            #expect(endpoint.timeWaitCountForTesting == 1)
+
+            // Step 4's TIME-WAIT arm: an acceptable segment nothing is done
+            // with, answered with an ACK the peer has no use for.
+            flood(fixture, lateSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 100)
+
+            // Thirty seconds into a sixty-second block, with the budget emptied
+            // through a path that does NOT restart the timer, so the only
+            // restart that can be at t=30 is the FIN retransmission's.
+            fixture.advance(by: .seconds(30))
+            flood(fixture, unacceptableSegment(), times: 2000)
+            #expect(challengeAcks(fixture) == 100)
+
+            fixture.inject(finRetransmission)
+            #expect(challengeAcks(fixture) == 0, "step 2's TIME-WAIT arm is gated too")
+
+            // Past where the original block would have expired. It is still here
+            // only if the token-less FIN retransmission restarted it.
+            fixture.advance(by: .seconds(31))
+            #expect(endpoint.timeWaitCountForTesting == 1, "the 2*MSL restart must not be contingent on a token")
+
+            // And the positive control: the block is not immortal, so the
+            // assertion above is about the restart and not about a timer that
+            // never fires.
+            fixture.advance(by: .seconds(31))
+            #expect(endpoint.timeWaitCountForTesting == 0)
+        }
+    }
     fixture.drain()
 }

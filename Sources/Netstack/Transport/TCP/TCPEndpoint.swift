@@ -66,6 +66,14 @@ import NIOCore
 /// - Our own FIN is retransmitted at most `maximumFinTransmissions` times before
 ///   the connection is given up, so a peer that never acknowledges it cannot pin
 ///   a block, a registration and a timer for the life of the process.
+/// - **The zero-window probe is the one thing here with no count bound at all**,
+///   and that is required rather than overlooked: RFC 1122 §4.2.2.17 makes
+///   "Sender timeout OK conn with zero wind" a MUST NOT. What bounds it is the
+///   interval (sixty seconds in the steady state) and the two resources a
+///   persisting connection holds, both of which are capped above — the block, by
+///   the backlog, and the send queue, by `sendBufferBytes`.
+///   `Sender.persistTimerFired` states the whole argument, including what RFC
+///   6429 §3 says the real cost of a persisting connection is.
 public final class TCPEndpoint: TransportEndpointDelegate {
     /// The largest backlog any caller may ask for. The application chooses the
     /// backlog, not the guest, so this is a guard rail rather than a defence --
@@ -82,7 +90,61 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// advertise (`TCB.rcvWndMax`). 65535 is the largest a 16-bit window field
     /// can carry, and nothing here negotiates a window scale -- see the SYN-ACK
     /// option list in `emitSynAck` for why not.
+    /// The window advertised in the handshake, and the widest one expressible
+    /// there. RFC 7323 §2.2 forbids scaling the window in a SYN or SYN-ACK, so
+    /// whatever scale is negotiated *on* the handshake cannot be used *by* it —
+    /// 65535 is the ceiling for those two segments no matter what.
     static let receiveWindowBytes = 65535
+
+    /// The widest window this connection may grow to once scaling is in effect.
+    ///
+    /// Bounded by what the reassembler can actually hold, not by what the field
+    /// can express. Advertising more than the queue can take is the same defect
+    /// the four-step ordering below exists to prevent, arriving by another route:
+    /// the peer fills the pipe it was promised and most of it is dropped.
+    static let maximumReceiveWindowBytes = TCPReassembler.defaultMaximumBytes
+
+    /// The smallest shift that lets `maximumReceiveWindowBytes` fit the header's
+    /// 16-bit field. **Derived, not written down**: a literal would drift the
+    /// moment someone changed the cap, and the two silently disagreeing is how
+    /// a stack ends up advertising a window it cannot honour.
+    ///
+    /// At the current 256 KiB cap this is 3. Note how close the boundary is —
+    /// `65535 << 2` is 262,140, four bytes short of 262,144 — which is the other
+    /// reason not to hardcode it.
+    static let derivedWindowScale: UInt8 = {
+        var shift: UInt8 = 0
+        while maximumReceiveWindowBytes >> Int(shift) > Int(UInt16.max) { shift += 1 }
+        return shift
+    }()
+
+    /// The Window Scale shift this stack puts in its own SYN and SYN-ACK, or
+    /// `nil` for "send no Window Scale option". **`nil`, deliberately, and this
+    /// is the single input that turns window scaling on.**
+    ///
+    /// It reaches every connection through `TCB.windowScaleToOffer`, and
+    /// `TCB.negotiateWindowScale(fromSynOptions:)` is the rule it feeds: RFC
+    /// 7323 §2.2 uses scaling only if *both* sides send the option, so a `nil`
+    /// here holds `sndWindScale` and `rcvWindScale` at zero on every connection
+    /// no matter what the peer offers.
+    ///
+    /// **Do not make this non-`nil` before the shifts are actually applied.**
+    /// The four steps are ordered: record the negotiated shifts, apply
+    /// `sndWindScale` to SND.WND (the two non-SYN sites in `TCPStateMachine`),
+    /// apply `rcvWindScale` to the window we advertise
+    /// (`Receiver.advertisedWindow` and `advertisedWindow(of:)` below), and only
+    /// then send the option. Reversing that order means advertising `win 65535`
+    /// *meaning up to 1 GB* against a reassembler that caps at 256 KiB: the peer
+    /// fills the pipe it was promised, most of it is dropped, and it presents as
+    /// packet loss with no error raised anywhere. See `emitSynAck`.
+    ///
+    /// Flipping it is not the whole of that last step either — the option has to
+    /// be added to the SYN in `connect` and to the SYN-ACK in `emitSynAck`, and
+    /// the SYN-ACK's copy must be gated on `tcb.peerOfferedWindowScale`. RFC
+    /// 7323 §2.2: "If a Window Scale option was received in the initial `<SYN>`
+    /// segment, then this option MAY be sent in the `<SYN,ACK>` segment." See
+    /// `TCB.peerOfferedWindowScale` for how exactly to read that clause.
+    static let windowScaleToOffer: UInt8? = derivedWindowScale
 
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
@@ -141,6 +203,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// `onClosed` fires once per connection. The peer's FIN and a reset are
         /// both "this stream is over", and a connection can meet both.
         var closedReported = false
+
+        /// When our half of the handshake went out and how many times, so that
+        /// the round trip can be sampled once it completes -- and refused when
+        /// Karn says it is ambiguous. Defaulted rather than passed to `init`,
+        /// because every connection starts with nothing recorded. See
+        /// `HandshakeRTT`.
+        var handshake = HandshakeRTT()
 
         /// The four-tuple this connection holds in the demuxer in its own right,
         /// once `close()` has released the endpoint's listening key. Nil while
@@ -303,10 +372,17 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         connection.tcb.sndNxt = connection.tcb.iss + 1
         connections[peer] = connection
 
+        // The active open's half of the handshake: our SYN goes out here and
+        // the SYN-ACK answering it closes the round trip. Recorded immediately
+        // before the emit rather than after it because `emit` is synchronous and
+        // the clock cannot move inside it, so the two instants are the same one.
+        connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn], sequence: connection.tcb.iss, on: connection,
-            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))],
-            acknowledgement: SequenceNumber(0))
+            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
+                + windowScaleOption(for: connection, answeringPeerSyn: false),
+            acknowledgement: SequenceNumber(0),
+            window: unscaledAdvertisedWindow(of: connection))
     }
 
     /// Queue bytes for transmission.
@@ -329,6 +405,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard connection.sender.write(bytes) else { throw StackError.wouldBlock }
         transmit(on: connection)
         armRetransmitTimer(on: connection)
+        // A write into a connection whose peer has closed its window puts
+        // nothing on the wire, so this is the ONE place an episode of persist
+        // can begin without a segment having arrived. Without it the connection
+        // waits for the peer to send something before it starts probing, which
+        // is precisely the wedge the probe exists to break.
+        armPersistTimer(on: connection)
     }
 
     /// Close every connection, release the **listening** port, and keep every
@@ -392,6 +474,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         for connection in connections.values {
             registerInOwnRight(connection)
             armRetransmitTimer(on: connection)
+            // Cancels it, in every state `close()` can leave a connection in.
+            // RFC 6429 §4 is the requirement being met here: a connection in the
+            // persist condition "needs to allow ... to be closed or aborted by
+            // their applications", which is the counterweight to persist itself
+            // having no give-up rule.
+            armPersistTimer(on: connection)
         }
         if let boundID {
             stack.transportDemuxer.unregister(boundID, protocolNumber: .tcp)
@@ -419,6 +507,18 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     var congestionWindowForTesting: Int? {
         guard connections.count == 1, let connection = connections.values.first else { return nil }
         return connection.sender.congestionControl.congestionWindow
+    }
+
+    /// Whether the single connection this endpoint holds has a zero-window probe
+    /// scheduled, or nil if it holds none or more than one.
+    ///
+    /// The NIO-level fact, not the sender's opinion: `Sender.persistDeadline`
+    /// says when a probe is due and this says that a timer was actually armed
+    /// for it. A test asserting only the former passes on an endpoint that never
+    /// calls `armPersistTimer`.
+    var hasPersistScheduledForTesting: Bool? {
+        guard connections.count == 1, let connection = connections.values.first else { return nil }
+        return connection.timers.hasPersistScheduled
     }
 
     /// How many of them are in TIME-WAIT. The cap is on this number, and a cap
@@ -482,8 +582,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// Drive one segment through the state machine and act on what it returns.
     private func process(segment: TCPSegment, on connection: Connection) {
         let stateBefore = connection.tcb.state
+        // The challenge-ACK budget comes from the STACK, not from the connection:
+        // every connection this endpoint holds, and every connection every other
+        // endpoint on the same stack holds, spends from one bucket. See
+        // `ChallengeACKBudget`.
         let actions = TCPStateMachine.receive(
-            segment: segment, on: &connection.tcb, receiver: &connection.receiver, sender: &connection.sender)
+            segment: segment, on: &connection.tcb, receiver: &connection.receiver, sender: &connection.sender,
+            challengeACKs: &stack.tcpChallengeACKs)
 
         var wantsAck = false
         var deleted = false
@@ -516,6 +621,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard connections[connection.peer] === connection else { return }
 
         if stateBefore != .established, connection.tcb.state == .established {
+            seedRoundTripEstimateFromHandshake(on: connection)
             onEstablished?()
         }
 
@@ -534,6 +640,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
         }
         armRetransmitTimer(on: connection)
+        armPersistTimer(on: connection)
 
         switch connection.tcb.state {
         case .closeWait, .closing, .lastAck, .timeWait, .closed:
@@ -627,10 +734,29 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     ///   it to actually send SACK blocks back.
     ///
     /// MSS stays, because it is the one option this stack acts on.
+    ///
+    /// ## The window scale is now *negotiated*, and still not *advertised*
+    ///
+    /// `TCB.negotiateWindowScale(fromSynOptions:)` records both shifts as of the
+    /// task that added it, so "nothing in this stack records a scale" is no
+    /// longer the reason the option is absent here. The reason is the ordering:
+    /// `windowScaleToOffer` is `nil`, so both shifts are zero on every
+    /// connection and the window below is a true, unscaled 65535. Nothing about
+    /// this list may change until the shifts are actually applied in both
+    /// directions -- see `windowScaleToOffer` for the four steps and for what
+    /// adding the option here will additionally require
+    /// (`tcb.peerOfferedWindowScale`, per RFC 7323 §2.2).
     private func emitSynAck(on connection: Connection) {
+        // Every SYN-ACK this stack sends passes through here, including the
+        // repeat that answers a retransmitted SYN in SYN-RECEIVED -- which is
+        // exactly the transmission Karn has to count. A second emission point
+        // would not be a missing count so much as a silently wrong RTO.
+        connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn, .ack], sequence: connection.tcb.iss, on: connection,
-            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))])
+            options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
+                + windowScaleOption(for: connection, answeringPeerSyn: true),
+            window: unscaledAdvertisedWindow(of: connection))
     }
 
     /// Our FIN. `TCPStateMachine.close(on:)` has already bumped SND.NXT to
@@ -668,6 +794,45 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
         }
         return segments.count
+    }
+
+    /// Fold the handshake's round trip into the connection's RTT estimator, at
+    /// the one moment both ends of it are known.
+    ///
+    /// ## Both directions, one call site
+    ///
+    /// A passive open times SYN-ACK -> ACK and an active open times SYN ->
+    /// SYN-ACK, and both finish at the same event: the transition INTO
+    /// ESTABLISHED. Hooking the transition rather than the two segment paths
+    /// separately is what makes the active and passive cases impossible to
+    /// implement inconsistently, and it is why there is no second copy of this
+    /// below.
+    ///
+    /// ## Ordering, which is the whole difficulty
+    ///
+    /// Two orderings have to hold, and neither raises anything when it does not:
+    ///
+    /// - **Before the first data send.** This runs inside `process`, ahead of
+    ///   the `transmit` below it, so the first data segment's retransmission
+    ///   timer is armed from the seeded RTO. Move it after `transmit` and the
+    ///   estimator still ends up holding exactly the right numbers while the
+    ///   timer that matters was armed from the wrong ones --
+    ///   `the-handshake-seeds-the-retransmission-timeout` in `tcp-data.vec` is
+    ///   the vector that catches that, as a frame 200 ms early.
+    /// - **After `adoptPeerSegmentSize`.** On an active open, a SYN-ACK
+    ///   carrying an MSS option makes `deliver` REBUILD `connection.sender`
+    ///   from scratch, which throws away the estimator with everything else in
+    ///   it. That happens before `process` runs, so seeding here is after the
+    ///   rebuild and survives it. Seeding anywhere in `deliver` ahead of that
+    ///   call would be discarded silently -- no error, no failing test, and an
+    ///   active open that quietly keeps the unseeded behaviour.
+    ///
+    /// `HandshakeRTT` decides whether there is a sample at all; Karn's refusal
+    /// and a zero-length round trip both arrive here as `nil`, and a connection
+    /// that gets no sample simply keeps RFC 6298 §2.1's initial one-second RTO.
+    private func seedRoundTripEstimateFromHandshake(on connection: Connection) {
+        guard let sample = connection.handshake.sample(at: stack.clock.now()) else { return }
+        connection.sender.measureHandshakeRoundTrip(sample)
     }
 
     // MARK: - Timers
@@ -734,6 +899,54 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         }
 
         armRetransmitTimer(on: connection)
+    }
+
+    /// Bring the persist timer into line with what the sender says, exactly as
+    /// `armRetransmitTimer` does for the retransmission timer, and with the same
+    /// `[weak self]` + re-find-by-key discipline for the same reason.
+    ///
+    /// The state gate is `send()`'s: those are the two states in which the
+    /// application can put data into the send queue, so they are the only two in
+    /// which a closed receive window can be holding data back. Everything past
+    /// them either has a FIN in the sequence space -- which `Sender
+    /// .persistApplies` refuses on its own, so this is belt as well as braces --
+    /// or is a connection with nothing left to send.
+    private func armPersistTimer(on connection: Connection) {
+        switch connection.tcb.state {
+        case .established, .closeWait:
+            break
+        case .closed, .listen, .synSent, .synReceived, .finWait1, .finWait2, .closing, .lastAck, .timeWait:
+            connection.timers.cancelPersist()
+            return
+        }
+        guard let deadline = connection.sender.persistDeadline else {
+            connection.timers.cancelPersist()
+            return
+        }
+        let now = stack.clock.now()
+        let delay = deadline > now ? deadline - now : .nanoseconds(0)
+        let peer = connection.peer
+        connection.timers.schedulePersist(after: delay) { [weak self] in
+            self?.persistTimerFired(peer: peer)
+        }
+    }
+
+    /// RFC 9293 §3.8.6.1's zero-window probe, out through the single egress
+    /// point like everything else this endpoint emits.
+    ///
+    /// The deadline is re-checked against the clock before the probe is taken,
+    /// for the same reason `retransmitTimerFired` re-checks the sender's: this
+    /// body is re-armed on every arriving segment, so it can be reached with the
+    /// deadline still in the future if the schedule and the sender's own idea of
+    /// when disagree. Re-arming and returning is then the whole of the work.
+    private func persistTimerFired(peer: Peer) {
+        guard let connection = connections[peer] else { return }
+        if let deadline = connection.sender.persistDeadline, deadline <= stack.clock.now(),
+            let segment = connection.sender.persistTimerFired(tcb: &connection.tcb)
+        {
+            emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
+        }
+        armPersistTimer(on: connection)
     }
 
     /// True while a FIN we sent is still unacknowledged.
@@ -844,7 +1057,9 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 iss: iss,
                 rcvNxt: SequenceNumber(0),
                 rcvWnd: Self.receiveWindowBytes,
-                irs: SequenceNumber(0)),
+                irs: SequenceNumber(0),
+                windowScaleToOffer: Self.windowScaleToOffer,
+                rcvWndMax: Self.maximumReceiveWindowBytes),
             receiver: Receiver(reassembler: TCPReassembler()),
             sender: Sender(
                 congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,
@@ -908,9 +1123,43 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     /// RCV.WND for the wire. `Receiver` owns the figure and has already written
     /// it into the TCB; this only clamps it to the field, which cannot be
-    /// exceeded with no window scale negotiated.
+    /// exceeded while `connection.tcb.rcvWindScale` is zero -- which it is on
+    /// every connection, since `windowScaleToOffer` is `nil` and RFC 7323 §2.2
+    /// scales nothing unless both sides sent the option. The step that applies
+    /// our own shift turns this clamp into `RCV.WND >> rcvWindScale` against a
+    /// ceiling of `65535 << rcvWindScale`, and must round the shift *downwards*
+    /// (see `Receiver.advertisedWindow`, which owns that arithmetic).
     private func advertisedWindow(of connection: Connection) -> UInt16 {
+        let scaled = max(0, connection.tcb.rcvWnd) >> Int(connection.tcb.rcvWindScale)
+        return UInt16(min(scaled, Int(UInt16.max)))
+    }
+
+    /// The window for a segment that carries SYN, which RFC 7323 §2.2 says
+    /// **must not be scaled**: "The window field in a segment where the SYN bit
+    /// is set (i.e., a `<SYN>` or `<SYN,ACK>`) MUST NOT be scaled."
+    ///
+    /// A second window-building site rather than a condition inside the first,
+    /// deliberately, and for the same reason `TCPStateMachine` labels its four
+    /// peer-window decodes individually: the asymmetry is the thing a reader
+    /// needs to see, and a branch hides it. `emit` defaults to the scaled one,
+    /// so the two SYN-bearing callers pass this explicitly — which also means a
+    /// new SYN-bearing emission that forgets to is visibly wrong at the call
+    /// site rather than silently scaled.
+    private func unscaledAdvertisedWindow(of connection: Connection) -> UInt16 {
         UInt16(min(max(0, connection.tcb.rcvWnd), Int(UInt16.max)))
+    }
+
+    /// The Window Scale option to put in an outgoing SYN, or `nil`.
+    ///
+    /// On a SYN-ACK this is gated on the peer having offered one first: RFC 7323
+    /// §2.2 permits the option in a `<SYN,ACK>` only "if a Window Scale option
+    /// was received in the initial `<SYN>` segment". `TCB.peerOfferedWindowScale`
+    /// is the flag rather than a non-zero shift, because a `shift.cnt` of 0 is a
+    /// legal offer and a recorded 0 cannot tell the two apart.
+    private func windowScaleOption(for connection: Connection, answeringPeerSyn: Bool) -> [TCPOption] {
+        guard let shift = Self.windowScaleToOffer else { return [] }
+        if answeringPeerSyn && !connection.tcb.peerOfferedWindowScale { return [] }
+        return [.windowScale(shift)]
     }
 }
 

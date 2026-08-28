@@ -86,6 +86,18 @@ public final class Stack {
     /// package's supported surface.
     let initialSequenceNumbers: any InitialSequenceNumbers
 
+    /// RFC 5961 §7's challenge-ACK budget, shared by **every** TCP connection on
+    /// this stack.
+    ///
+    /// Here rather than in each `TCB` because a guest opens connections as freely
+    /// as it sends segments: a per-connection bucket would still let it choose
+    /// the multiplier, at the price of one SYN per hundred challenge ACKs. See
+    /// `ChallengeACKBudget` for what the sharing costs.
+    ///
+    /// `var`, and mutated in place through `TCPStateMachine.receive` — loop-
+    /// confined like everything else here, and holding no lock.
+    var tcpChallengeACKs: ChallengeACKBudget
+
     private let allocator: ByteBufferAllocator
     private var maintenanceTask: RepeatedTask?
 
@@ -100,6 +112,7 @@ public final class Stack {
         self.allocator = allocator
         self.clock = clock
         self.initialSequenceNumbers = RFC6528SequenceNumbers(clock: clock)
+        self.tcpChallengeACKs = ChallengeACKBudget(clock: clock)
 
         let nic = NIC(id: 1, link: link)
         nic.addAddress(configuration.gatewayAddress, prefixLength: configuration.subnet.prefixLength)

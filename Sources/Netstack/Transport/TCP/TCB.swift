@@ -164,6 +164,35 @@ struct TCB: Equatable, Sendable {
     /// nothing later in the connection can reconstruct it.
     private(set) var peerOfferedWindowScale = false
 
+    /// RFC 7323 §3. Timestamps are in use only when **both** sides carried the
+    /// option in the handshake, exactly as with the window scale, and for the
+    /// same reason: the option in a SYN is an offer, and a SYN-ACK that omits it
+    /// declines. Written once, by `negotiateTimestamps(fromSynOptions:offering:)`.
+    private(set) var timestampsEnabled = false
+
+    /// Whether this stack puts the Timestamps option in its own SYN and
+    /// SYN-ACK. Carried on the TCB for the same reason `windowScaleToOffer` is:
+    /// the endpoint decides it, the state machine must not have to be told, and
+    /// negotiation happens deep inside a segment handler that has no other route
+    /// to the endpoint's configuration.
+    let offersTimestamps: Bool
+
+    /// TS.Recent (RFC 7323 §4.3): the most recent timestamp the peer sent that
+    /// was acceptable to echo back. Zero until the first one arrives.
+    ///
+    /// Not merely "the last TSval seen". §4.3's update rule is deliberately
+    /// narrow — a segment's timestamp replaces TS.Recent only when the segment
+    /// is *in sequence*, so a peer cannot poison the echo with a segment from
+    /// out of the past. PAWS is built on that narrowness; this field is where it
+    /// will live.
+    private(set) var tsRecent: UInt32 = 0
+
+    /// Whether `tsRecent` has ever been set. Distinct from `tsRecent == 0`
+    /// because zero is a legal timestamp value, and a peer whose clock starts
+    /// there would otherwise be indistinguishable from a peer that has not
+    /// spoken yet — the same trap `peerOfferedWindowScale` exists for.
+    private(set) var hasTSRecent = false
+
     /// The shift this stack puts in its **own** SYN and SYN-ACK, or `nil` for
     /// "we send no Window Scale option at all".
     ///
@@ -192,7 +221,8 @@ struct TCB: Equatable, Sendable {
         rcvWnd: Int,
         irs: SequenceNumber,
         windowScaleToOffer: UInt8? = nil,
-        rcvWndMax: Int? = nil
+        rcvWndMax: Int? = nil,
+        offersTimestamps: Bool = false
     ) {
         self.state = state
         self.sndUna = sndUna
@@ -214,6 +244,32 @@ struct TCB: Equatable, Sendable {
         self.rcvWndMax = rcvWndMax ?? rcvWnd
         self.irs = irs
         self.windowScaleToOffer = windowScaleToOffer
+        self.offersTimestamps = offersTimestamps
+    }
+
+    /// RFC 7323 §3's Timestamps negotiation, run from the same segment and at
+    /// the same moment as the window scale's, and subject to the same rule:
+    /// both sides must have sent the option or neither uses it.
+    ///
+    /// Reads `offersTimestamps` for this stack's half of the agreement, the way
+    /// the window scale's negotiation reads `windowScaleToOffer`.
+    mutating func negotiateTimestamps(fromSynOptions options: [TCPOption]) {
+        var peerSent = false
+        var peerValue: UInt32 = 0
+        for option in options {
+            if case .timestamps(let value, _) = option {
+                peerSent = true
+                peerValue = value
+            }
+        }
+        timestampsEnabled = peerSent && offersTimestamps
+        // TS.Recent is seeded from the SYN's own timestamp, per RFC 7323 §4.3's
+        // initialisation, and only when the option is actually in use: recording
+        // it otherwise would leave a value nothing may echo.
+        if timestampsEnabled {
+            tsRecent = peerValue
+            hasTSRecent = true
+        }
     }
 
     /// RFC 7323's Window Scale negotiation, run **once** per connection, from

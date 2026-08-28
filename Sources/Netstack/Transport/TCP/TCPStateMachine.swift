@@ -237,6 +237,7 @@ struct TCPStateMachine {
             // `TCB.negotiateWindowScale(fromSynOptions:)` for why there are no
             // others and why the result is still zero on every connection.
             tcb.negotiateWindowScale(fromSynOptions: header.options)
+            tcb.negotiateTimestamps(fromSynOptions: header.options)
             tcb.state = .synReceived
             return [.sendSynAck]
         }
@@ -298,6 +299,7 @@ struct TCPStateMachine {
             // by any segment with the SYN bit set, and in a simultaneous open
             // both sides have already sent theirs.
             tcb.negotiateWindowScale(fromSynOptions: header.options)
+            tcb.negotiateTimestamps(fromSynOptions: header.options)
             if header.flags.contains(.ack), ackAcceptable {
                 // Handshake retirement of our own SYN, which is the one
                 // sequence number `Sender` does not model. The acceptable range

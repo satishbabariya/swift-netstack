@@ -1039,3 +1039,53 @@ private func passiveOpenCompleted(peerShift: UInt8, ourShift: UInt8 = 5, windowI
     #expect(tcb.state == .established)
     #expect(tcb.sndWnd == 8_388_480, "65535 << 7, the same 65535 that was left alone in the SYN-ACK")
 }
+
+// MARK: - RFC 7323 §3 Timestamps negotiation
+
+@Test func timestampsAreInUseOnlyWhenBothSidesSentTheOption() {
+    // The same rule as the window scale, and it is stated separately because
+    // the two are negotiated from the same segment and it would be easy to make
+    // one depend on the other. They are independent: a peer may offer both,
+    // either, or neither, and each is settled on its own.
+    var both = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    both.negotiateTimestamps(fromSynOptions: [.timestamps(value: 4242, echo: 0)])
+    #expect(both.timestampsEnabled)
+    #expect(both.tsRecent == 4242, "TS.Recent is seeded from the SYN that negotiated it")
+    #expect(both.hasTSRecent)
+
+    // The peer offered and we did not.
+    var weDeclined = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: false)
+    weDeclined.negotiateTimestamps(fromSynOptions: [.timestamps(value: 4242, echo: 0)])
+    #expect(!weDeclined.timestampsEnabled)
+    #expect(!weDeclined.hasTSRecent, "nothing may be echoed, so nothing is recorded")
+
+    // We offered and the peer did not.
+    var peerDeclined = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    peerDeclined.negotiateTimestamps(fromSynOptions: [.maximumSegmentSize(1460)])
+    #expect(!peerDeclined.timestampsEnabled)
+}
+
+@Test func aTimestampOfZeroIsAnOfferAndNotAnAbsence() {
+    // Zero is a legal TSval — a peer whose clock starts there sends it — so
+    // `tsRecent == 0` cannot mean "no timestamp yet". `hasTSRecent` is what
+    // distinguishes them, and without it a first echo would be indistinguishable
+    // from never having heard from the peer. The same trap
+    // `peerOfferedWindowScale` exists for, one option over.
+    var tcb = TCB(
+        state: .listen, sndUna: SequenceNumber(0), sndNxt: SequenceNumber(0), sndWnd: 0,
+        sndWl1: SequenceNumber(0), sndWl2: SequenceNumber(0), iss: SequenceNumber(1000),
+        rcvNxt: SequenceNumber(0), rcvWnd: 65535, irs: SequenceNumber(0), offersTimestamps: true)
+    tcb.negotiateTimestamps(fromSynOptions: [.timestamps(value: 0, echo: 0)])
+    #expect(tcb.timestampsEnabled)
+    #expect(tcb.tsRecent == 0)
+    #expect(tcb.hasTSRecent, "a zero timestamp was still a timestamp")
+}

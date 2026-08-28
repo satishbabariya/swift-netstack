@@ -81,7 +81,7 @@ private final class DiffTarget {
         // in `tcp-data.vec` against a fixed peer instead.
         let endpoint = TCPEndpoint(
             stack: stack, initialSequenceNumbers: FixedInitialSequenceNumbers(diffISS),
-            delayedAckTimeout: .zero)
+            delayedAckTimeout: .zero, nagleDisabled: true)
         try endpoint.bind(address: diffGateway, port: diffLocalPort)
         try endpoint.listen(backlog: 64)
         self.endpoint = endpoint

@@ -597,6 +597,52 @@ or what the timer is armed against — not in whether the backoff survives. The
 rather than reasoning about: four lines in the harness's step loop, writing `RTO`,
 `RTT` and `RTTVar` out per step.
 
+## Nagle: another configuration difference, and two attempts that failed
+
+RFC 9293 §3.7.4 is implemented. gVisor does not apply it by default, so it sends
+the short tail of every write at once where this stack holds it until something is
+acknowledged — a configuration difference rather than a disagreement about the
+rule.
+
+**Two attempts to turn it on in gVisor, both measured and both ineffective**, so
+nobody repeats them:
+
+- `tcpip.TCPDelayEnabled(true)` as a transport protocol option. No change: gVisor
+  still sent every tail immediately.
+- `ep.SocketOptions().SetDelayOption(true)` on the accepted endpoint, on the
+  theory that the protocol option does not reach an endpoint the listener
+  produced. Also no change.
+
+Whatever gVisor's Nagle is gated on, neither knob reaches it from here. So the
+comparison runs with Nagle off on **this** side instead —
+`TCPEndpoint(nagleDisabled:)`, alongside the delayed-acknowledgement timeout,
+both stated at the one construction site.
+
+**What that costs:** the run does not compare small-segment buffering at all.
+`tcp-data.vec`'s `push-on-the-last-segment-of-a-write` pins it instead, and pins
+it better than the differential could — it shows the tail waiting for an
+acknowledgement and then going, which is the whole of what Nagle costs and buys
+on one write.
+
+**Two bugs the existing tests caught while implementing it**, both interactions
+invisible from Nagle alone:
+
+- **A zero-window crawl deadlocked.** A peer offering one byte at a time produces
+  a segment that is never full-sized, with something always outstanding — so
+  Nagle buffered it, and the peer, waiting on data before opening the window
+  further, never sent the acknowledgement that would release it. Fixed by the
+  third escape: when the *window* limits the segment rather than the data
+  available, send it. Nagle exists to stop an application dribbling into a path
+  that could carry more; it has nothing to say about a segment that is small
+  because the receiver said so.
+- **A zero-window probe counted as outstanding data.** The peer answers a probe by
+  reopening its window, and this stack then held everything queued because the
+  one byte it had been obliged to send to ask the question was unacknowledged.
+  The probe is excluded now: Nagle's "unacknowledged data" means user data this
+  sender chose to put on the path, and a probe is not that.
+
+Both were caught by *persist* tests rather than Nagle ones.
+
 ## Delayed acknowledgements break the run's alignment, and a recogniser cannot fix it
 
 RFC 9293 §3.8.6.3 is implemented. All 527 unit and vector tests pass, and the

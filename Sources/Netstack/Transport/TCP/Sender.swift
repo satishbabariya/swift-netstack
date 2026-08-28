@@ -245,6 +245,14 @@ struct Sender {
     /// the complete set.
     private var probeOutstanding = false
 
+    /// TCP_NODELAY: whether RFC 9293 §3.7.4's small-segment rule is switched off.
+    ///
+    /// Off by default, so the rule applies — which is the conformant default and
+    /// the one that protects a shared path from a chatty application. An
+    /// application that knows its own traffic is request/response can turn it on
+    /// and stop paying a round trip per write.
+    var nagleDisabled = false
+
     /// SEG.WND from the last acknowledgement that reached `acknowledged` --
     /// the number that was ON THE WIRE, not what the TCB made of it.
     ///
@@ -456,6 +464,62 @@ struct Sender {
 
         while unsent > 0, usable > 0, inFlight.count < maximumSegments {
             let length = min(segmentSize, min(unsent, usable))
+
+            // RFC 9293 §3.7.4, Nagle: "If there is unacknowledged data, then the
+            // sending TCP endpoint buffers all user data (regardless of the PSH
+            // bit) until the outstanding data has been acknowledged or until the
+            // TCP endpoint can send a full-sized segment."
+            //
+            // Both escapes matter and the second is the one that keeps bulk
+            // transfer working: a full-sized segment always goes, so a stream of
+            // them is never held. What is held is a SHORT segment while anything
+            // is still outstanding, which is exactly the telnet-style flow the
+            // rule exists for — one keystroke per segment, one segment per round
+            // trip, and the path carrying more header than payload.
+            //
+            // `nagleDisabled` is TCP_NODELAY. It exists because the rule has a
+            // real cost: an application doing request/response in small writes
+            // waits a round trip it did not need to. Combined with a peer that
+            // delays acknowledgements, that becomes the classic stall — the
+            // sender waiting for an acknowledgement the receiver is holding —
+            // and `tcp-data.vec` pins it rather than leaving it folklore.
+            let isFullSized = length >= segmentSize
+            // A zero-window probe does not count as outstanding data here.
+            //
+            // Nagle's "unacknowledged data" means user data this sender chose to
+            // put on the path — the dribble it exists to coalesce. A probe is
+            // neither: it is one byte we were obliged to send to ask whether the
+            // peer's window had reopened, and it is unacknowledged precisely
+            // because the peer has not answered yet.
+            //
+            // Counting it gives the wrong answer at the worst moment. The peer
+            // answers the probe by reopening its window; we then hold everything
+            // queued, because a byte sent only to ask the question is still
+            // outstanding. The connection would resume a round trip late every
+            // time it recovered from a closed window.
+            let outstandingUserData = outstanding - (probeOutstanding ? 1 : 0)
+            let somethingOutstanding = outstandingUserData > 0 || !out.isEmpty
+            // The third escape, and without it the rule deadlocks.
+            //
+            // A peer crawling out of a zero window offers one byte at a time. A
+            // one-byte segment is not full-sized and there is always something
+            // outstanding, so Nagle alone would buffer it — and the peer, waiting
+            // on data before it opens the window further, would never send the
+            // acknowledgement that releases it. The connection stops, and neither
+            // side is at fault.
+            //
+            // So: when the *window* is what limits the segment rather than the
+            // data available, send it. Nagle exists to stop an application
+            // dribbling small writes into a path that could carry more; it has
+            // nothing to say about a segment that is small because the receiver
+            // said so. RFC 1122 §4.2.3.4 makes the same point from the
+            // silly-window-syndrome side.
+            //
+            // Found by `aProbeAnsweredWithAWindowOfOneStaysInPersistAndAWindowOfTwoDoesNot`,
+            // which is a persist test rather than a Nagle one — the interaction
+            // was invisible from either feature alone.
+            let windowLimited = length >= usable
+            if !nagleDisabled, !isFullSized, !windowLimited, somethingOutstanding { break }
             let sequence = tcb.sndNxt
             let pushes = bytesRemainingInWrite(from: offset) <= segmentSize
             out.append(

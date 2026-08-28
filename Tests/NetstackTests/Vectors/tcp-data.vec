@@ -393,8 +393,14 @@
 0.020 < write 2941
 0.020 > .     1001:2461(1460) ack 1 win 65535
 0.020 > .     2461:3921(1460) ack 1 win 65535
-0.020 > P.    3921:3942(21) ack 1 win 65535
-0.030 < .     1:1(0) ack 3942 win 65535
+# The 21-byte tail is NOT here, and that is RFC 9293 3.7.4 rather than a lost
+# segment. Nagle buffers a short segment while anything is unacknowledged; the
+# two full-sized ones above went because a full-sized segment is always allowed.
+# The tail waits for the acknowledgement below — which is the whole of what
+# Nagle costs and the whole of what it buys, on one write.
+0.030 < .     1:1(0) ack 3921 win 65535
+0.030 > P.    3921:3942(21) ack 1 win 65535
+0.040 < .     1:1(0) ack 3942 win 65535
 
 
 # scenario: write-under-a-small-window

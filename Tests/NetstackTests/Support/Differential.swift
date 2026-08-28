@@ -631,6 +631,22 @@ struct DifferentialRun {
         // `ack` is NOT touched: it lives in the guest's sequence space, which
         // the generated script fixes identically for both stacks.
         line.options = line.options.map { $0.hasPrefix("timestamp ") ? "timestamp" : $0 }
+        // Option ORDER is normalised; the option SET and its values are not.
+        //
+        // RFC 9293 places no requirement on the order options appear in, and the
+        // two stacks disagree about it: this one emits `mss, wscale, timestamp`
+        // in a SYN-ACK and gVisor emits `mss, timestamp, wscale`. Nothing on the
+        // wire depends on which — a receiver parses them in any order — so
+        // comparing the sequence would report a difference that cannot affect a
+        // peer.
+        //
+        // This is deliberately narrower than it looks. Sorting removes ordering
+        // and nothing else: a missing option, an extra one, or a changed value
+        // still fails, because the sorted lists differ the moment their contents
+        // do. It is not a permitted divergence and it is not a recogniser — it is
+        // putting both sides into the same form before comparing, which is what
+        // the rest of this function does for sequence numbers.
+        line.options.sort()
         return .tcp(line)
     }
 }

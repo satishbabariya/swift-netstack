@@ -171,6 +171,12 @@ private enum DiffLimits {
     /// `TCPSenderTests`, and **is not differentially verified** — see
     /// `differential/README.md`.
     static let minimumOfferedWindow = 4096
+
+    /// What the Timestamps option costs a data segment: ten bytes plus two of
+    /// padding. Mirrors `TCPEndpoint.timestampOptionBytes`, and is stated here
+    /// rather than read from it so that a change to one is a visible
+    /// disagreement rather than a silent shift in what this generator produces.
+    static let timestampOptionBytes = 12
     /// The largest advance a single step may make, in milliseconds. Long
     /// enough to walk the whole RTO ladder across a sequence, short enough
     /// that no single step jumps over two rungs of it.
@@ -310,12 +316,30 @@ private struct DiffGenerator {
         // shift is a legal offer that leaves every window unscaled and would
         // make this lift look like it was exercising a path it was not.
         let guestWindowScale = 7
+        // The guest's TSval. Fixed per sequence rather than advancing, because
+        // the generator's steps carry no wall-clock meaning and a value that
+        // moved would have to be derived from the same virtual clock both stacks
+        // read — which is what the round trips already compare. What this
+        // exercises is that both stacks negotiate the option, echo it, and let
+        // PAWS see a value it must not reject.
+        let guestTimestamp: UInt32 = 900_000
 
         func tcp(_ flags: String, seq: UInt32, ack: UInt32?, payload: Int = 0, options: [String] = [], window: UInt16? = nil) -> VectorPacket {
-            .tcp(
+            // Once timestamps are negotiated the option goes on EVERY segment,
+            // and a generator that put it only in the SYN would not be modelling
+            // a conforming peer — it would be modelling one that negotiates the
+            // option and then stops using it. gVisor refuses such a connection
+            // outright: the third-leg ACK arrives without a timestamp and never
+            // completes the handshake, which surfaced here as "close has no
+            // accepted connection to act on" rather than as anything about
+            // timestamps.
+            let withTimestamp =
+                options.contains(where: { $0.hasPrefix("timestamp") })
+                ? options : options + ["timestamp \(guestTimestamp) 0"]
+            return .tcp(
                 TCPLine(
                     flags: flags, seqStart: seq, seqEnd: seq &+ UInt32(payload), payloadLength: payload,
-                    ack: ack, window: window ?? offered, options: options))
+                    ack: ack, window: window ?? offered, options: withTimestamp))
         }
 
         // --- Prologue: a handshake, then one in-order full segment.
@@ -338,8 +362,8 @@ private struct DiffGenerator {
         // option. This is `wscale`'s lift. `sackOK`'s belongs to whoever
         // implements SACK.
         try emit(
-            tcp("S", seq: guestISS, ack: nil, options: ["mss 1460", "wscale \(guestWindowScale)"]),
-            advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow) wscale=\(guestWindowScale)")
+            tcp("S", seq: guestISS, ack: nil, options: ["mss 1460", "wscale \(guestWindowScale)", "timestamp \(guestTimestamp) 0"]),
+            advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow) wscale=\(guestWindowScale) ts")
         try emit(tcp(".", seq: wire(rcvNxt), ack: 1), advanceMs: 10, note: "third-leg ACK")
 
         // The priming segment. gVisor's advertised right edge only leaves its
@@ -492,7 +516,20 @@ private struct DiffGenerator {
                 // readings are conformant, so this is a place the differential
                 // deliberately does not go rather than a defect either side
                 // has; see `differential/README.md`.
-                let bytes = 1 + Int(rng.next() % UInt64(min(Int(offered), 10 * DiffLimits.maximumDataSegment) - 1))
+                // The initial congestion window is TEN SEGMENTS, and with
+                // timestamps negotiated a segment carries twelve fewer bytes.
+                //
+                // That matters because the two stacks count the window in
+                // different units — bytes here, whole segments in gVisor — a
+                // difference the README records and this cap exists to stay away
+                // from. A write sized against 1460-byte segments now needs
+                // eleven 1448-byte ones, which this stack's byte count still
+                // admits and gVisor's segment count does not: gVisor withholds
+                // the eleventh and the run diverges on a frame that is about
+                // arithmetic units, not behaviour. Enabling timestamps is what
+                // made the difference reachable; the cap has to follow.
+                let segmentWithOption = DiffLimits.maximumDataSegment - DiffLimits.timestampOptionBytes
+                let bytes = 1 + Int(rng.next() % UInt64(min(Int(offered), 10 * segmentWithOption) - 1))
                 written = bytes
                 try emit(nil, advanceMs: advance, action: .write(bytes: bytes), note: "application write \(bytes)B")
 

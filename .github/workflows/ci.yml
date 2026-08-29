@@ -51,6 +51,12 @@ jobs:
       - name: Test
         run: swift test
 
+      # Deletes each guard in `scripts/guards.tsv` and requires that the named
+      # test notices. Guards drift out from under their tests as code around
+      # them changes, and nothing else here would say so.
+      - name: Falsify the guards
+        run: ./scripts/falsify.sh --all
+
   harness:
     name: Build the differential harness
     runs-on: ubuntu-latest

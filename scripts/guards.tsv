@@ -1,0 +1,15 @@
+# One guard per line: file, test filter, anchor, replacement. Tabs separate
+# them and \n is a newline, because the anchors span lines.
+#
+# `scripts/falsify.sh --all` deletes each guard in turn and requires that the
+# named test notices. A SURVIVED line means the guard is described rather than
+# guarded, which is the thing this repository keeps finding by hand.
+Sources/Netstack/Link/NetworkSwitch.swift	anAddressCannotBeStolenOntoAPortThatIsAlreadyFull	            guard claimed[port, default: 0] < maximumAddressesPerPort else {\n                addressesRefused += 1	            guard true else {\n                addressesRefused += 1
+Sources/Netstack/Link/NetworkSwitch.swift	anUnknownUnicastIsDroppedRatherThanFlooded	                unknownUnicastDropped += 1\n                log?.record(.switchUnknownUnicast, ["destination": .string(destination.description)])\n            }\n        }\n        if destination == linkAddress	                unknownUnicastDropped += 1\n                flood(packet, from: port)\n            }\n        }\n        if destination == linkAddress
+Sources/Netstack/Gateway/DHCPServer.swift	aStaticLeaseIsHonouredAndKeptOutOfThePool	            .filter { !Set(staticLeases.values).contains($0) }	
+Sources/Netstack/Gateway/OutboundTCPForwarder.swift	aGuestIsRefusedTheInstanceMetadataServiceByDefault	        guard allowsLinkLocal || !request.destination.isLinkLocal else {	        guard true else {
+Sources/Netstack/Gateway/OutboundTCPForwarder.swift	slotsAreReturnedExactlyOnceAcrossManyConnections	        guard !released else { return }	
+Sources/Netstack/Observability/NetstackLog.swift	suppressionHoldsEverythingAfterTheFirstWithinTheWindow	        guard now >= bucket.windowEnds else {	        guard true || now >= bucket.windowEnds else {
+Sources/Netstack/Observability/PacketCapture.swift	theRecordHeaderCountsAgainstTheLimitToo	        guard written + 16 + kept <= maximumBytes else {	        guard written + kept <= maximumBytes else {
+Sources/Netstack/Network/IPv4Protocol.swift	theStatisticsAccountForWhatArrivedRatherThanOnlyWhatSucceeded	            counters.unknownProtocol += 1\n            return	            return
+Sources/Netstack/Gateway/ICMPForwarder.swift	aPingToAnUnreachableAddressGoesUnansweredRatherThanFaked	        if header.destination == stack.configuration.gatewayAddress { return decline() }	        if true { return decline() }

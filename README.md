@@ -349,6 +349,13 @@ reassembler's table bound is caught. It also asserts how deep the mutants get,
 because the first version reached the TCP parser **zero** times — the corpus
 segment carried a placeholder checksum — and looked like it was working.
 
+`scripts/falsify.sh --all` deletes each guard in `scripts/guards.tsv` in turn and
+requires that the named test notices. `CAUGHT` is the guard being guarded;
+`SURVIVED` means it is only described. It keeps the three outcomes apart —
+including `NOT-BUILT`, a mutation that does not compile and therefore says
+nothing — because a falsification that reports the wrong one is worse than not
+running it.
+
 Many of these tests exist because falsification proved an earlier one could not
 fail. Three habits came out of that and are worth knowing before adding a test
 here:

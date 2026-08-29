@@ -714,6 +714,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // stands down and the retransmit timer takes over the question.
         connection.keepAliveProbes = 0
         armKeepAliveTimer(on: connection)
+        // And it creates a new tail. Armed here as well as on arrival, because a
+        // connection that sends its last segment and hears nothing more never
+        // reaches the arrival path -- which is exactly the case the probe is
+        // for.
+        armTailProbeTimer(on: connection)
     }
 
     /// Close every connection, release the **listening** port, and keep every
@@ -831,6 +836,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     var sackedForTesting: Int? {
         guard let connection = connections.values.first else { return nil }
         return connection.sender.selectivelyAcknowledgedBytes
+    }
+
+    var tailProbeDeadlineForTesting: NIODeadline? {
+        connections.values.first?.sender.tailProbeDeadline
     }
 
     var rackDeadlineForTesting: NIODeadline? {
@@ -1051,6 +1060,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         armRetransmitTimer(on: connection)
         armPersistTimer(on: connection)
         armRackTimer(on: connection)
+        armTailProbeTimer(on: connection)
         // Re-armed on every arriving segment, which is what makes "idle" mean
         // idle: any sign of life from the peer pushes the first probe out by a
         // full interval, and clears the probes already spent.
@@ -1626,6 +1636,29 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             _ = self.transmit(on: connection)
             self.armRetransmitTimer(on: connection)
             self.armRackTimer(on: connection)
+        }
+    }
+
+    /// Arm, re-arm or cancel RFC 8985 §7's tail loss probe.
+    private func armTailProbeTimer(on connection: Connection) {
+        guard let deadline = connection.sender.tailProbeDeadline else {
+            connection.timers.cancelTailProbe()
+            return
+        }
+        let now = stack.clock.now()
+        let delay = deadline > now ? deadline - now : .nanoseconds(0)
+        connection.timers.scheduleTailProbe(after: delay) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            guard
+                let probe = connection.sender.tailProbeTimerFired(
+                    tcb: &connection.tcb, mss: self.payloadSegmentSize(for: connection))
+            else { return }
+            self.emit(
+                probe.flags.union(.ack), sequence: probe.sequence, on: connection, payload: probe.payload)
+            // The retransmission timer keeps running underneath: the probe is a
+            // shortcut to an acknowledgement, not a replacement for the deadline
+            // that fires when none comes at all.
+            self.armRetransmitTimer(on: connection)
         }
     }
 

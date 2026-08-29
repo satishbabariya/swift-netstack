@@ -134,3 +134,52 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     guard let nonsense = run(["--not-a-flag"]) else { return }
     #expect(nonsense.output.contains("unknown option"), "unexpected error: \(nonsense.output)")
 }
+
+@Test func aConfigurationFileIsReadAndFlagsOverrideIt() throws {
+    // gvproxy takes a configuration file, and it is the only way to express
+    // zones, static leases, NAT and virtual addresses -- none of which any flag
+    // here can say. Without it the program could not be configured for most of
+    // what the library does.
+    let directory = FileManager.default.temporaryDirectory
+    let path = directory.appendingPathComponent("netstack-config-\(UInt32.random(in: 0...UInt32.max)).json").path
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    // Upstream's field names exactly, so a YAML config converts across without
+    // anything being re-learned.
+    let json = """
+        {"subnet":"10.9.0.0/24","gatewayIP":"10.9.0.1","hostIP":"10.9.0.254","mtu":1400,
+         "dnsSearchDomains":["svc.test"],
+         "dhcpStaticLeases":{"0a:00:00:00:11:22":"10.9.0.50"},
+         "nat":{"10.9.0.254":"127.0.0.1"},
+         "gatewayVirtualIPs":["10.9.0.254"],
+         "dns":[{"name":"svc.test","records":[{"name":"api","ip":"10.9.0.9"}]}]}
+        """
+    try json.write(toFile: path, atomically: true, encoding: .utf8)
+
+    // Accepted: it starts, so it got far enough to build a gateway from the
+    // file. Without a wire it stops at the argument check, which is what makes
+    // this a parse test rather than a run test.
+    guard let accepted = run(["--config", path]) else { return }
+    #expect(accepted.output.contains("no guest wire"), "the file was rejected: \(accepted.output)")
+
+    // A bad value in the file says which field, rather than failing to parse.
+    let badPath = directory.appendingPathComponent("netstack-bad-\(UInt32.random(in: 0...UInt32.max)).json").path
+    defer { try? FileManager.default.removeItem(atPath: badPath) }
+    try "{\"subnet\":\"not-a-subnet\"}".write(toFile: badPath, atomically: true, encoding: .utf8)
+    guard let bad = run(["--config", badPath]) else { return }
+    #expect(bad.output.contains("subnet is not valid"), "unhelpful error: \(bad.output)")
+
+    // A YAML file is refused as YAML rather than as unparseable. gvproxy reads
+    // YAML and this reads the same configuration as JSON, so "your file is
+    // wrong" and "this wants the same file in another notation" are different
+    // messages and the reader needs the second.
+    let yamlPath = directory.appendingPathComponent("netstack-yaml-\(UInt32.random(in: 0...UInt32.max)).yaml").path
+    defer { try? FileManager.default.removeItem(atPath: yamlPath) }
+    try "subnet: 10.9.0.0/24\ngatewayIP: 10.9.0.1\n".write(toFile: yamlPath, atomically: true, encoding: .utf8)
+    guard let yaml = run(["--config", yamlPath]) else { return }
+    #expect(yaml.output.contains("looks like YAML"), "unhelpful error: \(yaml.output)")
+
+    // A missing file says so.
+    guard let missing = run(["--config", "/nonexistent/netstack.json"]) else { return }
+    #expect(missing.output.contains("cannot read"), "unhelpful error: \(missing.output)")
+}

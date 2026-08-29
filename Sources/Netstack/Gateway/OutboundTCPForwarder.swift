@@ -34,6 +34,7 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     private let eventLoop: EventLoop
     private let maximumConnections: Int
     private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
+    private let dialTimeout: TimeAmount
     private var forwarder: TCPForwarder?
     private var live = 0
 
@@ -59,12 +60,14 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     /// outstanding the retransmit timer never runs.
     public init(
         stack: Stack, maximumInFlight: Int = 512, maximumConnections: Int = 1024,
-        keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration()
+        keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
+        dialTimeout: TimeAmount = .seconds(5)
     ) {
         self.stack = stack
         self.eventLoop = stack.eventLoop
         self.maximumConnections = max(1, maximumConnections)
         self.keepAlive = keepAlive
+        self.dialTimeout = dialTimeout
         forwarder = TCPForwarder(stack: stack, maximumInFlight: maximumInFlight) { [weak self] request in
             self?.handle(request)
         }
@@ -81,10 +84,22 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             request.refuse()
             return
         }
+        // The slot is taken HERE, where the decision is made, not when the
+        // splice succeeds.
+        //
+        // Taking it at the splice leaves the dial uncounted, and a dial is
+        // asynchronous: every request that passes the guard while earlier dials
+        // are still connecting sees the same low `live` and passes too. The
+        // bound is then exceeded by however many dials are in flight -- a soak
+        // found 33 against a limit of 32, and that figure is a property of how
+        // fast the test's dials completed rather than of anything in the code.
+        live += 1
+        let slot = ConnectionSlot(forwarder: self)
         guard
             let destination = try? SocketAddress(
                 ipAddress: request.destination.description, port: Int(request.destinationPort))
         else {
+            slot.release()
             request.refuse()
             return
         }
@@ -96,8 +111,26 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         // `autoRead` off on both sides, because the glue's backpressure is
         // exactly the reads it declines to issue. With it on the reads arrive
         // anyway and the queue moves one layer down, where nothing bounds it.
+        //
+        // ## The connect timeout is a bound, not a nicety
+        //
+        // A dial to an address nothing answers at hangs for as long as the
+        // operating system is willing to wait -- over a minute on macOS -- and
+        // holds a half-open slot for all of it. A guest that dials unroutable
+        // addresses in a loop therefore keeps `maximumInFlight` slots occupied
+        // permanently, and every legitimate connection it or anything else makes
+        // is dropped. That is not the flood the bound was written for; it is the
+        // bound being used as the weapon.
+        //
+        // A soak test found it: a flood of SYNs to random addresses starved the
+        // forwarder so completely that SYNs to a port that really was listening
+        // never got through at all. Shortening the wait does not remove the
+        // attack -- nothing can, for a gateway that dials on a guest's behalf --
+        // but it turns a permanent occupation into one the guest has to keep
+        // paying for, at a rate the half-open bound already limits.
         ClientBootstrap(group: eventLoop)
             .channelOption(.autoRead, value: false)
+            .connectTimeout(dialTimeout)
             .connect(to: destination)
             .whenComplete { [weak self] outcome in
                 guard let self else { return }
@@ -106,18 +139,20 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
                     // The guest hears "nothing is there" now, rather than after
                     // a handshake and a wait.
                     self.refusedForDial += 1
+                    slot.release()
                     request.refuse()
                 case .success(let outbound):
-                    self.splice(request, to: outbound)
+                    self.splice(request, to: outbound, slot: slot)
                 }
             }
     }
 
-    private func splice(_ request: ForwarderRequest, to outbound: Channel) {
+    private func splice(_ request: ForwarderRequest, to outbound: Channel, slot: ConnectionSlot) {
         // `complete()` is what answers the SYN, and it is deliberately the last
         // thing that can fail: everything above this line is reversible with a
         // `refuse`, and nothing below it is.
         guard let endpoint = (try? request.complete()) ?? nil else {
+            slot.release()
             outbound.close(promise: nil)
             return
         }
@@ -130,7 +165,6 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
                 ipAddress: request.destination.description, port: Int(request.destinationPort)),
             remote: try? SocketAddress(ipAddress: request.source.description, port: Int(request.sourcePort)))
 
-        live += 1
         let (guestGlue, hostGlue) = GlueHandler.matchedPair()
         do {
             // Not `setOption(...).wait()`: this runs ON the event loop, and
@@ -141,7 +175,7 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             try guestChannel.pipeline.syncOperations.addHandler(guestGlue)
             try outbound.pipeline.syncOperations.addHandler(hostGlue)
         } catch {
-            live -= 1
+            slot.release()
             outbound.close(promise: nil)
             guestChannel.close(promise: nil)
             return
@@ -150,10 +184,11 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         // Counted down once, whichever side ends first. Both futures fire on a
         // splice that closes cleanly -- each channel closes the other -- so
         // decrementing on both would return the slot twice and let the limit
-        // drift upward until it stopped limiting anything.
-        let release = ConnectionSlot(forwarder: self)
-        guestChannel.closeFuture.whenComplete { _ in release.release() }
-        outbound.closeFuture.whenComplete { _ in release.release() }
+        // drift upward until it stopped limiting anything. The same object is
+        // what every earlier failure path releases, so a slot is returned once
+        // however far the connection got.
+        guestChannel.closeFuture.whenComplete { _ in slot.release() }
+        outbound.closeFuture.whenComplete { _ in slot.release() }
 
         guestChannel.registerAlreadyConfigured0(promise: nil)
     }

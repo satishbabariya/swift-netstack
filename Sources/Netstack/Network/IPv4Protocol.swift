@@ -108,8 +108,19 @@ public final class IPv4Protocol {
         }
 
         let reply = ICMPv4.echoReply(to: icmp, payload: packet.payload, allocator: allocator)
-        // Answer from the address that was pinged, which under promiscuous
-        // mode need not be one of ours.
+        // Answer from the address that was pinged, which under promiscuous mode
+        // need not be one of ours.
+        //
+        // **So a ping through this gateway is answered by this gateway**, for
+        // any address at all, and a reader should know that before trusting one.
+        // A guest that pings 8.8.8.8 gets a reply whether or not 8.8.8.8 is
+        // reachable, so `ping` stops being a reachability test and becomes a
+        // test of whether the guest's own stack works.
+        //
+        // This matches upstream gvisor-tap-vsock's default -- gVisor's stack
+        // does the same -- and upstream's alternative is a separate mode that
+        // proxies echo through an unprivileged ICMP socket. That mode is not
+        // implemented here; if it is added, this is the branch it replaces.
         try? send(payload: reply, to: header.source, from: header.destination, protocolNumber: .icmp)
     }
 

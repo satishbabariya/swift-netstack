@@ -44,6 +44,11 @@ public final class DHCPServer {
     /// Requests dropped because the pool had nothing left.
     public private(set) var exhausted = 0
 
+    /// How many hardware addresses hold a lease. The figure the pool bounds,
+    /// and the one a test asking "did any of this reach the server" reads --
+    /// `leasedAddress(for:)` cannot answer that when the addresses were forged.
+    public var leaseCount: Int { leases.count }
+
     public static let serverPort: UInt16 = 67
     public static let clientPort: UInt16 = 68
 

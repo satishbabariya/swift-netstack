@@ -326,6 +326,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         var delayedAckPending = false
         /// Unanswered keep-alive probes since the last sign of life.
         var keepAliveProbes = 0
+        /// When our FIN last went out, and whether it has been probed. See
+        /// `finProbeDeadline`.
+        var finSentAt: NIODeadline?
+        var finProbeSent = false
 
         /// New in-order bytes received since the last acknowledgement went out.
         ///
@@ -1398,8 +1402,15 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             connection.finTransmissions = 0
         }
         connection.finTransmissions += 1
+        connection.finSentAt = stack.clock.now()
         connection.finDeadline = stack.clock.now() + connection.finTimeout
         emit([.fin, .ack], sequence: sequence, on: connection)
+        // A FIN is a tail like any other, and the peer's acknowledgement of it
+        // is what closes the connection. Armed here because nothing else will:
+        // `close` does not go through the write path, and a connection whose
+        // last act was a FIN never reaches the arrival path again if that FIN is
+        // lost.
+        armTailProbeTimer(on: connection)
     }
 
     /// Put whatever the sender has ready on the wire: a pending fast
@@ -1641,7 +1652,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     /// Arm, re-arm or cancel RFC 8985 §7's tail loss probe.
     private func armTailProbeTimer(on connection: Connection) {
-        guard let deadline = connection.sender.tailProbeDeadline else {
+        guard let deadline = connection.sender.tailProbeDeadline ?? finProbeDeadline(for: connection) else {
             connection.timers.cancelTailProbe()
             return
         }
@@ -1649,6 +1660,16 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         let delay = deadline > now ? deadline - now : .nanoseconds(0)
         connection.timers.scheduleTailProbe(after: delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
+            if connection.sender.tailProbeDeadline == nil, self.finProbeDeadline(for: connection) != nil {
+                // The tail is a FIN, which the sender does not model: it tracks
+                // the byte stream, and a FIN is sequence space the endpoint owns.
+                // So the probe is the FIN again, sent through the one place FINs
+                // leave by.
+                connection.finProbeSent = true
+                self.emitFin(on: connection)
+                self.armRetransmitTimer(on: connection)
+                return
+            }
             guard
                 let probe = connection.sender.tailProbeTimerFired(
                     tcb: &connection.tcb, mss: self.payloadSegmentSize(for: connection))
@@ -1660,6 +1681,35 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             // that fires when none comes at all.
             self.armRetransmitTimer(on: connection)
         }
+    }
+
+    /// When to probe an unacknowledged FIN, or nil when there is not one.
+    ///
+    /// The sender models the byte stream and a FIN is not part of it -- it is
+    /// sequence space this endpoint owns -- so a tail that is only a FIN is
+    /// invisible to `Sender.tailProbeDeadline`. gVisor probes it, and the
+    /// difference showed up as a FIN retransmission this stack did not make.
+    ///
+    /// Same interval as the sender's, and the same one-per-tail rule: a peer
+    /// that ignored the first will not answer a second sooner than the
+    /// retransmission timer finds out.
+    private func finProbeDeadline(for connection: Connection) -> NIODeadline? {
+        guard rack, !connection.finProbeSent, let sentAt = connection.finSentAt else { return nil }
+        switch connection.tcb.state {
+        case .finWait1, .closing, .lastAck:
+            break
+        case .closed, .listen, .synSent, .synReceived, .established, .closeWait, .finWait2, .timeWait:
+            return nil
+        }
+        // Nothing else outstanding: with data still in flight the sender's own
+        // probe covers this tail, and two probes for one tail is one too many.
+        guard connection.sender.flightSize == 0 else { return nil }
+        let smoothed = connection.sender.smoothedRoundTrip
+        guard smoothed > .zero else { return nil }
+        var interval = TimeAmount.nanoseconds(smoothed.nanoseconds * 2) + .milliseconds(200)
+        let timeout = connection.sender.retransmissionTimeout
+        if interval > timeout { interval = timeout }
+        return sentAt + interval
     }
 
     /// Arm, re-arm or cancel the keep-alive timer for a connection.

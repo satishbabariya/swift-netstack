@@ -20,16 +20,16 @@ import Testing
 // MARK: - Fixture
 
 private let tcpGateway = IPv4Address("192.168.127.1")!
-private let tcpGuest = IPv4Address("192.168.127.2")!
+let tcpGuest = IPv4Address("192.168.127.2")!
 private let tcpOtherGuest = IPv4Address("192.168.127.3")!
 private let tcpGatewayMAC = MACAddress("5a:94:ef:e4:0c:ee")!
-private let tcpGuestMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
+let tcpGuestMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
 
 /// The port the endpoint under test listens on, and the guest port that talks
 /// to it. Fixed rather than ephemeral so an emitted frame can be identified by
 /// its ports alone.
 private let tcpLocalPort: UInt16 = 8080
-private let tcpPeerPort: UInt16 = 50000
+let tcpPeerPort: UInt16 = 50000
 
 /// One `EmbeddedEventLoop`, one `ManualClock` and one started `Stack`, advanced
 /// together.
@@ -38,7 +38,7 @@ private let tcpPeerPort: UInt16 = 50000
 /// `TCPTimerTests` says: `TCPTimers` computes deadlines from the clock while
 /// the loop decides what has come due from its own time, and letting them drift
 /// makes a deadline meaningless.
-private final class TCPFixture {
+final class TCPFixture {
     let loop = EmbeddedEventLoop()
     let clock = ManualClock(start: .uptimeNanoseconds(0))
     let link: RecordingEndpoint
@@ -133,7 +133,7 @@ private final class TCPFixture {
 
 /// A guest-side segment, built with production `TCPHeader` -- the same codec
 /// `TCPHeaderTests` cross-checks against `VectorFrames`' independent one.
-private func guestSegment(
+func guestSegment(
     sequence: UInt32, ack: UInt32 = 0, flags: TCPFlags, window: UInt16 = 65535,
     options: [TCPOption] = [], peerPort: UInt16 = tcpPeerPort
 ) -> TCPHeader {
@@ -150,7 +150,7 @@ private func guestSegment(
         options: options)
 }
 
-private func tcpPayload(_ count: Int, fill: UInt8 = 0x5a) -> ByteBuffer {
+func tcpPayload(_ count: Int, fill: UInt8 = 0x5a) -> ByteBuffer {
     var buffer = ByteBufferAllocator().buffer(capacity: count)
     buffer.writeBytes([UInt8](repeating: fill, count: count))
     return buffer
@@ -195,8 +195,8 @@ private final class CompletionFlag: @unchecked Sendable {
 
 /// The guest's ISS. Kept away from the gateway's so a confusion between the two
 /// directions cannot pass unnoticed.
-private let guestISS: UInt32 = 7000
-private let gatewayISS: UInt32 = 1000
+let guestISS: UInt32 = 7000
+let gatewayISS: UInt32 = 1000
 
 /// Drive a passive open to ESTABLISHED and return the endpoint's SYN-ACK.
 ///
@@ -204,7 +204,7 @@ private let gatewayISS: UInt32 = 1000
 /// the endpoint cuts -- set it to 1 and a four-byte write becomes four
 /// segments, which is what the duplicate-ACK tests need.
 @discardableResult
-private func completeHandshake(
+func completeHandshake(
     _ fixture: TCPFixture, mss: UInt16 = 1460, peerPort: UInt16 = tcpPeerPort, from source: IPv4Address = tcpGuest
 ) -> [(header: TCPHeader, payload: ByteBuffer)] {
     fixture.inject(
@@ -216,7 +216,7 @@ private func completeHandshake(
     return synAck
 }
 
-private func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = gatewayISS) throws -> TCPEndpoint {
+func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = gatewayISS) throws -> TCPEndpoint {
     let endpoint = TCPEndpoint(stack: fixture.stack, initialSequenceNumbers: FixedInitialSequenceNumbers(iss))
     try endpoint.bind(address: tcpGateway, port: tcpLocalPort)
     try endpoint.listen(backlog: backlog)

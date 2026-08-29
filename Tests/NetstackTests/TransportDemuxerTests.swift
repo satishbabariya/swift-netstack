@@ -128,7 +128,7 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: endpoint)
 
     var intercepted = 0
-    demuxer.setProtocolHandler(.udp) { _, _ in
+    demuxer.setProtocolHandler(.udp) { _, _, _, _ in
         intercepted += 1
         return true
     }
@@ -144,7 +144,7 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     let demuxer = TransportDemuxer()
     let endpoint = Recorder()
     try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: endpoint)
-    demuxer.setProtocolHandler(.udp) { _, _ in false }
+    demuxer.setProtocolHandler(.udp) { _, _, _, _ in false }
 
     #expect(demuxer.deliver(
         protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
@@ -159,7 +159,7 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
 
     // While installed, the handler consumes everything and the endpoint
     // sees nothing.
-    demuxer.setProtocolHandler(.udp) { _, _ in true }
+    demuxer.setProtocolHandler(.udp) { _, _, _, _ in true }
     #expect(demuxer.deliver(
         protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
         payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))

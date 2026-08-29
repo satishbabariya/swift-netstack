@@ -14,7 +14,7 @@ public final class TransportDemuxer {
     }
 
     private var registrations: [Key: Registration] = [:]
-    private var protocolHandlers: [UInt8: (IPv4Header, ByteBuffer) -> Bool] = [:]
+    private var protocolHandlers: [UInt8: (IPv4Header, ByteBuffer, UInt16, UInt16) -> Bool] = [:]
     private var nextEphemeral: UInt16 = 49152
 
     public init() {}
@@ -54,7 +54,23 @@ public final class TransportDemuxer {
     ///
     /// Return `true` to consume the segment, `false` to let normal endpoint
     /// matching proceed. Pass nil to remove.
-    public func setProtocolHandler(_ protocolNumber: IPProtocol, _ handler: ((IPv4Header, ByteBuffer) -> Bool)?) {
+    ///
+    /// ## The `payload` is not the same shape for every protocol
+    ///
+    /// It is whatever the network layer handed the demuxer, and that differs by
+    /// design: a TCP segment arrives whole, header and all, because a TCP
+    /// endpoint parses its own; a UDP datagram arrives as its PAYLOAD, because
+    /// the network layer has already parsed the header it needed for the ICMP
+    /// port-unreachable it may have to send.
+    ///
+    /// That is why the ports are parameters. A handler that needed them and
+    /// could only get them by parsing would work for one protocol and silently
+    /// fail for the other -- which is exactly what the first UDP forwarder did,
+    /// parsing a header that was not there and falling through on every
+    /// datagram.
+    public func setProtocolHandler(
+        _ protocolNumber: IPProtocol, _ handler: ((IPv4Header, ByteBuffer, UInt16, UInt16) -> Bool)?
+    ) {
         protocolHandlers[protocolNumber.rawValue] = handler
     }
 
@@ -74,7 +90,7 @@ public final class TransportDemuxer {
     public func deliver(
         protocolNumber: IPProtocol, header: IPv4Header, payload: ByteBuffer, localPort: UInt16, remotePort: UInt16
     ) -> Bool {
-        if let handler = protocolHandlers[protocolNumber.rawValue], handler(header, payload) {
+        if let handler = protocolHandlers[protocolNumber.rawValue], handler(header, payload, localPort, remotePort) {
             return true
         }
 

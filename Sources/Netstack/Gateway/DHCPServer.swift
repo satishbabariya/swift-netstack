@@ -54,6 +54,11 @@ public final class DHCPServer {
     /// `leasedAddress(for:)` cannot answer that when the addresses were forged.
     public var leaseCount: Int { leases.count }
 
+    /// Every lease, hardware address to address. Upstream serves this on
+    /// `GET /leases`, and it is how a caller finds a guest to forward a port to
+    /// without being told where it is.
+    public var allLeases: [MACAddress: IPv4Address] { leases }
+
     public static let serverPort: UInt16 = 67
     public static let clientPort: UInt16 = 68
 

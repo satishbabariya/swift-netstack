@@ -33,6 +33,14 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case dnsUnmatchedReply
     /// A lease request with no free address left in the pool.
     case dhcpPoolExhausted
+    /// A frame for an address on no port the switch knows, dropped rather than
+    /// flooded. See `NetworkSwitch`.
+    case switchUnknownUnicast
+    /// A source address not learned because its port had claimed its limit.
+    case switchAddressRefused
+    /// An address that moved from one port to another: a guest reconnecting, or
+    /// one guest claiming another's address.
+    case switchAddressMoved
 
     /// What a first occurrence is worth. A guest can cause every one of these,
     /// so none of them is an error -- they are the stack working as designed
@@ -42,6 +50,9 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
         switch self {
         case .outboundFrameRejected: return .error
         case .dnsRefusedNoUpstream: return .warning
+        // Either a guest came back on a new port or one is claiming another's
+        // address, and nothing here can tell which. An operator should see it.
+        case .switchAddressMoved: return .warning
         default: return .notice
         }
     }

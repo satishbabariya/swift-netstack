@@ -244,3 +244,33 @@ private func request(
     close(guestSide)
     try? await group.shutdownGracefully()
 }
+
+@Test func theLeaseAndAddressTableRoutesAnswerEvenWithNothingToReport() async throws {
+    // Upstream serves both. An empty object rather than a 404 is the point of
+    // this test: a gateway on a single wire has no switch and no address table,
+    // and a tool polling /cam should not have to tell "no switch" apart from
+    // "nothing learned yet" -- especially since the second becomes the first
+    // every time it restarts.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let cam = try request("GET", "/cam", body: nil, to: api)
+    #expect(cam.status == 200)
+    #expect(cam.body == "{}")
+
+    let leases = try request("GET", "/leases", body: nil, to: api)
+    #expect(leases.status == 200)
+    #expect(leases.body == "{}")
+
+    // And a route that does not exist still says so, so the two answers above
+    // are the route working rather than the fallback answering everything.
+    let missing = try request("GET", "/no-such-thing", body: nil, to: api)
+    #expect(missing.status == 404)
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}

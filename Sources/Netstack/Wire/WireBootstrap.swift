@@ -180,6 +180,58 @@ public enum WireBootstrap {
         return arrived.futureResult
     }
 
+    /// Bind a unix stream socket and give **every** guest that connects a port
+    /// on a switch, so one gateway serves a whole network rather than one VM.
+    ///
+    /// The returned future completes when the socket is **bound**, not when a
+    /// guest arrives -- unlike `listeningStreamSocket`, and deliberately. A link
+    /// with no wire behind it is not a link, so that one has to wait; a switch
+    /// with no ports is an ordinary and valid state, and a caller that had to
+    /// wait for the first guest could not publish ports or answer its control
+    /// socket until one turned up.
+    ///
+    /// ## Why `childGroup` is a single loop
+    ///
+    /// Everything in this package is loop-confined instead of locked, and the
+    /// switch reads and writes its CAM on every frame. `ServerBootstrap` spreads
+    /// child channels across the group it is given, so accepting guests on a
+    /// multi-threaded group would deliver frames to the switch from several
+    /// threads at once -- a data race, not a slow path. Pinning the children to
+    /// the switch's own loop is what makes the no-locks rule hold here.
+    public static func switchedStreamSocket(
+        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16
+    ) -> EventLoopFuture<NetworkSwitch> {
+        try? FileManager.default.removeItem(atPath: path)
+        let loop = group.next()
+        let netSwitch = NetworkSwitch(
+            linkAddress: linkAddress, mtu: mtu, eventLoop: loop,
+            maximumAddressesPerPort: maximumAddressesPerPort)
+        let limit = max(1, maximumGuests)
+
+        return ServerBootstrap(group: group, childGroup: loop)
+            .childChannelInitializer { channel in
+                // Counted on the switch's loop, where `portCount` is safe to
+                // read -- and the child is already on that loop, so this is a
+                // check rather than a hop.
+                guard netSwitch.portCount < limit else { return channel.close() }
+                return configure(
+                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true
+                ).map { link in
+                    let id = netSwitch.addPort(link)
+                    // A guest that goes away takes its port with it, and with it
+                    // everything the switch learned on that port. Without this a
+                    // disconnected guest's addresses keep naming a dead port and
+                    // frames for them are dropped in silence.
+                    channel.closeFuture.whenComplete { _ in
+                        _ = netSwitch.removePort(id)
+                    }
+                }
+            }
+            .bind(unixDomainSocketPath: path)
+            .map { _ in netSwitch }
+    }
+
     /// Build the link and install the pipeline, on the channel's own loop.
     ///
     /// The link is constructed **before** the handlers that reference it, and

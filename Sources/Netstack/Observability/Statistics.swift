@@ -58,6 +58,17 @@ extension Gateway {
 
         /// Host ports currently published to the guest. A **gauge**.
         public var forwardedPorts: Int
+
+        /// Guests connected to the switch, when there is one. A **gauge**;
+        /// always zero for a gateway on a single wire.
+        public var switchPorts: Int
+        /// Frames dropped for naming an address on no port the switch knows.
+        public var switchUnknownUnicastDropped: Int
+        /// Source addresses not learned because a port had claimed its limit.
+        public var switchAddressesRefused: Int
+        /// Addresses that moved between ports: a guest reconnecting, or one
+        /// guest claiming another's address.
+        public var switchAddressesMoved: Int
     }
 
     /// Read every counter, on the event loop, as one consistent set.
@@ -85,7 +96,11 @@ extension Gateway {
             dnsUnmatchedReplies: dns.unmatchedReplies,
             dhcpLeases: dhcp.leaseCount,
             dhcpPoolExhausted: dhcp.exhausted,
-            forwardedPorts: forwardedPorts.count)
+            forwardedPorts: forwardedPorts.count,
+            switchPorts: networkSwitch?.portCount ?? 0,
+            switchUnknownUnicastDropped: networkSwitch?.unknownUnicastDropped ?? 0,
+            switchAddressesRefused: networkSwitch?.addressesRefused ?? 0,
+            switchAddressesMoved: networkSwitch?.addressesMoved ?? 0)
     }
 }
 
@@ -115,6 +130,10 @@ extension Gateway.Statistics {
             ("dhcp_leases", dhcpLeases),
             ("dhcp_pool_exhausted", dhcpPoolExhausted),
             ("forwarded_ports", forwardedPorts),
+            ("switch_ports", switchPorts),
+            ("switch_unknown_unicast_dropped", switchUnknownUnicastDropped),
+            ("switch_addresses_refused", switchAddressesRefused),
+            ("switch_addresses_moved", switchAddressesMoved),
         ]
         return "{" + fields.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",") + "}"
     }

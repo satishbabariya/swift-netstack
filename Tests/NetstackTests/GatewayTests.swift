@@ -15,10 +15,10 @@ import Testing
 // these check is that the pieces fit, and that the ORDER they are built in --
 // which is the only knowledge this type exists to hold -- is right.
 
-private let gwGuestMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
+let gwGuestMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
 
 /// A DISCOVER, then the REQUEST for what it offers, as a guest would.
-private func dhcpDiscover(hardware: MACAddress, transaction: UInt32) -> ByteBuffer {
+func dhcpDiscover(hardware: MACAddress, transaction: UInt32) -> ByteBuffer {
     var buffer = ByteBuffer()
     buffer.writeInteger(UInt8(1))
     buffer.writeInteger(UInt8(1))
@@ -37,9 +37,9 @@ private func dhcpDiscover(hardware: MACAddress, transaction: UInt32) -> ByteBuff
     return buffer
 }
 
-private func frame(
+func frame(
     from source: IPv4Address, to destination: IPv4Address, sourcePort: UInt16, destinationPort: UInt16,
-    payload: ByteBuffer, destinationMAC: MACAddress
+    payload: ByteBuffer, destinationMAC: MACAddress, sourceMAC: MACAddress = gwGuestMAC
 ) -> [UInt8] {
     let allocator = ByteBufferAllocator()
     let datagram = UDPHeader.serialize(
@@ -49,7 +49,7 @@ private func frame(
     IPv4Header(
         source: source, destination: destination, protocolNumber: .udp, payloadLength: datagram.readableBytes
     ).prepend(to: &packet)
-    EthernetHeader(destination: destinationMAC, source: gwGuestMAC, etherType: .ipv4).prepend(to: &packet)
+    EthernetHeader(destination: destinationMAC, source: sourceMAC, etherType: .ipv4).prepend(to: &packet)
     return Array(packet.frame.readableBytesView)
 }
 

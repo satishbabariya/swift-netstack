@@ -44,6 +44,9 @@ public final class Gateway: @unchecked Sendable {
         public var maximumTCPConnections: Int
         public var maximumUDPFlows: Int
         public var maximumHalfOpenConnections: Int
+        /// How many guests may share one switch. Only read by
+        /// `start(switchListeningOnStreamSocketAt:)`.
+        public var maximumGuests: Int
         /// Applied to every forwarded connection's guest-side endpoint. On by
         /// default -- see `OutboundTCPForwarder.init` for why that is the
         /// opposite of `TCPEndpoint`'s default and right here.
@@ -72,6 +75,7 @@ public final class Gateway: @unchecked Sendable {
             maximumTCPConnections: Int = 1024,
             maximumUDPFlows: Int = 512,
             maximumHalfOpenConnections: Int = 512,
+            maximumGuests: Int = 32,
             keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
             logger: Logger = Logger(label: "netstack"),
             logWindow: TimeAmount = .seconds(10)
@@ -92,13 +96,19 @@ public final class Gateway: @unchecked Sendable {
             self.maximumTCPConnections = maximumTCPConnections
             self.maximumUDPFlows = maximumUDPFlows
             self.maximumHalfOpenConnections = maximumHalfOpenConnections
+            self.maximumGuests = maximumGuests
             self.keepAlive = keepAlive
             self.logger = logger
             self.logWindow = logWindow
         }
     }
 
-    public let link: WireLinkEndpoint
+    /// Either one guest on one wire, or a `NetworkSwitch` carrying several.
+    public let link: GatewayLink
+    /// The switch, when this gateway was started on one. `nil` for a gateway on
+    /// a single wire, which is what makes "is this a network or a link?" a
+    /// question a caller can answer rather than infer.
+    public var networkSwitch: NetworkSwitch? { link as? NetworkSwitch }
     public let stack: Stack
     public let dhcp: DHCPServer
     public let dns: DNSServer
@@ -119,7 +129,7 @@ public final class Gateway: @unchecked Sendable {
     public var eventLoop: EventLoop { link.eventLoop }
 
     private init(
-        link: WireLinkEndpoint, stack: Stack, dhcp: DHCPServer, dns: DNSServer,
+        link: GatewayLink, stack: Stack, dhcp: DHCPServer, dns: DNSServer,
         tcp: OutboundTCPForwarder, udp: UDPForwarder,
         keepAlive: TCPEndpoint.KeepAliveConfiguration?, log: RateLimitedLogger
     ) {
@@ -188,6 +198,31 @@ public final class Gateway: @unchecked Sendable {
         }
     }
 
+    /// Bind a unix stream socket and serve **every** guest that connects, each
+    /// on its own port of a `NetworkSwitch`.
+    ///
+    /// This is upstream's ordinary shape and the one `listeningStreamSocket`
+    /// does not cover: gvisor-tap-vsock is a network, not a point-to-point link,
+    /// and guests on it can reach each other without the gateway seeing the
+    /// traffic at all. DHCP already leases per hardware address, so each guest
+    /// gets its own.
+    ///
+    /// The future completes when the socket is bound rather than when a guest
+    /// arrives -- a switch with no ports is a valid state, and a caller that had
+    /// to wait for the first guest could not publish ports or answer its control
+    /// socket until one turned up.
+    public static func start(
+        switchListeningOnStreamSocketAt path: String, group: EventLoopGroup,
+        configuration: Configuration = Configuration()
+    ) -> EventLoopFuture<Gateway> {
+        WireBootstrap.switchedStreamSocket(
+            atPath: path, group: group, linkAddress: configuration.linkAddress, mtu: configuration.mtu,
+            maximumGuests: configuration.maximumGuests
+        ).flatMap { netSwitch in
+            assemble(on: netSwitch, group: group, configuration: configuration)
+        }
+    }
+
     /// Build everything on the link's own loop.
     ///
     /// The order is not arbitrary and this is the one place it is written down:
@@ -196,7 +231,7 @@ public final class Gateway: @unchecked Sendable {
     /// through -- which it does for anything addressed to the gateway -- there
     /// is something bound for the datagram to reach.
     private static func assemble(
-        on link: WireLinkEndpoint, group: EventLoopGroup, configuration: Configuration
+        on link: GatewayLink, group: EventLoopGroup, configuration: Configuration
     ) -> EventLoopFuture<Gateway> {
         link.eventLoop.submit {
             let stack = Stack(
@@ -302,6 +337,18 @@ public final class Gateway: @unchecked Sendable {
     /// One extra hop is enough and no more: the deferred blocks were queued
     /// before this hop, and a loop runs its queue in order.
     public func close() -> EventLoopFuture<Void> {
+        // Hopped onto the loop first, because everything below is loop-confined:
+        // `forwards` is mutated by `forward` from a future callback on the loop,
+        // and the services' `close` methods each touch state their own loop
+        // owns. Reading them from the caller's thread -- which is what this did,
+        // and what every test here does -- is a data race that happened to be
+        // quiet. A `preconditionInEventLoop` added to `NetworkSwitch.close` is
+        // what turned it into a crash and found it.
+        eventLoop.flatSubmit { self.closeOnLoop() }
+    }
+
+    private func closeOnLoop() -> EventLoopFuture<Void> {
+        eventLoop.preconditionInEventLoop()
         var closing = forwards.values.map { $0.close() }
         forwards.removeAll()
         closing.append(udp.close())

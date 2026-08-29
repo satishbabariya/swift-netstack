@@ -425,3 +425,86 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     _ = holder.stack
 }
 
+
+@Test func slotsAreReturnedExactlyOnceAcrossManyConnections() async throws {
+    // The counter that decides `maximumConnections` is maintained by hand: taken
+    // at the decision, returned by whichever of two close futures fires first.
+    // Both fire on a clean close, and every failure path in between has to
+    // return it too.
+    //
+    // Nothing here tested that across churn. The existing checks open one
+    // connection, and a slot leaked or double-returned once per connection is
+    // invisible at one. It matters because it drifts in one direction: leak, and
+    // the forwarder refuses everything long before the limit; double-return, and
+    // the limit stops limiting.
+    //
+    // This is the shape that has already broken twice in this package -- a bound
+    // exceeded by concurrent dials, and the switch's per-port counts -- so it is
+    // worth a test that runs it hundreds of times rather than once.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide, maximumConnections: 8)
+
+    let listener = try await ServerBootstrap(group: group)
+        .childChannelInitializer { channel in channel.eventLoop.makeSucceededVoidFuture() }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+    // A port nothing answers on, so half the connections fail at the dial --
+    // the path that returns the slot without ever splicing.
+    let scout = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
+    let deadPort = UInt16(scout.localAddress!.port!)
+    try await scout.close()
+
+    var peak = 0
+    var sourcePort: UInt16 = 40000
+    for round in 0..<120 {
+        let reachable = round % 2 == 0
+        sourcePort &+= 1
+        send(guestSide, guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: reachable ? port : deadPort,
+            sequence: UInt32(round) &* 1000 &+ 7000, flags: [.syn], sourcePort: sourcePort))
+        let answer = await awaitSegments(guestSide) { !$0.isEmpty }
+
+        // Close whatever was opened, from the guest's side.
+        if let opened = answer.first(where: {
+            $0.header.flags.contains(.syn) && $0.header.flags.contains(.ack)
+        }) {
+            send(guestSide, guestFrame(
+                to: IPv4Address("127.0.0.1")!, destinationPort: port,
+                sequence: UInt32(round) &* 1000 &+ 7001,
+                acknowledgement: opened.header.sequence.value &+ 1, flags: [.rst],
+                sourcePort: sourcePort))
+        }
+        _ = await awaitSegments(guestSide) { _ in true }
+
+        let live = try await holder.stack!.eventLoop.submit { holder.forwarder!.establishedCount }.get()
+        peak = max(peak, live)
+    }
+
+    #expect(peak <= 8, "the live count reached \(peak) against a limit of 8")
+
+    // And it comes back to zero. Polled, because the last closes are in flight:
+    // a fixed wait is either flaky or slow depending on the machine.
+    var settled = -1
+    for _ in 0..<400 where settled != 0 {
+        settled = try await holder.stack!.eventLoop.submit { holder.forwarder!.establishedCount }.get()
+        if settled != 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+    #expect(settled == 0, "\(settled) slots were never returned after 120 connections")
+
+    // The floor: connections really were made, so "no slots outstanding" is not
+    // satisfied by a forwarder that refused everything.
+    let dialled = try await holder.stack!.eventLoop.submit {
+        (holder.forwarder!.refusedForDial, holder.forwarder!.refusedForLimit)
+    }.get()
+    #expect(dialled.0 > 0, "no connection ever reached the dial")
+    #expect(dialled.1 == 0, "connections were refused by the limit, so the churn never exercised it")
+
+    try? await listener.close()
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

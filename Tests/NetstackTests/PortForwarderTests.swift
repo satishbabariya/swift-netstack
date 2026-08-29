@@ -392,3 +392,58 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+@Test func hostSideSlotsAreReturnedExactlyOnceAcrossManyConnections() async throws {
+    // The mirror of the outbound forwarder's churn test, and the same hand-kept
+    // counter: taken when a host connection is accepted, returned by whichever
+    // of two close futures fires first.
+    //
+    // The failure paths here are different from the outbound side's, which is
+    // why it needs its own: the guest may never answer the SYN, and the host may
+    // hang up before it does.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await portForwardingGateway(
+        group: group, guestSide: &guestSide, guestPort: 8080, maximumConnections: 8)
+    let hostPort = holder.forwarder!.listeningAddress!.port!
+
+    var peak = 0
+    for round in 0..<100 {
+        let dialler = try await ClientBootstrap(group: group)
+            .connect(host: "127.0.0.1", port: hostPort).get()
+
+        let syn = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+        // Half the rounds the guest accepts; half it never answers and the host
+        // hangs up first. Both have to return the slot.
+        if round % 2 == 0, let opening = syn.first(where: { $0.header.flags.contains(.syn) }) {
+            let bytes = pfGuestSegment(
+                sourcePort: 8080, destinationPort: opening.header.sourcePort, sequence: 5000,
+                acknowledgement: opening.header.sequence.value &+ 1, flags: [.syn, .ack])
+            _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+        }
+        try? await dialler.close()
+        _ = pfDrain(guestSide)
+
+        let live = try await holder.stack!.eventLoop.submit { holder.forwarder!.establishedCount }.get()
+        peak = max(peak, live)
+    }
+
+    #expect(peak <= 8, "the live count reached \(peak) against a limit of 8")
+
+    var settled = -1
+    for _ in 0..<400 where settled != 0 {
+        settled = try await holder.stack!.eventLoop.submit { holder.forwarder!.establishedCount }.get()
+        if settled != 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+    #expect(settled == 0, "\(settled) slots were never returned after 100 connections")
+    // The floor: the limit was never hit, so the churn was slots being returned
+    // rather than connections being refused.
+    #expect(holder.forwarder?.refusedForLimit == 0, "connections were refused, so nothing was churned")
+
+    holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

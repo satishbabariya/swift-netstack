@@ -88,7 +88,11 @@ public final class Gateway: @unchecked Sendable {
     public let tcp: OutboundTCPForwarder
     public let udp: UDPForwarder
 
-    private var forwards: [PortForwarder] = []
+    /// Live forwards, keyed by the host port they publish on. A dictionary
+    /// rather than an array because the control plane addresses them by that
+    /// port -- and because two forwards on one port is a state the type should
+    /// not be able to represent.
+    private var forwards: [Int: PortForwarder] = [:]
     private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
 
     public var eventLoop: EventLoop { link.eventLoop }
@@ -182,7 +186,11 @@ public final class Gateway: @unchecked Sendable {
         let forwarder = PortForwarder(
             stack: stack, guestAddress: guestAddress, guestPort: guestPort, keepAlive: keepAlive)
         return forwarder.listen(host: host, port: hostPort).map { [weak self] _ -> PortForwarder in
-            self?.forwards.append(forwarder)
+            // Keyed on the port the LISTENER ended up with, not on the one that
+            // was asked for: a caller may ask for zero and mean "anything free",
+            // and a forward filed under zero is one nothing can ever address.
+            let bound = forwarder.listeningAddress?.port ?? hostPort
+            self?.forwards[bound] = forwarder
             return forwarder
         }
     }
@@ -193,8 +201,29 @@ public final class Gateway: @unchecked Sendable {
         dhcp.leasedAddress(for: hardware)
     }
 
+    /// Stop publishing a port. Returns whether there was one to stop.
+    ///
+    /// Closing the listener does not close the connections already spliced
+    /// through it, and that is the right behaviour rather than an omission: a
+    /// forward being withdrawn means "accept no more", and tearing down live
+    /// connections would make unexposing a port a way to cut off work in
+    /// progress.
+    @discardableResult
+    public func stopForwarding(hostPort: Int) -> Bool {
+        guard let forwarder = forwards.removeValue(forKey: hostPort) else { return false }
+        forwarder.close()
+        return true
+    }
+
+    /// The host ports currently published, ascending.
+    public var forwardedPorts: [Int] { forwards.keys.sorted() }
+
+    /// The forwarder on a given host port. For tests, and for a caller that
+    /// wants to read where a forward actually landed.
+    public func forwarderForTesting(hostPort: Int) -> PortForwarder? { forwards[hostPort] }
+
     public func close() -> EventLoopFuture<Void> {
-        for forwarder in forwards { forwarder.close() }
+        for forwarder in forwards.values { forwarder.close() }
         forwards.removeAll()
         udp.close()
         dns.close()

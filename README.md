@@ -41,6 +41,26 @@ let leased = gateway.leasedAddress(for: guestMAC)!
 _ = try await gateway.forward(hostPort: 8080, toGuest: leased, port: 80).get()
 ```
 
+Or at runtime, over upstream's HTTP API, so a tool written against `gvproxy`
+works unchanged:
+
+```swift
+let control = ControlPlane(gateway: gateway)
+try await control.listen(unixSocketPath: "/tmp/netstack.sock").get()
+```
+
+```
+POST /services/forwarder/expose   {"local":":8080","remote":"192.168.127.2:80"}
+POST /services/forwarder/unexpose {"local":":8080"}
+GET  /services/forwarder/all
+```
+
+It listens on a unix socket because anything that can reach it can publish any
+guest port on the host, and a unix socket puts that behind the filesystem where
+an operator can see and set who may use it. `":8080"` — upstream's spelling with
+no host — means loopback rather than `0.0.0.0`, which is the safe reading of a
+request that did not say.
+
 `Gateway` is an assembly of public parts, and unusual arrangements should reach
 past it: `WireBootstrap` for the wire, `Stack` for the stack, and
 `DHCPServer` / `DNSServer` / `OutboundTCPForwarder` / `UDPForwarder` /
@@ -68,10 +88,9 @@ to the gateway and something has to be bound for those datagrams to reach.
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
-| **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding |
+| **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 
-**Not yet implemented:** RACK-TLP, IPv6, and the HTTP control plane upstream
-exposes for managing forwards at runtime.
+**Not yet implemented:** RACK-TLP and IPv6.
 
 **Reno is the default and CUBIC is opt-in** (`TCPEndpoint.congestionControl`),
 and the reason is evidence rather than preference: Reno is compared

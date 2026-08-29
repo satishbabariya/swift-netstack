@@ -65,6 +65,7 @@ POST /services/forwarder/unexpose {"local":":8080","protocol":"tcp"}
 GET  /services/forwarder/all
 GET  /stats
 GET  /leases
+GET  /services/dhcp/leases
 GET  /cam
 GET  /services/dns/all
 POST /services/dns/add      {"name":"svc.test.","records":[{"name":"api","ip":"10.1.2.3"}]}
@@ -77,6 +78,10 @@ and then carries that connection to a guest's port — a port forward for one
 connection, with no listener. `/connect` makes the connection a **port on the
 switch**, which is how a guest that can reach only this socket joins the
 network.
+
+Field names are matched case-insensitively, because Go's `encoding/json` is and
+upstream's types carry no json tags — so its own client sends `Name`/`Local`
+where its documentation says `name`/`local`, and both have to work.
 
 `protocol` is `tcp` (the default), `udp`, or `unix` — where `local` is a socket
 path rather than a port, and who may reach the guest is decided by filesystem
@@ -309,7 +314,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-760 tests, plus a differential harness in `differential/` that drives gVisor's
+761 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

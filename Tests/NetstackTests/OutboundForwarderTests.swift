@@ -29,7 +29,8 @@ private final class Holder: @unchecked Sendable {
 /// Everything a guest needs to reach the host: a socketpair for the wire, a
 /// stack on it, and an outbound forwarder.
 private func gateway(
-    group: EventLoopGroup, guestSide: inout Int32, maximumConnections: Int = 1024
+    group: EventLoopGroup, guestSide: inout Int32, maximumConnections: Int = 1024,
+    nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false
 ) async throws -> Holder {
     var pair: [Int32] = [0, 0]
     #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
@@ -50,7 +51,9 @@ private func gateway(
         // ARP for before it could answer anything.
         stack.arpCache.record(IPv4Address("192.168.127.2")!, outboundGuestMAC)
         holder.stack = stack
-        holder.forwarder = OutboundTCPForwarder(stack: stack, maximumConnections: maximumConnections)
+        holder.forwarder = OutboundTCPForwarder(
+            stack: stack, maximumConnections: maximumConnections, nat: nat,
+            allowsLinkLocal: allowsLinkLocal)
     }.get()
     return holder
 }
@@ -301,3 +304,124 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+@Test func aGuestReachingTheHostAddressIsDialledOnLoopback() async throws {
+    // The headline feature of this whole package, and it did not work.
+    //
+    // `host.containers.internal` used to resolve to the gateway's own address,
+    // so a guest that looked it up and dialled it had the gateway try to reach
+    // 192.168.127.1 on the host -- where nothing is listening, because the
+    // host's services are on its loopback. Nothing failed loudly: the guest
+    // simply could not reach the host, which is the one thing it is here for.
+    //
+    // Upstream keeps the two apart and translates: the host has an address of
+    // its own inside the subnet, and `nat` rewrites a dial to it into a dial to
+    // 127.0.0.1.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let hostAddress = IPv4Address("192.168.127.254")!
+    let holder = try await gateway(
+        group: group, guestSide: &guestSide,
+        nat: [hostAddress: IPv4Address("127.0.0.1")!])
+
+    // A real listener on loopback -- the shape of every host service a guest
+    // would want.
+    let listener = try await ServerBootstrap(group: group)
+        .childChannelInitializer { channel in channel.pipeline.addHandler(UppercasingEcho()) }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+
+    // The guest dials the HOST address, which exists on no host interface.
+    send(guestSide, guestFrame(
+        to: hostAddress, destinationPort: port, sequence: 7000, flags: [.syn], sourcePort: 50010))
+    let answer = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+
+    #expect(
+        answer.contains { $0.header.flags.contains(.syn) && $0.header.flags.contains(.ack) },
+        "the guest could not reach the host: dialled \(hostAddress) and got no handshake")
+    #expect(holder.forwarder?.refusedForDial == 0, "the dial was attempted without translation")
+
+    try? await listener.close()
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func aGuestIsRefusedTheInstanceMetadataServiceByDefault() async throws {
+    // 169.254.169.254 hands out credentials to whatever asks from the host. On
+    // a host running in EC2, GCP or Azure, a gateway that dials on a guest's
+    // behalf is exactly a way for a hostile guest to ask -- and this package's
+    // whole threat model is that the guest is hostile.
+    //
+    // Refused before a slot or a dial is spent, and counted under its own name,
+    // because "a guest tried to read the instance metadata service" is not the
+    // same event as a busy gateway or an absent server.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide)
+
+    send(guestSide, guestFrame(
+        to: IPv4Address("169.254.169.254")!, destinationPort: 80, sequence: 8000, flags: [.syn],
+        sourcePort: 50011))
+    let answer = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.rst) } }
+
+    let reset = try #require(answer.first { $0.header.flags.contains(.rst) })
+    #expect(reset.header.acknowledgement == SequenceNumber(8001))
+    #expect(holder.forwarder?.refusedForLinkLocal == 1)
+    // Refused before the connection limit was consulted, so a guest hammering
+    // link-local cannot also exhaust the slots for everything else.
+    #expect(holder.forwarder?.refusedForLimit == 0)
+    #expect(holder.forwarder?.establishedCount == 0)
+
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func linkLocalIsReachableWhenItIsDeliberatelyAllowed() async throws {
+    // The floor under the test above: without this, a forwarder that refused
+    // every connection would pass it. Also the switch an operator on a machine
+    // that legitimately needs link-local has to be able to turn on, which is
+    // what upstream's `Ec2MetadataAccess` is.
+    //
+    // The connection has to actually SUCCEED, which is why the address is
+    // translated to a real listener. Asserting instead that the dial was
+    // attempted and failed -- `refusedForDial == 1` -- reads the outcome of an
+    // asynchronous connect to an unroutable address, and how long that takes is
+    // a property of the machine. It passed alone and failed in the full suite.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let metadata = IPv4Address("169.254.169.254")!
+    let holder = try await gateway(
+        group: group, guestSide: &guestSide, nat: [metadata: IPv4Address("127.0.0.1")!],
+        allowsLinkLocal: true)
+
+    let listener = try await ServerBootstrap(group: group)
+        .childChannelInitializer { channel in channel.eventLoop.makeSucceededVoidFuture() }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+
+    send(guestSide, guestFrame(
+        to: metadata, destinationPort: port, sequence: 8100, flags: [.syn], sourcePort: 50012))
+    let answer = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+
+    #expect(
+        answer.contains { $0.header.flags.contains(.syn) && $0.header.flags.contains(.ack) },
+        "link-local was blocked despite being allowed")
+    #expect(holder.forwarder?.refusedForLinkLocal == 0)
+
+    try? await listener.close()
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+

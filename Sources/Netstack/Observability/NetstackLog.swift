@@ -23,8 +23,13 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case tcpRefusedByLimit
     /// A guest connection refused because the destination did not accept.
     case tcpDialFailed
+    /// A guest connection to a link-local address, refused. See
+    /// `IPv4Address.isLinkLocal` for why this one has its own name.
+    case tcpRefusedLinkLocal
     /// A guest datagram dropped because `maximumUDPFlows` was reached.
     case udpRefusedByLimit
+    /// A guest datagram to a link-local address, dropped.
+    case udpRefusedLinkLocal
     /// A query this gateway does not own, with nowhere configured to send it.
     case dnsRefusedNoUpstream
     /// A query dropped because too many were already outstanding.
@@ -50,6 +55,9 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
         switch self {
         case .outboundFrameRejected: return .error
         case .dnsRefusedNoUpstream: return .warning
+        // A guest reaching for the instance metadata service is worth an
+        // operator's attention whether it meant to or not.
+        case .tcpRefusedLinkLocal, .udpRefusedLinkLocal: return .warning
         // Either a guest came back on a new port or one is claiming another's
         // address, and nothing here can tell which. An operator should see it.
         case .switchAddressMoved: return .warning

@@ -42,4 +42,15 @@ public struct IPv4Address: Hashable, Sendable, CustomStringConvertible {
 
     public static let any = IPv4Address(0)
     public static let broadcast = IPv4Address(0xffff_ffff)
+
+    /// 169.254.0.0/16, RFC 3927.
+    ///
+    /// Worth a name of its own because of what lives there: 169.254.169.254 is
+    /// the cloud instance metadata service on EC2, GCP and Azure, and it hands
+    /// out credentials to anything that asks from the host. A gateway that
+    /// forwards a guest's connections is a way for the guest to ask. See
+    /// `OutboundTCPForwarder.allowsLinkLocal`.
+    public var isLinkLocal: Bool {
+        bytes[0] == 169 && bytes[1] == 254
+    }
 }

@@ -52,6 +52,8 @@ public final class UDPForwarder: @unchecked Sendable {
     private let stack: Stack
     private let gateway: IPv4Address
     private let maximumFlows: Int
+    private let nat: [IPv4Address: IPv4Address]
+    private let allowsLinkLocal: Bool
     private let idleTimeout: TimeAmount
     private var flows: [FlowKey: Flow] = [:]
     /// Flows whose socket is still being opened. A guest sending a burst to one
@@ -61,6 +63,9 @@ public final class UDPForwarder: @unchecked Sendable {
 
     public private(set) var refusedForLimit = 0
     public private(set) var reclaimed = 0
+
+    /// Datagrams dropped for naming a link-local address.
+    public private(set) var refusedForLinkLocal = 0
 
     /// Host sockets opened over this forwarder's life, which is not the same as
     /// `flowCount` and is the figure that shows a flow being reused.
@@ -81,8 +86,11 @@ public final class UDPForwarder: @unchecked Sendable {
     public var flowCount: Int { flows.count }
 
     public init(
-        stack: Stack, maximumFlows: Int = 512, idleTimeout: TimeAmount = .seconds(60)
+        stack: Stack, maximumFlows: Int = 512, idleTimeout: TimeAmount = .seconds(60),
+        nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false
     ) {
+        self.nat = nat
+        self.allowsLinkLocal = allowsLinkLocal
         self.stack = stack
         self.gateway = stack.configuration.gatewayAddress
         self.maximumFlows = max(1, maximumFlows)
@@ -108,6 +116,16 @@ public final class UDPForwarder: @unchecked Sendable {
         // and whatever is bound next. Falling through is what leaves them
         // working.
         guard header.destination != gateway, header.destination != .broadcast else { return false }
+
+        // Consumed and dropped, not passed on. See
+        // `OutboundTCPForwarder.handle` for why link-local is refused by
+        // default; DNS over UDP to 169.254.169.254 reaches the same metadata
+        // service as TCP does.
+        guard allowsLinkLocal || !header.destination.isLinkLocal else {
+            refusedForLinkLocal += 1
+            log?.record(.udpRefusedLinkLocal, ["destination": .string(header.destination.description)])
+            return true
+        }
 
         // The ports come from the demuxer, not from a header parsed here. By
         // the time a UDP datagram reaches a protocol handler the network layer
@@ -140,8 +158,12 @@ public final class UDPForwarder: @unchecked Sendable {
     }
 
     private func open(_ key: FlowKey, firstDatagram: ByteBuffer) {
+        // Translated at the dial, not in the key: the flow is still the guest's
+        // flow to the address it named, and replies have to come back from that
+        // address or the guest will not match them to anything it sent.
+        let translated = nat[key.destination] ?? key.destination
         guard let remote = try? SocketAddress(
-            ipAddress: key.destination.description, port: Int(key.destinationPort))
+            ipAddress: translated.description, port: Int(key.destinationPort))
         else { return }
         opening.insert(key)
 

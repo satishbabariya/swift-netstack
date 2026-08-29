@@ -30,6 +30,31 @@ public final class Gateway: @unchecked Sendable {
         public var gatewayAddress: IPv4Address
         public var subnet: IPv4Subnet
         public var linkAddress: MACAddress
+        /// The address inside the subnet that means "the host".
+        ///
+        /// Separate from `gatewayAddress` because they are different things and
+        /// upstream keeps them apart for a reason: the gateway is a router, and
+        /// the host is a machine reachable through it. The gateway answers ARP
+        /// for this address so a guest can address it, and `nat` rewrites a dial
+        /// to it into a dial to the host's loopback -- which is where the host's
+        /// own services actually are.
+        public var hostAddress: IPv4Address
+        /// Rewrites applied to the address a guest dialled, before it is dialled
+        /// for real. Upstream's `NAT`; the default maps `hostAddress` to
+        /// loopback and nothing else.
+        public var nat: [IPv4Address: IPv4Address]
+        /// Extra addresses the gateway answers ARP for. Upstream's
+        /// `GatewayVirtualIPs`; `hostAddress` is added to this by default,
+        /// because an address nothing answers ARP for is an address no guest can
+        /// send to.
+        public var gatewayVirtualAddresses: [IPv4Address]
+        /// Whether guests may reach 169.254.0.0/16.
+        ///
+        /// **Off by default, and this is a security default rather than a
+        /// preference.** 169.254.169.254 is the cloud instance metadata service,
+        /// which hands credentials to whatever asks from the host. Upstream
+        /// spells the same switch `Ec2MetadataAccess` and also defaults it off.
+        public var allowsLinkLocal: Bool
         public var mtu: UInt32
         /// Names this gateway answers itself. The zone of each is also owned:
         /// with `gateway.containers.internal` here, any other name under
@@ -39,6 +64,13 @@ public final class Gateway: @unchecked Sendable {
         /// not forward at all, and says so with REFUSED rather than a timeout.
         public var upstreamResolvers: [SocketAddress]
         public var leaseSeconds: UInt32
+        /// Addresses pinned to a hardware address. Upstream's
+        /// `DHCPStaticLeases`, and how a caller gives a guest an address it can
+        /// forward a port to before the guest has ever booted.
+        public var dhcpStaticLeases: [MACAddress: IPv4Address]
+        /// Search domains offered in every DHCP reply, so a guest can resolve
+        /// short names. Upstream's `DNSSearchDomains`.
+        public var dnsSearchDomains: [String]
         /// Every bound a guest can push against, in one place because they are
         /// one decision: how much of this process a guest may occupy.
         public var maximumTCPConnections: Int
@@ -68,10 +100,16 @@ public final class Gateway: @unchecked Sendable {
             gatewayAddress: IPv4Address = IPv4Address("192.168.127.1")!,
             subnet: IPv4Subnet = IPv4Subnet(cidr: "192.168.127.0/24")!,
             linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:ee")!,
+            hostAddress: IPv4Address = IPv4Address("192.168.127.254")!,
+            nat: [IPv4Address: IPv4Address]? = nil,
+            gatewayVirtualAddresses: [IPv4Address]? = nil,
+            allowsLinkLocal: Bool = false,
             mtu: UInt32 = 1500,
             dnsRecords: [DNSServer.StaticRecord]? = nil,
             upstreamResolvers: [SocketAddress] = [],
             leaseSeconds: UInt32 = 3600,
+            dhcpStaticLeases: [MACAddress: IPv4Address] = [:],
+            dnsSearchDomains: [String] = [],
             maximumTCPConnections: Int = 1024,
             maximumUDPFlows: Int = 512,
             maximumHalfOpenConnections: Int = 512,
@@ -83,16 +121,29 @@ public final class Gateway: @unchecked Sendable {
             self.gatewayAddress = gatewayAddress
             self.subnet = subnet
             self.linkAddress = linkAddress
+            self.hostAddress = hostAddress
+            self.nat = nat ?? [hostAddress: IPv4Address("127.0.0.1")!]
+            self.gatewayVirtualAddresses = gatewayVirtualAddresses ?? [hostAddress]
+            self.allowsLinkLocal = allowsLinkLocal
             self.mtu = mtu
             // The two names upstream publishes, so a guest written against
             // gvisor-tap-vsock finds what it expects. Both resolve to the
             // gateway: the host is reachable through it and only through it.
+            // `host.containers.internal` resolves to the HOST address, not to
+            // the gateway. They were the same here once, and that was wrong in a
+            // way nothing failed on: a guest that resolved the name got the
+            // gateway's address, dialled it, and the gateway then tried to reach
+            // 192.168.127.1 on the host -- where nothing is listening, because
+            // the host's own services are on its loopback. Reaching the host is
+            // the headline feature of this whole package and it did not work.
             self.dnsRecords = dnsRecords ?? [
                 .init(name: "gateway.containers.internal", address: gatewayAddress),
-                .init(name: "host.containers.internal", address: gatewayAddress),
+                .init(name: "host.containers.internal", address: hostAddress),
             ]
             self.upstreamResolvers = upstreamResolvers
             self.leaseSeconds = leaseSeconds
+            self.dhcpStaticLeases = dhcpStaticLeases
+            self.dnsSearchDomains = dnsSearchDomains
             self.maximumTCPConnections = maximumTCPConnections
             self.maximumUDPFlows = maximumUDPFlows
             self.maximumHalfOpenConnections = maximumHalfOpenConnections
@@ -242,15 +293,28 @@ public final class Gateway: @unchecked Sendable {
 
             let dhcp = try DHCPServer(
                 stack: stack, leaseSeconds: configuration.leaseSeconds,
-                mtu: UInt16(truncatingIfNeeded: configuration.mtu))
+                mtu: UInt16(truncatingIfNeeded: configuration.mtu),
+                staticLeases: configuration.dhcpStaticLeases,
+                searchDomains: configuration.dnsSearchDomains)
             let dns = try DNSServer(
                 stack: stack, records: configuration.dnsRecords,
                 upstream: configuration.upstreamResolvers)
+            // Every virtual address the gateway answers for, added to the NIC
+            // before anything can ask: ARP is answered from `NIC.hasAddress`,
+            // so an address that is not here is one no guest can send to,
+            // whatever the DNS says it resolves to.
+            for address in configuration.gatewayVirtualAddresses {
+                stack.nic.addAddress(address, prefixLength: configuration.subnet.prefixLength)
+            }
+
             let tcp = OutboundTCPForwarder(
                 stack: stack, maximumInFlight: configuration.maximumHalfOpenConnections,
                 maximumConnections: configuration.maximumTCPConnections,
-                keepAlive: configuration.keepAlive)
-            let udp = UDPForwarder(stack: stack, maximumFlows: configuration.maximumUDPFlows)
+                keepAlive: configuration.keepAlive, nat: configuration.nat,
+                allowsLinkLocal: configuration.allowsLinkLocal)
+            let udp = UDPForwarder(
+                stack: stack, maximumFlows: configuration.maximumUDPFlows, nat: configuration.nat,
+                allowsLinkLocal: configuration.allowsLinkLocal)
 
             // One limiter shared by every part, not one each. Nine components
             // with a window apiece would let a guest that can drive several

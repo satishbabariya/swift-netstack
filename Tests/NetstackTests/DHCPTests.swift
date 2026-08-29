@@ -18,7 +18,10 @@ private final class DHCPFixture {
     let stack: Stack
     let server: DHCPServer
 
-    init(cidr: String = "192.168.127.0/24") throws {
+    init(
+        cidr: String = "192.168.127.0/24", staticLeases: [MACAddress: IPv4Address] = [:],
+        searchDomains: [String] = []
+    ) throws {
         link = RecordingEndpoint(eventLoop: loop, linkAddress: dhcpGatewayMAC)
         stack = Stack(
             link: link,
@@ -26,7 +29,8 @@ private final class DHCPFixture {
                 gatewayAddress: dhcpGateway, subnet: IPv4Subnet(cidr: cidr)!),
             clock: ManualClock())
         stack.start()
-        server = try DHCPServer(stack: stack)
+        server = try DHCPServer(
+            stack: stack, staticLeases: staticLeases, searchDomains: searchDomains)
     }
 
     /// Deliver a client message as though it arrived on the wire, broadcast
@@ -58,6 +62,19 @@ private final class DHCPFixture {
             if let message = DHCPCodec.parse(packet.payload) { out.append(message) }
         }
         return out
+    }
+
+    /// DISCOVER from one hardware address, and the address it is offered.
+    func discover(from hardware: MACAddress, transaction: UInt32 = 0x1234_5678) -> IPv4Address? {
+        send(clientMessage(type: .discover, transaction: transaction, hardware: hardware))
+        return replies().first { $0.messageType == .offer }?.yourAddress
+    }
+
+    /// The options carried by the offer, by code.
+    func discoverOptions(from hardware: MACAddress) -> [UInt8: [UInt8]]? {
+        send(clientMessage(type: .discover, hardware: hardware))
+        guard let raw = rawReplies().first else { return nil }
+        return optionValues(in: raw)
     }
 
     func drain() {
@@ -325,4 +342,96 @@ extension DHCPFixture {
         }
         return out
     }
+}
+
+@Test func aStaticLeaseIsHonouredAndKeptOutOfThePool() throws {
+    // How a caller gives a guest a known address before the guest has ever
+    // booted, which is what makes "forward host port 8080 to the guest" possible
+    // without first asking where the guest ended up.
+    //
+    // The order here is the test. The pinned guest asks **last**, after every
+    // other address is gone -- because that is the case the pool exclusion is
+    // for and the only one it is needed in. Ask the pinned guest first and its
+    // address is in `leases`, which the allocator already skips; the exclusion
+    // then changes nothing and a test written that way passes with it deleted.
+    //
+    // A /28 rather than a /24 so the pool can actually be exhausted: with 253
+    // addresses, handing out a few dozen never reaches the pinned one.
+    let pinned = IPv4Address("192.168.127.5")!
+    let known = MACAddress("0a:00:00:00:77:77")!
+    let harness = try DHCPFixture(cidr: "192.168.127.0/28", staticLeases: [known: pinned])
+    defer { harness.drain() }
+
+    var handedOut: Set<IPv4Address> = []
+    for index in 0..<32 {
+        let mac = MACAddress(bytes: [0x0a, 0, 0, 0, 0x99, UInt8(index)])!
+        if let address = harness.discover(from: mac) { handedOut.insert(address) }
+    }
+    #expect(!handedOut.isEmpty, "no addresses were handed out at all")
+    #expect(
+        harness.discover(from: MACAddress("0a:00:00:00:fe:fe")!) == nil,
+        "the pool was not exhausted, so the check below proves nothing")
+    #expect(
+        !handedOut.contains(pinned),
+        "the pinned address was handed to a guest that booted first")
+
+    // And it is still there for the guest it was pinned to, which arrives to
+    // find every other address taken.
+    #expect(harness.discover(from: known) == pinned, "the static lease was ignored")
+}
+
+@Test func searchDomainsAreOfferedAsOption119() throws {
+    // RFC 3397, so a guest can resolve `web` as `web.svc.test`. Encoded as DNS
+    // labels rather than text: `3svc4test0`.
+    let harness = try DHCPFixture(searchDomains: ["svc.test", "example.com"])
+    defer { harness.drain() }
+    let options = try #require(harness.discoverOptions(from: MACAddress("0a:00:00:00:aa:bb")!))
+    let list = try #require(options[119], "no search list was offered")
+
+    #expect(list == [3, 115, 118, 99, 4, 116, 101, 115, 116, 0]
+        + [7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0])
+}
+
+@Test func noSearchDomainsMeansNoOptionRatherThanAnEmptyOne() throws {
+    // An empty option is not the same as an absent one: some clients read a
+    // zero-length 119 as "the search list is empty", which overrides whatever
+    // they were configured with. Saying nothing leaves them alone.
+    let harness = try DHCPFixture()
+    defer { harness.drain() }
+    let options = try #require(harness.discoverOptions(from: MACAddress("0a:00:00:00:cc:dd")!))
+    #expect(options[119] == nil)
+    // The floor: the reply carried its ordinary options, so this is the search
+    // list being absent rather than the reply being empty.
+    #expect(options[53] != nil, "the offer had no message type")
+    #expect(options[3] != nil, "the offer had no router")
+}
+
+@Test func aLabelTooLongToEncodeIsSkippedRatherThanTruncated() throws {
+    // A DNS label's length byte has two reserved top bits, so 63 is the most it
+    // can express. Truncating to fit would put a different name in the guest's
+    // search list -- one an operator never wrote and cannot see -- and a name
+    // that resolves is worse than a name that is missing.
+    let long = String(repeating: "a", count: 64)
+    let encoded = DHCPServer.encodeSearchList(["\(long).test", "ok.test"])
+
+    #expect(!encoded.contains(64), "an unencodable label was written anyway")
+    // The rest of the list still arrives.
+    #expect(encoded.suffix(9) == [2, 111, 107, 4, 116, 101, 115, 116, 0])
+}
+
+
+/// Every option in a reply, by code, with its bytes. `optionCodes` above answers
+/// "was it there"; several tests need to know what it said.
+private func optionValues(in buffer: ByteBuffer) -> [UInt8: [UInt8]] {
+    var buffer = buffer
+    guard buffer.readSlice(length: DHCPMessage.fixedLength + 4) != nil else { return [:] }
+    var out: [UInt8: [UInt8]] = [:]
+    while let code = buffer.readInteger(as: UInt8.self), code != 255 {
+        if code == 0 { continue }
+        guard let length = buffer.readInteger(as: UInt8.self),
+            let value = buffer.readBytes(length: Int(length))
+        else { break }
+        out[code] = value
+    }
+    return out
 }

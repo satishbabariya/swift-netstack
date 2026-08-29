@@ -309,3 +309,77 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+@Test func theNameGuestsAreGivenForTheHostIsAnAddressTheGatewayTranslates() async throws {
+    // Two settings that have to agree, in different parts of the configuration,
+    // with nothing connecting them: the DNS record a guest resolves for
+    // `host.containers.internal`, and the `nat` table that decides what a dial
+    // to that address becomes.
+    //
+    // When they drifted apart -- the record pointed at the gateway, the table
+    // translated the host address -- nothing failed. A guest resolved the name,
+    // dialled what it was given, and the gateway tried to reach 192.168.127.1 on
+    // the host, where nothing listens because the host's services are on its
+    // loopback. Reaching the host is what this package is for, and it was quietly
+    // broken.
+    //
+    // So this asserts the relationship rather than either value: whatever the
+    // name resolves to must be an address `nat` rewrites. Change either one alone
+    // and this fails.
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let configuration = Gateway.Configuration()
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: configuration
+    ).get()
+
+    let discover = frame(
+        from: .any, to: .broadcast, sourcePort: DHCPServer.clientPort,
+        destinationPort: DHCPServer.serverPort, payload: dhcpDiscover(hardware: gwGuestMAC, transaction: 61),
+        destinationMAC: .broadcast)
+    _ = discover.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    let offer = try #require(await awaitUDP(pair[1], fromPort: DHCPServer.serverPort))
+    let leased = try #require(DHCPCodec.parse(offer)).yourAddress
+
+    var query = ByteBuffer()
+    query.writeInteger(UInt16(0x4242), endianness: .big)
+    query.writeInteger(UInt16(0x0100), endianness: .big)
+    query.writeInteger(UInt16(1), endianness: .big)
+    query.writeBytes([UInt8](repeating: 0, count: 6))
+    for label in ["host", "containers", "internal"] {
+        query.writeInteger(UInt8(label.utf8.count))
+        query.writeBytes(Array(label.utf8))
+    }
+    query.writeInteger(UInt8(0))
+    query.writeInteger(UInt16(1), endianness: .big)
+    query.writeInteger(UInt16(1), endianness: .big)
+
+    let ask = frame(
+        from: leased, to: configuration.gatewayAddress, sourcePort: 40100, destinationPort: 53,
+        payload: query, destinationMAC: configuration.linkAddress)
+    _ = ask.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    let answer = try #require(await awaitUDP(pair[1], fromPort: 53))
+
+    // The A record is the last four bytes of a single-answer reply.
+    #expect(
+        answer.getInteger(at: answer.readerIndex + 6, endianness: .big, as: UInt16.self) == 1,
+        "host.containers.internal was not answered")
+    let bytes = Array(answer.readableBytesView.suffix(4))
+    #expect(bytes.count == 4)
+    let resolved = IPv4Address(bytes[0], bytes[1], bytes[2], bytes[3])
+
+    #expect(
+        configuration.nat[resolved] != nil,
+        "guests are told the host is at \(resolved), which the gateway does not translate")
+    // And it translates to loopback, which is where a host's own services are.
+    #expect(configuration.nat[resolved] == IPv4Address("127.0.0.1")!)
+    // The gateway also has to answer ARP for it, or no guest can send there at
+    // all whatever the DNS says.
+    let reachable = try await gateway.eventLoop.submit { gateway.stack.nic.hasAddress(resolved) }.get()
+    #expect(reachable, "nothing answers ARP for the address guests are given for the host")
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

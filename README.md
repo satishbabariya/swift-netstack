@@ -274,6 +274,7 @@ which is the part that explains it.
 ```
 swift test
 NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
+NETSTACK_FUZZ_ITERATIONS=500000 swift test --filter Fuzz
 NETSTACK_THROUGHPUT=1 swift test -c release --filter Throughput
 ```
 
@@ -286,11 +287,19 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-748 tests, plus a differential harness in `differential/` that drives gVisor's
+750 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three
 documented differences, each with a reason recorded in `differential/README.md`.
+
+The fuzzer mutates real frames rather than generating random bytes — uniformly
+random input is rejected by the first length check and never reaches anything.
+It has **found no bugs**, and what makes that worth saying is that the oracles
+are checked: a canary that traps on a 17-byte frame is caught, and removing the
+reassembler's table bound is caught. It also asserts how deep the mutants get,
+because the first version reached the TCP parser **zero** times — the corpus
+segment carried a placeholder checksum — and looked like it was working.
 
 Many of these tests exist because falsification proved an earlier one could not
 fail. Three habits came out of that and are worth knowing before adding a test

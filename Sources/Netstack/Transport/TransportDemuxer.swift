@@ -58,6 +58,17 @@ public final class TransportDemuxer {
         protocolHandlers[protocolNumber.rawValue] = handler
     }
 
+    /// Whether something has already taken over a protocol's datapath.
+    ///
+    /// There is one slot per protocol, so installing a second handler displaces
+    /// the first **silently**: the displaced one does not error, it simply stops
+    /// being called. A caller that would install one asks this first so the
+    /// collision surfaces as a failure rather than as a gateway that quietly
+    /// sees no connections.
+    public func hasProtocolHandler(_ protocolNumber: IPProtocol) -> Bool {
+        protocolHandlers[protocolNumber.rawValue] != nil
+    }
+
     /// Returns false when nothing wanted the segment, so the caller can answer
     /// with an ICMP port-unreachable.
     public func deliver(

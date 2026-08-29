@@ -371,6 +371,23 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// readiness only costs it a wasted call.
     public var onData: (() -> Void)?
 
+    /// Fired when a write that was previously refused could now be retried.
+    ///
+    /// ## Why this exists, and why it is not "the buffer has room"
+    ///
+    /// `send` refuses rather than truncating, which leaves the caller holding
+    /// the bytes. Something has to tell it to try again. Before this signal
+    /// the only thing that did was the *source's* next `onData` — fine while
+    /// the source keeps sending, and a permanent stall the moment it stops.
+    /// `aSpliceDeliversItsHeldChunkOnceTheFarSideDrains` is that stall: the far
+    /// side drained, had room, and nothing asked it again.
+    ///
+    /// It fires only after a refusal, not whenever space is freed. An
+    /// acknowledgement frees send-buffer space on almost every segment, so the
+    /// unconditional form would signal constantly to tell nobody anything. The
+    /// refusal is what creates a caller waiting to hear.
+    public var onWritable: (() -> Void)?
+
     /// Take up to `maximum` bytes of in-order data, and reopen the window by
     /// what was taken.
     ///
@@ -429,6 +446,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         return taken
     }
     /// A connection reached ESTABLISHED.
+    /// Set by a refused `send`, cleared by the signal it arms. Without it this
+    /// endpoint cannot tell "space was freed" — true constantly — from "space
+    /// was freed and someone is waiting for it".
+    private var sendRefused = false
+
     public var onEstablished: (() -> Void)?
     /// A connection's stream is over: the peer's FIN was reached, or the block
     /// was deleted by a reset or by the end of the closing handshake. Fires at
@@ -517,6 +539,33 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         isListening = true
     }
 
+    /// Prepare to receive one connection a forwarder has already decided to
+    /// accept, **without taking the listening port**.
+    ///
+    /// ## Why binding would be wrong here, not merely unnecessary
+    ///
+    /// `bind` registers the wildcard key `(local, port, any, 0)`, and that key
+    /// is exclusive. A forwarder that bound one per accepted connection could
+    /// therefore accept exactly **one connection per destination port** — the
+    /// second would fail with `portInUse`. That is not an edge case: a browser
+    /// opens six connections to the same host and port, and a gateway that
+    /// serves only the first is not a gateway.
+    ///
+    /// It cost nothing to give up because the forwarder holds the demuxer's
+    /// protocol slot and routes segments to this endpoint by four-tuple itself.
+    /// The listening key would never have been matched against. Each connection
+    /// still registers in its own right once it exists, which is what a
+    /// lingering TIME-WAIT needs and what keeps two peers dialling the same port
+    /// apart.
+    ///
+    /// Found by an accept-backpressure test that accepted its second connection
+    /// and got nothing: `complete()` threw, the request was consumed, and the
+    /// only visible symptom was a connection that vanished.
+    func listenForForwardedConnection() {
+        isListening = true
+        backlog = 1
+    }
+
     /// Active open. The endpoint must already be bound.
     public func connect(to address: IPv4Address, port: UInt16) throws {
         guard let boundID, !isListening, connections.isEmpty else { throw StackError.invalidEndpointState }
@@ -576,7 +625,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         case .closed, .listen, .synSent, .synReceived, .finWait1, .finWait2, .closing, .lastAck, .timeWait:
             throw StackError.notConnected
         }
-        guard connection.sender.write(bytes) else { throw StackError.wouldBlock }
+        guard connection.sender.write(bytes) else {
+            sendRefused = true
+            throw StackError.wouldBlock
+        }
         transmit(on: connection)
         armRetransmitTimer(on: connection)
         // A write into a connection whose peer has closed its window puts
@@ -662,6 +714,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         isListening = false
         onData = nil
         onEstablished = nil
+        onWritable = nil
     }
 
     /// How many connections this endpoint currently holds, live and lingering
@@ -882,6 +935,44 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             reportClosed(connection)
         case .listen, .synSent, .synReceived, .established, .finWait1, .finWait2:
             break
+        }
+
+        // Last, after every send this segment provoked. Signalling earlier would
+        // invite the waiter to write into a buffer this call is still about to
+        // fill from its own queue, and the retry would be refused for a reason
+        // that had nothing to do with the peer.
+        signalWritableIfWaiting(on: connection)
+    }
+
+    /// Wake a caller whose `send` was refused, if there is now anywhere for it
+    /// to go.
+    ///
+    /// `sendRefused` is what makes this quiet. An acknowledgement frees send
+    /// buffer space on almost every segment, so signalling on space alone would
+    /// fire constantly and tell nobody anything -- which is asserted by
+    /// `aWritableSignalIsNotSentToAnEndpointThatWasNeverRefused` rather than
+    /// left as a claim.
+    ///
+    /// The state test is honestly weaker than it looks, and saying so is the
+    /// point. `close()` clears `onWritable` along with the other callbacks, so
+    /// this endpoint cannot in practice reach FIN-WAIT-1 with a waiter still
+    /// attached; removing the switch entirely fails no test, and that was run
+    /// rather than assumed. What it buys is that the flag does not survive into
+    /// a state where nothing could ever satisfy it -- cheap, and one less piece
+    /// of state whose staleness a future reader has to reason about.
+    ///
+    /// One connection is all this can ever concern: `send` refuses outright on
+    /// an endpoint holding more than one, so a per-endpoint flag cannot be
+    /// armed by one connection and answered by another.
+    private func signalWritableIfWaiting(on connection: Connection) {
+        guard sendRefused else { return }
+        switch connection.tcb.state {
+        case .established, .closeWait:
+            guard connection.sender.hasBufferSpace else { return }
+            sendRefused = false
+            onWritable?()
+        case .closed, .listen, .synSent, .synReceived, .finWait1, .finWait2, .closing, .lastAck, .timeWait:
+            sendRefused = false
         }
     }
 

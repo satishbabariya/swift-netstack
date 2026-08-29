@@ -188,3 +188,61 @@ import Testing
     left.drain()
     right.drain()
 }
+
+@Test func aSpliceDeliversItsHeldChunkOnceTheFarSideDrains() throws {
+    // Liveness, which the bound and the no-loss test between them do not cover.
+    // Both of those describe a splice under *continuing* pressure — the source
+    // keeps sending, so `onData` keeps firing, so the held chunk keeps getting
+    // retried. Neither says what happens when the source goes quiet.
+    //
+    // It went nowhere. The retry lived only on the source's `onData`, so a
+    // source that had sent its last byte left the tail of the stream held
+    // forever: the far side drained, took acknowledgements, had room — and
+    // nothing ever asked it again. A stalled transfer, not a dropped one, which
+    // is why no existing assertion saw it.
+    let left = TCPFixture()
+    let right = TCPFixture()
+    do {
+        let a = try listeningEndpoint(left)
+        let b = try listeningEndpoint(right)
+        let splice = TCPSplice(a, b)
+        try withExtendedLifetime((a, b, splice)) {
+            completeHandshake(left)
+            completeHandshake(right)
+            _ = left.drainSegments()
+            _ = right.drainSegments()
+
+            // Push until the far side refuses and the splice is holding.
+            var offset = UInt32(0)
+            var forwarded = 0
+            while splice.heldForTesting == 0 && offset < 400_000 {
+                left.inject(
+                    guestSegment(
+                        sequence: guestISS + 1 + offset, ack: gatewayISS + 1, flags: [.ack, .psh]),
+                    payload: tcpPayload(1000))
+                offset += 1000
+                left.advance(by: TCPEndpoint.delayedAckTimeout)
+                _ = left.drainSegments()
+                forwarded += right.drainSegments().map(\.payload.readableBytes).reduce(0, +)
+            }
+            #expect(splice.heldForTesting > 0, "the far side never filled: the rest proves nothing")
+
+            // The source now goes quiet. This is the whole point: no further
+            // `onData` will fire on `a`, so anything that only retries there
+            // is about to stall.
+            let held = splice.heldForTesting
+
+            // The far side drains: it acknowledges everything it was sent, so
+            // its send buffer empties and it can take writes again.
+            right.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1 + UInt32(forwarded), flags: .ack))
+            let delivered = right.drainSegments().map(\.payload.readableBytes).reduce(0, +)
+
+            #expect(delivered >= held, "the held chunk never left: the splice stalled with the source quiet")
+            #expect(splice.heldForTesting == 0, "the splice is still holding after the far side drained")
+        }
+    }
+    left.drain()
+    right.drain()
+}

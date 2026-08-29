@@ -318,6 +318,15 @@ struct Sender {
     /// bounds, and it is deliberately larger than the bytes written.
     var bufferedBytes: Int { accountedBytes }
 
+    /// Whether the buffer is below its bound at all.
+    ///
+    /// Deliberately weaker than "the next write will be accepted", which cannot
+    /// be answered without knowing that write's size. A caller woken on this and
+    /// then refused again simply re-arms its wait, so the weak form costs a
+    /// retry; the strong form would need the pending write's length carried down
+    /// here, and would still be wrong for the second waiter.
+    var hasBufferSpace: Bool { accountedBytes < maximumBufferedBytes }
+
     /// Consecutive duplicate acknowledgements, by RFC 5681 §3.2's definition
     /// and not by "the ACK number repeated" -- see `acknowledged`.
     var duplicateAcknowledgements: Int { duplicates }

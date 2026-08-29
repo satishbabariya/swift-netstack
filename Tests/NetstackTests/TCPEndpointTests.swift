@@ -156,6 +156,13 @@ func tcpPayload(_ count: Int, fill: UInt8 = 0x5a) -> ByteBuffer {
     return buffer
 }
 
+/// A count an escaping callback and the assertion after it can share, for the
+/// same reason `DataRecorder` is a class.
+final class Counter {
+    private(set) var value = 0
+    func increment() { value += 1 }
+}
+
 /// Reference-typed recorders, so an escaping callback and the assertion after
 /// it look at the same storage -- and so a test never captures the endpoint
 /// inside its own callback, which would be a retain cycle the lifetime tests
@@ -2085,6 +2092,65 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             #expect(held > 0, "the bytes are held, not dropped")
             let taken = endpoint.read()
             #expect(taken.readableBytes == held, "and reading gives back exactly what was held")
+        }
+    }
+    fixture.drain()
+}
+
+// MARK: - The writable signal
+
+@Test func aWritableSignalIsNotSentToAnEndpointThatWasNeverRefused() throws {
+    // The signal exists to restart a caller `send` turned away. Every
+    // acknowledgement frees buffer space, so a version that fired on space
+    // alone would fire on essentially every segment — correct, useless, and
+    // indistinguishable from this one by any test of what eventually arrives.
+    let fixture = TCPFixture()
+    let signals = Counter()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            endpoint.onWritable = { signals.increment() }
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            try endpoint.send(tcpPayload(200))
+            let sent = fixture.drainSegments().map(\.payload.readableBytes).reduce(0, +)
+            #expect(sent == 200, "nothing went out: there is no acknowledgement to test with")
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1 + UInt32(sent), flags: [.ack]))
+
+            #expect(signals.value == 0, "an endpoint nobody was waiting on was signalled anyway")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aRefusedSenderIsSignalledOnceItsBufferDrains() throws {
+    let fixture = TCPFixture()
+    let signals = Counter()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            endpoint.onWritable = { signals.increment() }
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            var refused = false
+            for _ in 0..<64 where !refused {
+                do { try endpoint.send(tcpPayload(16 * 1024)) } catch { refused = true }
+            }
+            #expect(refused, "the buffer never filled: the rest proves nothing")
+            #expect(signals.value == 0, "signalled before anything drained")
+
+            var acknowledged = UInt32(0)
+            for _ in 0..<64 where signals.value == 0 {
+                acknowledged += UInt32(fixture.drainSegments().map(\.payload.readableBytes).reduce(0, +))
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: gatewayISS + 1 + acknowledged, flags: [.ack],
+                        window: 65535))
+            }
+            #expect(signals.value > 0, "the refused caller was never told it could resume")
         }
     }
     fixture.drain()

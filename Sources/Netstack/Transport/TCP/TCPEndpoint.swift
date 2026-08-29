@@ -177,6 +177,16 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// there is no data to retransmit, so the retransmit timer never runs.
     public var keepAlive: KeepAliveConfiguration?
 
+    /// Whether new connections use RFC 8985 RACK alongside RFC 6675's
+    /// scoreboard.
+    ///
+    /// Off by default for the same reason CUBIC is: the differential harness
+    /// compares this stack against gVisor with gVisor's own RACK disabled, so
+    /// turning it on here would compare one stack's time-based loss detection
+    /// against another stack's absence of it. What stands behind RACK is
+    /// `RackTests`, against RFC 8985's own rules.
+    public var rack = false
+
     /// Which congestion-control algorithm new connections on this endpoint use.
     ///
     /// Reno by default: it is the one the differential harness validates against
@@ -814,6 +824,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// each algorithm is covered where the algorithm is, and a test that
     /// inferred which one was in use from a window figure would be re-testing
     /// that behaviour to answer a question about wiring.
+    var usesRackForTesting: Bool {
+        guard let connection = connections.values.first else { return false }
+        return connection.sender.rackEnabledForTesting
+    }
+
     var usesCubicForTesting: Bool {
         guard let connection = connections.values.first else { return false }
         return connection.sender.congestionControl is Cubic
@@ -1243,6 +1258,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             congestionControl: congestionControl.make(maximumSegmentSize: size), clock: stack.clock,
             maximumBufferedBytes: Self.sendBufferBytes)
         connection.sender.nagleDisabled = nagleDisabled
+        connection.sender.rackEnabled = rack
     }
 
     /// The largest options area this connection can put on a data segment.
@@ -1774,6 +1790,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                     congestionControl: congestionControl.make(maximumSegmentSize: mss), clock: stack.clock,
                     maximumBufferedBytes: Self.sendBufferBytes)
                 sender.nagleDisabled = nagleDisabled
+                sender.rackEnabled = rack
                 return sender
             }(),
             mss: mss)
@@ -1831,6 +1848,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         connection.sender = Sender(
             congestionControl: congestionControl.make(maximumSegmentSize: connection.mss), clock: stack.clock,
             maximumBufferedBytes: Self.sendBufferBytes)
+        connection.sender.rackEnabled = rack
     }
 
     /// RCV.WND for the wire. `Receiver` owns the figure and has already written

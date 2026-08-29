@@ -220,6 +220,69 @@ struct Sender {
     /// `pipe`, because they are no longer in the network.
     private var sackedBytes = 0
 
+    /// RFC 8985 RACK: loss detected by TIME rather than by counting what
+    /// arrived above a hole.
+    ///
+    /// ## Why a second loss detector, when RFC 6675 already works
+    ///
+    /// 6675 declares a segment lost when enough SACKed data sits above it. That
+    /// needs enough data above it to exist -- three discontiguous runs, or two
+    /// segments' worth of bytes -- so the last few segments of a transfer are
+    /// invisible to it: nothing is sent after them, nothing arrives above them,
+    /// and the retransmission timer is the only thing left. RACK asks a
+    /// different question. A segment sent BEFORE one that has since been
+    /// delivered, and not itself delivered after a reordering window has passed,
+    /// is lost -- and that question has an answer for the tail as well as the
+    /// middle.
+    ///
+    /// **What is here is RACK's detection and not its reordering timer.** §6.3's
+    /// timer re-examines the scoreboard once the window expires with no further
+    /// acknowledgements; without it, a segment whose window has not yet passed
+    /// when the last acknowledgement arrives waits for the RTO instead. That is
+    /// the case the tail loss probe covers, which is why the two are usually
+    /// spoken of together, and it is why this is `rackTimeBasedLossDetection`
+    /// rather than `rack`.
+    private struct RACK {
+        /// `rack.xmit_ts` and `rack.end_seq`: when the most recently SENT of the
+        /// delivered segments went out, and where it ended. "Most recently sent",
+        /// not "most recently delivered" -- the whole comparison below is about
+        /// send order.
+        var mostRecentSend: NIODeadline?
+        var mostRecentEnd: SequenceNumber?
+        /// `rack.rtt`: the round trip of that most recently sent delivered
+        /// segment. §6.2 measures a segment's age against `now` as
+        /// `xmit_ts + rack.rtt + reo_wnd`, so this is part of how long a segment
+        /// is given before it is called lost -- not a statistic.
+        var roundTrip: TimeAmount = .zero
+        /// `rack.reo_wnd`: how long to wait before calling a gap loss rather
+        /// than reordering.
+        var reorderWindow: TimeAmount = .zero
+        /// Whether reordering has ever been observed. Until it has, the window
+        /// is zero -- §7.2 -- because waiting for reordering that this path has
+        /// never shown is a round trip spent on nothing.
+        var sawReordering = false
+        /// The smallest round trip seen, which the window is a fraction of.
+        var minimumRoundTrip: TimeAmount?
+    }
+
+    private var rack = RACK()
+
+    /// RACK's reordering window, and whether reordering has been observed.
+    ///
+    /// Exposed because the window is zero until reordering is seen, so a test
+    /// about the window has to be able to say which of the two states it is in
+    /// -- and inferring that from whether a segment was marked confuses "the
+    /// window is open" with "this segment happened to be inside it".
+    var rackEnabledForTesting: Bool { rackEnabled }
+    var reorderWindowForTesting: TimeAmount { rack.reorderWindow }
+    var sawReorderingForTesting: Bool { rack.sawReordering }
+
+    /// Whether RACK is consulted. Off by default for the same reason CUBIC is:
+    /// the differential harness compares this stack against gVisor with gVisor's
+    /// own RACK disabled, so turning it on here would compare one stack's
+    /// time-based detection against another stack's absence of it.
+    var rackEnabled = false
+
     /// SND.NXT at the moment SACK-based recovery began, RFC 6675's
     /// RecoveryPoint. Non-nil exactly while an episode is running.
     ///
@@ -759,6 +822,12 @@ struct Sender {
                 // a run of them either.
                 duplicates = 0
             }
+            // RACK last, and the placement is the point: its window is a
+            // fraction of the smallest round trip seen, and the sample that
+            // would establish one is taken during retirement -- which does not
+            // happen on this path. Running it here uses what was learned
+            // before, which is all there is.
+            _ = detectLossByTime(tcb: &tcb, flightSize: flightBefore)
             // Acceptable, but it retired nothing and the timer keeps running
             // against the transmission it was armed for -- RFC 6298 §5.3
             // restarts on new data only.
@@ -794,6 +863,13 @@ struct Sender {
             }
         }
         retire(previousUna: previousUna, advanced: advanced, timestampSample: timestampSample)
+        // After retirement, because retirement is where this acknowledgement's
+        // round-trip sample is taken and RACK's window is a fraction of the
+        // smallest one seen. Run before it, the window on the first
+        // acknowledgement of a connection is a fraction of nothing -- zero --
+        // and everything below the delivered segment is declared lost on the
+        // spot.
+        _ = detectLossByTime(tcb: &tcb, flightSize: flightBefore)
         congestionControl.acked(
             bytes: advanced, flightSize: flightBefore, now: clock.now(),
             smoothedRoundTrip: estimator.smoothed)
@@ -928,6 +1004,19 @@ struct Sender {
         // it, and a RecoveryPoint left standing would suppress entry into the
         // next one.
         recoveryPoint = nil
+        // RACK's state is deliberately NOT cleared here, and that is a
+        // correction: it was, until falsification showed the clearing made no
+        // difference, and it was removed rather than left as protection that
+        // protects nothing.
+        //
+        // Everything outstanding is about to be retransmitted, which gives every
+        // record a send time later than anything RACK remembers -- so RACK marks
+        // nothing until a new delivery updates it, cleared or not. And the
+        // delivery that would update it has to be of an UNAMBIGUOUS
+        // transmission, which a retransmitted record is not. The honest summary
+        // is that RACK goes quiet after a timeout until fresh data is sent and
+        // acknowledged; RFC 8985 keeps it working through timestamps and DSACK,
+        // which this does not implement.
 
         // §5.4's retransmission is unconditional -- it is not gated on the
         // window, the way `fastRetransmitPending`'s is not. It is also the only
@@ -1389,10 +1478,153 @@ struct Sender {
                 inFlight[index].sacked = true
                 sackedBytes += record.length
                 learned = true
+                noteDelivered(inFlight[index], at: clock.now())
                 break
             }
         }
         return learned
+    }
+
+    /// The smallest round trip seen, which RACK's reordering window is a
+    /// fraction of.
+    ///
+    /// The MINIMUM rather than the smoothed average, and §7.2 is specific about
+    /// it: the window is meant to cover the reordering a path introduces, and a
+    /// smoothed round trip that has been inflated by queuing would make the
+    /// window grow exactly when loss detection most needs to be prompt.
+    private mutating func noteRoundTrip(_ sample: TimeAmount) {
+        guard sample > .zero else { return }
+        guard let current = rack.minimumRoundTrip else {
+            rack.minimumRoundTrip = sample
+            return
+        }
+        if sample < current { rack.minimumRoundTrip = sample }
+    }
+
+    /// Record a delivered segment against RACK's view of send order.
+    ///
+    /// Only unambiguous transmissions count. A segment sent twice has an
+    /// acknowledgement that may be answering either, so treating the second
+    /// send's time as "the most recently sent thing that arrived" would date
+    /// the comparison from a transmission the peer may never have seen --
+    /// Karn's argument, applied to send order rather than to the round trip.
+    /// **The ambiguity guard is not covered by a test, and saying so is the
+    /// point.** Falsification did not fail against anything here: constructing a
+    /// case where an ambiguous retransmission's arrival would mark other
+    /// segments needs a connection that keeps sending BETWEEN an original and
+    /// its retransmission, so that segments exist which are older than the
+    /// retransmission, still unacknowledged, and not already marked by whatever
+    /// caused the retransmission. Every ordinary path either acknowledges those
+    /// segments or has already marked them.
+    ///
+    /// It stays because the reasoning is Karn's and the cost is one comparison:
+    /// an acknowledgement of a segment sent twice may be answering either send,
+    /// so dating "the most recently sent thing that arrived" from the second
+    /// would measure from a transmission the peer may never have seen.
+    private mutating func noteDelivered(_ record: InFlight, at now: NIODeadline) {
+        guard record.transmissions == 1 else { return }
+        let end = record.sequence + record.length
+        if let previous = rack.mostRecentSend, record.sentAt <= previous {
+            // Something sent EARLIER arrived after something sent later: that is
+            // reordering, and it is the observation that opens the window. Until
+            // a path shows reordering, waiting for it costs a round trip on
+            // every loss and buys nothing.
+            if let recorded = rack.mostRecentEnd, end.lessThan(recorded) {
+                rack.sawReordering = true
+            }
+            return
+        }
+        rack.mostRecentSend = record.sentAt
+        rack.mostRecentEnd = end
+        rack.roundTrip = now > record.sentAt ? now - record.sentAt : .zero
+        // §6.2 keeps its own minimum, from ITS samples. The estimator's minimum
+        // would do for a connection whose acknowledgements advance SND.UNA, and
+        // is empty for one whose only news is selective -- which is exactly the
+        // connection RACK exists for.
+        noteRoundTrip(rack.roundTrip)
+    }
+
+    /// RFC 8985 §6.2: mark lost everything sent before the most recently
+    /// delivered segment that has not itself been delivered within the
+    /// reordering window.
+    ///
+    /// Returns whether anything was newly marked.
+    private mutating func detectLossByTime(tcb: inout TCB, flightSize: Int) -> Bool {
+        guard rackEnabled, let mostRecentSend = rack.mostRecentSend, let mostRecentEnd = rack.mostRecentEnd
+        else { return false }
+        updateReorderWindow()
+        let now = clock.now()
+
+        var newlyLost = false
+        for index in inFlight.indices {
+            let record = inFlight[index]
+            guard !record.sacked, !record.presumedLost else { continue }
+            // §6.2's two tests, and they are genuinely two.
+            //
+            // `RACK_sent_after` asks whether the delivered segment was sent
+            // after this one -- by time, with sequence as the tie-break for a
+            // flight that left in the same instant. The second asks whether
+            // enough time has passed since this one was sent: its send time,
+            // plus a round trip, plus the reordering window, against NOW.
+            //
+            // An earlier version compared the two SEND times against each other
+            // and dropped the round trip. That collapses the two tests into one
+            // -- a segment sent later than the delivered one has a negative
+            // difference, which no window admits -- so the ordering test became
+            // unfalsifiable, which is how the redundancy was noticed. It was
+            // also wrong: without the round trip, a segment is called lost as
+            // soon as something sent a window later arrives, rather than after
+            // it has had a round trip to appear in.
+            let end = record.sequence + record.length
+            let sentAfter =
+                mostRecentSend > record.sentAt
+                || (mostRecentSend == record.sentAt && end.lessThan(mostRecentEnd))
+            guard sentAfter else { continue }
+            let deadline = record.sentAt + rack.roundTrip + rack.reorderWindow
+            guard now >= deadline else { continue }
+            inFlight[index].presumedLost = true
+            lostBytes += record.length
+            newlyLost = true
+        }
+        guard newlyLost else { return false }
+        enterScoreboardRecovery(tcb: &tcb, flightSize: flightSize)
+        return true
+    }
+
+    /// §7.2's window: a quarter of the smallest round trip seen, capped at the
+    /// smoothed one -- and **zero only when there is already strong evidence of
+    /// loss**.
+    ///
+    /// ## The condition is not "until reordering is seen", and the first version
+    /// had it that way
+    ///
+    /// Reading §7.2 as "wait for reordering before opening the window" is the
+    /// obvious reading and it is backwards. The window's default is
+    /// `min_RTT / 4`; the ZERO is the special case, taken only when the sender
+    /// is already in recovery or has counted DupThresh duplicate
+    /// acknowledgements -- states in which something is known to have been lost
+    /// and there is no reason to keep waiting.
+    ///
+    /// The difference is not academic. Under the wrong reading the very first
+    /// selective acknowledgement of a connection declares everything below it
+    /// lost, because nothing has had a chance to reorder yet -- a burst that
+    /// arrives slightly out of order costs a retransmission and a halved window
+    /// on a path with no loss at all. A test was written asserting exactly that
+    /// behaviour and passed, which is what a test encoding a misreading looks
+    /// like from the inside.
+    private mutating func updateReorderWindow() {
+        if !rack.sawReordering, recoveryPoint != nil || duplicates >= Self.duplicateThreshold {
+            rack.reorderWindow = .zero
+            return
+        }
+        let minimum = rack.minimumRoundTrip ?? estimator.smoothed
+        let quarter = TimeAmount.nanoseconds(max(0, minimum.nanoseconds / 4))
+        // Capped at the smoothed round trip -- §7.2 -- but only once there is
+        // one. Before the estimator has a sample its smoothed value is zero, and
+        // capping at zero would close the window on every connection whose
+        // acknowledgements have not yet advanced SND.UNA. Those are the
+        // connections RACK is for.
+        rack.reorderWindow = estimator.smoothed > .zero ? min(quarter, estimator.smoothed) : quarter
     }
 
     /// RFC 6675 §4's `IsLost`, applied to every record, in one pass.
@@ -1487,6 +1719,7 @@ struct Sender {
 
         for entry in inFlight {
             guard (entry.sequence - previousUna) + entry.length <= advanced else { break }
+            noteDelivered(entry, at: clock.now())
             // Karn's algorithm. A segment sent more than once has an ambiguous
             // ACK -- it may be answering either transmission -- and a sample
             // taken from the wrong one corrupts the RTO for everything after
@@ -1544,8 +1777,10 @@ struct Sender {
         // one is valid in strictly more cases.
         if let timestampSample {
             estimator.measure(timestampSample)
+            noteRoundTrip(timestampSample)
         } else if let sample {
             estimator.measure(sample)
+            noteRoundTrip(sample)
         }
         trimChunks(by: advanced)
     }

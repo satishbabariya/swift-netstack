@@ -307,7 +307,12 @@ public final class ControlPlane: @unchecked Sendable {
             let entries = table.map { "\"\($0.key.description)\":\($0.value)" }.sorted()
             return loop.makeSucceededFuture((.ok, "{" + entries.joined(separator: ",") + "}"))
 
-        case (.GET, "/leases"):
+        // Both spellings, because upstream serves both: `/leases` at the top
+        // level and `/services/dhcp/leases` under the services mux -- and its
+        // own client library calls the second. A gateway that served only the
+        // first would be one that `pkg/client` cannot talk to, which is a
+        // narrow and very concrete definition of not being a port.
+        case (.GET, "/leases"), (.GET, "/services/dhcp/leases"):
             // Upstream's, and the one a caller needs to find a guest before it
             // can forward a port to it.
             let leases = gateway.dhcp.allLeases.map { "\"\($0.value.description)\":\"\($0.key.description)\"" }.sorted()
@@ -388,6 +393,25 @@ public final class ControlPlane: @unchecked Sendable {
     }
 }
 
+/// A JSON object field, found however it was capitalised.
+///
+/// Go's `encoding/json` matches field names case-insensitively, and upstream's
+/// `types.Zone` carries no json tags at all -- so its own client sends `Name`,
+/// `Records`, `IP` and `DefaultIP`, while its YAML config and its documentation
+/// use `name`, `records`, `ip` and `defaultIP`. Both are the same request to
+/// upstream and only one of them was to this, which meant `pkg/client` could
+/// read from this gateway and not write to it.
+///
+/// Matching the reference implementation's leniency is the interoperable
+/// choice, and it is leniency about spelling rather than about meaning: an
+/// unknown field is still ignored and a missing one is still an error.
+func jsonField(_ fields: [String: Any], _ name: String) -> Any? {
+    if let exact = fields[name] { return exact }
+    let wanted = name.lowercased()
+    for (key, value) in fields where key.lowercased() == wanted { return value }
+    return nil
+}
+
 extension ControlPlane {
     /// Enough JSON string escaping for the values this API emits, which are
     /// names and patterns rather than arbitrary text. Quotes and backslashes
@@ -419,7 +443,7 @@ private struct ZoneRequest {
     init?(_ body: ByteBuffer) {
         guard let object = try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)),
             let fields = object as? [String: Any],
-            let name = fields["name"] as? String
+            let name = jsonField(fields, "name") as? String
         else { return nil }
         // Upstream's validation, and each rule is one an operator can hit by
         // accident: the root zone would make this gateway authoritative for the
@@ -432,15 +456,15 @@ private struct ZoneRequest {
         else { return nil }
 
         var records: [DNSServer.Zone.Record] = []
-        for entry in (fields["records"] as? [[String: Any]]) ?? [] {
-            guard let recordName = entry["name"] as? String, !recordName.isEmpty else { return nil }
-            let address = (entry["ip"] as? String).flatMap(IPv4Address.init)
-            let pattern = entry["regexp"] as? String
+        for entry in (jsonField(fields, "records") as? [[String: Any]]) ?? [] {
+            guard let recordName = jsonField(entry, "name") as? String, !recordName.isEmpty else { return nil }
+            let address = (jsonField(entry, "ip") as? String).flatMap(IPv4Address.init)
+            let pattern = jsonField(entry, "regexp") as? String
             guard address != nil || pattern != nil else { return nil }
             records.append(
                 DNSServer.Zone.Record(name: recordName, address: address, pattern: pattern))
         }
-        let defaultAddress = (fields["defaultIP"] as? String).flatMap(IPv4Address.init)
+        let defaultAddress = (jsonField(fields, "defaultIP") as? String).flatMap(IPv4Address.init)
         guard !records.isEmpty || defaultAddress != nil else { return nil }
         zone = DNSServer.Zone(name: trimmed, records: records, defaultAddress: defaultAddress)
     }
@@ -672,9 +696,10 @@ private struct ExposeRequest {
     init?(_ body: ByteBuffer) {
         guard let object = try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)),
             let fields = object as? [String: Any],
-            let local = fields["local"] as? String, let remote = fields["remote"] as? String
+            let local = jsonField(fields, "local") as? String,
+            let remote = jsonField(fields, "remote") as? String
         else { return nil }
-        let transport = ForwardTransport(rawValue: (fields["protocol"] as? String) ?? "tcp")
+        let transport = ForwardTransport(rawValue: (jsonField(fields, "protocol") as? String) ?? "tcp")
         guard let transport else { return nil }
         self.transport = transport
 
@@ -725,9 +750,9 @@ private struct UnexposeRequest {
     init?(_ body: ByteBuffer) {
         guard let object = try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)),
             let fields = object as? [String: Any],
-            let local = fields["local"] as? String
+            let local = jsonField(fields, "local") as? String
         else { return nil }
-        guard let transport = ForwardTransport(rawValue: (fields["protocol"] as? String) ?? "tcp")
+        guard let transport = ForwardTransport(rawValue: (jsonField(fields, "protocol") as? String) ?? "tcp")
         else { return nil }
         self.transport = transport
         self.local = local

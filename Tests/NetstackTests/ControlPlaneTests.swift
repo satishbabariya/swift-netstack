@@ -659,3 +659,54 @@ private func rawProbe(_ bytes: [UInt8], to address: SocketAddress) -> RawOutcome
     close(guestSide)
     try? await group.shutdownGracefully()
 }
+
+@Test func upstreamsOwnClientLibraryWouldWorkAgainstThisGateway() async throws {
+    // Every route `pkg/client` calls, in the spelling it calls it, with the
+    // capitalisation Go's encoder produces. That is a narrow and very concrete
+    // definition of being a port: upstream's own client can drive this.
+    //
+    // Two things failed it. `/services/dhcp/leases` did not exist -- upstream
+    // serves leases at two paths and its client uses the one this did not have.
+    // And `types.Zone` carries no json tags, so Go emits `Name`, `Records`,
+    // `IP`, `DefaultIP`, while this read only lowercase keys: the client could
+    // read zones from this gateway and not write them.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    for path in ["/services/forwarder/all", "/services/dns/all", "/services/dhcp/leases"] {
+        let answer = try request("GET", path, body: nil, to: api)
+        #expect(answer.status == 200, "\(path) answered \(answer.status)")
+    }
+
+    // Go's field names, which is what the client sends.
+    let exposed = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"Local\":\":0\",\"Remote\":\"192.168.127.2:80\",\"Protocol\":\"tcp\"}", to: api)
+    #expect(exposed.status == 200, "an expose in Go's capitalisation failed: \(exposed.body)")
+    let bound = try #require(boundPort(in: exposed.body))
+
+    let zone = try request(
+        "POST", "/services/dns/add",
+        body: "{\"Name\":\"client.test.\",\"Records\":[{\"Name\":\"api\",\"IP\":\"10.4.5.6\"}]}", to: api)
+    #expect(zone.status == 200, "a zone in Go's capitalisation failed: \(zone.body)")
+    let zones = try request("GET", "/services/dns/all", body: nil, to: api)
+    #expect(zones.body.contains("10.4.5.6"), "the zone was accepted but not stored: \(zones.body)")
+
+    let withdrawn = try request(
+        "POST", "/services/forwarder/unexpose", body: "{\"Local\":\":\(bound)\"}", to: api)
+    #expect(withdrawn.status == 200)
+
+    // The floor: lowercase still works, so this is leniency added rather than
+    // one spelling swapped for another. Both are the same request to upstream.
+    let lower = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"lower.test.\",\"records\":[{\"name\":\"api\",\"ip\":\"10.7.8.9\"}]}", to: api)
+    #expect(lower.status == 200, "the documented lowercase spelling stopped working")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}

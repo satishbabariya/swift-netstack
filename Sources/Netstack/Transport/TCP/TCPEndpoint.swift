@@ -573,9 +573,22 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         backlog = 1
     }
 
-    /// Active open. The endpoint must already be bound.
+    /// Active open. Binds first if nothing has, which is what a socket does.
+    ///
+    /// The implicit bind is not a convenience: an endpoint dialling out has no
+    /// reason to care which local port it uses, and requiring the caller to
+    /// choose one makes every caller repeat the same two lines and gives each of
+    /// them a chance to pick a port already in use. The local ADDRESS is not
+    /// arbitrary in the same way -- it is this stack's own, and it is what the
+    /// peer will answer to -- so it comes from the NIC rather than from a
+    /// wildcard.
     public func connect(to address: IPv4Address, port: UInt16) throws {
-        guard let boundID, !isListening, connections.isEmpty else { throw StackError.invalidEndpointState }
+        guard !isListening, connections.isEmpty else { throw StackError.invalidEndpointState }
+        if boundID == nil {
+            guard let local = stack.nic.primaryAddress else { throw StackError.noRoute }
+            try bind(address: local, port: 0)
+        }
+        guard let boundID else { throw StackError.invalidEndpointState }
 
         // A wildcard bind has no address of its own to answer from, and the
         // checksum's pseudo-header must match the IP header's source exactly

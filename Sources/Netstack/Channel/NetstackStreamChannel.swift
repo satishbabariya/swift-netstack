@@ -288,6 +288,16 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     }
 
     private func peerClosed() {
+        // A connection that never became active ended before it began: the peer
+        // reset the SYN, or the endpoint gave up on it. That has to fail the
+        // CONNECT, not merely close the channel -- a caller waiting on the
+        // connect promise would otherwise wait forever, and the port forwarder
+        // is exactly such a caller. The first version guarded on `.active` alone
+        // and left a refused connection stuck in `.connecting` for good.
+        if state == .connecting {
+            finish(error: StackError.connectionRefused, promise: nil)
+            return
+        }
         guard state == .active else { return }
         // The peer's FIN with bytes still held is not a reason to drop them:
         // `onClosed` says no MORE will arrive, not that what arrived is void.

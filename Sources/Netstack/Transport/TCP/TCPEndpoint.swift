@@ -662,7 +662,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // `ChallengeACKBudget`.
         let actions = TCPStateMachine.receive(
             segment: segment, on: &connection.tcb, receiver: &connection.receiver, sender: &connection.sender,
-            challengeACKs: &stack.tcpChallengeACKs)
+            challengeACKs: &stack.tcpChallengeACKs,
+            timestampClockNow: timestampClock())
 
         var wantsAck = false
         var wantsDelayableAck = false
@@ -1012,6 +1013,16 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     private func seedRoundTripEstimateFromHandshake(on connection: Connection) {
         guard let sample = connection.handshake.sample(at: stack.clock.now()) else { return }
         connection.sender.measureHandshakeRoundTrip(sample)
+    }
+
+    /// The first connection's smoothed round-trip estimate, for tests.
+    ///
+    /// Exposed because RFC 7323 §4.1's claim is about the *estimate*, and the
+    /// RTO is a poor proxy for it — floored at one second, it reads the same
+    /// whether a sample was taken or not. This project has already had to be
+    /// shown that by arithmetic rather than by a failing test once.
+    var smoothedRoundTripForTesting: TimeAmount {
+        connections.values.first?.sender.smoothedRoundTrip ?? .zero
     }
 
     // MARK: - Timers

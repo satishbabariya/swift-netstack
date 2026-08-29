@@ -329,6 +329,15 @@ struct Sender {
     /// The current RTO, including any accumulated backoff.
     var retransmissionTimeout: TimeAmount { estimator.retransmissionTimeout }
 
+    /// The estimate itself, separately from the RTO computed out of it.
+    ///
+    /// The RTO is a poor observable for "was a sample taken": RFC 6298 §2.4
+    /// floors it at one second, so on a host-local path it reads the same
+    /// whether the estimator moved or not. Anything asserting that a sample was
+    /// or was not taken — Karn's tests, and RFC 7323 §4.1's timestamp sampling —
+    /// has to read this instead.
+    var smoothedRoundTrip: TimeAmount { estimator.smoothed }
+
     /// When the next zero-window probe should go out, or `nil` when this sender
     /// is not in RFC 9293 §3.8.6.1's persist condition. The caller owns the
     /// actual timer; this type only says when.
@@ -577,7 +586,10 @@ struct Sender {
     /// for a zero-window probe, which satisfies every one of §3.2's five
     /// conditions and is evidence of the opposite of loss; see the fourth
     /// condition on the duplicate branch below.
-    mutating func acknowledged(upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0, advertisedWindow: Int) -> Bool {
+    mutating func acknowledged(
+        upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0, advertisedWindow: Int,
+        echoedTimestamp: UInt32? = nil, timestampClockNow: UInt32? = nil
+    ) -> Bool {
         // As in `segmentsToTransmit`, and for the same reason. The one that
         // matters here is the `advanced == 0` return: an acknowledgement that
         // retires nothing and reopens the window is the whole point of RFC 9293
@@ -668,7 +680,18 @@ struct Sender {
         probeOutstanding = false
         let previousUna = tcb.sndUna
         tcb.sndUna = ack
-        retire(previousUna: previousUna, advanced: advanced)
+        // The timestamp round trip, in the same milliseconds `TCPEndpoint`
+        // stamps with. Only when the echo is one we could have sent: a zero
+        // echo is what a peer puts on a segment before it has heard from us,
+        // and a value ahead of our own clock is not a round trip at all.
+        var timestampSample: TimeAmount?
+        if let echo = echoedTimestamp, let now = timestampClockNow, echo != 0 {
+            let elapsed = Int64(bitPattern: UInt64(now &- echo))
+            if elapsed >= 0, elapsed < 60_000 {
+                timestampSample = .milliseconds(elapsed)
+            }
+        }
+        retire(previousUna: previousUna, advanced: advanced, timestampSample: timestampSample)
         congestionControl.acked(bytes: advanced, flightSize: flightBefore)
 
         if inFlight.isEmpty {
@@ -1187,7 +1210,7 @@ struct Sender {
 
     /// Drop the in-flight records the acknowledgement covers, take at most one
     /// RTT sample from them, and release the chunks whose bytes they were.
-    private mutating func retire(previousUna: SequenceNumber, advanced: Int) {
+    private mutating func retire(previousUna: SequenceNumber, advanced: Int, timestampSample: TimeAmount? = nil) {
         var sample: TimeAmount?
         var retired = 0
 
@@ -1227,7 +1250,24 @@ struct Sender {
             }
         }
 
-        if let sample { estimator.measure(sample) }
+        // RFC 7323 §4.1: a timestamp echo makes the measurement unambiguous, so
+        // it is taken even from an acknowledgement Karn would refuse.
+        //
+        // **This is the point of the option, not a side effect.** Karn exists
+        // because an acknowledgement of retransmitted data cannot be attributed
+        // to a transmission — and the whole cost of that is that a connection
+        // losing segments stops measuring the path exactly when the path has
+        // changed. TSecr names the transmission being acknowledged, so the
+        // ambiguity is gone and the sample is legitimate.
+        //
+        // `timestampSample` is preferred over `sample` when present rather than
+        // averaged with it: they measure the same round trip, and the timestamp
+        // one is valid in strictly more cases.
+        if let timestampSample {
+            estimator.measure(timestampSample)
+        } else if let sample {
+            estimator.measure(sample)
+        }
         trimChunks(by: advanced)
     }
 

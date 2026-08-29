@@ -1921,3 +1921,122 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     }
     fixture.drain()
 }
+
+@Test func aTimestampEchoProducesAnRttSampleFromAnAcknowledgementKarnWouldRefuse() throws {
+    // RFC 7323 §4.1, and the reason the option is worth its twelve bytes.
+    //
+    // Karn's algorithm exists because an acknowledgement of retransmitted data
+    // cannot be attributed to a transmission — and its cost is that a connection
+    // losing segments stops measuring the path at exactly the moment the path
+    // has changed. TSecr names the transmission being acknowledged, so the
+    // ambiguity is gone and the sample is legitimate.
+    //
+    // Asserted on the estimate, not on the RTO: the RTO is floored at one second
+    // and would read the same either way, which is the trap a previous task in
+    // this plan walked into and had to be shown by arithmetic rather than by a
+    // failing test.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .timestamps(value: 7000, echo: 0)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+            var ourTimestamp: UInt32 = 0
+            for option in synAck.options {
+                if case .timestamps(let value, _) = option { ourTimestamp = value }
+            }
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xaa, count: 100)))
+            let sent = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(sent.count == 1, "positive control: the write really went out")
+
+            // Force a retransmission, which is what makes the acknowledgement
+            // below ambiguous for Karn.
+            fixture.advance(by: .seconds(1))
+            let again = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(again.count == 1, "positive control: the RTO really fired")
+
+            // Now acknowledge, echoing the timestamp we stamped 400 ms ago.
+            fixture.advance(by: .milliseconds(400))
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1 + 100, flags: [.ack],
+                    options: [.timestamps(value: 9000, echo: ourTimestamp &+ 1000)]))
+            _ = fixture.drainSegments()
+
+            // Karn alone would have left the estimator untouched.
+            #expect(
+                endpoint.smoothedRoundTripForTesting != .zero,
+                "a timestamped acknowledgement is unambiguous, so it produces a sample")
+        }
+    }
+    fixture.drain()
+}
+
+
+@Test func aGuestCannotDriveTheRoundTripEstimateWithAForgedTimestampEcho() throws {
+    // The guest chooses TSecr. Nothing stops it echoing a value we never sent.
+    //
+    // Both directions are hostile. An echo far in the past claims a round trip of
+    // minutes and inflates the RTO, so a real loss goes undetected for as long as
+    // the guest likes. An echo AHEAD of our clock produces a negative elapsed
+    // time, which as an unsigned subtraction wraps to roughly 2^32 milliseconds —
+    // seven weeks — and does the same thing far more violently.
+    //
+    // This test exists because falsifying the bound changed nothing: the sample
+    // was taken and nothing looked at whether it was plausible.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .timestamps(value: 7000, echo: 0)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+            var ourTimestamp: UInt32 = 0
+            for option in synAck.options {
+                if case .timestamps(let value, _) = option { ourTimestamp = value }
+            }
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xaa, count: 100)))
+            _ = fixture.drainSegments()
+            fixture.advance(by: .milliseconds(50))
+
+            // An echo from a minute and a half ago. Never sent by us: the
+            // connection is 50 ms old.
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1 + 100, flags: [.ack],
+                    options: [.timestamps(value: 9000, echo: ourTimestamp &- 90_000)]))
+            _ = fixture.drainSegments()
+            // Not zero: this acknowledgement is unambiguous for Karn too, so a
+            // legitimate 50 ms sample was taken from the send time. What matters
+            // is that the FORGED value did not win — the estimate reflects the
+            // real round trip, not the ninety seconds the guest claimed.
+            #expect(
+                endpoint.smoothedRoundTripForTesting < .seconds(1),
+                "an implausible echo must not be believed: \(endpoint.smoothedRoundTripForTesting)")
+
+            // And one from the future, which wraps to an enormous elapsed time.
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xbb, count: 100)))
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1 + 200, flags: [.ack],
+                    options: [.timestamps(value: 9100, echo: ourTimestamp &+ 90_000)]))
+            _ = fixture.drainSegments()
+            #expect(
+                endpoint.smoothedRoundTripForTesting < .seconds(1),
+                "an echo ahead of our own clock is not a round trip: \(endpoint.smoothedRoundTripForTesting)")
+        }
+    }
+    fixture.drain()
+}

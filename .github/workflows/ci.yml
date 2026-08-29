@@ -54,6 +54,13 @@ jobs:
       # Deletes each guard in `scripts/guards.tsv` and requires that the named
       # test notices. Guards drift out from under their tests as code around
       # them changes, and nothing else here would say so.
+      # The design conventions this package rests on: no locks, no direct clock
+      # reads, no printing from a library, and the TCP state machine staying
+      # behind its own surface. Cheap, and each was true when written and is
+      # only true now because something checks.
+      - name: Check the conventions
+        run: ./scripts/conventions.sh
+
       - name: Falsify the guards
         run: ./scripts/falsify.sh --all
 

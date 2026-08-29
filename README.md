@@ -270,11 +270,16 @@ a ping that works badly beats a network that fails to start.
 
 Every packet, timer, and endpoint state transition runs on a single
 `EventLoop`. There are no locks anywhere in `Sources/Netstack` except one, in the
-test-only `ManualClock`. That is a convention rather than a guarantee: nothing
-fails if someone adds a lock, and the absence is checked by reading rather than
-by a test. It is worth saying plainly, because a claim of structural safety that
-is really a discipline is exactly the kind of thing that stops the next reader
-checking.
+test-only `ManualClock`.
+
+That used to be a convention checked by reading, and this file used to say so.
+Reading missed a second lock that had appeared in `WireBootstrap` — in a package
+whose entire concurrency design is that there are none. `scripts/conventions.sh`
+checks it now, along with three others that were equally true when written: no
+direct clock reads outside `NetstackClock`, nothing in a library writing to the
+process's own output, and the TCP state machine staying behind a named surface.
+CI runs it. A convention nothing enforces is a convention until somebody is
+busy.
 
 The stack is deliberately promiscuous and spoofing: it accepts frames addressed
 to any host and transmits from addresses it does not own. That is not a

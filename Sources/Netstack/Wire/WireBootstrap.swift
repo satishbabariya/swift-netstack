@@ -162,16 +162,26 @@ public enum WireBootstrap {
         framing: StreamFraming = .qemu
     ) -> EventLoopFuture<WireLinkEndpoint> {
         try? FileManager.default.removeItem(atPath: path)
-        let arrived = group.any().makePromise(of: WireLinkEndpoint.self)
-        let accepted = NIOLockedValueBox(false)
-        ServerBootstrap(group: group)
+        // Children pinned to one loop, the way `switchedStreamSocket` pins
+        // them, and for a reason beyond consistency: `ServerBootstrap` spreads
+        // children across the group it is given, so the "have we already taken
+        // one?" flag was shared between threads and needed a lock to be read at
+        // all.
+        //
+        // That lock was the second in `Sources/Netstack`, in a package whose
+        // whole concurrency design is that there are none -- everything is
+        // confined to an event loop instead. On one loop the flag is ordinary
+        // loop-confined state and the lock is not needed. `scripts/conventions.sh`
+        // now fails the build if another appears.
+        let loop = group.next()
+        let arrived = loop.makePromise(of: WireLinkEndpoint.self)
+        let accepted = FirstGuest()
+        ServerBootstrap(group: group, childGroup: loop)
             .serverChannelOption(.backlog, value: 1)
             .childChannelInitializer { channel in
-                let first = accepted.withLockedValue { taken -> Bool in
-                    defer { taken = true }
-                    return !taken
-                }
-                guard first else { return channel.close() }
+                // On `loop`, because the child was pinned to it.
+                guard !accepted.taken else { return channel.close() }
+                accepted.taken = true
                 return configure(
                     channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
                 ).map { link in
@@ -268,4 +278,16 @@ public enum WireBootstrap {
             return link
         }
     }
+}
+
+/// Whether the one guest this wire carries has already arrived.
+///
+/// A class rather than a captured `var` because the compiler cannot see that the
+/// closure reading it is pinned to a single loop, and `@unchecked Sendable` on
+/// exactly the terms the rest of this package uses: the safety is real and comes
+/// from loop confinement, not from anything the compiler checked. A lock here
+/// would be the second in `Sources/Netstack`, which is the thing
+/// `scripts/conventions.sh` exists to prevent.
+private final class FirstGuest: @unchecked Sendable {
+    var taken = false
 }

@@ -196,18 +196,22 @@ func play(r run) ([][]string, error) {
 	// Turn RACK off, which is a configuration difference and not a permitted
 	// divergence -- see ../README.md.
 	//
-	// This stack now HAS RACK-TLP, so the reason has changed and is worth
-	// stating precisely: turning it on here was tried, and what it found was
-	// not a disagreement about RACK. Loss detection and the reordering timer
-	// agreed frame for frame across two thousand sequences. What did not agree
-	// was WHEN the tail loss probe goes out, because both stacks cap the probe
-	// at their own retransmission timer and those timers differ -- by the same
-	// amount ../README.md already records under "The RTO disagreement, traced
-	// to a cause".
+	// This stack now HAS RACK-TLP, and the estimator disagreement that used to
+	// be blamed for this is fixed (see ../README.md, RFC 7323 Appendix G). The
+	// lift was attempted again afterwards and still does not hold, for a
+	// reason that is now precise:
 	//
-	// So this constraint is now downstream of that one. Fix the RTO
-	// disagreement and this comes off with it; leave it, and turning RACK on
-	// here reports the RTO difference wearing a probe's clothing.
+	// gVisor REPLACES its retransmission timer with the probe timer while a
+	// probe is armed -- `schedulePTO` disables `resendTimer` and
+	// `probeTimerExpired` re-enables it -- so with RACK on, the first
+	// retransmission of a flight is owned by a different timer than it is here,
+	// where both run side by side and the retransmission timer wins. Loss
+	// detection and the reordering timer agree frame for frame; what differs is
+	// which timer fires first.
+	//
+	// Adopting gVisor's structure would change when the RTO fires on every
+	// connection with RACK enabled, which is a bigger decision than parity and
+	// is not one to take by default. Recorded rather than chased.
 	recovery := tcpip.TCPRecovery(0)
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
 		return nil, fmt.Errorf("disable RACK: %s", err)

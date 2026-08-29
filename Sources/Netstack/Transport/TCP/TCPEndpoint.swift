@@ -1652,15 +1652,24 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     /// Arm, re-arm or cancel RFC 8985 §7's tail loss probe.
     private func armTailProbeTimer(on connection: Connection) {
-        guard let deadline = connection.sender.tailProbeDeadline ?? finProbeDeadline(for: connection) else {
+        let now = stack.clock.now()
+        // The sender gives an INTERVAL from now, per RFC 8985 §7.5.1: the timer
+        // is armed on a transmission or an acknowledgement, and the PTO runs
+        // from that moment rather than from when the last segment went out. The
+        // FIN half still yields a deadline, because a FIN has one send time and
+        // nothing re-arms it.
+        let delay: TimeAmount
+        if let interval = connection.sender.tailProbeInterval {
+            delay = interval
+        } else if let deadline = finProbeDeadline(for: connection) {
+            delay = deadline > now ? deadline - now : .nanoseconds(0)
+        } else {
             connection.timers.cancelTailProbe()
             return
         }
-        let now = stack.clock.now()
-        let delay = deadline > now ? deadline - now : .nanoseconds(0)
         connection.timers.scheduleTailProbe(after: delay) { [weak self, weak connection] in
             guard let self, let connection else { return }
-            if connection.sender.tailProbeDeadline == nil, self.finProbeDeadline(for: connection) != nil {
+            if connection.sender.tailProbeInterval == nil, self.finProbeDeadline(for: connection) != nil {
                 // The tail is a FIN, which the sender does not model: it tracks
                 // the byte stream, and a FIN is sequence space the endpoint owns.
                 // So the probe is the FIN again, sent through the one place FINs

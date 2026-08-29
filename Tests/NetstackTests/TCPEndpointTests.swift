@@ -1962,9 +1962,24 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
             _ = fixture.drainSegments()
 
+            // TWO writes, and the second one is why.
+            //
+            // RFC 7323 Appendix G's `ExpectedSamples` is
+            // `ceil(FlightSize / (2 * SMSS))`, and a flight of zero makes it
+            // zero -- so a sample taken by the acknowledgement that empties the
+            // flight has no gain to be applied with and is discarded. This test
+            // is about the timestamp making an AMBIGUOUS acknowledgement usable,
+            // which is a different question, so the fixture leaves something
+            // outstanding for the appendix to divide by.
             try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xaa, count: 100)))
             let sent = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
             #expect(sent.count == 1, "positive control: the write really went out")
+            // Full-sized, because Nagle holds a SHORT segment while data is
+            // outstanding -- so a hundred-byte second write leaves the flight at
+            // one segment and the fixture back where it started.
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xbb, count: 2000)))
+            let second = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(!second.isEmpty, "the second write was held: the flight is still one segment")
 
             // Force a retransmission, which is what makes the acknowledgement
             // below ambiguous for Karn.
@@ -2037,8 +2052,12 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
                 "an implausible echo must not be believed: \(endpoint.smoothedRoundTripForTesting)")
 
             // And one from the future, which wraps to an enormous elapsed time.
-            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xbb, count: 100)))
-            _ = fixture.drainSegments()
+            // Full-sized, because Nagle holds a SHORT segment while data is
+            // outstanding -- so a hundred-byte second write leaves the flight at
+            // one segment and the fixture back where it started.
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xbb, count: 2000)))
+            let second = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(!second.isEmpty, "the second write was held: the flight is still one segment")
             fixture.inject(
                 guestSegment(
                     sequence: guestISS + 1, ack: gatewayISS + 1 + 200, flags: [.ack],
@@ -2152,6 +2171,72 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
                         window: 65535))
             }
             #expect(signals.value > 0, "the refused caller was never told it could resume")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theAcknowledgementThatEmptiesTheFlightProducesNoSample() throws {
+    // RFC 7323 Appendix G's edge, and the cause of a disagreement this project
+    // carried through the whole of the TCP work.
+    //
+    // The appendix divides RFC 6298's gains by `ExpectedSamples`, which is
+    // `ceil(FlightSize / (2 * SMSS))` — and a flight of zero makes that zero, a
+    // division by zero rather than a gain of one. So the acknowledgement that
+    // retires the last outstanding segment carries no usable sample.
+    //
+    // That matters far more than it sounds, because that acknowledgement is
+    // exactly the one most likely to be inflated: it is the one that arrives
+    // after a retransmission, echoing a timestamp from a transmission the peer
+    // may never have seen. Taking it once moved this estimator from 10 ms to
+    // 259 ms on a path whose real round trip was 10 ms, and every timer derived
+    // from it landed late for the rest of the connection.
+    //
+    // The consequence is worth stating plainly rather than discovering later: a
+    // connection that sends one segment at a time and waits for each
+    // acknowledgement never updates its estimate after the handshake. gVisor
+    // behaves the same way, which is what settled it — this was found by
+    // instrumenting both estimators, after an earlier attempt reasoned from
+    // Linux's behaviour and reached a conclusion that did not describe gVisor at
+    // all.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .timestamps(value: 7000, echo: 0)]))
+            let synAck = try #require(fixture.drainSegments().first).header
+            var ourTimestamp: UInt32 = 0
+            for option in synAck.options {
+                if case .timestamps(let value, _) = option { ourTimestamp = value }
+            }
+            // The handshake has to TAKE time for it to seed anything: a
+            // zero-length sample is discarded, and the assertion below would
+            // then be comparing nothing with nothing.
+            fixture.advance(by: .milliseconds(10))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+            let afterHandshake = endpoint.smoothedRoundTripForTesting
+            #expect(afterHandshake != .zero, "positive control: the handshake seeded the estimator")
+
+            try endpoint.send(ByteBuffer(bytes: Array(repeating: 0xaa, count: 100)))
+            _ = fixture.drainSegments()
+
+            // A full second later — a sample twenty-five times the handshake's,
+            // and the only segment outstanding.
+            fixture.advance(by: .seconds(1))
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1 + 100, flags: [.ack],
+                    options: [.timestamps(value: 9000, echo: ourTimestamp &+ 1000)]))
+            _ = fixture.drainSegments()
+
+            #expect(
+                endpoint.smoothedRoundTripForTesting == afterHandshake,
+                "the acknowledgement that emptied the flight moved the estimate")
         }
     }
     fixture.drain()

@@ -430,6 +430,31 @@ func play(r run) ([][]string, error) {
 			settle()
 		}
 
+		// TEMPORARY DIAGNOSTIC. gVisor's own view of its retransmission timer,
+		// per step, on stderr so it cannot disturb the JSON on stdout.
+		//
+		// This is the tool ../README.md names for the residual RTO
+		// disagreement: reasoning about which stack arms what against which
+		// instant has produced one wrong answer already ("Linux clears the
+		// backoff, so gVisor must"), and the estimator is a thing that can
+		// simply be asked.
+		if path := os.Getenv("NETSTACK_HARNESS_RTO"); path != "" {
+			// A FILE rather than stderr: the Swift side owns the harness's
+			// pipes, and a diagnostic that goes somewhere the caller has
+			// already redirected is a diagnostic nobody reads.
+			if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				for _, ep := range accepted {
+					var info tcpip.TCPInfoOption
+					if tcpErr := ep.GetSockOpt(&info); tcpErr == nil {
+						fmt.Fprintf(
+							f, "RTO step=%d now=%v rto=%v rtt=%v rttvar=%v\n",
+							i, clock.NowMonotonic(), info.RTO, info.RTT, info.RTTVar)
+					}
+				}
+				f.Close()
+			}
+		}
+
 		emitted := link.TakeEmitted()
 		steps[i] = make([]string, len(emitted))
 		for j, frame := range emitted {

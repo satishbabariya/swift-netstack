@@ -933,7 +933,9 @@ struct Sender {
                 timestampSample = .milliseconds(elapsed)
             }
         }
-        retire(previousUna: previousUna, advanced: advanced, timestampSample: timestampSample)
+        retire(
+            previousUna: previousUna, advanced: advanced, timestampSample: timestampSample,
+            timestampsInUse: tcb.timestampsEnabled)
         // After retirement, because retirement is where this acknowledgement's
         // round-trip sample is taken and RACK's window is a fraction of the
         // smallest one seen. Run before it, the window on the first
@@ -1830,7 +1832,10 @@ struct Sender {
 
     /// Drop the in-flight records the acknowledgement covers, take at most one
     /// RTT sample from them, and release the chunks whose bytes they were.
-    private mutating func retire(previousUna: SequenceNumber, advanced: Int, timestampSample: TimeAmount? = nil) {
+    private mutating func retire(
+        previousUna: SequenceNumber, advanced: Int, timestampSample: TimeAmount? = nil,
+        timestampsInUse: Bool = false
+    ) {
         var sample: TimeAmount?
         var retired = 0
 
@@ -1892,12 +1897,45 @@ struct Sender {
         // `timestampSample` is preferred over `sample` when present rather than
         // averaged with it: they measure the same round trip, and the timestamp
         // one is valid in strictly more cases.
-        if let timestampSample {
-            estimator.measure(timestampSample)
-            noteRoundTrip(timestampSample)
-        } else if let sample {
-            estimator.measure(sample)
-            noteRoundTrip(sample)
+        //
+        // ## RFC 7323 Appendix G, and it applies to BOTH samples
+        //
+        // Once timestamps are in use, a usable measurement arrives with every
+        // acknowledgement rather than once per round trip -- and that is true of
+        // the Karn-timed sample as well, because the connection is producing
+        // acknowledgements at the same rate either way. RFC 6298's α = 1/8 and
+        // β = 1/4 are chosen for one sample per round trip, so the appendix
+        // divides both by the number expected in one, approximated as half the
+        // flight.
+        //
+        // **And the sample is discarded outright when nothing is left
+        // outstanding.** The appendix's `ExpectedSamples` is
+        // `ceil(FlightSize / (2 * SMSS))`, and a flight of zero makes that zero
+        // -- a division by zero, not a gain of one.
+        //
+        // That edge is what produced the residual disagreement this project
+        // carried for the whole of the TCP work. The acknowledgement that
+        // retires the last outstanding segment is exactly the one whose sample
+        // is the full backed-off timeout; taking it moved this estimate from
+        // 10 ms to 259 ms while gVisor's stayed at 10, and every retransmission
+        // timed against it landed a step late. Both estimators were instrumented
+        // rather than reasoned about, which is how it was found -- the previous
+        // attempt reasoned, and reached a conclusion about Linux that turned out
+        // not to describe gVisor at all.
+        //
+        // The flight is read AFTER retirement, which is what "still outstanding"
+        // means and what gVisor's `s.Outstanding` holds at the same point.
+        let chosen = timestampSample ?? sample
+        if let chosen {
+            if timestampsInUse {
+                if !inFlight.isEmpty {
+                    let expected = max(1, Int((Double(inFlight.count) / 2).rounded(.up)))
+                    estimator.measure(chosen, expectedSamples: expected)
+                }
+            } else {
+                estimator.measure(chosen)
+            }
+            noteRoundTrip(chosen)
         }
         trimChunks(by: advanced)
     }

@@ -150,3 +150,36 @@ import Testing
     #expect(answered.first?.header.flags.contains(.rst) == true, "with a reset, because nothing is listening")
     fixture.drain()
 }
+
+@Test func aForwarderAcceptsManyConnectionsToTheSameDestinationPort() throws {
+    // The defect this catches made the forwarder useless for its actual job.
+    //
+    // `accept` used to `bind` each new endpoint to the destination port, and
+    // that registration is the exclusive wildcard key `(local, port, any, 0)`.
+    // The first connection to port 8080 took it; every later one failed with
+    // `portInUse` inside `complete()`. A browser opens six connections to the
+    // same host and port, so this was not an edge case — it was every real
+    // workload, failing in the quietest possible way: `complete()` threw, the
+    // request was already consumed, and the connection simply never appeared.
+    //
+    // It surfaced from an accept-backpressure test one layer up that asked for
+    // its second connection and got nothing back.
+    let fixture = TCPFixture()
+    var accepted: [TCPEndpoint] = []
+    let forwarder = TCPForwarder(stack: fixture.stack) { request in
+        if let endpoint = try? request.complete() { accepted.append(endpoint) }
+    }
+    try withExtendedLifetime(forwarder) {
+        for peerPort in UInt16(50001)...UInt16(50006) {
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: peerPort))
+        }
+        #expect(accepted.count == 6, "connections after the first were refused by our own port table")
+        // Each was answered, and answered separately: six SYN-ACKs, not one
+        // endpoint quietly serving six four-tuples.
+        let synAcks = fixture.drainSegments().filter { $0.header.flags.contains(.syn) }
+        #expect(synAcks.count == 6)
+        #expect(Set(synAcks.map(\.header.destinationPort)).count == 6)
+    }
+    accepted.removeAll()
+    fixture.drain()
+}

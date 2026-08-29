@@ -178,8 +178,10 @@ public final class TCPForwarder {
     ) throws -> TCPEndpoint {
         inFlight.removeValue(forKey: id)
         let endpoint = TCPEndpoint(stack: stack, initialSequenceNumbers: stack.initialSequenceNumbers)
-        try endpoint.bind(address: header.destination, port: request.destinationPort)
-        try endpoint.listen(backlog: 1)
+        // Deliberately not `bind` + `listen`: see
+        // `listenForForwardedConnection`. Binding would cap this forwarder at
+        // one live connection per destination port.
+        endpoint.listenForForwardedConnection()
         endpoints[id] = endpoint
         // Replay the SYN into the endpoint now that it exists. The endpoint has
         // not seen it -- the forwarder consumed it to build this request -- and

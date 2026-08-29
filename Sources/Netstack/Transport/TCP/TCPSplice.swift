@@ -46,6 +46,12 @@ public final class TCPSplice {
     private func wire() {
         a.onData = { [weak self] in self?.pump(from: .a) }
         b.onData = { [weak self] in self?.pump(from: .b) }
+        // Note the crossing: `a` becoming writable is what unblocks the side
+        // reading from `b`. The signal is about the sink, the pump is named for
+        // the source, and wiring these straight through -- which reads more
+        // naturally -- makes each side retry the buffer it is not holding.
+        a.onWritable = { [weak self] in self?.pump(from: .b) }
+        b.onWritable = { [weak self] in self?.pump(from: .a) }
         a.onClosed = { [weak self] in self?.closeBoth() }
         b.onClosed = { [weak self] in self?.closeBoth() }
     }

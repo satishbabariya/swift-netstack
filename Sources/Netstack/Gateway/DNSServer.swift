@@ -72,6 +72,12 @@ public final class DNSServer: @unchecked Sendable {
     public private(set) var answeredLocally = 0
     public private(set) var forwarded = 0
     public private(set) var refusedForLimit = 0
+
+    /// Queries refused for want of anywhere to forward them. Separate from
+    /// `refusedForLimit` because they mean different things: one is a gateway
+    /// with no resolver configured, the other is a guest asking faster than one
+    /// can answer.
+    public private(set) var refusedForNoUpstream = 0
     public private(set) var unmatchedReplies = 0
 
     public static let port: UInt16 = 53
@@ -155,6 +161,7 @@ public final class DNSServer: @unchecked Sendable {
 
     private func forward(_ query: DNSQuery, payload: ByteBuffer, to source: IPv4Address, port: UInt16) {
         guard let channel = upstreamChannel, let server = upstream.first else {
+            refusedForNoUpstream += 1
             refuse(query, payload: payload, to: source, port: port)
             return
         }

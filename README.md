@@ -70,9 +70,16 @@ to the gateway and something has to be bound for those datagrams to reach.
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding |
 
-**Not yet implemented:** keepalives, CUBIC, RACK-TLP, IPv6, ICMP forwarding
-(a guest can ping the gateway but not through it), and the HTTP control plane
+**Not yet implemented:** CUBIC, RACK-TLP, IPv6, and the HTTP control plane
 upstream exposes for managing forwards at runtime.
+
+**One behaviour worth knowing before you trust it:** a ping *through* the
+gateway is answered *by* the gateway, for any address at all. A guest that pings
+8.8.8.8 gets a reply whether or not 8.8.8.8 is reachable, so `ping` is a test of
+the guest's own stack rather than of the path. This matches upstream's default —
+gVisor's stack does the same — and upstream's alternative is a separate mode
+that proxies echo through an unprivileged ICMP socket, which is not implemented
+here.
 
 ## Design
 

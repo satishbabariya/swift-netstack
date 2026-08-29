@@ -115,8 +115,14 @@ private func transferHarness() throws -> TransferHarness {
     try endpoint.listen(backlog: 8)
 
     let application = TransferApplicationState()
-    endpoint.onData = { buffer in
-        application.deliveries.append(TransferDelivery(bytes: buffer.readableBytes, at: clock.now()))
+    // Reads immediately, which is what every vector written before backpressure
+    // assumed the stack did on the application's behalf. A harness that did not
+    // read would shrink the advertised window and change every `win` in every
+    // scenario — a different test, not the same one.
+    endpoint.onData = { [weak endpoint] in
+        guard let endpoint else { return }
+        let taken = endpoint.read()
+        application.deliveries.append(TransferDelivery(bytes: taken.readableBytes, at: clock.now()))
     }
     endpoint.onClosed = { application.closedReports += 1 }
 
@@ -329,11 +335,17 @@ private let closeVectors = "tcp-close"
 
 @Test func sequenceNumbersThatWrapAreComparedSeriallyAndNotAsIntegers() throws {
     let harness = try runTransferScenario(dataVectors, "sequence-wrap")
-    // Ninety-five bytes up to the wrap, then the fifty that were queued past
-    // it, released by the same segment — 145 bytes in one delivery pass. Under
-    // integer order the queued fifty were never admitted at all, so this reads
-    // `[95]`, which is the half the wire line cannot show as sharply.
-    #expect(harness.application.deliveries.map(\.bytes) == [95, 50])
+    // Ninety-five bytes up to the wrap, then the fifty that were queued past it,
+    // released by the same segment. **One delivery of 145, not two of 95 and 50**
+    // — `onData` is a readiness signal fired once per batch of arriving segments
+    // now, and the application reads whatever the buffer holds. Segment
+    // boundaries do not survive above the stack and should not: the application
+    // reads a byte count, not a segment list.
+    //
+    // The number is what matters here and it is unchanged. Under integer order
+    // the queued fifty were never admitted at all, so this reads `[95]` — the
+    // half the wire line cannot show as sharply.
+    #expect(harness.application.deliveries.map(\.bytes) == [145])
 }
 
 @Test func anRttSampleAboveTheFloorSetsTheRtoTheRetransmissionIsThenTimedBy() throws {

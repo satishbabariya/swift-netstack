@@ -97,7 +97,13 @@ private final class DiffTarget {
             close: { endpoint.close() })
         self.failures = failures
 
-        endpoint.onData = { [weak self] buffer in self?.deliveredBytes += buffer.readableBytes }
+        // Reads on every signal. `onData` is a readiness notification now, and
+        // a differential target that never read would advertise a shrinking
+        // window and stop the peer — measuring backpressure instead of TCP.
+        endpoint.onData = { [weak self, weak endpoint] in
+            guard let endpoint else { return }
+            self?.deliveredBytes += endpoint.read().readableBytes
+        }
     }
 
     /// Application calls this stack refused.

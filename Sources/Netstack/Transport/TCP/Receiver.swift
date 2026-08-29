@@ -273,7 +273,9 @@ struct Receiver {
         let filledAGap = delivered.count > 1
         let ackMayBeDelayed = !outOfOrder && !filledAGap && !finReached
 
-        let window = advertisedWindow(offered: offered, consumed: consumed, maximum: tcb.rcvWndMax, scale: tcb.rcvWindScale)
+        let window = advertisedWindow(
+            offered: offered, consumed: consumed, maximum: tcb.rcvWndMax, scale: tcb.rcvWindScale,
+            held: tcb.heldBytes)
         tcb.rcvWnd = Int(window) << Int(tcb.rcvWindScale)
 
         // Every segment that occupies sequence space is acknowledged: in order,
@@ -372,9 +374,14 @@ struct Receiver {
     /// handshake could actually have put on the wire, which is the edge the
     /// peer was really given. Rounding it up instead would let the first
     /// advertisement exceed `rcvWndMax` and defeat that cap.
-    private func advertisedWindow(offered: Int, consumed: Int, maximum: Int, scale: UInt8) -> UInt16 {
+    private func advertisedWindow(offered: Int, consumed: Int, maximum: Int, scale: UInt8, held: Int) -> UInt16 {
         let shift = Int(scale)
-        let free = reassembler.availableBytes
+        // What the reassembler can take, less what the application has not yet
+        // read. Before the endpoint held anything this was the whole story and
+        // the window never moved; now a connection whose reader has stopped
+        // advertises less, and eventually zero, which is the entire point of
+        // having a buffer at all.
+        let free = max(0, reassembler.availableBytes - held)
         let floor = max(0, (offered >> shift) - (consumed >> shift))
         let ceiling = max(0, min(free, maximum)) >> shift
         return UInt16(min(max(floor, ceiling), Self.maximumUnscaledWindow))

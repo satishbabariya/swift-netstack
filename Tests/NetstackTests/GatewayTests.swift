@@ -421,3 +421,144 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+/// Whether this machine lets an unprivileged process open an ICMP socket.
+///
+/// macOS and Linux normally do; a sandbox may not. Where it does not, the
+/// forwarder declines every request and the gateway answers locally -- which is
+/// the documented fallback, and means the assertions about real reachability
+/// have nothing to say rather than something wrong to say.
+private func unprivilegedICMPIsAvailable() -> Bool {
+    let fd = socket(AF_INET, SOCK_DGRAM, Int32(IPPROTO_ICMP))
+    guard fd >= 0 else { return false }
+    close(fd)
+    return true
+}
+
+private func gwEchoRequest(from source: IPv4Address, to destination: IPv4Address, identifier: UInt16, sequence: UInt16) -> [UInt8] {
+    let allocator = ByteBufferAllocator()
+    var message = ByteBuffer()
+    message.writeInteger(UInt8(8))
+    message.writeInteger(UInt8(0))
+    message.writeInteger(UInt16(0))
+    message.writeInteger(identifier, endianness: .big)
+    message.writeInteger(sequence, endianness: .big)
+    message.writeBytes([UInt8](repeating: 0x61, count: 32))
+    let checksum = message.readableBytesView.withUnsafeBytes { Checksum.compute($0) }
+    message.setInteger(checksum, at: message.readerIndex + 2, endianness: .big)
+
+    var packet = PacketBuffer(allocator: allocator, payload: message)
+    IPv4Header(
+        source: source, destination: destination, protocolNumber: .icmp,
+        payloadLength: message.readableBytes
+    ).prepend(to: &packet)
+    EthernetHeader(
+        destination: MACAddress("5a:94:ef:e4:0c:ee")!, source: gwGuestMAC, etherType: .ipv4
+    ).prepend(to: &packet)
+    return Array(packet.frame.readableBytesView)
+}
+
+/// The first ICMP echo reply to arrive, if one does.
+private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identifier: UInt16)? {
+    for _ in 0..<300 {
+        var back = [UInt8](repeating: 0, count: 4096)
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        if read > 0 {
+            var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
+            guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,
+                let ip = IPv4Header.parse(&packet), ip.protocolNumber == .icmp,
+                let icmp = ICMPv4Header.parse(&packet), icmp.type == .echoReply
+            else { continue }
+            return (ip.source, icmp.identifier ?? 0)
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return nil
+}
+
+@Test func aPingToTheGatewayIsAnsweredByTheGatewayAndOneToTheHostIsSentForReal() async throws {
+    // Before this, the gateway answered every echo request itself, for any
+    // address at all -- so a guest that pinged 8.8.8.8 got a reply whether or
+    // not 8.8.8.8 was reachable, and ping stopped being a reachability test.
+    //
+    // Two addresses, two behaviours, and the difference is the point: the
+    // gateway's own address is the router answering a question about itself, and
+    // the host address is translated and sent for real.
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let configuration = Gateway.Configuration()
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: configuration
+    ).get()
+
+    // The router answers for itself, whether or not ICMP sockets are available.
+    _ = gwEchoRequest(
+        from: IPv4Address("192.168.127.2")!, to: configuration.gatewayAddress, identifier: 0x1111,
+        sequence: 1
+    ).withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    let local = await gwAwaitEchoReply(pair[1])
+    #expect(local?.source == configuration.gatewayAddress, "the gateway did not answer a ping to itself")
+    #expect(local?.identifier == 0x1111, "the reply did not carry the guest's identifier")
+
+    if unprivilegedICMPIsAvailable() {
+        // The host address is translated to loopback, which is reachable, so
+        // this one comes back from a real ping.
+        _ = gwEchoRequest(
+            from: IPv4Address("192.168.127.2")!, to: configuration.hostAddress, identifier: 0x2222,
+            sequence: 2
+        ).withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+        let host = await gwAwaitEchoReply(pair[1])
+        #expect(host?.source == configuration.hostAddress, "the host did not answer a real ping")
+        // The identifier is the guest's, not whatever the kernel chose: Linux
+        // rewrites it on an unprivileged socket, and a guest whose ping came
+        // back with a different one would not match it to anything it sent.
+        #expect(host?.identifier == 0x2222, "the reply carried the kernel's identifier")
+
+        let forwarded = try await gateway.eventLoop.submit { gateway.icmp.forwarded }.get()
+        #expect(forwarded == 1, "the host ping was answered locally rather than sent")
+    }
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}
+
+@Test func aPingToAnUnreachableAddressGoesUnansweredRatherThanFaked() async throws {
+    // The behaviour that makes ping worth anything. A reply from an address
+    // nothing is at is worse than no reply: it is a wrong answer to the one
+    // question ping asks.
+    guard unprivilegedICMPIsAvailable() else { return }
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group,
+        // A second of patience, so the test does not wait out the default five.
+        configuration: .init()
+    ).get()
+
+    // 192.0.2.0/24 is TEST-NET-1, reserved for documentation and routed
+    // nowhere.
+    _ = gwEchoRequest(
+        from: IPv4Address("192.168.127.2")!, to: IPv4Address("192.0.2.1")!, identifier: 0x3333,
+        sequence: 3
+    ).withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+
+    var sawReply = false
+    for _ in 0..<40 where !sawReply {
+        if await gwAwaitEchoReply(pair[1]) != nil { sawReply = true }
+        break
+    }
+    #expect(!sawReply, "an unreachable address appeared to answer")
+
+    let counts = try await gateway.eventLoop.submit {
+        (gateway.icmp.forwarded, gateway.icmp.declined)
+    }.get()
+    #expect(counts.0 == 1, "the request was not forwarded")
+    #expect(counts.1 == 0, "the request was declined rather than sent")
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

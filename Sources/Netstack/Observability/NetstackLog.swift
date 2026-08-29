@@ -30,6 +30,8 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case udpRefusedByLimit
     /// A guest datagram to a link-local address, dropped.
     case udpRefusedLinkLocal
+    /// An echo request dropped because too many were already in flight.
+    case icmpRefusedByLimit
     /// A query this gateway does not own, with nowhere configured to send it.
     case dnsRefusedNoUpstream
     /// A query dropped because too many were already outstanding.

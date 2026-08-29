@@ -179,6 +179,9 @@ public final class Gateway: @unchecked Sendable {
     public let dns: DNSServer
     public let tcp: OutboundTCPForwarder
     public let udp: UDPForwarder
+    /// Sends guests' pings for real. See `ICMPForwarder` for why the gateway
+    /// answering them itself is not good enough.
+    public let icmp: ICMPForwarder
     /// The bounded logger every part of this gateway reports through. Public so
     /// an embedder assembling extra pieces can share the same window rather
     /// than opening a second, unbounded one alongside it.
@@ -204,7 +207,7 @@ public final class Gateway: @unchecked Sendable {
 
     private init(
         link: GatewayLink, stack: Stack, dhcp: DHCPServer, dns: DNSServer,
-        tcp: OutboundTCPForwarder, udp: UDPForwarder,
+        tcp: OutboundTCPForwarder, udp: UDPForwarder, icmp: ICMPForwarder,
         keepAlive: TCPEndpoint.KeepAliveConfiguration?, log: RateLimitedLogger,
         notifications: NotificationSender?
     ) {
@@ -217,6 +220,7 @@ public final class Gateway: @unchecked Sendable {
         self.dns = dns
         self.tcp = tcp
         self.udp = udp
+        self.icmp = icmp
     }
 
     /// Start on an already-connected datagram socket -- the descriptor
@@ -355,6 +359,9 @@ public final class Gateway: @unchecked Sendable {
             let udp = UDPForwarder(
                 stack: stack, maximumFlows: configuration.maximumUDPFlows, nat: configuration.nat,
                 allowsLinkLocal: configuration.allowsLinkLocal)
+            let icmp = ICMPForwarder(
+                stack: stack, nat: configuration.nat,
+                allowsLinkLocal: configuration.allowsLinkLocal)
 
             // One limiter shared by every part, not one each. Nine components
             // with a window apiece would let a guest that can drive several
@@ -377,8 +384,9 @@ public final class Gateway: @unchecked Sendable {
             dns.log = log
             tcp.log = log
             udp.log = log
+            icmp.log = log
             return Gateway(
-                link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp,
+                link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp, icmp: icmp,
                 keepAlive: configuration.keepAlive, log: log, notifications: notifications)
         }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in
             gateway.dns.startForwarding(group: group).map { _ in gateway }

@@ -40,14 +40,28 @@ import Testing
 // MiB of 1400-byte segments through the whole gateway to a real loopback
 // listener.
 //
-// **A good part of that 0.43 s is this test, not the stack.** It builds every
-// frame in Swift and makes one `send` syscall per segment: twenty-four thousand
-// syscalls, serialised with the work being measured on a single thread. So the
-// stack's own share is higher than the figure, and the figure is the one worth
-// tracking anyway, because it is what a caller doing the same thing would see.
-// Anyone chasing the gap should profile before optimising rather than assume the
-// syscalls dominate — that assumption is exactly the shape this project has been
-// wrong about before.
+// **Most of that time is syscalls, and that is measured rather than assumed.**
+// This note first said "profile before optimising rather than assume the
+// syscalls dominate"; the profile was then run, and they do. `sample` over a
+// 1.5 GB run, by top of stack:
+//
+// ```
+// write     2146      TCPHeader.serialize   101
+// sendto    1855      TCPHeader.parse        70
+// recvfrom  1355
+// read       750
+// ```
+//
+// The stack's own header work is around two per cent of what the socket calls
+// cost. So this measures the harness at least as much as the stack — one `send`
+// per 1400-byte segment, serialised with the work being measured on a single
+// thread — and the figure is still the one worth tracking, because it is what a
+// caller doing the same thing would see.
+//
+// `swift_beginAccess` and `AccessSet::insert` together take another 207 samples,
+// which is exclusivity checking that a plain release build does not do: this has
+// to be built with `-enable-testing` to reach `@testable` internals, so even the
+// release figure is conservative.
 
 private let benchGuest = IPv4Address("192.168.127.2")!
 private let benchGateway = IPv4Address("192.168.127.1")!
@@ -147,7 +161,12 @@ private func benchFrame(
     // Bulk. One MSS-sized segment per frame, with a window the gateway's own
     // receive buffer will bound long before this does.
     let payloadSize = 1400
-    let total = 32 * 1024 * 1024
+    // Configurable, because 32 MiB finishes in under half a second in a release
+    // build -- too fast to attach a sampling profiler to, which is the first
+    // thing anyone chasing the number will want to do.
+    let total =
+        (ProcessInfo.processInfo.environment["NETSTACK_THROUGHPUT_MB"].flatMap(Int.init) ?? 32)
+        * 1024 * 1024
     var payload = ByteBufferAllocator().buffer(capacity: payloadSize)
     payload.writeBytes([UInt8](repeating: 0x5a, count: payloadSize))
     var sequence = guestISS + 1

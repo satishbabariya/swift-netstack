@@ -363,23 +363,35 @@ private struct DiffGenerator {
 
         // --- Prologue: a handshake, then one in-order full segment.
         //
-        // The SYN offers `mss` and `wscale`, and deliberately NOT `sackOK`.
+        // The SYN offers `mss`, `wscale` and `timestamp`, and deliberately NOT
+        // `sackOK` — but the reason has changed, and so has what it will take to
+        // lift it.
         //
-        // gVisor mirrors its peer's options — it offers back exactly what the
-        // SYN offered, and no configuration makes it omit one — so an option
-        // this stack does not implement would put a difference on the SYN-ACK
-        // of every single sequence. `wscale` used to be such an option and is
-        // not any more: both stacks now negotiate and apply it, so offering it
-        // is what puts scaled windows under comparison rather than leaving that
-        // path untested. `sackOK` still is one: nothing here acts on a SACK
-        // block, so gVisor would send blocks into a stack that ignores them.
+        // gVisor mirrors its peer's options and no configuration makes it omit
+        // one, so an option this stack did not implement would put a difference
+        // on the SYN-ACK of every sequence. That is why the generator withholds
+        // options rather than the comparison permitting divergences: a permitted
+        // divergence is a hole in the instrument that stays open, and a
+        // generator constraint is lifted by the task that implements the option.
         //
-        // That asymmetry is the point of having made this a *generator*
-        // constraint rather than a permitted divergence. A permitted divergence
-        // is a hole in the instrument that stays open; a generator constraint
-        // is lifted, one option at a time, by the task that implements the
-        // option. This is `wscale`'s lift. `sackOK`'s belongs to whoever
-        // implements SACK.
+        // This stack now implements SACK's RECEIVER half: it negotiates the
+        // option and reports what it holds out of order. The lift was attempted
+        // on that basis and has to wait, because the two halves are not
+        // separable at this seam. With `sackOK` on, gVisor's SENDER switches to
+        // SACK-based recovery, and on the third duplicate acknowledgement the
+        // two stacks make different choices about what to put on the wire —
+        // this stack inflates cwnd by RFC 5681 §3.2 and sends, gVisor computes
+        // `pipe` by RFC 6675 and does not. That is a genuine behavioural
+        // difference in a path this comparison exists to cover, not an option
+        // mismatch to be normalised away.
+        //
+        // The attempt was not wasted: run against gVisor, it found four defects
+        // in the receiver half that the unit tests had not — data segments that
+        // overflowed the options area, a payload budget that a later
+        // retransmission could break, blocks still reported after close, and
+        // block ordering that disagreed from the second arrival onward. Each is
+        // now covered by a test here. The lift itself belongs to the task that
+        // implements RFC 6675.
         try emit(
             tcp("S", seq: guestISS, ack: nil, options: ["mss 1460", "wscale \(guestWindowScale)", "timestamp \(guestTimestamp) 0"]),
             advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow) wscale=\(guestWindowScale) ts")

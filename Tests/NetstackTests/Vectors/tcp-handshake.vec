@@ -40,19 +40,23 @@
 # scenario: passive-open
 #
 # The guest connects; the gateway accepts. The guest offers a window scale and
-# SACK; we advertise NEITHER back.
+# SACK; we answer with our own scale and accept SACK.
 #
-# `<mss 1460,wscale 3>` alone, and this is a ruling rather than an omission. Advertising
-# `wscale 7` beside `win 65535` promises the peer 8 MB against a reassembler
-# that caps at 256 KiB: it fills the pipe it was promised, we drop most of it,
-# and the connection presents as a lossy path with no error raised anywhere.
-# RFC 7323 section 2.2 makes leaving the option out the clean fix -- a scale
-# applies only if BOTH sides send it, so omitting it disables scaling in both
-# directions. `sackOK` is the same mistake one size smaller: RFC 2018 expects a
-# receiver that sent it to send SACK blocks back, and this stack discards them.
-# The guest may offer both, as the first line does; we simply do not accept.
+# `wscale 3` rather than the 7 the guest offered: the scale is not a value both
+# sides agree on, it is each side's own, and ours is derived from what the
+# reassembler can actually hold. Advertising `wscale 7` beside `win 65535`
+# would promise the peer 8 MB against a 256 KiB buffer -- it fills the pipe it
+# was promised, we drop most of it, and the connection presents as a lossy path
+# with no error raised anywhere.
+#
+# `sackOK` was once omitted here for a related reason, and the comment said so:
+# RFC 2018 expects a receiver that sent it to send SACK blocks back, and this
+# stack discarded them. It does not any more, so the option is now answered.
+# The two cases only looked alike -- the scale's problem was a promise about
+# capacity, which is still real; SACK's was an unimplemented feature, which is
+# the kind of reason that expires.
 0.000 < S  0:0(0) win 65535 <mss 1460,wscale 7,sackOK>
-0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460,wscale 3>
+0.000 > S. 1000:1000(0) ack 1 win 65535 <mss 1460,wscale 3,sackOK>
 # The handshake's third leg. It acknowledges our SYN and occupies no sequence
 # space, so it draws nothing back: two peers that acknowledged each other's
 # acknowledgements would never stop. The runner reports any frame this file
@@ -132,7 +136,7 @@
 # behaviour to give those bits and RFC 3168 section 6.1.1 has a non-ECN server
 # answer an ECN-setup SYN exactly this way.
 0.000 < SEW 0:0(0) win 65535 <mss 1460,sackOK>
-0.000 > S.  1000:1000(0) ack 1 win 65535 <mss 1460>
+0.000 > S.  1000:1000(0) ack 1 win 65535 <mss 1460,sackOK>
 0.010 < .   1:1(0) ack 1001 win 512
 
 

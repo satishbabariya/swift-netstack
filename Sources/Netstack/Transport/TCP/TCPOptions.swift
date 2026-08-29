@@ -9,6 +9,15 @@ import NIOCore
 /// peer is free to send options we know nothing about — so parsing records
 /// that one was there (by kind) rather than aborting or silently dropping
 /// it.
+/// One selectively acknowledged range, half-open: `right` is the sequence
+/// number just past the last byte, exactly as it goes on the wire.
+struct SACKBlock: Equatable, Sendable {
+    var left: SequenceNumber
+    var right: SequenceNumber
+
+    var length: Int { right - left }
+}
+
 enum TCPOption: Equatable, Sendable {
     case maximumSegmentSize(UInt16)
     /// Shift count. When this comes from `TCPOptionCodec.parse` it is at
@@ -16,6 +25,12 @@ enum TCPOption: Equatable, Sendable {
     /// not get to choose a larger one.
     case windowScale(UInt8)
     case sackPermitted
+    /// Selectively acknowledged ranges, each `[left, right)`. RFC 2018 §3
+    /// allows at most four in a 40-byte options area, and fewer once anything
+    /// else is present -- `TCPOptionCodec.maximumSackBlocks(alongside:)` is
+    /// what decides, rather than a constant that would be wrong the day a
+    /// timestamp joined them.
+    case selectiveAcknowledgement([SACKBlock])
     case timestamps(value: UInt32, echo: UInt32)
     case unknown(kind: UInt8)
 }
@@ -31,6 +46,7 @@ enum TCPOptionCodec {
     private static let maximumSegmentSizeKind: UInt8 = 2
     private static let windowScaleKind: UInt8 = 3
     private static let sackPermittedKind: UInt8 = 4
+    private static let sackKind: UInt8 = 5
     private static let timestampsKind: UInt8 = 8
 
     /// The largest window scale this stack will honour from a peer. RFC 7323
@@ -100,6 +116,19 @@ enum TCPOptionCodec {
             case sackPermittedKind:
                 guard valueLength == 0 else { return nil }
                 options.append(.sackPermitted)
+            case sackKind:
+                // Two 32-bit edges per block, so anything not a multiple of
+                // eight is malformed rather than truncatable. A zero-block
+                // option is malformed too: the option exists to carry blocks.
+                guard valueLength > 0, valueLength % 8 == 0 else { return nil }
+                var blocks: [SACKBlock] = []
+                for _ in 0..<(valueLength / 8) {
+                    guard let left = bytes.readInteger(endianness: .big, as: UInt32.self),
+                        let right = bytes.readInteger(endianness: .big, as: UInt32.self)
+                    else { return nil }
+                    blocks.append(SACKBlock(left: SequenceNumber(left), right: SequenceNumber(right)))
+                }
+                options.append(.selectiveAcknowledgement(blocks))
             case timestampsKind:
                 guard valueLength == 8,
                     let value = bytes.readInteger(endianness: .big, as: UInt32.self),
@@ -117,6 +146,30 @@ enum TCPOptionCodec {
         return options
     }
 
+    /// How many SACK blocks still fit once `others` have taken their space.
+    ///
+    /// Derived rather than fixed. RFC 2018 §3's "four blocks" is the figure for
+    /// an otherwise empty options area; a timestamp takes twelve bytes with its
+    /// own padding and drops it to three, and a constant would have been
+    /// silently wrong from the moment timestamps were negotiated. The
+    /// arithmetic: the area is 40 bytes, and the option costs `2 + 2 + 8n` --
+    /// two NOPs to align its 32-bit edges, then its kind and length.
+    static func maximumSackBlocks(alongside others: [TCPOption]) -> Int {
+        // `encode` pads its result to a word, so `used` can overstate the room
+        // the other options really take by up to three bytes. That direction is
+        // safe -- it can only reserve one block fewer than would have fit -- and
+        // the alternative is an unpadded encoder that exists solely to be
+        // measured.
+        let used = encode(others).count
+        let aligned = used + (2 + 4 - used % 4) % 4
+        let available = maximumOptionsBytes - aligned - 2 /* kind and length */
+        return max(0, min(4, available / 8))
+    }
+
+    /// The options area is what a header's four-bit data offset can address
+    /// beyond the fixed twenty bytes: (15 - 5) words.
+    static let maximumOptionsBytes = 40
+
     /// Encode options to wire bytes, padded with NOP (kind 1) to a 4-byte
     /// boundary — the header's data offset is in 32-bit words, so the
     /// options area must land on one. `.unknown` cannot be re-encoded (this
@@ -132,6 +185,31 @@ enum TCPOptionCodec {
                 bytes += [windowScaleKind, 3, shift]
             case .sackPermitted:
                 bytes += [sackPermittedKind, 2]
+            case .selectiveAcknowledgement(let blocks):
+                guard !blocks.isEmpty else { continue }
+                // NOPs first, and they are alignment rather than padding. The
+                // option's payload is 32-bit sequence numbers behind a two-byte
+                // kind and length, so the edges land on a word boundary only if
+                // the option itself starts two bytes short of one. RFC 2018 §3
+                // lays it out this way and every real stack emits it so.
+                //
+                // Written as "pad until two bytes short of a boundary" rather
+                // than the customary literal `NOP NOP`, because the literal is
+                // only correct from an already-aligned position. Beside a
+                // timestamp -- ten bytes, which this encoder does not pad
+                // individually -- two NOPs would leave the edges at byte 14. The
+                // first version did exactly that, and a test asserting the
+                // boundary is what caught it.
+                while bytes.count % 4 != 2 { bytes.append(noOperation) }
+                bytes += [sackKind, UInt8(2 + blocks.count * 8)]
+                for block in blocks {
+                    for edge in [block.left.value, block.right.value] {
+                        bytes += [
+                            UInt8(edge >> 24), UInt8((edge >> 16) & 0xff), UInt8((edge >> 8) & 0xff),
+                            UInt8(edge & 0xff),
+                        ]
+                    }
+                }
             case .timestamps(let value, let echo):
                 bytes += [timestampsKind, 10]
                 bytes += [UInt8(value >> 24), UInt8((value >> 16) & 0xff), UInt8((value >> 8) & 0xff), UInt8(value & 0xff)]

@@ -189,6 +189,14 @@ struct TCB: Equatable, Sendable {
     /// to the endpoint's configuration.
     let offersTimestamps: Bool
 
+    /// Whether SACK is in use on this connection. Written once, by
+    /// `negotiateSelectiveAcknowledgement(fromSynOptions:)`.
+    private(set) var sackPermitted = false
+
+    /// Whether this stack puts SACK-Permitted in its own SYN and SYN-ACK.
+    /// Carried here for the same reason `offersTimestamps` is.
+    let offersSelectiveAcknowledgement: Bool
+
     /// TS.Recent (RFC 7323 §4.3): the most recent timestamp the peer sent that
     /// was acceptable to echo back. Zero until the first one arrives.
     ///
@@ -323,7 +331,8 @@ struct TCB: Equatable, Sendable {
         irs: SequenceNumber,
         windowScaleToOffer: UInt8? = nil,
         rcvWndMax: Int? = nil,
-        offersTimestamps: Bool = false
+        offersTimestamps: Bool = false,
+        offersSelectiveAcknowledgement: Bool = false
     ) {
         self.state = state
         self.sndUna = sndUna
@@ -346,6 +355,21 @@ struct TCB: Equatable, Sendable {
         self.irs = irs
         self.windowScaleToOffer = windowScaleToOffer
         self.offersTimestamps = offersTimestamps
+        self.offersSelectiveAcknowledgement = offersSelectiveAcknowledgement
+    }
+
+    /// RFC 2018 §2's SACK-Permitted negotiation: both sides must have sent the
+    /// option in their SYN, exactly as for timestamps and the window scale.
+    ///
+    /// Note what this enables and what it does not. It says this connection may
+    /// **send** SACK blocks describing what it holds out of order, and that the
+    /// peer's blocks are meaningful. It says nothing about the sender's use of
+    /// them -- an implementation may negotiate SACK, report faithfully, and
+    /// still recover by RFC 5681's duplicate-ACK rules, which is what this stack
+    /// did between the two halves of the work landing.
+    mutating func negotiateSelectiveAcknowledgement(fromSynOptions options: [TCPOption]) {
+        let peerSent = options.contains { if case .sackPermitted = $0 { return true } else { return false } }
+        sackPermitted = peerSent && offersSelectiveAcknowledgement
     }
 
     /// RFC 7323 §3's Timestamps negotiation, run from the same segment and at

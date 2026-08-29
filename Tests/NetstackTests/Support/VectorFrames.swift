@@ -240,6 +240,7 @@ struct VectorFrames {
 
     /// MSS: kind 2, length 4, `"mss <value>"`. Window scale: kind 3, length
     /// 3, `"wscale <shift>"`. SACK-permitted: kind 4, length 2, `"sackOK"`.
+    /// SACK blocks: kind 5, `"sack <left>:<right> [<left>:<right>...]"`.
     /// Timestamps: kind 8, length 10, `"timestamp <value> <echo>"` — not
     /// exercised by any vector in this task, but implemented for symmetry
     /// with `decodeTCPOptions` and because Task 7 expects the codec to be
@@ -258,6 +259,36 @@ struct VectorFrames {
             case "sackOK":
                 guard parts.count == 1 else { throw VectorFrameError.malformedTCPOption(option) }
                 bytes += [4, 2]
+            case "sack":
+                // `"sack 1000:1500 3000:3500"` — kind 5, two 32-bit edges per
+                // block.
+                //
+                // One option carrying several blocks, not several options,
+                // because that is what it is on the wire: a receiver reporting
+                // two ranges sends one option, and a form that could express
+                // two SACK options would let a vector describe a segment no
+                // stack emits.
+                //
+                // Blocks are separated by SPACES rather than commas, which
+                // looks like the odd choice and is the necessary one: the
+                // script splits an options list on commas, so a comma inside an
+                // option would be read as the end of it.
+                let blocks = parts.dropFirst()
+                guard !blocks.isEmpty else { throw VectorFrameError.malformedTCPOption(option) }
+                var edges: [UInt8] = []
+                for block in blocks {
+                    let bounds = block.split(separator: ":", omittingEmptySubsequences: false)
+                    guard bounds.count == 2, let left = UInt32(bounds[0]), let right = UInt32(bounds[1]) else {
+                        throw VectorFrameError.malformedTCPOption(option)
+                    }
+                    for edge in [left, right] {
+                        edges += [
+                            UInt8(edge >> 24), UInt8((edge >> 16) & 0xff), UInt8((edge >> 8) & 0xff),
+                            UInt8(edge & 0xff),
+                        ]
+                    }
+                }
+                bytes += [5, UInt8(2 + edges.count)] + edges
             case "timestamp":
                 guard parts.count == 3, let value = UInt32(parts[1]), let echo = UInt32(parts[2]) else {
                     throw VectorFrameError.malformedTCPOption(option)
@@ -401,6 +432,16 @@ struct VectorFrames {
             case 4:
                 guard valueLength == 0 else { return nil }
                 options.append("sackOK")
+            case 5:
+                guard valueLength > 0, valueLength % 8 == 0 else { return nil }
+                var blocks: [String] = []
+                for _ in 0..<(valueLength / 8) {
+                    guard let left = buffer.readInteger(endianness: .big, as: UInt32.self),
+                        let right = buffer.readInteger(endianness: .big, as: UInt32.self)
+                    else { return nil }
+                    blocks.append("\(left):\(right)")
+                }
+                options.append("sack " + blocks.joined(separator: " "))
             case 8:
                 guard valueLength == 8, let value = buffer.readInteger(endianness: .big, as: UInt32.self),
                     let echo = buffer.readInteger(endianness: .big, as: UInt32.self)

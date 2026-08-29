@@ -254,3 +254,31 @@ private func codec() -> VectorFrames {
         try codec().encode(.applicationClose, direction: .inbound)
     }
 }
+
+@Test func aSackOptionRoundTripsThroughTheFrameCodec() throws {
+    // The differential's comparison runs through this codec for BOTH stacks —
+    // gVisor's frames are decoded here too — so a SACK option this cannot
+    // render is a difference the harness would report as agreement.
+    let line = TCPLine(
+        flags: ".", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 65535,
+        options: ["sack 1000:1500 3000:3500"])
+    let frame = try codec().encode(.tcp(line), direction: .expectedOutbound)
+    let decoded = try #require(codec().decode(frame))
+    guard case .tcp(let back) = decoded else {
+        Issue.record("a TCP frame decoded as something else: \(decoded)")
+        return
+    }
+    #expect(back.options == ["sack 1000:1500 3000:3500"])
+}
+
+@Test func aSackOptionWithATruncatedBlockIsRejectedRatherThanHalfRead() throws {
+    // Eight bytes per block. A length that is not a multiple of eight cannot be
+    // a SACK option, and reading the whole blocks out of it and ignoring the
+    // remainder would turn a malformed segment into a plausible one.
+    #expect(throws: VectorFrameError.self) {
+        _ = try codec().encode(
+            .tcp(TCPLine(flags: ".", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 0,
+                         options: ["sack 1000"])),
+            direction: .expectedOutbound)
+    }
+}

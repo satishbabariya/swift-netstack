@@ -1134,7 +1134,7 @@ func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = ga
             // and cannot be written down, but everything about the option that
             // is a decision — that it is present, and that its echo is zero on a
             // segment answering nothing — can be.
-            #expect(syn.options.count == 3)
+            #expect(syn.options.count == 4)
             #expect(syn.options[0] == .maximumSegmentSize(1460))
             #expect(syn.options[1] == .windowScale(TCPEndpoint.derivedWindowScale))
             if case .timestamps(_, let echo) = syn.options[2] {
@@ -1142,6 +1142,7 @@ func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = ga
             } else {
                 Issue.record("the SYN did not carry a Timestamps option: \(syn.options)")
             }
+            #expect(syn.options[3] == .sackPermitted, "an active open offers SACK unconditionally")
             #expect(recorder.establishedCount == 0, "positive control: not established until the SYN-ACK arrives")
 
             fixture.inject(

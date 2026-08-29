@@ -194,6 +194,13 @@ struct Receiver {
 
     private let reassembler: TCPReassembler
 
+    /// What is held out of order, as RFC 2018 blocks. Asked for at the moment a
+    /// segment is emitted rather than kept alongside the queue, so the report
+    /// cannot describe a queue that has since changed.
+    func sackBlocks(rcvNxt: SequenceNumber, limit: Int) -> [SACKBlock] {
+        reassembler.sackBlocks(rcvNxt: rcvNxt, limit: limit)
+    }
+
     init(reassembler: TCPReassembler = TCPReassembler()) {
         self.reassembler = reassembler
     }

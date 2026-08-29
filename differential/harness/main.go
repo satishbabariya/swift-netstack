@@ -193,6 +193,21 @@ func play(r run) ([][]string, error) {
 		return nil, fmt.Errorf("disable receive buffer moderation: %s", err)
 	}
 
+	// Turn RACK off, which is a configuration difference and not a permitted
+	// divergence -- see ../README.md.
+	//
+	// With SACK negotiated gVisor enables RACK-TLP (RFC 8985). A tail loss
+	// probe fires roughly 200 ms after the last transmission, so gVisor
+	// retransmits a FIN once before its RTO would have, and this stack --
+	// which has no RACK -- waits out the full RTO. The difference is real,
+	// gVisor's behaviour is better, and recognising it away would hide the gap
+	// rather than record it. Off here, named as the next TCP feature, and the
+	// comparison stays about what both stacks actually implement.
+	recovery := tcpip.TCPRecovery(0)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
+		return nil, fmt.Errorf("disable RACK: %s", err)
+	}
+
 	if err := s.CreateNIC(nicID, link); err != nil {
 		return nil, fmt.Errorf("create NIC: %s", err)
 	}

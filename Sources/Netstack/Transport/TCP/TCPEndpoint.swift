@@ -155,6 +155,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// the window scale, for the same reason.
     static let offersTimestamps = true
 
+    /// Whether this stack puts SACK-Permitted in its SYN and SYN-ACK.
+    ///
+    /// Reporting and using are separate, and this is the reporting half: with
+    /// it on, a peer learns exactly which ranges arrived out of order, which is
+    /// what lets its sender retransmit the hole rather than everything after it.
+    static let offersSelectiveAcknowledgement = true
+
     /// What the Timestamps option costs a data segment, in bytes.
     ///
     /// Ten bytes of option plus two of padding to a four-byte boundary. It comes
@@ -603,7 +610,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             [.syn], sequence: connection.tcb.iss, on: connection,
             options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
                 + windowScaleOption(for: connection, answeringPeerSyn: false)
-                + handshakeTimestampOption(for: connection, answeringPeerSyn: false),
+                + handshakeTimestampOption(for: connection, answeringPeerSyn: false)
+                + handshakeSackPermittedOption(for: connection, answeringPeerSyn: false),
             acknowledgement: SequenceNumber(0),
             window: unscaledAdvertisedWindow(of: connection))
     }
@@ -1038,7 +1046,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             window: window ?? advertisedWindow(of: connection),
             checksum: 0,
             urgentPointer: 0,
-            options: options + timestampOption(for: connection, alreadyCarrying: options))
+            options: optionsToSend(for: connection, flags: flags, requested: options))
         // RFC 7323 §4.3's Last.ACK.sent, recorded at the single point every
         // segment leaves by so it cannot drift from what the peer actually saw.
         // Only segments that carry the ACK bit count: a bare SYN acknowledges
@@ -1048,6 +1056,39 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             connection.tcb.recordAckSent(ack)
         }
         emit(header, payload: payload, from: connection.localAddress, to: connection.peer.address)
+    }
+
+    /// Everything this segment carries in its options area.
+    ///
+    /// The order is not cosmetic. Timestamps are added first because SACK takes
+    /// whatever space is left -- `maximumSackBlocks(alongside:)` is given the
+    /// options already committed to, so a connection using both reports three
+    /// blocks and one using only SACK reports four. Deciding the count before
+    /// the timestamp was added would have overflowed the 40-byte area, and the
+    /// only symptom would have been a header the peer could not parse.
+    private func optionsToSend(
+        for connection: Connection, flags: TCPFlags, requested: [TCPOption]
+    ) -> [TCPOption] {
+        let withTimestamps = requested + timestampOption(for: connection, alreadyCarrying: requested)
+        return withTimestamps + sackOption(for: connection, flags: flags, alreadyCarrying: withTimestamps)
+    }
+
+    /// The SACK option for an outgoing segment, or none.
+    ///
+    /// RFC 2018 §3: sent only on ACKs, only when SACK was negotiated, and only
+    /// when there is something out of order to report. The SYN exclusion is
+    /// separate from all of that -- a SYN carries SACK-*Permitted*, and a
+    /// SYN-ACK that also carried blocks would be describing a queue that cannot
+    /// exist yet.
+    private func sackOption(
+        for connection: Connection, flags: TCPFlags, alreadyCarrying: [TCPOption]
+    ) -> [TCPOption] {
+        guard connection.tcb.sackPermitted, flags.contains(.ack), !flags.contains(.syn) else { return [] }
+        let blocks = connection.receiver.sackBlocks(
+            rcvNxt: connection.tcb.rcvNxt,
+            limit: TCPOptionCodec.maximumSackBlocks(alongside: alreadyCarrying))
+        guard !blocks.isEmpty else { return [] }
+        return [.selectiveAcknowledgement(blocks)]
     }
 
     /// The Timestamps option for an outgoing segment, or none.
@@ -1080,6 +1121,35 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard Self.offersTimestamps else { return [] }
         if answeringPeerSyn && !connection.tcb.timestampsEnabled { return [] }
         return [.timestamps(value: timestampClock(), echo: answeringPeerSyn ? connection.tcb.tsRecent : 0)]
+    }
+
+    /// The largest options area this connection can put on a data segment.
+    ///
+    /// Built by asking for the maximum number of SACK blocks rather than the
+    /// current one; see `transmit` for why the current one is the wrong
+    /// question. The block contents are irrelevant -- only the encoded length is
+    /// read -- so they are zeroes.
+    private func maximumOptionBytes(for connection: Connection) -> Int {
+        var options = timestampOption(for: connection, alreadyCarrying: [])
+        if connection.tcb.sackPermitted {
+            let count = TCPOptionCodec.maximumSackBlocks(alongside: options)
+            if count > 0 {
+                options.append(
+                    .selectiveAcknowledgement(
+                        Array(repeating: SACKBlock(left: SequenceNumber(0), right: SequenceNumber(0)), count: count)))
+            }
+        }
+        return TCPOptionCodec.encode(options).count
+    }
+
+    /// SACK-Permitted for a SYN or SYN-ACK, gated exactly as the timestamp is:
+    /// a SYN offers unconditionally, a SYN-ACK only answers an offer. By the
+    /// time the SYN-ACK is built, `negotiateSelectiveAcknowledgement` has
+    /// already recorded whether the peer sent one.
+    private func handshakeSackPermittedOption(for connection: Connection, answeringPeerSyn: Bool) -> [TCPOption] {
+        guard Self.offersSelectiveAcknowledgement else { return [] }
+        if answeringPeerSyn && !connection.tcb.sackPermitted { return [] }
+        return [.sackPermitted]
     }
 
     /// TSval, in milliseconds off the injected clock.
@@ -1133,7 +1203,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             [.syn, .ack], sequence: connection.tcb.iss, on: connection,
             options: [.maximumSegmentSize(UInt16(advertisedSegmentSize))]
                 + windowScaleOption(for: connection, answeringPeerSyn: true)
-                + handshakeTimestampOption(for: connection, answeringPeerSyn: true),
+                + handshakeTimestampOption(for: connection, answeringPeerSyn: true)
+                + handshakeSackPermittedOption(for: connection, answeringPeerSyn: true),
             window: unscaledAdvertisedWindow(of: connection))
     }
 
@@ -1178,10 +1249,33 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // connection short by twelve bytes, including connections that never
         // negotiated timestamps.
         //
-        // Conditional on the option actually being in use, which it can be here
-        // — unlike during the handshake, where the MSS is fixed before the
+        // Conditional on the options actually being in use, which they can be
+        // here — unlike during the handshake, where the MSS is fixed before the
         // negotiation settles.
-        let optionBytes = connection.tcb.timestampsEnabled ? Self.timestampOptionBytes : 0
+        //
+        // The budget is the WORST CASE this connection can emit, not what it
+        // would emit right now, and the difference is a bug that took two
+        // attempts to see.
+        //
+        // The first version charged the timestamp alone. When SACK started
+        // riding on data segments the budget did not know, a full-sized segment
+        // overflowed the 40-byte options area, the data offset wrapped, and the
+        // frame was one no peer could parse -- reported by the differential, in
+        // as many words, as "Swift emitted an undecodable frame".
+        //
+        // Charging the options present at this instant fixed that case and not
+        // the general one. A segment is cut once and may be **retransmitted much
+        // later**, when the connection is reporting more SACK blocks than it was
+        // when the payload was sized: the retransmission carries a bigger header
+        // over the same payload and overflows exactly as before. Nothing in the
+        // sender remembers what the header cost the first time, and nothing
+        // should -- the fix is to make the payload fit whatever the header may
+        // grow to.
+        //
+        // gVisor arrives at the same answer (`endpoint.maxOptionSize` builds its
+        // options with a full set of SACK blocks), which is why both stacks cut
+        // 1420-byte segments on a connection with timestamps and SACK.
+        let optionBytes = maximumOptionBytes(for: connection)
         let segments = connection.sender.segmentsToTransmit(
             tcb: &connection.tcb, mss: max(1, connection.mss - optionBytes))
         for segment in segments {
@@ -1471,7 +1565,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 irs: SequenceNumber(0),
                 windowScaleToOffer: Self.windowScaleToOffer,
                 rcvWndMax: Self.maximumReceiveWindowBytes,
-                offersTimestamps: Self.offersTimestamps),
+                offersTimestamps: Self.offersTimestamps,
+                offersSelectiveAcknowledgement: Self.offersSelectiveAcknowledgement),
             receiver: Receiver(reassembler: TCPReassembler()),
             sender: {
                 var sender = Sender(

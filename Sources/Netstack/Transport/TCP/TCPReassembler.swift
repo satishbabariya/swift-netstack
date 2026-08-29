@@ -251,6 +251,24 @@ final class TCPReassembler {
     /// is trimmed against this queue before any of it is admitted.
     private var queue: [Entry] = []
     private var accountedBytes = 0
+
+    /// Where the last few out-of-order pieces landed, most recent first. Used
+    /// only by `sackBlocks`, to order its report by recency as RFC 2018 §4 asks.
+    ///
+    /// Sequence numbers rather than block identities, because a block has no
+    /// stable identity: two runs merge into one when the gap between them fills,
+    /// and a run's left edge moves when a piece arrives below it. A recorded
+    /// position stays valid across both — whichever run ends up containing it is
+    /// the run that was recently touched.
+    ///
+    /// Bounded at eight, which is twice the most blocks that can ever be
+    /// reported. Entries that no longer fall inside any run simply never match;
+    /// they cost a comparison and nothing else, which is cheaper than pruning
+    /// them on a path that runs per segment.
+    private var recentTouches: [SequenceNumber] = []
+
+    private static let recentTouchesKept = 8
+
     private var fin: SequenceNumber?
 
     /// - Parameters:
@@ -408,6 +426,55 @@ final class TCPReassembler {
         queue.removeAll()
         accountedBytes = 0
         fin = nil
+        recentTouches.removeAll()
+    }
+
+    /// The ranges held out of order, as RFC 2018 SACK blocks.
+    ///
+    /// Two things here are the RFC and not convenience:
+    ///
+    /// - **Contiguous entries are merged.** The queue stores whatever pieces
+    ///   arrived; `[1000,1500)` and `[1500,2000)` are two entries and one
+    ///   block. Reporting them separately would be legal but would spend two
+    ///   of the four available blocks saying one thing.
+    /// - **The block holding the most recent arrival goes first**, per §4. A
+    ///   sender uses the first block to know its ACK was triggered by *this*
+    ///   segment; a receiver that always reported in sequence order would
+    ///   still be describing its state correctly and would still be wrong.
+    ///
+    /// - **The rest follow in the order they were most recently touched**, which
+    ///   is §4's SHOULD. This was skipped in the first version, with a comment
+    ///   saying to revisit it if the differential ever showed a divergence that
+    ///   traced back here. It did, within one run of enabling `sackOK` in the
+    ///   generator: gVisor keeps its previous ordering and prepends, and a
+    ///   receiver that re-sorts ascending disagrees with it from the second
+    ///   out-of-order arrival onward. The cost of getting it wrong is not
+    ///   cosmetic when more runs exist than fit -- the block that gets dropped
+    ///   by the limit is chosen by this order, so sorting ascending drops the
+    ///   *highest* run rather than the stalest one.
+    func sackBlocks(rcvNxt: SequenceNumber, limit: Int) -> [SACKBlock] {
+        guard limit > 0, !queue.isEmpty else { return [] }
+        var blocks: [SACKBlock] = []
+        for entry in queue {
+            let end = entry.sequence + entry.bytes.readableBytes
+            if var last = blocks.last, last.right == entry.sequence {
+                last.right = end
+                blocks[blocks.count - 1] = last
+            } else {
+                blocks.append(SACKBlock(left: entry.sequence, right: end))
+            }
+        }
+        // Rank by the most recent touch each run contains; runs nothing has
+        // touched recently rank last. The enumerated tie-break keeps the sort
+        // deterministic -- Swift's is not stable, and every untouched run shares
+        // the same rank -- so those fall back to sequence order.
+        let ranked = blocks.enumerated().map { position, block -> (rank: Int, position: Int, block: SACKBlock) in
+            let rank =
+                recentTouches.firstIndex { !$0.lessThan(block.left) && $0.lessThan(block.right) } ?? Int.max
+            return (rank, position, block)
+        }
+        .sorted { ($0.rank, $0.position) < ($1.rank, $1.position) }
+        return ranked.prefix(limit).map(\.block)
     }
 
     // MARK: - Trimming an arriving segment against what is already queued
@@ -498,6 +565,13 @@ final class TCPReassembler {
             let entry = Entry(sequence: rcvNxt + piece.start, bytes: copy, charge: charge)
             queue.insert(entry, at: insertionIndex(forOffset: piece.start, rcvNxt: rcvNxt))
             accountedBytes += charge
+            // Recorded for SACK reporting, not for reassembly. RFC 2018 §4 makes
+            // the block containing the most recently received segment the
+            // required first one and asks for the rest in the order they were
+            // most recently reported; this is the only place that knows the
+            // order things arrived in by the time the endpoint asks.
+            recentTouches.insert(entry.sequence, at: 0)
+            if recentTouches.count > Self.recentTouchesKept { recentTouches.removeLast() }
         }
 
         return delivered

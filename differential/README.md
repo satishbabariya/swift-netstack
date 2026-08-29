@@ -746,6 +746,56 @@ behaviour, so this needs settling before persist can be compared frame for frame
 in a range that does not overlap the one above it, and assert
 `coverage.enteredPersist` is non-zero before reading anything else into the result.
 
+## SACK: the constraint that was lifted, found four defects, and went back
+
+`sackOK` was the last option the generator withheld. It was lifted once the
+receiver half of RFC 2018 landed — negotiation plus reporting what is held out
+of order — and it is back in place, because the lift does not survive the
+*sender* half being absent.
+
+**What the lift found, in one run, that eleven unit tests had not:**
+
+1. **Data segments overflowed the options area.** Options come out of the
+   payload (RFC 6691), and SACK is added at the egress point, after a segment
+   has been cut. The payload budget charged the timestamp only. A full-sized
+   segment plus a timestamp plus blocks put the header past 40 bytes, the
+   four-bit data offset wrapped, and the frame went out unparseable — reported
+   here, in as many words, as "Swift emitted an undecodable frame".
+2. **The per-segment budget fixed the wrong problem.** A segment is cut once and
+   may be retransmitted much later, when more blocks are being reported than
+   when it was sized. Charging the options present at cutting time overflows on
+   the retransmission instead. The budget has to be the connection's worst case,
+   which is what gVisor's `endpoint.maxOptionSize` also computes.
+3. **Blocks were still reported after close** — and the first fix for that was
+   wrong too. Dropping the queue on close matched gVisor's silence, but a later
+   sequence showed gVisor still acknowledging data it had queued before closing,
+   which contradicts the explanation the fix was built on. Reverted rather than
+   kept: matching an observation without a mechanism is what this file exists to
+   stop. The post-close question returns with RFC 6675.
+4. **Block ordering disagreed from the second out-of-order arrival onward.** RFC
+   2018 §4 requires the run containing the newest segment first and asks for the
+   rest in the order they were most recently reported. The first version did the
+   MUST and skipped the SHOULD, with a comment saying to revisit if the
+   differential ever showed a divergence. It did, immediately.
+
+**Why it went back.** With `sackOK` negotiated, gVisor's *sender* switches to
+SACK-based recovery. On the third duplicate acknowledgement the two stacks make
+different choices: this one inflates cwnd by RFC 5681 §3.2 and sends, gVisor
+computes `pipe` by RFC 6675 and does not. That is a real behavioural difference
+in a path this comparison exists to cover — not an option mismatch to normalise
+away — so the constraint stands until the sender half exists. All four findings
+above are now carried by unit tests in `TCPSackTests.swift`, so nothing rests on
+a run that no longer happens.
+
+**RACK is off in the harness** (`tcpip.TCPRecovery(0)`), which is a
+configuration difference in the same family as Nagle and delayed ACKs above.
+With SACK negotiated gVisor enables RACK-TLP (RFC 8985), whose tail loss probe
+fires around 200 ms after the last transmission — so gVisor retransmits a FIN
+once before its RTO would have, and this stack waits out the full RTO. gVisor's
+behaviour is better and the setting records a gap rather than denying one. It
+has no effect while `sackOK` is withheld, since RACK follows SACK; it is here so
+the next lift does not have to rediscover it.
+
 ## Known gaps in this stack, visible from here
 
 Not comparison nuisances — real limitations, recorded because the

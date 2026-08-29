@@ -211,6 +211,19 @@ enum TCPOptionCodec {
                     }
                 }
             case .timestamps(let value, let echo):
+                // Aligned for the same reason SACK is, and by the same rule.
+                // The option carries two 32-bit values behind a two-byte kind
+                // and length, so they land on a word boundary only if the
+                // option starts two bytes short of one.
+                //
+                // This is also what makes the reserved options area come out at
+                // the customary 40 bytes on a connection using both options,
+                // rather than 36: `NOP NOP TS` is twelve, `NOP NOP SACK` with
+                // three blocks is twenty-eight. Linux and gVisor both lay them
+                // out this way, and gVisor's payload budget is derived from it,
+                // so a stack that packed them tightly would cut segments four
+                // bytes longer than every peer it talks to.
+                while bytes.count % 4 != 2 { bytes.append(noOperation) }
                 bytes += [timestampsKind, 10]
                 bytes += [UInt8(value >> 24), UInt8((value >> 16) & 0xff), UInt8((value >> 8) & 0xff), UInt8(value & 0xff)]
                 bytes += [UInt8(echo >> 24), UInt8((echo >> 16) & 0xff), UInt8((echo >> 8) & 0xff), UInt8(echo & 0xff)]

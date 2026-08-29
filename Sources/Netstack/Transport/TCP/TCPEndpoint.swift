@@ -876,6 +876,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard connections[connection.peer] === connection else { return }
 
         if stateBefore != .established, connection.tcb.state == .established {
+            adoptCongestionControlSegmentSize(on: connection)
             seedRoundTripEstimateFromHandshake(on: connection)
             onEstablished?()
         }
@@ -1123,6 +1124,47 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         return [.timestamps(value: timestampClock(), echo: answeringPeerSyn ? connection.tcb.tsRecent : 0)]
     }
 
+    /// The largest payload a segment on this connection can carry: the
+    /// negotiated MSS less the options that ride on every one of them.
+    ///
+    /// **This is SMSS**, and naming it once is the point. RFC 5681 defines SMSS
+    /// as the largest segment the sender can transmit "excluding TCP/IP headers
+    /// and options", so it is this number and not the negotiated MSS that the
+    /// congestion window is measured in. Using the MSS there instead makes the
+    /// initial window of ten segments a few hundred bytes wider than ten
+    /// segments, which is invisible until a write lands just past the boundary
+    /// -- one extra short segment on the first burst, and thereafter two stacks
+    /// with different ideas about what is outstanding.
+    ///
+    /// Found by the differential: gVisor stopped its opening burst one segment
+    /// earlier, having sized its own initial window off `maxPayloadSize`.
+    private func payloadSegmentSize(for connection: Connection) -> Int {
+        max(1, connection.mss - maximumOptionBytes(for: connection))
+    }
+
+    /// Rebuild the sender's congestion control around the payload size, at the
+    /// one moment the options that decide it are settled and nothing is in
+    /// flight.
+    ///
+    /// A rebuild rather than a setter because `Reno` takes SMSS at
+    /// initialisation and derives its initial window from it; the same reason
+    /// `adoptPeerSegmentSize` rebuilds in SYN-SENT. Safe here for the same
+    /// reason it is safe there, and the precondition says so rather than
+    /// trusting it: nothing can have been written until the connection is
+    /// established, which is the transition this runs on.
+    private func adoptCongestionControlSegmentSize(on connection: Connection) {
+        let size = payloadSegmentSize(for: connection)
+        guard size != connection.sender.congestionControl.segmentSize else { return }
+        precondition(
+            connection.sender.bufferedBytes == 0,
+            "the sender is being rebuilt with data already queued, which would drop it")
+        let nagleDisabled = connection.sender.nagleDisabled
+        connection.sender = Sender(
+            congestionControl: Reno(maximumSegmentSize: size), clock: stack.clock,
+            maximumBufferedBytes: Self.sendBufferBytes)
+        connection.sender.nagleDisabled = nagleDisabled
+    }
+
     /// The largest options area this connection can put on a data segment.
     ///
     /// Built by asking for the maximum number of SACK blocks rather than the
@@ -1275,9 +1317,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // gVisor arrives at the same answer (`endpoint.maxOptionSize` builds its
         // options with a full set of SACK blocks), which is why both stacks cut
         // 1420-byte segments on a connection with timestamps and SACK.
-        let optionBytes = maximumOptionBytes(for: connection)
         let segments = connection.sender.segmentsToTransmit(
-            tcb: &connection.tcb, mss: max(1, connection.mss - optionBytes))
+            tcb: &connection.tcb, mss: payloadSegmentSize(for: connection))
         for segment in segments {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
         }

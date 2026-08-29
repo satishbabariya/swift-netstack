@@ -196,6 +196,18 @@ private enum DiffLimits {
     /// rather than read from it so that a change to one is a visible
     /// disagreement rather than a silent shift in what this generator produces.
     static let timestampOptionBytes = 12
+
+    /// What EVERY data segment's options cost on a connection using both
+    /// timestamps and SACK: twelve for `NOP NOP TS`, twenty-eight for
+    /// `NOP NOP SACK` with the three blocks that fit beside it.
+    ///
+    /// Forty, which is the whole options area — both stacks reserve the worst
+    /// case rather than the current one, because a segment cut today may be
+    /// retransmitted while more blocks are being reported. Stated here rather
+    /// than read from the stack, for the same reason as the constant above: a
+    /// change to one should be a visible disagreement, not a silent shift in
+    /// what this generator produces.
+    static let dataSegmentOptionBytes = 40
     /// The largest advance a single step may make, in milliseconds. Long
     /// enough to walk the whole RTO ladder across a sequence, short enough
     /// that no single step jumps over two rungs of it.
@@ -363,38 +375,29 @@ private struct DiffGenerator {
 
         // --- Prologue: a handshake, then one in-order full segment.
         //
-        // The SYN offers `mss`, `wscale` and `timestamp`, and deliberately NOT
-        // `sackOK` — but the reason has changed, and so has what it will take to
-        // lift it.
+        // The SYN offers every option either stack implements: `mss`,
+        // `wscale`, `timestamp` and `sackOK`. There are no generator
+        // constraints on options left.
         //
         // gVisor mirrors its peer's options and no configuration makes it omit
         // one, so an option this stack did not implement would put a difference
-        // on the SYN-ACK of every sequence. That is why the generator withholds
-        // options rather than the comparison permitting divergences: a permitted
+        // on the SYN-ACK of every sequence. That is why options were withheld
+        // here rather than normalised away in the comparison: a permitted
         // divergence is a hole in the instrument that stays open, and a
-        // generator constraint is lifted by the task that implements the option.
+        // generator constraint is lifted by the task that implements the
+        // option. `wscale` was lifted when scaling landed; `sackOK` was lifted
+        // once, when SACK's receiver half landed, and had to go back -- gVisor's
+        // sender switched to RFC 6675 recovery and this one was still counting
+        // duplicate acknowledgements, which is a difference in behaviour and not
+        // in options.
         //
-        // This stack now implements SACK's RECEIVER half: it negotiates the
-        // option and reports what it holds out of order. The lift was attempted
-        // on that basis and has to wait, because the two halves are not
-        // separable at this seam. With `sackOK` on, gVisor's SENDER switches to
-        // SACK-based recovery, and on the third duplicate acknowledgement the
-        // two stacks make different choices about what to put on the wire —
-        // this stack inflates cwnd by RFC 5681 §3.2 and sends, gVisor computes
-        // `pipe` by RFC 6675 and does not. That is a genuine behavioural
-        // difference in a path this comparison exists to cover, not an option
-        // mismatch to be normalised away.
-        //
-        // The attempt was not wasted: run against gVisor, it found four defects
-        // in the receiver half that the unit tests had not — data segments that
-        // overflowed the options area, a payload budget that a later
-        // retransmission could break, blocks still reported after close, and
-        // block ordering that disagreed from the second arrival onward. Each is
-        // now covered by a test here. The lift itself belongs to the task that
-        // implements RFC 6675.
+        // This is the second and final lift. Both halves are here now, so what
+        // is under comparison is the whole of SACK: which ranges each stack
+        // reports, in which order, what each concludes is lost from them, and
+        // what each puts on the wire while recovering.
         try emit(
-            tcp("S", seq: guestISS, ack: nil, options: ["mss 1460", "wscale \(guestWindowScale)", "timestamp \(guestTimestamp) 0"]),
-            advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow) wscale=\(guestWindowScale) ts")
+            tcp("S", seq: guestISS, ack: nil, options: ["mss 1460", "wscale \(guestWindowScale)", "timestamp \(guestTimestamp) 0", "sackOK"]),
+            advanceMs: 10, note: "SYN iss=\(guestISS) win=\(guestWindow) wscale=\(guestWindowScale) ts sackOK")
         try emit(tcp(".", seq: wire(rcvNxt), ack: 1), advanceMs: 10, note: "third-leg ACK")
 
         // The priming segment. gVisor's advertised right edge only leaves its
@@ -547,19 +550,25 @@ private struct DiffGenerator {
                 // readings are conformant, so this is a place the differential
                 // deliberately does not go rather than a defect either side
                 // has; see `differential/README.md`.
-                // The initial congestion window is TEN SEGMENTS, and with
-                // timestamps negotiated a segment carries twelve fewer bytes.
+                // The initial congestion window is TEN SEGMENTS, and a segment
+                // carries forty fewer bytes than the MSS once timestamps and
+                // SACK are both negotiated.
                 //
-                // That matters because the two stacks count the window in
-                // different units — bytes here, whole segments in gVisor — a
-                // difference the README records and this cap exists to stay away
-                // from. A write sized against 1460-byte segments now needs
-                // eleven 1448-byte ones, which this stack's byte count still
-                // admits and gVisor's segment count does not: gVisor withholds
-                // the eleventh and the run diverges on a frame that is about
-                // arithmetic units, not behaviour. Enabling timestamps is what
-                // made the difference reachable; the cap has to follow.
-                let segmentWithOption = DiffLimits.maximumDataSegment - DiffLimits.timestampOptionBytes
+                // That matters twice over. First, the two stacks count the
+                // window in different units — bytes here, whole segments in
+                // gVisor — a difference the README records and this cap exists
+                // to stay away from. Second, and this is what SACK added: the
+                // step after the write acknowledges *all* of it, so a write
+                // larger than one window is acknowledged before it has been
+                // sent. RFC 9293 §3.10.7.4 answers an ACK for unsent data with
+                // an ACK of its own; gVisor stays silent, and the run diverges
+                // on the two stacks' handling of an acknowledgement the
+                // generator never meant to produce.
+                //
+                // The subtraction has been wrong once already in exactly this
+                // way — it named the timestamp alone, and enabling SACK widened
+                // the options without widening the cap.
+                let segmentWithOption = DiffLimits.maximumDataSegment - DiffLimits.dataSegmentOptionBytes
                 let bytes = 1 + Int(rng.next() % UInt64(min(Int(offered), 10 * segmentWithOption) - 1))
                 written = bytes
                 try emit(nil, advanceMs: advance, action: .write(bytes: bytes), note: "application write \(bytes)B")
@@ -1083,10 +1092,23 @@ private let differentialBaseSeed: UInt64 = {
     let scaledWindow = recognisedCounts["scaled-advertised-window"] ?? 0
     #expect(scaledWindow >= total, "the scaled-window difference stopped appearing: \(scaledWindow) over \(total) sequences")
 
-    // And nothing else is recognised. A third label appearing without anyone
+    // SACK reported outside ESTABLISHED, always paired with the window
+    // difference because the frames it appears on carry both. Bounded below
+    // rather than counted: it needs a sequence that both closes and is still
+    // holding something out of order, which is common but not universal.
+    //
+    // The compound label is the honest shape. gVisor's restriction is in
+    // `sendRaw`; see `Differential.recogniseSackAfterEstablished`.
+    let sackOutside = recognisedCounts["sack-outside-established+scaled-advertised-window"] ?? 0
+    #expect(sackOutside > 0, "the SACK-outside-ESTABLISHED difference stopped appearing")
+
+    // And nothing else is recognised. A fourth label appearing without anyone
     // deciding to add one is the failure this whole mechanism exists to prevent.
     #expect(
-        Set(recognisedCounts.keys) == ["syn-ack-initial-window", "scaled-advertised-window"],
+        Set(recognisedCounts.keys) == [
+            "syn-ack-initial-window", "scaled-advertised-window",
+            "sack-outside-established+scaled-advertised-window",
+        ],
         "an unexpected recognised difference appeared: \(recognisedCounts)")
 }
 

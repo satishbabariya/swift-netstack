@@ -746,10 +746,22 @@ struct TCPStateMachine {
                     if case .timestamps(_, let echo) = option { echoed = echo }
                 }
             }
+            // The peer's report of what it holds out of order, and only when
+            // the option was negotiated. Reading blocks off a connection that
+            // never agreed to SACK would let any peer -- or anything able to
+            // forge a segment onto one -- tell this sender that data it has not
+            // received is safely delivered.
+            var blocks: [SACKBlock] = []
+            if tcb.sackPermitted {
+                for option in header.options {
+                    if case .selectiveAcknowledgement(let reported) = option { blocks = reported }
+                }
+            }
             _ = sender.acknowledged(
                 upTo: header.acknowledgement, tcb: &tcb, segmentLength: segment.length,
                 advertisedWindow: Int(header.window),
-                echoedTimestamp: echoed, timestampClockNow: timestampClockNow)
+                echoedTimestamp: echoed, timestampClockNow: timestampClockNow,
+                selectiveAcknowledgements: blocks)
 
             switch tcb.state {
             case .finWait1:

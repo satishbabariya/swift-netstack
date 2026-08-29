@@ -158,7 +158,7 @@ struct TCPStateMachine {
     /// defence.
     static func receive(
         segment: TCPSegment, on tcb: inout TCB, receiver: inout Receiver, sender: inout Sender,
-        challengeACKs: inout ChallengeACKBudget
+        challengeACKs: inout ChallengeACKBudget, timestampClockNow: UInt32? = nil
     ) -> [TCPAction] {
         switch tcb.state {
         case .closed:
@@ -169,7 +169,8 @@ struct TCPStateMachine {
             return synSentStateSegmentArrives(segment: segment, tcb: &tcb)
         case .synReceived, .established, .finWait1, .finWait2, .closeWait, .closing, .lastAck, .timeWait:
             return generalSegmentArrives(
-                segment: segment, tcb: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &challengeACKs)
+                segment: segment, tcb: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &challengeACKs,
+                timestampClockNow: timestampClockNow)
         }
     }
 
@@ -417,7 +418,7 @@ struct TCPStateMachine {
     ///   `connect()` rather than told it was refused.
     private static func generalSegmentArrives(
         segment: TCPSegment, tcb: inout TCB, receiver: inout Receiver, sender: inout Sender,
-        challengeACKs: inout ChallengeACKBudget
+        challengeACKs: inout ChallengeACKBudget, timestampClockNow: UInt32? = nil
     ) -> [TCPAction] {
         let header = segment.header
 
@@ -734,9 +735,19 @@ struct TCPStateMachine {
             // duplicate-ACK test is about the window this segment ADVERTISED,
             // and the update just above may deliberately have refused to take
             // it. See `Sender.acknowledged`.
+            // The peer's echo of our own timestamp, when the option is in use.
+            // RFC 7323 §4.1 makes the round trip it measures unambiguous, which
+            // is what lets `Sender` take a sample Karn would otherwise refuse.
+            var echoed: UInt32?
+            if tcb.timestampsEnabled {
+                for option in header.options {
+                    if case .timestamps(_, let echo) = option { echoed = echo }
+                }
+            }
             _ = sender.acknowledged(
                 upTo: header.acknowledgement, tcb: &tcb, segmentLength: segment.length,
-                advertisedWindow: Int(header.window))
+                advertisedWindow: Int(header.window),
+                echoedTimestamp: echoed, timestampClockNow: timestampClockNow)
 
             switch tcb.state {
             case .finWait1:

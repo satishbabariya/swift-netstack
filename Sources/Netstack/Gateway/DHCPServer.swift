@@ -44,6 +44,11 @@ public final class DHCPServer {
     /// Requests dropped because the pool had nothing left.
     public private(set) var exhausted = 0
 
+    /// Where refusals are reported, if anywhere. `Gateway` sets this; a
+    /// hand-assembled arrangement opts in by setting it too.
+    public var log: RateLimitedLogger?
+
+
     /// How many hardware addresses hold a lease. The figure the pool bounds,
     /// and the one a test asking "did any of this reach the server" reads --
     /// `leasedAddress(for:)` cannot answer that when the addresses were forged.
@@ -99,6 +104,7 @@ public final class DHCPServer {
         case .discover:
             guard let offered = lease(for: request.clientHardwareAddress) else {
                 exhausted += 1
+                log?.record(.dhcpPoolExhausted, ["mac": .string(request.clientHardwareAddress.description)])
                 return
             }
             reply(.offer, to: request, address: offered)
@@ -109,6 +115,7 @@ public final class DHCPServer {
             if let identifier = request.serverIdentifier, identifier != gateway { return }
             guard let offered = lease(for: request.clientHardwareAddress) else {
                 exhausted += 1
+                log?.record(.dhcpPoolExhausted, ["mac": .string(request.clientHardwareAddress.description)])
                 return
             }
             // A client asking for an address that is not the one it holds is
@@ -170,8 +177,12 @@ public final class DHCPServer {
         try? endpoint.send(frame, to: .broadcast, port: Self.clientPort)
     }
 
-    public func close() {
+    /// Close. Returns a future for symmetry with the services that own a host
+    /// socket; this one owns none, so it is already complete.
+    @discardableResult
+    public func close() -> EventLoopFuture<Void> {
         endpoint.close()
+        return stack.eventLoop.makeSucceededVoidFuture()
     }
 
     /// The address leased to a hardware address, if any. For tests and for a

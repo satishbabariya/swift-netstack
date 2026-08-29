@@ -212,3 +212,35 @@ private func request(
     close(guestSide)
     try? await group.shutdownGracefully()
 }
+
+@Test func statisticsAreReadableOverTheApiAndMoveWhenSomethingHappens() async throws {
+    // A gauge that never moves is indistinguishable from a gauge that is not
+    // wired to anything, so this reads the same field twice with a real change
+    // in between rather than asserting a shape once. Checking only that the
+    // JSON parses would pass for a handler returning a constant.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let before = try request("GET", "/stats", body: nil, to: api)
+    #expect(before.status == 200)
+    #expect(before.body.contains("\"forwarded_ports\":0"), "unexpected stats: \(before.body)")
+    // The keys are an operator's dashboard, so their spelling is part of the
+    // interface rather than an accident of Swift property names.
+    #expect(before.body.contains("\"tcp_refused_by_limit\":0"))
+    #expect(before.body.contains("\"dns_refused_no_upstream\":0"))
+
+    let exposed = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    #expect(exposed.status == 200)
+
+    let after = try request("GET", "/stats", body: nil, to: api)
+    #expect(after.body.contains("\"forwarded_ports\":1"), "the forward did not reach stats: \(after.body)")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}

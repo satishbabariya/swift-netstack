@@ -148,6 +148,11 @@ private func awaitSegments(
     #expect(text == "HELLO", "the listener's answer did not come back to the guest: \(String(describing: text))")
 
     try? await listener.close()
+    // The forwarder owns the host socket this connection was spliced to, and
+    // nothing else closes it: the guest side is going away with the link, but a
+    // host socket outlives that until the forwarder is told to let go.
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -178,6 +183,7 @@ private func awaitSegments(
     #expect(reset.header.acknowledgement == SequenceNumber(7001))
     #expect(holder.forwarder?.refusedForDial == 1)
 
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -218,6 +224,9 @@ private func awaitSegments(
     #expect(holder.forwarder?.establishedCount == 1, "the slot was not held by the live connection")
 
     try? await listener.close()
+    // The connection that took the slot is still spliced to a host socket.
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -286,6 +295,7 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     #expect(live == 0, "the host socket was not released")
 
     try? await listener.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()

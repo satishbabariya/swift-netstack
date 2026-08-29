@@ -53,6 +53,7 @@ try await control.listen(unixSocketPath: "/tmp/netstack.sock").get()
 POST /services/forwarder/expose   {"local":":8080","remote":"192.168.127.2:80"}
 POST /services/forwarder/unexpose {"local":":8080"}
 GET  /services/forwarder/all
+GET  /stats
 ```
 
 It listens on a unix socket because anything that can reach it can publish any
@@ -95,6 +96,11 @@ netstack-gateway --listen /tmp/net.sock --dns 1.1.1.1:53 \
                  --forward 8080:192.168.127.2:80
 ```
 
+`--log-level` picks how much it says; the default is `notice`, which is every
+refusal and nothing else. It is the only place in the package that bootstraps
+`LoggingSystem` — a library that installs a global log handler has decided for
+every other library in the process, and only the process is entitled to.
+
 Everything it does is available as an API, and a Swift host process should use
 that instead.
 
@@ -110,6 +116,7 @@ that instead.
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
+| **Observability** | `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
 
 **Not yet implemented:** IPv6.
 
@@ -161,6 +168,18 @@ established connections, UDP flows, DHCP leases, outstanding DNS queries,
 reassembly memory, and the length a frame may claim on a stream wire. Several of
 those bounds exist because removing one and running the tests found nothing.
 
+**A log line is one of those resources.** Every event this stack reports is one
+a guest can cause on purpose, so `RateLimitedLogger` emits the first of each kind
+immediately and holds the rest, reporting how many it held. The key is a closed
+enum rather than anything off the wire — a limiter keyed on a destination or a
+queried name is not a bound at all, it just moves the flood out of the log file
+and into the limiter's own table. Guest-chosen text still reaches the log as
+metadata, sanitized, because a DNS name containing a newline is how a guest
+forges a log entry an operator reads as authentic.
+
+Counters, unlike log lines, have no window: `Gateway.statistics()` counts every
+occurrence and is where a monitoring system should read from.
+
 ## Testing
 
 ```
@@ -178,7 +197,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-637 tests, plus a differential harness in `differential/` that drives gVisor's
+698 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

@@ -56,6 +56,14 @@ private func request(
     }
     #expect(connected == 0, "could not reach the control plane")
 
+    // A read deadline, because without one a route that answers nothing makes
+    // this block forever: the test does not fail, it hangs, and the only signal
+    // is the whole job timing out with nothing to point at. Found by mutating
+    // `HTTPMessageFramer` to swallow the request body -- the request then never
+    // completed and the suite stopped rather than reporting anything.
+    var deadline = timeval(tv_sec: 5, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
+
     var text = "\(method) \(path) HTTP/1.1\r\nHost: localhost\r\n"
     if let body {
         text += "Content-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\n\r\n\(body)"
@@ -74,6 +82,7 @@ private func request(
         if received <= 0 { break }
         response += String(decoding: buffer[0..<received], as: UTF8.self)
     }
+    #expect(!response.isEmpty, "the control plane did not answer \(method) \(path) within five seconds")
     let statusLine = response.split(separator: "\r\n").first ?? ""
     let status = Int(statusLine.split(separator: " ").dropFirst().first ?? "0") ?? 0
     let payload = response.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
@@ -314,6 +323,24 @@ private func request(
     let root = try request(
         "POST", "/services/dns/add", body: "{\"name\":\".\",\"defaultIP\":\"6.6.6.6\"}", to: api)
     #expect(root.status == 400, "the root zone was accepted")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func connectIsRefusedOnAGatewayWithNoSwitch() async throws {
+    // A gateway on a single wire has one guest already and nowhere to put a
+    // second. Refused with a status rather than by hijacking and then failing,
+    // because a client that has been hijacked has no way to be told anything.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let refused = try request("POST", "/connect", body: nil, to: api)
+    #expect(refused.status == 409, "connect was accepted on a gateway with no switch")
 
     holder.plane?.close()
     _ = try? await holder.gateway?.close().get()

@@ -358,3 +358,59 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+@Test func theHyperkitFramingIsTwoBytesLittleEndian() throws {
+    // Upstream's second stream framing, and the default its own `/connect`
+    // endpoint uses. qemu writes four bytes big-endian; hyperkit and vpnkit
+    // write two bytes little-endian. They are not compatible and nothing on the
+    // wire says which is in use, so a client that guesses wrong sees a framing
+    // error rather than anything naming the mismatch.
+    let channel = EmbeddedChannel()
+    let link = WireLinkEndpoint(channel: channel, linkAddress: wireMAC, mtu: 1500)
+    try channel.pipeline.syncOperations.addHandler(
+        ByteToMessageHandler(FrameDecoder(maximumFrame: 1514, framing: .hyperkit)))
+    try channel.pipeline.syncOperations.addHandler(
+        MessageToByteHandler(FrameEncoder(maximumFrame: 1514, framing: .hyperkit)))
+    try channel.pipeline.syncOperations.addHandler(WireInboundHandler(link: link))
+
+    let payload = ByteBuffer(bytes: [UInt8](repeating: 0xab, count: 300))
+    link.write([PacketBuffer(received: payload)])
+    channel.flush()
+    let encoded = try #require(try channel.readOutbound(as: ByteBuffer.self))
+
+    // 300 is 0x012C: little-endian puts the low byte first, which is what
+    // distinguishes this from qemu's framing rather than merely the width.
+    #expect(Array(encoded.readableBytesView.prefix(2)) == [0x2C, 0x01])
+    #expect(encoded.readableBytes == 302)
+
+    let collector = FramingCollector()
+    link.attach(collector)
+    try channel.writeInbound(encoded)
+    #expect(collector.frames.count == 1, "the frame it wrote did not decode")
+    #expect(collector.frames.first?.readableBytes == 300)
+    _ = try? channel.finish()
+}
+
+@Test func aTwoByteFramingWillNotAcceptALengthItsOwnPrefixCouldNotWrite() throws {
+    // The bound is the smaller of the MTU and what the prefix can express. A
+    // decoder built for a jumbo link with a two-byte prefix would otherwise
+    // accept lengths it could never have written -- and the encoder on the far
+    // side would have truncated them, so the two ends would disagree about where
+    // the next frame starts.
+    let decoder = FrameDecoder(maximumFrame: 200_000, framing: .hyperkit)
+    #expect(decoder.maximumFrame == 65535)
+
+    // The floor: qemu's four bytes are not clamped to hyperkit's ceiling.
+    let wide = FrameDecoder(maximumFrame: 200_000, framing: .qemu)
+    #expect(wide.maximumFrame == 200_000)
+}
+
+
+/// Collects what a link delivered upward. `ListeningWireTests` has its own,
+/// file-private; one per file is cheaper than making either shared.
+private final class FramingCollector: LinkDispatcher, @unchecked Sendable {
+    var frames: [ByteBuffer] = []
+    func deliverInbound(_ frame: PacketBuffer) {
+        frames.append(frame.frame)
+    }
+}

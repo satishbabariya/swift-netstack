@@ -95,47 +95,21 @@ public final class PortForwarder: @unchecked Sendable {
             return inbound.close()
         }
 
-        let endpoint = TCPEndpoint(stack: stack)
-        endpoint.keepAlive = keepAlive
-        let guestChannel = NetstackStreamChannel(
-            eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
-        guestChannel.installCallbacks()
-
+        // Slot taken before the dial, and released by whichever side ends
+        // first -- see `PortForwardSlot`.
         live += 1
         let slot = PortForwardSlot(forwarder: self)
         inbound.closeFuture.whenComplete { _ in slot.release() }
+
+        guard
+            let guestChannel = GuestSplice.connect(
+                stack: stack, host: inbound, to: guestAddress, port: guestPort, keepAlive: keepAlive)
+        else {
+            slot.release()
+            inbound.close(promise: nil)
+            return inbound.eventLoop.makeSucceededVoidFuture()
+        }
         guestChannel.closeFuture.whenComplete { _ in slot.release() }
-
-        let (guestGlue, hostGlue) = GlueHandler.matchedPair()
-        do {
-            try guestChannel.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
-            try guestChannel.pipeline.syncOperations.addHandler(guestGlue)
-            try inbound.pipeline.syncOperations.addHandler(hostGlue)
-        } catch {
-            inbound.close(promise: nil)
-            guestChannel.close(promise: nil)
-            return inbound.eventLoop.makeSucceededVoidFuture()
-        }
-
-        // Registered first, connected second, and the order matters: `connect`
-        // makes the guest-side channel active as soon as the handshake
-        // completes, and a channel that becomes active before its pipeline is
-        // registered delivers `channelActive` to nobody.
-        guestChannel.register0(promise: nil)
-        let address = try? SocketAddress(ipAddress: guestAddress.description, port: Int(guestPort))
-        guard let address else {
-            inbound.close(promise: nil)
-            guestChannel.close(promise: nil)
-            return inbound.eventLoop.makeSucceededVoidFuture()
-        }
-        let connected = eventLoop.makePromise(of: Void.self)
-        guestChannel.connect0(to: address, promise: connected)
-        connected.futureResult.whenFailure { _ in
-            // The guest is not listening, or is gone. The host dialler is told
-            // by the only means a TCP server has: the connection it made goes
-            // away.
-            inbound.close(promise: nil)
-        }
         return inbound.eventLoop.makeSucceededVoidFuture()
     }
 

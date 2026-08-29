@@ -58,7 +58,15 @@ GET  /leases
 GET  /cam
 GET  /services/dns/all
 POST /services/dns/add      {"name":"svc.test.","records":[{"name":"api","ip":"10.1.2.3"}]}
+GET  /tunnel?ip=<guest>&port=<port>
+POST /connect
 ```
+
+The last two take the connection away from HTTP. `/tunnel` answers a bare `OK`
+and then carries that connection to a guest's port — a port forward for one
+connection, with no listener. `/connect` makes the connection a **port on the
+switch**, which is how a guest that can reach only this socket joins the
+network.
 
 It listens on a unix socket because anything that can reach it can publish any
 guest port on the host, and a unix socket puts that behind the filesystem where
@@ -89,6 +97,13 @@ which is what `vfkit` and `qemu` do.
 | `WireBootstrap.adoptingStreamSocket` | A stream descriptor already connected. A four-byte big-endian length in front of each frame. |
 | `WireBootstrap.listeningStreamSocket` | qemu's `-netdev socket`, bess, stdio. One guest; a second connection is closed. |
 | `WireBootstrap.switchedStreamSocket` | The same, but every guest that connects gets a port on a `NetworkSwitch`. |
+
+Stream wires carry a length prefix, and there are **two incompatible spellings**
+of it: qemu's four-byte big-endian (the default here) and hyperkit's two-byte
+little-endian (upstream's default for `/connect`, and what this uses there).
+Nothing on the wire says which is in use, so a mismatch shows up as a frame
+claiming an impossible length rather than as anything naming the problem. Pick
+with `framing:`.
 
 ### Names
 
@@ -243,7 +258,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-718 tests, plus a differential harness in `differential/` that drives gVisor's
+724 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

@@ -89,21 +89,23 @@ public enum WireBootstrap {
     ///
     /// Ownership passes to NIO, as above.
     public static func adoptingStreamSocket(
-        _ descriptor: NIOBSDSocket.Handle, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
+        _ descriptor: NIOBSDSocket.Handle, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        framing: StreamFraming = .qemu
     ) -> EventLoopFuture<WireLinkEndpoint> {
         ClientBootstrap(group: group).withConnectedSocket(descriptor).flatMap { channel in
-            configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true)
+            configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing)
         }
     }
 
     /// Connect a unix stream socket to `path`, carrying length-prefixed frames.
     public static func connectingStreamSocket(
-        toPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
+        toPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        framing: StreamFraming = .qemu
     ) -> EventLoopFuture<WireLinkEndpoint> {
         do {
             let remote = try SocketAddress(unixDomainSocketPath: path)
             return ClientBootstrap(group: group).connect(to: remote).flatMap { channel in
-                configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true)
+                configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing)
             }
         } catch {
             return group.any().makeFailedFuture(error)
@@ -156,7 +158,8 @@ public enum WireBootstrap {
     /// carries one ethernet segment, and two guests on it would need a switch
     /// that learns which addresses are behind which socket.
     public static func listeningStreamSocket(
-        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
+        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        framing: StreamFraming = .qemu
     ) -> EventLoopFuture<WireLinkEndpoint> {
         try? FileManager.default.removeItem(atPath: path)
         let arrived = group.any().makePromise(of: WireLinkEndpoint.self)
@@ -170,7 +173,7 @@ public enum WireBootstrap {
                 }
                 guard first else { return channel.close() }
                 return configure(
-                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true
+                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
                 ).map { link in
                     arrived.succeed(link)
                 }
@@ -200,7 +203,7 @@ public enum WireBootstrap {
     /// the switch's own loop is what makes the no-locks rule hold here.
     public static func switchedStreamSocket(
         atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
-        maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16
+        maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16, framing: StreamFraming = .qemu
     ) -> EventLoopFuture<NetworkSwitch> {
         try? FileManager.default.removeItem(atPath: path)
         let loop = group.next()
@@ -216,7 +219,7 @@ public enum WireBootstrap {
                 // check rather than a hop.
                 guard netSwitch.portCount < limit else { return channel.close() }
                 return configure(
-                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true
+                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
                 ).map { link in
                     let id = netSwitch.addPort(link)
                     // A guest that goes away takes its port with it, and with it
@@ -238,9 +241,12 @@ public enum WireBootstrap {
     /// referenced weakly by them: the link owns the channel and the channel's
     /// pipeline owns the handlers, so a strong reference back would close a
     /// cycle around a wire that is never released.
-    private static func configure(
+    /// Internal rather than private because `ControlPlane` builds a link on a
+    /// connection it hijacked from HTTP, which is the same job as every
+    /// bootstrap above with the socket already in hand.
+    static func configure(
         channel: Channel, linkAddress: MACAddress, mtu: UInt32, framed: Bool, remote: SocketAddress? = nil,
-        flushPerFrame: Bool = false, learnsPeer: Bool = false
+        flushPerFrame: Bool = false, learnsPeer: Bool = false, framing: StreamFraming = .qemu
     ) -> EventLoopFuture<WireLinkEndpoint> {
         let link = WireLinkEndpoint(
             channel: channel, linkAddress: linkAddress, mtu: mtu, flushPerFrame: flushPerFrame)
@@ -253,8 +259,10 @@ public enum WireBootstrap {
             }
             if framed {
                 let maximumFrame = Int(mtu) + EthernetHeader.length
-                try sync.addHandler(ByteToMessageHandler(FrameDecoder(maximumFrame: maximumFrame)))
-                try sync.addHandler(MessageToByteHandler(FrameEncoder(maximumFrame: maximumFrame)))
+                try sync.addHandler(
+                    ByteToMessageHandler(FrameDecoder(maximumFrame: maximumFrame, framing: framing)))
+                try sync.addHandler(
+                    MessageToByteHandler(FrameEncoder(maximumFrame: maximumFrame, framing: framing)))
             }
             try sync.addHandler(WireInboundHandler(link: link))
             return link

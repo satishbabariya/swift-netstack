@@ -43,6 +43,10 @@ public final class Gateway: @unchecked Sendable {
         public var maximumTCPConnections: Int
         public var maximumUDPFlows: Int
         public var maximumHalfOpenConnections: Int
+        /// Applied to every forwarded connection's guest-side endpoint. On by
+        /// default -- see `OutboundTCPForwarder.init` for why that is the
+        /// opposite of `TCPEndpoint`'s default and right here.
+        public var keepAlive: TCPEndpoint.KeepAliveConfiguration?
 
         public init(
             gatewayAddress: IPv4Address = IPv4Address("192.168.127.1")!,
@@ -54,7 +58,8 @@ public final class Gateway: @unchecked Sendable {
             leaseSeconds: UInt32 = 3600,
             maximumTCPConnections: Int = 1024,
             maximumUDPFlows: Int = 512,
-            maximumHalfOpenConnections: Int = 512
+            maximumHalfOpenConnections: Int = 512,
+            keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration()
         ) {
             self.gatewayAddress = gatewayAddress
             self.subnet = subnet
@@ -72,6 +77,7 @@ public final class Gateway: @unchecked Sendable {
             self.maximumTCPConnections = maximumTCPConnections
             self.maximumUDPFlows = maximumUDPFlows
             self.maximumHalfOpenConnections = maximumHalfOpenConnections
+            self.keepAlive = keepAlive
         }
     }
 
@@ -83,13 +89,16 @@ public final class Gateway: @unchecked Sendable {
     public let udp: UDPForwarder
 
     private var forwards: [PortForwarder] = []
+    private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
 
     public var eventLoop: EventLoop { link.eventLoop }
 
     private init(
         link: WireLinkEndpoint, stack: Stack, dhcp: DHCPServer, dns: DNSServer,
-        tcp: OutboundTCPForwarder, udp: UDPForwarder
+        tcp: OutboundTCPForwarder, udp: UDPForwarder,
+        keepAlive: TCPEndpoint.KeepAliveConfiguration?
     ) {
+        self.keepAlive = keepAlive
         self.link = link
         self.stack = stack
         self.dhcp = dhcp
@@ -149,9 +158,12 @@ public final class Gateway: @unchecked Sendable {
                 upstream: configuration.upstreamResolvers)
             let tcp = OutboundTCPForwarder(
                 stack: stack, maximumInFlight: configuration.maximumHalfOpenConnections,
-                maximumConnections: configuration.maximumTCPConnections)
+                maximumConnections: configuration.maximumTCPConnections,
+                keepAlive: configuration.keepAlive)
             let udp = UDPForwarder(stack: stack, maximumFlows: configuration.maximumUDPFlows)
-            return Gateway(link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp)
+            return Gateway(
+                link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp,
+                keepAlive: configuration.keepAlive)
         }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in
             gateway.dns.startForwarding(group: group).map { _ in gateway }
         }
@@ -168,7 +180,7 @@ public final class Gateway: @unchecked Sendable {
         host: String = "127.0.0.1"
     ) -> EventLoopFuture<PortForwarder> {
         let forwarder = PortForwarder(
-            stack: stack, guestAddress: guestAddress, guestPort: guestPort)
+            stack: stack, guestAddress: guestAddress, guestPort: guestPort, keepAlive: keepAlive)
         return forwarder.listen(host: host, port: hostPort).map { [weak self] _ -> PortForwarder in
             self?.forwards.append(forwarder)
             return forwarder

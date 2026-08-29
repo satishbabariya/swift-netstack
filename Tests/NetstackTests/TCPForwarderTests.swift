@@ -183,3 +183,35 @@ import Testing
     accepted.removeAll()
     fixture.drain()
 }
+
+@Test func replacingAForwarderLeavesTheReplacementInstalled() throws {
+    // The hazard the unconditional teardown was. Two owners' lifetimes overlap
+    // whenever one replaces another: the replacement installs its handler, the
+    // original is released, and its teardown removes the REPLACEMENT's. Nothing
+    // errors -- the datapath simply stops being intercepted, which presents as a
+    // gateway that has silently stopped forwarding.
+    //
+    // Found by a test one layer up that replaced a forwarder to shorten its
+    // keep-alive, and whose next connection was never answered. The comment on
+    // the teardown said removing that line "changes no observable behaviour".
+    let fixture = TCPFixture()
+    var seen = 0
+    var replacement: TCPForwarder?
+    do {
+        var original: TCPForwarder? = TCPForwarder(stack: fixture.stack) { $0.refuse() }
+        replacement = TCPForwarder(stack: fixture.stack) { request in
+            seen += 1
+            request.refuse()
+        }
+        // The original goes away AFTER the replacement is installed, which is
+        // the ordering that matters and the only one that can go wrong.
+        original = nil
+        _ = original
+    }
+    try withExtendedLifetime(replacement) {
+        fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: 9999))
+        #expect(seen == 1, "the replacement's handler was uninstalled by the original's teardown")
+    }
+    replacement = nil
+    fixture.drain()
+}

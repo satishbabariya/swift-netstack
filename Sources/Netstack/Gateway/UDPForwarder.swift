@@ -82,14 +82,17 @@ public final class UDPForwarder: @unchecked Sendable {
         self.gateway = stack.configuration.gatewayAddress
         self.maximumFlows = max(1, maximumFlows)
         self.idleTimeout = idleTimeout
-        stack.transportDemuxer.setProtocolHandler(.udp) { [weak self] header, payload, localPort, remotePort in
+        stack.transportDemuxer.setProtocolHandler(.udp, ownedBy: self) {
+            [weak self] header, payload, localPort, remotePort in
             self?.handle(
                 header: header, payload: payload, localPort: localPort, remotePort: remotePort) ?? false
         }
     }
 
     deinit {
-        stack.transportDemuxer.setProtocolHandler(.udp, nil)
+        // Ownership-checked; see `TCPForwarder.deinit` for the defect the
+        // unconditional form was.
+        stack.transportDemuxer.clearProtocolHandler(.udp, ownedBy: self)
     }
 
     /// Returns true when the datagram was consumed.
@@ -193,7 +196,7 @@ public final class UDPForwarder: @unchecked Sendable {
     }
 
     public func close() {
-        stack.transportDemuxer.setProtocolHandler(.udp, nil)
+        stack.transportDemuxer.clearProtocolHandler(.udp, ownedBy: self)
         for flow in flows.values { flow.channel.close(promise: nil) }
         flows.removeAll()
     }

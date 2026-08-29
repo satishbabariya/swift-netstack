@@ -35,6 +35,7 @@ public final class PortForwarder: @unchecked Sendable {
     private let guestAddress: IPv4Address
     private let guestPort: UInt16
     private let maximumConnections: Int
+    private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
     private var listener: Channel?
     private var live = 0
 
@@ -45,14 +46,18 @@ public final class PortForwarder: @unchecked Sendable {
     /// port when it asked for zero.
     public var listeningAddress: SocketAddress? { listener?.localAddress }
 
+    /// `keepAlive` defaults on for the same reason it does on the outbound
+    /// forwarder: see `OutboundTCPForwarder.init`.
     public init(
-        stack: Stack, guestAddress: IPv4Address, guestPort: UInt16, maximumConnections: Int = 256
+        stack: Stack, guestAddress: IPv4Address, guestPort: UInt16, maximumConnections: Int = 256,
+        keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration()
     ) {
         self.stack = stack
         self.eventLoop = stack.eventLoop
         self.guestAddress = guestAddress
         self.guestPort = guestPort
         self.maximumConnections = max(1, maximumConnections)
+        self.keepAlive = keepAlive
     }
 
     /// Start listening. `host` defaults to loopback: see the type comment for
@@ -82,6 +87,7 @@ public final class PortForwarder: @unchecked Sendable {
         }
 
         let endpoint = TCPEndpoint(stack: stack)
+        endpoint.keepAlive = keepAlive
         let guestChannel = NetstackStreamChannel(
             eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
         guestChannel.installCallbacks()

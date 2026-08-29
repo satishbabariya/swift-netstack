@@ -476,9 +476,14 @@ struct Sender {
         // is trying to beat.
         var interval = TimeAmount.nanoseconds(smoothed.nanoseconds * 2)
         if inFlight.count == 1 { interval = interval + Self.delayedAckAllowance }
-        let timeout = estimator.retransmissionTimeout
-        if interval > timeout { interval = timeout }
-        return last.sentAt + interval
+        var deadline = last.sentAt + interval
+        // Capped at the RETRANSMISSION TIMER'S OWN DEADLINE, not at the RTO
+        // interval. The two differ whenever the timer was armed before this
+        // segment went out -- which is the ordinary case for a flight -- and the
+        // probe exists to beat that timer, so a probe scheduled past it is a
+        // probe that never happens.
+        if let timer = timerDeadline, deadline > timer { deadline = timer }
+        return deadline
     }
 
     /// RFC 8985 §7.2's `WCDelAckT`: the worst-case delayed acknowledgement a

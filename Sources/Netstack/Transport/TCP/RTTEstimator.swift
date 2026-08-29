@@ -79,7 +79,30 @@ struct RTTEstimator: Sendable, Equatable {
     /// RFC 6298 §5.7: a fresh measurement is evidence the path is delivering
     /// again, so the doubled timers from the previous loss episode no longer
     /// describe it.
-    mutating func measure(_ sample: TimeAmount) {
+    /// `expectedSamples` is RFC 7323 Appendix G's correction, and it is not
+    /// optional once timestamps are in use.
+    ///
+    /// ## Why a per-ACK sample must be damped
+    ///
+    /// RFC 6298's α = 1/8 and β = 1/4 are chosen for ONE sample per round trip,
+    /// which is what Karn's algorithm and a single timed segment give. With
+    /// timestamps every acknowledgement carries a usable measurement, so a
+    /// window of ten segments produces ten samples per round trip -- and the
+    /// estimator tracks ten times faster than it was designed to. Appendix G's
+    /// fix is to divide both gains by the number of samples expected in a round
+    /// trip, which it approximates as half the flight.
+    ///
+    /// This was found by measurement, not by reading. The differential harness
+    /// had a residual disagreement about when a FIN is retransmitted, and both
+    /// estimators were instrumented rather than reasoned about: at the same
+    /// instant, on the same acknowledgement, gVisor's smoothed round trip stayed
+    /// at 10 ms and this one jumped to 259 ms. gVisor applies Appendix G; this
+    /// did not, so one ambiguous-but-timestamped sample of a full second moved
+    /// the estimate twenty-five times further here than there.
+    ///
+    /// Pass 1 -- the default -- when the sample is Karn-timed, which is one per
+    /// round trip by construction.
+    mutating func measure(_ sample: TimeAmount, expectedSamples: Int = 1) {
         let r = sample.nanoseconds
         // A zero or negative sample means the clock moved backwards or the
         // sample was taken wrongly -- not that the path is instantaneous.
@@ -92,8 +115,22 @@ struct RTTEstimator: Sendable, Equatable {
             // defines the variance in terms of the estimate the sample is
             // being compared against, not the one that includes it.
             let difference = srtt >= r ? srtt - r : r - srtt
-            rttvar = rttvar - (rttvar >> 2) + (difference >> 2)
-            srtt = srtt - (srtt >> 3) + (r >> 3)
+            let samples = Int64(max(1, expectedSamples))
+            if samples == 1 {
+                // The integer shifts are exact for α = 1/8 and β = 1/4 and are
+                // kept for that case: it is every connection without
+                // timestamps, and it is the arithmetic the vectors were derived
+                // against.
+                rttvar = rttvar - (rttvar >> 2) + (difference >> 2)
+                srtt = srtt - (srtt >> 3) + (r >> 3)
+            } else {
+                // Appendix G, in integer arithmetic. α' = 1/(8n) and β' = 1/(4n)
+                // become divisions by 8n and 4n, which is the same expression
+                // with the shift replaced by a divide -- and the divide is what
+                // makes n expressible at all.
+                rttvar = rttvar - (rttvar / (4 * samples)) + (difference / (4 * samples))
+                srtt = srtt - (srtt / (8 * samples)) + (r / (8 * samples))
+            }
         } else {
             // RFC 6298 §2.2. Nothing to blend against yet.
             srtt = r

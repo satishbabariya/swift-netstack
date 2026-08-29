@@ -611,13 +611,42 @@ after the path has demonstrably delivered detects the next loss twice as slowly.
 But it would have to be argued on its merits, as a deliberate divergence from the
 reference, rather than on "everyone does it" — which turned out to be false.
 
-**The residual disagreement is still open, and reverting does not close it.**
-Before the change this stack retransmitted the FIN one step *after* gVisor, and
-both stacks keep their backoffs, so the difference is in when a doubling happens
-or what the timer is armed against — not in whether the backoff survives. The
-`TCPInfoOption` diagnostic is the tool for it and is worth re-adding temporarily
-rather than reasoning about: four lines in the harness's step loop, writing `RTO`,
-`RTT` and `RTTVar` out per step.
+## The residual disagreement: closed, by RFC 7323 Appendix G
+
+**Closed.** The reproduction above — seed `6840123409045651477` with the write
+follow-up at 2000 ms — now agrees on every frame.
+
+The cause was not the backoff and not the arming. It was the **sampling gain**,
+and it was found by doing what this section already recommended: instrumenting
+both estimators rather than reasoning about them. `NETSTACK_HARNESS_RTO=<path>`
+writes gVisor's `TCPInfoOption` per step; the same figures were printed from this
+side, and at one instant, on one acknowledgement, gVisor's smoothed round trip
+stayed at 10 ms while this one jumped to 259 ms.
+
+**RFC 7323 Appendix G.** RFC 6298's α = 1/8 and β = 1/4 are chosen for one sample
+per round trip, which is what Karn's algorithm gives. Timestamps make a usable
+sample arrive with *every* acknowledgement, so the estimator tracks as many times
+too fast as there are segments in the window. The appendix divides both gains by
+`ExpectedSamples = ceil(FlightSize / (2 * SMSS))`.
+
+**The edge is what mattered.** A flight of zero makes that divisor zero — a
+division by zero, not a gain of one — so the acknowledgement that retires the
+*last* outstanding segment carries no usable sample. gVisor guards it with
+`if s.Outstanding == 0 { return }` in `updateRTO`. And that acknowledgement is
+exactly the one most likely to be inflated: the one arriving after a
+retransmission, echoing a timestamp from a transmission the peer may never have
+seen. Taking it once moved the estimate twenty-five-fold on a path whose real
+round trip was 10 ms, and every timer derived from it landed a step late for the
+rest of the connection.
+
+**The consequence is worth knowing rather than discovering.** A connection that
+sends one segment at a time and waits for each acknowledgement never updates its
+estimate after the handshake. That is what gVisor does too, which is what settled
+it — `theAcknowledgementThatEmptiesTheFlightProducesNoSample` records it as a
+property rather than leaving it to be found.
+
+The earlier attempt in this section reasoned from Linux's `icsk_backoff` and
+reached a conclusion that did not describe gVisor at all. This one asked.
 
 ## Nagle: another configuration difference, and two attempts that failed
 

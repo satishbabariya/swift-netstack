@@ -209,3 +209,186 @@ private func pfGuestSegment(
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+@Test func aHostDatagramReachesTheGuestAndTheReplyGoesBackToItsSender() async throws {
+    // UDP forwarding end to end. The control-plane test checks the bookkeeping;
+    // this checks that a datagram actually crosses, in both directions, and that
+    // the reply reaches the sender rather than being dropped for want of anything
+    // to match it to.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let guestSide = pair[1]
+    defer { close(guestSide) }
+    let link = try await WireBootstrap.adoptingDatagramSocket(
+        pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
+    ).get()
+    let holder = PFHolder()
+    holder.link = link
+    let forwarder = try await link.eventLoop.submit { () -> UDPPortForwarder in
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: pfGateway, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!))
+        stack.start()
+        stack.arpCache.record(pfGuest, pfGuestMAC)
+        holder.stack = stack
+        return UDPPortForwarder(stack: stack, guestAddress: pfGuest, guestPort: 9999)
+    }.get()
+    try await forwarder.listen(port: 0).get()
+    let hostPort = forwarder.listeningAddress!.port!
+
+    // A host sender, bound so it can be replied to.
+    let sender = socket(AF_INET, SOCK_DGRAM, 0)
+    #expect(sender >= 0)
+    defer { close(sender) }
+    var target = sockaddr_in()
+    target.sin_family = sa_family_t(AF_INET)
+    target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    target.sin_port = UInt16(hostPort).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr)
+    let payload = Array("ping".utf8)
+    _ = withUnsafePointer(to: &target) { addr in
+        addr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+            payload.withUnsafeBytes {
+                sendto(sender, $0.baseAddress, $0.count, 0, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+
+    // It should arrive at the guest, on the guest port that was published.
+    var arrived: (source: UInt16, payload: [UInt8])?
+    for _ in 0..<400 where arrived == nil {
+        var back = [UInt8](repeating: 0, count: 4096)
+        let read = back.withUnsafeMutableBytes { recv(guestSide, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        if read > 0 {
+            var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
+            guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,
+                let ip = IPv4Header.parse(&packet), ip.protocolNumber == .udp,
+                let udp = UDPHeader.parse(&packet, header: ip), udp.destinationPort == 9999
+            else { continue }
+            arrived = (udp.sourcePort, Array(packet.payload.readableBytesView))
+        } else {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+    let request = try #require(arrived, "the host's datagram never reached the guest")
+    #expect(String(decoding: request.payload, as: UTF8.self) == "ping")
+
+    // The guest answers to the port the gateway used, which is what the reply
+    // has to be matched by.
+    let reply = udpGuestDatagram(
+        sourcePort: 9999, destinationPort: request.source, payload: Array("pong".utf8))
+    _ = reply.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+
+    var answer = [UInt8](repeating: 0, count: 128)
+    var received = -1
+    for _ in 0..<400 where received <= 0 {
+        received = answer.withUnsafeMutableBytes { recv(sender, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        if received <= 0 { try? await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(received == 4, "the guest's reply never came back to the host sender")
+    #expect(String(decoding: answer[0..<max(0, received)], as: UTF8.self) == "pong")
+
+    _ = try? await forwarder.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+/// One UDP datagram from the guest to the gateway.
+private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, payload: [UInt8]) -> [UInt8] {
+    let allocator = ByteBufferAllocator()
+    let datagram = UDPHeader.serialize(
+        payload: ByteBuffer(bytes: payload), source: pfGuest, destination: pfGateway,
+        sourcePort: sourcePort, destinationPort: destinationPort, allocator: allocator)!
+    var packet = PacketBuffer(allocator: allocator, payload: datagram)
+    IPv4Header(
+        source: pfGuest, destination: pfGateway, protocolNumber: .udp,
+        payloadLength: datagram.readableBytes
+    ).prepend(to: &packet)
+    EthernetHeader(destination: pfGatewayMAC, source: pfGuestMAC, etherType: .ipv4).prepend(to: &packet)
+    return Array(packet.frame.readableBytesView)
+}
+
+@Test func udpFlowsAreBoundedAndIdleOnesAreReclaimed() async throws {
+    // UDP has no connections, so nothing here ends on its own. The peer is
+    // whatever can reach the listening socket, and a sender that varies its
+    // source port makes a new flow per datagram -- so without a bound one host
+    // process makes this table grow without limit, and without a timeout the
+    // bound turns into a permanent refusal rather than a temporary one.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    defer { close(pair[1]) }
+    let link = try await WireBootstrap.adoptingDatagramSocket(
+        pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
+    ).get()
+    let holder = PFHolder()
+    holder.link = link
+    let clock = ManualClock()
+    let forwarder = try await link.eventLoop.submit { () -> UDPPortForwarder in
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: pfGateway, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!),
+            clock: clock)
+        stack.start()
+        stack.arpCache.record(pfGuest, pfGuestMAC)
+        holder.stack = stack
+        return UDPPortForwarder(
+            stack: stack, guestAddress: pfGuest, guestPort: 9999, maximumFlows: 2,
+            idleTimeout: .seconds(60))
+    }.get()
+    try await forwarder.listen(port: 0).get()
+    let hostPort = forwarder.listeningAddress!.port!
+
+    /// One datagram from a socket of its own, so each has its own source port
+    /// and is therefore its own flow.
+    func sendFromANewSocket() {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        defer { close(fd) }
+        var target = sockaddr_in()
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        target.sin_port = UInt16(hostPort).bigEndian
+        inet_pton(AF_INET, "127.0.0.1", &target.sin_addr)
+        let payload = Array("x".utf8)
+        _ = withUnsafePointer(to: &target) { addr in
+            addr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+                payload.withUnsafeBytes {
+                    sendto(fd, $0.baseAddress, $0.count, 0, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+    }
+
+    for _ in 0..<12 { sendFromANewSocket() }
+    var flows = 0
+    for _ in 0..<200 where flows < 2 {
+        flows = try await link.eventLoop.submit { forwarder.flowCount }.get()
+        if flows < 2 { try? await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    let settled = try await link.eventLoop.submit { forwarder.flowCount }.get()
+    #expect(settled == 2, "the flow table grew to \(settled) against a limit of 2")
+    let refused = try await link.eventLoop.submit { forwarder.refusedForLimit }.get()
+    #expect(refused > 0, "twelve senders against a limit of two refused none")
+
+    // Time passes with nothing sent, and the next datagram finds room: the
+    // bound is a limit on concurrent flows, not a lifetime quota.
+    clock.advance(by: .seconds(120))
+    sendFromANewSocket()
+    var reclaimed = 0
+    for _ in 0..<200 where reclaimed == 0 {
+        reclaimed = try await link.eventLoop.submit { forwarder.reclaimed }.get()
+        if reclaimed == 0 { try? await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(reclaimed >= 2, "idle flows were never reclaimed")
+
+    _ = try? await forwarder.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

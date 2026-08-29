@@ -184,6 +184,13 @@ public final class Gateway: @unchecked Sendable {
     /// port -- and because two forwards on one port is a state the type should
     /// not be able to represent.
     private var forwards: [Int: PortForwarder] = [:]
+    /// UDP forwards, keyed by host port. A separate table from the TCP one
+    /// because a host port is only unique **within** a protocol: 8080/tcp and
+    /// 8080/udp are two different things and both may be published at once, which
+    /// is why upstream keys its own proxies by protocol and port together.
+    private var udpForwards: [Int: UDPPortForwarder] = [:]
+    /// Forwards published on a unix socket, keyed by path.
+    private var unixForwards: [String: PortForwarder] = [:]
     private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
 
     public var eventLoop: EventLoop { link.eventLoop }
@@ -384,6 +391,59 @@ public final class Gateway: @unchecked Sendable {
         }
     }
 
+    /// Publish a guest's **UDP** port on the host.
+    public func forwardUDP(
+        hostPort: Int, toGuest guestAddress: IPv4Address, port guestPort: UInt16,
+        host: String = "127.0.0.1"
+    ) -> EventLoopFuture<UDPPortForwarder> {
+        let forwarder = UDPPortForwarder(
+            stack: stack, guestAddress: guestAddress, guestPort: guestPort)
+        forwarder.log = log
+        return forwarder.listen(host: host, port: hostPort).map { [weak self] _ -> UDPPortForwarder in
+            let bound = forwarder.listeningAddress?.port ?? hostPort
+            self?.udpForwards[bound] = forwarder
+            return forwarder
+        }
+    }
+
+    /// Publish a guest's TCP port on a **unix socket** rather than a host port.
+    ///
+    /// Who may reach the guest is then decided by filesystem permissions, which
+    /// is a stronger and more visible answer than "anything that can open a
+    /// connection to a port on this machine".
+    public func forward(
+        unixSocketPath path: String, toGuest guestAddress: IPv4Address, port guestPort: UInt16
+    ) -> EventLoopFuture<PortForwarder> {
+        let forwarder = PortForwarder(
+            stack: stack, guestAddress: guestAddress, guestPort: guestPort, keepAlive: keepAlive)
+        forwarder.log = log
+        return forwarder.listen(unixSocketPath: path).map { [weak self] _ -> PortForwarder in
+            self?.unixForwards[path] = forwarder
+            return forwarder
+        }
+    }
+
+    /// Stop a UDP forward. Returns whether there was one to stop.
+    @discardableResult
+    public func stopForwardingUDP(hostPort: Int) -> Bool {
+        guard let forwarder = udpForwards.removeValue(forKey: hostPort) else { return false }
+        forwarder.close()
+        return true
+    }
+
+    /// Stop a unix-socket forward. Returns whether there was one to stop.
+    @discardableResult
+    public func stopForwarding(unixSocketPath path: String) -> Bool {
+        guard let forwarder = unixForwards.removeValue(forKey: path) else { return false }
+        forwarder.close()
+        return true
+    }
+
+    /// The host UDP ports currently published, ascending.
+    public var forwardedUDPPorts: [Int] { udpForwards.keys.sorted() }
+    /// The unix socket paths currently published, sorted.
+    public var forwardedUnixPaths: [String] { unixForwards.keys.sorted() }
+
     /// The address leased to a guest, once it has asked for one. This is how a
     /// caller learns where to forward a port to without being told.
     public func leasedAddress(for hardware: MACAddress) -> IPv4Address? {
@@ -439,6 +499,10 @@ public final class Gateway: @unchecked Sendable {
         eventLoop.preconditionInEventLoop()
         var closing = forwards.values.map { $0.close() }
         forwards.removeAll()
+        closing.append(contentsOf: unixForwards.values.map { $0.close() })
+        unixForwards.removeAll()
+        closing.append(contentsOf: udpForwards.values.map { $0.close() })
+        udpForwards.removeAll()
         closing.append(udp.close())
         closing.append(dns.close())
         closing.append(dhcp.close())

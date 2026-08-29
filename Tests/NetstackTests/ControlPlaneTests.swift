@@ -105,8 +105,7 @@ private func request(
     #expect(exposed.status == 200)
     // Port zero means "anything free", so the answer has to name what was
     // actually bound: a caller told ":0" has no way to address it later.
-    let bound = Int(exposed.body.replacingOccurrences(of: "{\"local\":\":", with: "")
-        .replacingOccurrences(of: "\"}", with: "")) ?? 0
+    let bound = boundPort(in: exposed.body) ?? 0
     #expect(bound > 0, "the answer did not name the port that was bound: \(exposed.body)")
 
     let listed = try request("GET", "/services/forwarder/all", body: nil, to: api)
@@ -341,6 +340,150 @@ private func request(
 
     let refused = try request("POST", "/connect", body: nil, to: api)
     #expect(refused.status == 409, "connect was accepted on a gateway with no switch")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+
+/// The port named by `{"local":":8080",...}`, parsed rather than string-stripped.
+///
+/// The first version of this stripped a known prefix and suffix, so adding a
+/// field to the response broke it in four places at once and said nothing about
+/// which change caused it.
+private func boundPort(in body: String) -> Int? {
+    guard let object = try? JSONSerialization.jsonObject(with: Data(body.utf8)),
+        let fields = object as? [String: Any], let local = fields["local"] as? String,
+        let colon = local.lastIndex(of: ":")
+    else { return nil }
+    return Int(local[local.index(after: colon)...])
+}
+
+@Test func aUdpPortCanBeExposedAlongsideATcpOneOnTheSameNumber() async throws {
+    // A host port is only unique within a protocol. 8080/tcp and 8080/udp are
+    // two different forwards and both may be published at once -- so keying the
+    // table by port alone makes exposing the second silently displace the
+    // first, and unexposing either take down whichever happens to be there.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let tcp = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    #expect(tcp.status == 200, "tcp expose failed: \(tcp.body)")
+    let tcpPort = try #require(boundPort(in: tcp.body))
+
+    // The same number, as UDP. Bound explicitly rather than with :0, because
+    // the point is that the number collides.
+    let udp = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":\(tcpPort)\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"udp\"}", to: api)
+    #expect(udp.status == 200, "udp expose on the same port failed: \(udp.body)")
+
+    let listed = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(listed.body.contains("\"protocol\":\"tcp\""), "the tcp forward is gone: \(listed.body)")
+    #expect(listed.body.contains("\"protocol\":\"udp\""), "the udp forward is not listed: \(listed.body)")
+
+    // Withdrawing the UDP one leaves the TCP one alone.
+    let withdrawn = try request(
+        "POST", "/services/forwarder/unexpose",
+        body: "{\"local\":\":\(tcpPort)\",\"protocol\":\"udp\"}", to: api)
+    #expect(withdrawn.status == 200)
+    let after = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(after.body.contains("\"protocol\":\"tcp\""), "withdrawing udp took the tcp forward with it")
+    #expect(!after.body.contains("\"protocol\":\"udp\""))
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func aForwardOnAUnixSocketIsPublishedAtItsPath() async throws {
+    // Upstream's `unix` protocol. Who may reach the guest is then decided by
+    // filesystem permissions rather than by whoever can open a connection to a
+    // port on this machine, which is a stronger and a more visible answer.
+    let path = "/tmp/netstack-unix-forward-\(UInt32.random(in: 0...UInt32.max)).sock"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let exposed = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"\(path)\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"unix\"}", to: api)
+    #expect(exposed.status == 200, "unix expose failed: \(exposed.body)")
+    #expect(FileManager.default.fileExists(atPath: path), "no socket was created at \(path)")
+
+    let listed = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(listed.body.contains(path), "the unix forward is not listed: \(listed.body)")
+
+    let withdrawn = try request(
+        "POST", "/services/forwarder/unexpose",
+        body: "{\"local\":\"\(path)\",\"protocol\":\"unix\"}", to: api)
+    #expect(withdrawn.status == 200)
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func aRelativeUnixPathIsRefusedRatherThanResolvedAgainstTheWorkingDirectory() async throws {
+    // Where a relative path lands depends on whichever directory this process
+    // happens to be in, which the caller has no way to know -- so the socket
+    // appears somewhere neither of them expected, and a caller that asked twice
+    // could get two different sockets.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let refused = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"relative.sock\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"unix\"}", to: api)
+    #expect(refused.status == 400, "a relative socket path was accepted")
+
+    // The floor: an absolute one is fine, so this is the path check rather than
+    // unix forwarding being refused outright.
+    let path = "/tmp/netstack-abs-\(UInt32.random(in: 0...UInt32.max)).sock"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    let accepted = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"\(path)\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"unix\"}", to: api)
+    #expect(accepted.status == 200)
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func anUnknownProtocolIsRefusedRatherThanTreatedAsTcp() async throws {
+    // Defaulting an unrecognised value to TCP would publish a port the caller
+    // did not ask for, on a protocol it did not ask for, and report success.
+    // An absent `protocol` still means TCP -- that is upstream's default and
+    // keeps every request written before this existed working.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let refused = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"sctp\"}", to: api)
+    #expect(refused.status == 400, "an unknown protocol was accepted")
+
+    let defaulted = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    #expect(defaulted.status == 200, "an absent protocol was not treated as tcp")
+    #expect(defaulted.body.contains("\"protocol\":\"tcp\""))
 
     holder.plane?.close()
     _ = try? await holder.gateway?.close().get()

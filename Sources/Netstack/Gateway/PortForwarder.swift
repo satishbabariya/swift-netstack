@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 import NIOPosix
 
@@ -63,9 +64,27 @@ public final class PortForwarder: @unchecked Sendable {
         self.keepAlive = keepAlive
     }
 
-    /// Start listening. `host` defaults to loopback: see the type comment for
-    /// why that default is not `0.0.0.0`.
-    public func listen(host: String = "127.0.0.1", port: Int) -> EventLoopFuture<Void> {
+    /// Listen on a unix socket instead of a TCP port, and carry each connection
+    /// to the same guest address and port.
+    ///
+    /// Upstream's `unix` forwarding protocol, and the useful thing about it is
+    /// exactly what makes it different from a TCP listener: the socket is a file,
+    /// so who may reach the guest's port is decided by filesystem permissions
+    /// rather than by whoever can open a connection to a port on this machine.
+    ///
+    /// An existing socket at that path is removed first, which is conventional
+    /// and worth naming as a hazard: the path is deleted before it is bound, so
+    /// pointing this at a file that is not a stale socket deletes that file.
+    public func listen(unixSocketPath path: String) -> EventLoopFuture<Void> {
+        try? FileManager.default.removeItem(atPath: path)
+        return bootstrap()
+            .bind(unixDomainSocketPath: path)
+            .map { [weak self] channel in
+                self?.listener = channel
+            }
+    }
+
+    private func bootstrap() -> ServerBootstrap {
         ServerBootstrap(group: eventLoop)
             .serverChannelOption(.backlog, value: 64)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
@@ -74,6 +93,12 @@ public final class PortForwarder: @unchecked Sendable {
                 guard let self else { return inbound.close() }
                 return self.accept(inbound)
             }
+    }
+
+    /// Start listening. `host` defaults to loopback: see the type comment for
+    /// why that default is not `0.0.0.0`.
+    public func listen(host: String = "127.0.0.1", port: Int) -> EventLoopFuture<Void> {
+        bootstrap()
             .bind(host: host, port: port)
             .map { [weak self] channel in
                 self?.listener = channel

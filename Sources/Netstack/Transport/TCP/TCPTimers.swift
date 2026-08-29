@@ -48,6 +48,7 @@ final class TCPTimers {
     private var persistTask: Scheduled<Void>?
     private var timeWaitTask: Scheduled<Void>?
     private var delayedAckTask: Scheduled<Void>?
+    private var keepAliveTask: Scheduled<Void>?
 
     init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
         self.eventLoop = eventLoop
@@ -132,6 +133,24 @@ final class TCPTimers {
         delayedAckTask = nil
     }
 
+    /// RFC 1122 §4.2.3.6's keep-alive.
+    ///
+    /// Its own slot, like the three above and for the same reason. This one has
+    /// the longest lifetime of any timer here -- hours, by the RFC's own
+    /// requirement -- so sharing a handle with the retransmit timer would mean
+    /// every retransmission silently postponed the keep-alive, and the bug would
+    /// take two hours per attempt to observe.
+    func scheduleKeepAlive(after delay: TimeAmount, _ body: @escaping () -> Void) {
+        keepAliveTask?.cancel()
+        let box = TimerBody(run: body)
+        keepAliveTask = eventLoop.scheduleTask(deadline: clock.now() + delay) { box.run() }
+    }
+
+    func cancelKeepAlive() {
+        keepAliveTask?.cancel()
+        keepAliveTask = nil
+    }
+
     func startTimeWait(_ body: @escaping () -> Void) {
         timeWaitTask?.cancel()
         timeWaitTask = nil
@@ -145,6 +164,7 @@ final class TCPTimers {
         cancelRetransmit()
         cancelPersist()
         cancelDelayedAck()
+        cancelKeepAlive()
         timeWaitTask?.cancel()
         timeWaitTask = nil
     }

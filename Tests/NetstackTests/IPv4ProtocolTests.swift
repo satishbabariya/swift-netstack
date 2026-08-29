@@ -286,3 +286,27 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
             protocolNumber: .udp)
     }
 }
+
+@Test func aBroadcastGoesToTheBroadcastLinkAddressWithoutAsking() throws {
+    // ARP cannot resolve 255.255.255.255: there is no host there to answer. A
+    // broadcast that went through the cache would emit an ARP request per
+    // attempt and never send anything.
+    //
+    // Not hypothetical. It is what a DHCP offer is -- broadcast precisely
+    // BECAUSE the client does not have an address yet and therefore cannot
+    // answer an ARP for one -- so without this the gateway can never tell a
+    // guest what its address is.
+    let fixture = makeFixture()
+    _ = fixture.link.drainTransmitted()
+    try fixture.ip.send(
+        payload: ByteBuffer(bytes: [1, 2, 3, 4]), to: .broadcast, from: nil, protocolNumber: .udp)
+
+    let frames = fixture.link.drainTransmitted()
+    #expect(frames.count == 1, "the broadcast produced \(frames.count) frames rather than one")
+    var packet = PacketBuffer(received: try #require(frames.first))
+    let ethernet = try #require(EthernetHeader.parse(&packet))
+    #expect(ethernet.etherType == .ipv4, "an ARP request went out instead of the datagram")
+    #expect(ethernet.destination == .broadcast)
+    let ip = try #require(IPv4Header.parse(&packet))
+    #expect(ip.destination == .broadcast)
+}

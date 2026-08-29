@@ -128,18 +128,42 @@ public final class IPv4Protocol {
     public func send(payload: ByteBuffer, to destination: IPv4Address, from source: IPv4Address?, protocolNumber: IPProtocol) throws {
         guard payload.readableBytes <= Self.maximumPayload else { throw StackError.messageTooLong }
 
-        guard let route = routes.lookup(destination: destination, preferredSource: source) else {
-            throw StackError.noRoute
-        }
-        guard route.sourceWasHonoured else { throw StackError.noRoute }
-        guard let nextHopMAC = arpCache.lookup(route.nextHop) else {
-            arpResponder.request(route.nextHop, from: route.source)
-            throw StackError.noRoute
+        // A limited broadcast is routed by definition, not by lookup.
+        //
+        // 255.255.255.255 is link-local: it goes out the interface and no
+        // farther, so there is no next hop to choose and nothing for a route to
+        // decide. Consulting the table would be worse than redundant -- with a
+        // default route present it would pick the default gateway's next hop and
+        // ARP for it, which is a unicast decision applied to an address that is
+        // not one.
+        //
+        // ARP cannot help either: there is no host at 255.255.255.255 to answer,
+        // so a broadcast that went through the cache would emit an ARP request
+        // per attempt and never send anything. Not hypothetical -- a DHCP offer
+        // is a broadcast precisely BECAUSE the client has no address yet and
+        // therefore cannot answer an ARP for one, so without this a gateway can
+        // never tell a guest what its address is.
+        let localSource: IPv4Address
+        let nextHopMAC: MACAddress
+        if destination == .broadcast {
+            nextHopMAC = .broadcast
+            localSource = source ?? nic.primaryAddress ?? .any
+        } else {
+            guard let route = routes.lookup(destination: destination, preferredSource: source) else {
+                throw StackError.noRoute
+            }
+            guard route.sourceWasHonoured else { throw StackError.noRoute }
+            guard let resolved = arpCache.lookup(route.nextHop) else {
+                arpResponder.request(route.nextHop, from: route.source)
+                throw StackError.noRoute
+            }
+            nextHopMAC = resolved
+            localSource = route.source
         }
 
         identificationCounter &+= 1
         var template = IPv4Header(
-            source: route.source, destination: destination,
+            source: localSource, destination: destination,
             protocolNumber: protocolNumber, payloadLength: payload.readableBytes)
         template.identification = identificationCounter
 

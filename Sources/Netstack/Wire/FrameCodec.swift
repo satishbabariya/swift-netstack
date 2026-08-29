@@ -1,5 +1,55 @@
 import NIOCore
 
+/// How a stream wire says where one frame ends and the next begins.
+///
+/// There are two, and they are not compatible: reading one as the other gives a
+/// length that is not a length, so the first frame is wrong and every byte after
+/// it is garbage. Upstream picks between them by the `--listen` URL scheme, and
+/// a client that guesses wrong sees a connection that closes immediately with a
+/// framing error rather than anything that names the mismatch -- which is worth
+/// knowing before debugging one.
+public enum StreamFraming: Sendable {
+    /// Four bytes, big-endian. qemu's `-netdev socket`, and with it bess and
+    /// stdio.
+    case qemu
+    /// Two bytes, little-endian. hyperkit and vpnkit, and the default upstream
+    /// uses for a guest that joins over its own `/connect` endpoint.
+    case hyperkit
+
+    var lengthBytes: Int {
+        switch self {
+        case .qemu: return 4
+        case .hyperkit: return 2
+        }
+    }
+
+    /// The largest length the prefix itself can express. Two bytes cannot say
+    /// more than 65535 whatever the link's MTU is, so the frame bound is the
+    /// smaller of this and the wire's.
+    var greatestExpressibleLength: Int {
+        switch self {
+        case .qemu: return Int(UInt32.max)
+        case .hyperkit: return Int(UInt16.max)
+        }
+    }
+
+    func length(from buffer: ByteBuffer, at index: Int) -> Int? {
+        switch self {
+        case .qemu:
+            return buffer.getInteger(at: index, endianness: .big, as: UInt32.self).map(Int.init)
+        case .hyperkit:
+            return buffer.getInteger(at: index, endianness: .little, as: UInt16.self).map(Int.init)
+        }
+    }
+
+    func write(_ length: Int, to buffer: inout ByteBuffer) {
+        switch self {
+        case .qemu: buffer.writeInteger(UInt32(length), endianness: .big)
+        case .hyperkit: buffer.writeInteger(UInt16(length), endianness: .little)
+        }
+    }
+}
+
 /// The framing qemu's `-netdev socket` uses, and with it bess and stdio: a
 /// four-byte big-endian length, then that many bytes of ethernet frame.
 ///
@@ -32,33 +82,37 @@ struct FrameDecoder: ByteToMessageDecoder {
     /// The largest frame this decoder will assemble. Anything claiming more is
     /// a framing error, not a large frame.
     let maximumFrame: Int
+    let framing: StreamFraming
 
-    private static let lengthBytes = 4
-
-    init(maximumFrame: Int) {
-        self.maximumFrame = max(1, maximumFrame)
+    init(maximumFrame: Int, framing: StreamFraming = .qemu) {
+        // A two-byte prefix cannot describe a frame longer than 65535 however
+        // large the MTU is, so the bound is the smaller of the two. Taking the
+        // MTU alone would leave a decoder willing to accept a length its own
+        // prefix could not have written.
+        self.maximumFrame = max(1, min(maximumFrame, framing.greatestExpressibleLength))
+        self.framing = framing
     }
 
     mutating func decode(context: ChannelHandlerContext, buffer: inout ByteBuffer) throws -> DecodingState {
-        guard let length = buffer.getInteger(at: buffer.readerIndex, endianness: .big, as: UInt32.self) else {
+        guard let length = framing.length(from: buffer, at: buffer.readerIndex) else {
             return .needMoreData
         }
         // Checked BEFORE the readable-bytes test, so an impossible length is
         // rejected on the four bytes that carry it rather than after waiting for
         // data that is never coming. The order is the whole difference between
         // bounding the guest and merely noticing afterwards.
-        guard length > 0, length <= UInt32(maximumFrame) else {
-            throw FrameCodecError.frameTooLarge(claimed: length, maximum: maximumFrame)
+        guard length > 0, length <= maximumFrame else {
+            throw FrameCodecError.frameTooLarge(claimed: UInt32(length), maximum: maximumFrame)
         }
-        guard buffer.readableBytes >= Self.lengthBytes + Int(length) else { return .needMoreData }
+        guard buffer.readableBytes >= framing.lengthBytes + length else { return .needMoreData }
 
-        buffer.moveReaderIndex(forwardBy: Self.lengthBytes)
+        buffer.moveReaderIndex(forwardBy: framing.lengthBytes)
         // `readSlice` cannot fail here -- the guard above is exactly its
         // precondition -- but the failure branch throws rather than
         // force-unwrapping, because "cannot fail" is a claim about today's
         // guard and the crash would be the guest's to trigger.
-        guard let frame = buffer.readSlice(length: Int(length)) else {
-            throw FrameCodecError.frameTooLarge(claimed: length, maximum: maximumFrame)
+        guard let frame = buffer.readSlice(length: length) else {
+            throw FrameCodecError.frameTooLarge(claimed: UInt32(length), maximum: maximumFrame)
         }
         context.fireChannelRead(wrapInboundOut(frame))
         return .continue
@@ -81,12 +135,18 @@ struct FrameEncoder: MessageToByteEncoder {
     typealias OutboundIn = ByteBuffer
 
     let maximumFrame: Int
+    let framing: StreamFraming
+
+    init(maximumFrame: Int, framing: StreamFraming = .qemu) {
+        self.maximumFrame = max(1, min(maximumFrame, framing.greatestExpressibleLength))
+        self.framing = framing
+    }
 
     func encode(data: ByteBuffer, out: inout ByteBuffer) throws {
         guard data.readableBytes > 0, data.readableBytes <= maximumFrame else {
             throw FrameCodecError.frameTooLarge(claimed: UInt32(data.readableBytes), maximum: maximumFrame)
         }
-        out.writeInteger(UInt32(data.readableBytes), endianness: .big)
+        framing.write(data.readableBytes, to: &out)
         out.writeImmutableBuffer(data)
     }
 }

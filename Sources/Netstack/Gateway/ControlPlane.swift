@@ -43,6 +43,18 @@ public final class ControlPlane: @unchecked Sendable {
     private let gateway: Gateway
     private var channel: Channel?
 
+    /// The framing a guest joining over `/connect` speaks.
+    ///
+    /// Upstream's default is hyperkit's two-byte little-endian length, which is
+    /// what its own `cmd/vm` writes, so that is the default here. Nothing on the
+    /// wire says which framing is in use -- a mismatch shows up as a frame that
+    /// claims an impossible length -- so this has to agree with the client out
+    /// of band.
+    public var connectFraming: StreamFraming = .hyperkit
+
+    /// Whether `/connect` has anywhere to put a guest.
+    fileprivate var gatewayHasSwitch: Bool { gateway.networkSwitch != nil }
+
     public init(gateway: Gateway) {
         self.gateway = gateway
     }
@@ -84,10 +96,135 @@ public final class ControlPlane: @unchecked Sendable {
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { [weak self] channel in
                 guard let self else { return channel.close() }
-                return channel.pipeline.configureHTTPServerPipeline().flatMap {
-                    channel.pipeline.addHandler(ControlPlaneHandler(plane: self))
+                // Named handlers rather than `configureHTTPServerPipeline`,
+                // because `/tunnel` and `/connect` take the connection away from
+                // HTTP and hand it to the network -- and removing handlers by
+                // name is the only way to do that without knowing what a
+                // convenience method happened to install.
+                //
+                // Added through `syncOperations` on the channel's own loop, the
+                // way `WireBootstrap.configure` does: NIO's HTTP handlers are
+                // not `Sendable`, so chaining `addHandler` futures would carry
+                // them across a boundary the compiler is right to object to.
+                return channel.eventLoop.submit {
+                    let sync = channel.pipeline.syncOperations
+                    try sync.addHandler(HTTPMessageFramer(), name: Self.framerName)
+                    try sync.addHandler(HTTPResponseEncoder(), name: Self.encoderName)
+                    try sync.addHandler(
+                        ByteToMessageHandler(HTTPRequestDecoder()), name: Self.decoderName)
+                    try sync.addHandler(ControlPlaneHandler(plane: self), name: Self.handlerName)
                 }
             }
+    }
+
+    static let framerName = "netstack.http.framer"
+    static let encoderName = "netstack.http.encoder"
+    static let decoderName = "netstack.http.decoder"
+    static let handlerName = "netstack.control"
+
+    // MARK: Hijacking
+
+    /// Take a connection away from HTTP and give it to the network.
+    ///
+    /// Upstream calls this hijacking, and both of its raw endpoints need it:
+    /// `/tunnel` splices the connection to a guest's port, and `/connect` makes
+    /// it a port on the switch. Neither can be expressed as a request and a
+    /// response, because after the handshake the bytes are not HTTP any more.
+    ///
+    /// ## Why this is not three `removeHandler` calls
+    ///
+    /// A client with no reason to wait writes its request and its first frame in
+    /// one call, and both arrive in one read. `ByteToMessageHandler` decodes the
+    /// whole buffer in that one `channelRead`: it finishes the request, then
+    /// carries straight on and tries to parse the frame as a *second* HTTP
+    /// request. Removals scheduled from here are futures and land a tick later,
+    /// by which time the frame is gone -- consumed as a malformed request.
+    ///
+    /// So the decoder's removal is started first and synchronously, which stops
+    /// it decoding further and makes it forward what it has not parsed. Those
+    /// bytes arrive at `ControlPlaneHandler`, which is still in the pipeline and
+    /// buffers them; once the wire handlers are in, it replays them forward and
+    /// removes itself.
+    ///
+    /// Upstream has the same race and loses the same frame: Go's `Hijack` hands
+    /// back a `bufrw` holding the buffered read bytes, and upstream uses the raw
+    /// `conn` instead -- so anything already buffered is dropped. Nothing errors
+    /// either way. The guest has simply sent a DISCOVER that never arrived and,
+    /// DHCP being what it is, waits seconds before trying again.
+    fileprivate func hijack(
+        _ channel: Channel, carrying framer: HTTPMessageFramer,
+        then install: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) {
+        let pipeline = channel.pipeline
+        // Decoder first, and its removal is what stops the parse. The encoder
+        // next, because everything written from here is raw bytes and
+        // `HTTPResponseEncoder` would be handed a `ByteBuffer` where it expects
+        // an `HTTPServerResponsePart`.
+        pipeline.removeHandler(name: Self.handlerName)
+            .flatMap { pipeline.removeHandler(name: Self.decoderName) }
+            .flatMap { pipeline.removeHandler(name: Self.encoderName) }
+            // `install` returns a future because building a wire adds its
+            // handlers on a later tick; not awaiting it would replay the guest's
+            // first frame into a pipeline that cannot yet read it.
+            .flatMap { install(channel) }
+            .flatMap { framer.replayAndRemove() }
+            .whenComplete { outcome in
+                switch outcome {
+                case .failure: channel.close(promise: nil)
+                // Reads were held while the pipeline was rebuilt; whatever
+                // `install` put in owns them from here.
+                case .success: channel.read()
+                }
+            }
+    }
+
+    /// `GET /tunnel?ip=<guest>&port=<port>`: splice this connection to a guest.
+    ///
+    /// A port forward for one connection and without a listener. `expose`
+    /// publishes a host port and leaves it published; this is for a caller that
+    /// already has a connection and wants it carried, which is how upstream's
+    /// own ssh client reaches a guest.
+    fileprivate func tunnel(
+        _ channel: Channel, carrying framer: HTTPMessageFramer, to address: IPv4Address, port: UInt16
+    ) {
+        hijack(channel, carrying: framer) { [weak self] channel -> EventLoopFuture<Void> in
+            guard let self else { return channel.eventLoop.makeFailedFuture(StackError.notConnected) }
+            // Upstream writes a bare `OK` -- not an HTTP response, because the
+            // connection stopped being HTTP a moment ago. A client waits for it
+            // before sending, so it has to come before the splice.
+            var acknowledgement = channel.allocator.buffer(capacity: 2)
+            acknowledgement.writeString("OK")
+            return channel.writeAndFlush(acknowledgement).flatMapThrowing {
+                guard
+                    GuestSplice.connect(
+                        stack: self.gateway.stack, host: channel, to: address, port: port,
+                        keepAlive: nil) != nil
+                else { throw StackError.notConnected }
+            }
+        }
+    }
+
+    /// `POST /connect`: make this connection a port on the switch.
+    ///
+    /// How a guest joins a network it can reach only over this socket --
+    /// upstream's `cmd/vm` does exactly this. It needs a switch: a gateway on a
+    /// single wire has one guest already and nowhere to put a second.
+    fileprivate func connectGuest(
+        _ channel: Channel, carrying framer: HTTPMessageFramer, framing: StreamFraming
+    ) {
+        guard let netSwitch = gateway.networkSwitch else {
+            channel.close(promise: nil)
+            return
+        }
+        hijack(channel, carrying: framer) { channel -> EventLoopFuture<Void> in
+            WireBootstrap.configure(
+                channel: channel, linkAddress: netSwitch.linkAddress, mtu: netSwitch.mtu,
+                framed: true, framing: framing
+            ).map { link in
+                let id = netSwitch.addPort(link)
+                channel.closeFuture.whenComplete { _ in _ = netSwitch.removePort(id) }
+            }
+        }
     }
 
     // MARK: Routes
@@ -251,6 +388,165 @@ private struct ZoneRequest {
     }
 }
 
+/// Forwards exactly one HTTP message to the decoder and holds everything after
+/// it.
+///
+/// ## Why the HTTP decoder cannot be trusted with those bytes
+///
+/// A client with no reason to wait writes its request and its first ethernet
+/// frame in one call, and both arrive in one read. `ByteToMessageHandler` hands
+/// the whole buffer to llhttp in a single pass: llhttp finishes the request,
+/// fires `.end`, and then -- still inside that same call -- carries on into the
+/// frame and fails with "invalid HTTP method". The bytes are consumed by the
+/// failed parse.
+///
+/// Nothing downstream can prevent that. Removing the decoder from the handler
+/// that receives `.end` is already too late, whether the removal is a future or
+/// synchronous: llhttp is mid-pass and will not be interrupted. So the decoder
+/// must never be given the bytes in the first place, which is what this does.
+///
+/// It frames rather than parses: everything up to and including the blank line
+/// that ends the headers, then `Content-Length` bytes of body, and not one byte
+/// more. What is left is the client's, held here until a hijack asks for it.
+///
+/// Upstream loses these bytes. Go's `Hijack` returns a `bufrw` holding whatever
+/// was already buffered and upstream uses the raw `conn` instead, so a guest
+/// that pipelines its first frame sends a DHCP DISCOVER that never arrives.
+/// Nothing errors; the network simply takes a retransmit to come up.
+///
+/// Holding rather than forwarding also means this API cannot be
+/// request-smuggled: a second request pipelined behind the first is never
+/// parsed, and the connection closes after one answer.
+final class HTTPMessageFramer: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias InboundOut = ByteBuffer
+
+    private enum State {
+        case headers
+        case body(remaining: Int)
+        case holding
+    }
+
+    private var state = State.headers
+    private var pending = ByteBuffer()
+    private var held: [ByteBuffer] = []
+    private var context: ChannelHandlerContext?
+
+    /// The most a request's headers may occupy before this gives up. The body
+    /// has its own cap in `ControlPlaneHandler`; this one is about the bytes
+    /// that arrive before anything has said how long the message is.
+    static let maximumHeaderBytes = 16 * 1024
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        self.context = context
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        self.context = nil
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = unwrapInboundIn(data)
+        pending.writeBuffer(&incoming)
+        advance(context: context)
+    }
+
+    private func advance(context: ChannelHandlerContext) {
+        while true {
+            switch state {
+            case .headers:
+                guard let end = Self.endOfHeaders(in: pending) else {
+                    if pending.readableBytes > Self.maximumHeaderBytes { context.close(promise: nil) }
+                    return
+                }
+                guard var headers = pending.readSlice(length: end) else { return }
+                let length = Self.contentLength(in: headers)
+                state = length > 0 ? .body(remaining: length) : .holding
+                context.fireChannelRead(wrapInboundOut(headers))
+                headers.clear()
+            case .body(let remaining):
+                guard pending.readableBytes > 0 else { return }
+                let take = min(remaining, pending.readableBytes)
+                guard let chunk = pending.readSlice(length: take) else { return }
+                state = take == remaining ? .holding : .body(remaining: remaining - take)
+                context.fireChannelRead(wrapInboundOut(chunk))
+            case .holding:
+                // Whatever is left belongs to whoever hijacks this connection.
+                if pending.readableBytes > 0, let rest = pending.readSlice(length: pending.readableBytes) {
+                    held.append(rest)
+                }
+                pending.clear()
+                return
+            }
+        }
+    }
+
+    /// The offset just past the blank line ending the headers, if it has
+    /// arrived.
+    private static func endOfHeaders(in buffer: ByteBuffer) -> Int? {
+        let bytes = buffer.readableBytesView
+        guard bytes.count >= 4 else { return nil }
+        var index = bytes.startIndex
+        let limit = bytes.index(bytes.endIndex, offsetBy: -4)
+        while index <= limit {
+            if bytes[index] == 0x0D, bytes[bytes.index(index, offsetBy: 1)] == 0x0A,
+                bytes[bytes.index(index, offsetBy: 2)] == 0x0D,
+                bytes[bytes.index(index, offsetBy: 3)] == 0x0A
+            {
+                return bytes.distance(from: bytes.startIndex, to: index) + 4
+            }
+            index = bytes.index(after: index)
+        }
+        return nil
+    }
+
+    /// `Content-Length`, read case-insensitively from the header block. Absent
+    /// or unparseable means no body, which for this API is the ordinary case.
+    private static func contentLength(in headers: ByteBuffer) -> Int {
+        let text = String(decoding: headers.readableBytesView, as: UTF8.self)
+        for line in text.split(separator: "\r\n") {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            guard line[line.startIndex..<colon].lowercased() == "content-length" else { continue }
+            return Int(line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)) ?? 0
+        }
+        return 0
+    }
+
+    /// Hand the held bytes to whatever replaced HTTP, then leave.
+    func replayAndRemove() -> EventLoopFuture<Void> {
+        guard let context else {
+            return MultiThreadedEventLoopGroup.singleton.any().makeSucceededVoidFuture()
+        }
+        let carried = held
+        held.removeAll()
+        for buffer in carried {
+            context.fireChannelRead(wrapInboundOut(buffer))
+        }
+        if !carried.isEmpty { context.fireChannelReadComplete() }
+        return context.pipeline.syncOperations.removeHandler(context: context)
+    }
+}
+
+/// `?ip=192.168.127.2&port=22`, upstream's query for `/tunnel`.
+private struct TunnelRequest {
+    let address: IPv4Address
+    let port: UInt16
+
+    init?(_ query: String) {
+        var fields: [String: String] = [:]
+        for pair in query.split(separator: "&") {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            fields[String(parts[0])] = String(parts[1])
+        }
+        guard let ip = fields["ip"], let address = IPv4Address(ip),
+            let text = fields["port"], let port = UInt16(text)
+        else { return nil }
+        self.address = address
+        self.port = port
+    }
+}
+
 /// `{"local": ":8080", "remote": "192.168.127.2:80"}`, in upstream's shape.
 private struct ExposeRequest {
     let hostInterface: String
@@ -302,7 +598,12 @@ private struct UnexposeRequest {
     }
 }
 
-private final class ControlPlaneHandler: ChannelInboundHandler, @unchecked Sendable {
+/// `RemovableChannelHandler` because `/tunnel` and `/connect` take the
+/// connection off HTTP, and removing this handler is the first step. Without the
+/// conformance the removal fails with "Unremovable handler" and the hijack
+/// closes the connection instead -- which looks exactly like a route that is
+/// not wired up.
+private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
@@ -340,6 +641,35 @@ private final class ControlPlaneHandler: ChannelInboundHandler, @unchecked Senda
                 return
             }
             let channel = context.channel
+            // The hijacking routes are dispatched here rather than in `handle`,
+            // because `handle` answers with a status and a body and these two do
+            // neither: they take the connection off HTTP entirely.
+            let path = head.uri.split(separator: "?", maxSplits: 1)
+            switch String(path[0]) {
+            case "/tunnel":
+                let query = path.count > 1 ? String(path[1]) : ""
+                guard let target = TunnelRequest(query) else {
+                    respond(
+                        context: context, status: .badRequest,
+                        json: "{\"error\":\"tunnel wants ip and port\"}")
+                    return
+                }
+                guard let framer = hijackFramer(context) else { return }
+                plane.tunnel(channel, carrying: framer, to: target.address, port: target.port)
+                return
+            case "/connect":
+                guard plane.gatewayHasSwitch else {
+                    respond(
+                        context: context, status: .conflict,
+                        json: "{\"error\":\"this gateway is on a single wire and has no switch\"}")
+                    return
+                }
+                guard let framer = hijackFramer(context) else { return }
+                plane.connectGuest(channel, carrying: framer, framing: plane.connectFraming)
+                return
+            default:
+                break
+            }
             plane.handle(method: head.method, path: head.uri, body: body).whenSuccess { outcome in
                 // Written through the CHANNEL rather than the context: the
                 // answer arrives after the read that provoked it has returned,
@@ -349,11 +679,24 @@ private final class ControlPlaneHandler: ChannelInboundHandler, @unchecked Senda
         }
     }
 
+    /// The framer at the head of this pipeline, which is holding whatever the
+    /// client sent after its request.
+    private func hijackFramer(_ context: ChannelHandlerContext) -> HTTPMessageFramer? {
+        guard
+            let found = try? context.pipeline.syncOperations.context(name: ControlPlane.framerName),
+            let framer = found.handler as? HTTPMessageFramer
+        else {
+            context.close(promise: nil)
+            return nil
+        }
+        return framer
+    }
+
     private func respond(context: ChannelHandlerContext, status: HTTPResponseStatus, json: String) {
         Self.respond(on: context.channel, status: status, json: json)
     }
 
-    private static func respond(on channel: Channel, status: HTTPResponseStatus, json: String) {
+    fileprivate static func respond(on channel: Channel, status: HTTPResponseStatus, json: String) {
         var buffer = channel.allocator.buffer(capacity: json.utf8.count)
         buffer.writeString(json)
         var headers = HTTPHeaders()

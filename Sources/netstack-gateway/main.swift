@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import Netstack
 import NIOCore
 import NIOPosix
@@ -19,6 +20,7 @@ struct Options {
     var gateway = "192.168.127.1"
     var subnet = "192.168.127.0/24"
     var mtu: UInt32 = 1500
+    var logLevel = "notice"
     var forwards: [(host: Int, guest: String, guestPort: UInt16)] = []
 
     /// Hand-rolled rather than a dependency. The whole surface is six flags, and
@@ -41,6 +43,7 @@ struct Options {
             case "--dns": options.upstreamResolver = try value(flag)
             case "--gateway": options.gateway = try value(flag)
             case "--subnet": options.subnet = try value(flag)
+            case "--log-level": options.logLevel = try value(flag)
             case "--mtu":
                 let text = try value(flag)
                 guard let mtu = UInt32(text), mtu >= 576, mtu <= 65535 else {
@@ -100,6 +103,7 @@ netstack-gateway — a userspace network for a VM, over a socket.
   --gateway <address>     The gateway's own address (default 192.168.127.1)
   --subnet <cidr>         The subnet leased to guests (default 192.168.127.0/24)
   --mtu <bytes>           Link MTU (default 1500)
+  --log-level <level>     trace|debug|info|notice|warning|error (default notice)
   --forward <h:addr:g>    Publish guest addr:g on host port h, repeatable
 
 Exactly one of --listen or --listen-stream is required: they are two different
@@ -136,9 +140,24 @@ if let resolver = options.upstreamResolver {
     resolvers = [address]
 }
 
+guard let logLevel = Logger.Level(rawValue: options.logLevel) else {
+    FileHandle.standardError.write(Data("error: --log-level is not a level\n".utf8))
+    exit(2)
+}
+// Bootstrapped here rather than in the library: a library that installs a
+// global log handler decides for every other library in the process, and this
+// is the one place in the package that is entitled to, because it is the
+// process.
+LoggingSystem.bootstrap { label in
+    var handler = StreamLogHandler.standardError(label: label)
+    handler.logLevel = logLevel
+    return handler
+}
+
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 let configuration = Gateway.Configuration(
-    gatewayAddress: gatewayAddress, subnet: subnet, mtu: options.mtu, upstreamResolvers: resolvers)
+    gatewayAddress: gatewayAddress, subnet: subnet, mtu: options.mtu, upstreamResolvers: resolvers,
+    logger: Logger(label: "netstack"))
 
 do {
     // The wire is a socket this process creates and listens on: the VM connects

@@ -1,3 +1,4 @@
+import Logging
 import NIOCore
 import NIOPosix
 
@@ -47,6 +48,18 @@ public final class Gateway: @unchecked Sendable {
         /// default -- see `OutboundTCPForwarder.init` for why that is the
         /// opposite of `TCPEndpoint`'s default and right here.
         public var keepAlive: TCPEndpoint.KeepAliveConfiguration?
+        /// Where this gateway reports what it refuses and why.
+        ///
+        /// Defaults to `Logger(label: "netstack")`, which routes through
+        /// whatever the host process bootstrapped -- the ecosystem convention,
+        /// and the one that means an embedder who has already configured
+        /// logging gets these lines without asking. Every event a guest can
+        /// cause is rate-limited before it reaches this; see
+        /// `RateLimitedLogger` for why that is not optional.
+        public var logger: Logger
+        /// How often a repeating guest-caused event may be logged. See
+        /// `RateLimitedLogger`.
+        public var logWindow: TimeAmount
 
         public init(
             gatewayAddress: IPv4Address = IPv4Address("192.168.127.1")!,
@@ -59,7 +72,9 @@ public final class Gateway: @unchecked Sendable {
             maximumTCPConnections: Int = 1024,
             maximumUDPFlows: Int = 512,
             maximumHalfOpenConnections: Int = 512,
-            keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration()
+            keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
+            logger: Logger = Logger(label: "netstack"),
+            logWindow: TimeAmount = .seconds(10)
         ) {
             self.gatewayAddress = gatewayAddress
             self.subnet = subnet
@@ -78,6 +93,8 @@ public final class Gateway: @unchecked Sendable {
             self.maximumUDPFlows = maximumUDPFlows
             self.maximumHalfOpenConnections = maximumHalfOpenConnections
             self.keepAlive = keepAlive
+            self.logger = logger
+            self.logWindow = logWindow
         }
     }
 
@@ -87,6 +104,10 @@ public final class Gateway: @unchecked Sendable {
     public let dns: DNSServer
     public let tcp: OutboundTCPForwarder
     public let udp: UDPForwarder
+    /// The bounded logger every part of this gateway reports through. Public so
+    /// an embedder assembling extra pieces can share the same window rather
+    /// than opening a second, unbounded one alongside it.
+    public let log: RateLimitedLogger
 
     /// Live forwards, keyed by the host port they publish on. A dictionary
     /// rather than an array because the control plane addresses them by that
@@ -100,9 +121,10 @@ public final class Gateway: @unchecked Sendable {
     private init(
         link: WireLinkEndpoint, stack: Stack, dhcp: DHCPServer, dns: DNSServer,
         tcp: OutboundTCPForwarder, udp: UDPForwarder,
-        keepAlive: TCPEndpoint.KeepAliveConfiguration?
+        keepAlive: TCPEndpoint.KeepAliveConfiguration?, log: RateLimitedLogger
     ) {
         self.keepAlive = keepAlive
+        self.log = log
         self.link = link
         self.stack = stack
         self.dhcp = dhcp
@@ -194,9 +216,23 @@ public final class Gateway: @unchecked Sendable {
                 maximumConnections: configuration.maximumTCPConnections,
                 keepAlive: configuration.keepAlive)
             let udp = UDPForwarder(stack: stack, maximumFlows: configuration.maximumUDPFlows)
+
+            // One limiter shared by every part, not one each. Nine components
+            // with a window apiece would let a guest that can drive several
+            // events at once emit several lines per window -- the bound would
+            // then be per event *per component*, which is not the bound this
+            // was written to be. Sharing it also means the counts an operator
+            // reads add up across the whole gateway.
+            let log = RateLimitedLogger(
+                logger: configuration.logger, clock: stack.clock, window: configuration.logWindow)
+            link.log = log
+            dhcp.log = log
+            dns.log = log
+            tcp.log = log
+            udp.log = log
             return Gateway(
                 link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp,
-                keepAlive: configuration.keepAlive)
+                keepAlive: configuration.keepAlive, log: log)
         }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in
             gateway.dns.startForwarding(group: group).map { _ in gateway }
         }
@@ -214,6 +250,7 @@ public final class Gateway: @unchecked Sendable {
     ) -> EventLoopFuture<PortForwarder> {
         let forwarder = PortForwarder(
             stack: stack, guestAddress: guestAddress, guestPort: guestPort, keepAlive: keepAlive)
+        forwarder.log = log
         return forwarder.listen(host: host, port: hostPort).map { [weak self] _ -> PortForwarder in
             // Keyed on the port the LISTENER ended up with, not on the one that
             // was asked for: a caller may ask for zero and mean "anything free",
@@ -265,12 +302,33 @@ public final class Gateway: @unchecked Sendable {
     /// One extra hop is enough and no more: the deferred blocks were queued
     /// before this hop, and a loop runs its queue in order.
     public func close() -> EventLoopFuture<Void> {
-        for forwarder in forwards.values { forwarder.close() }
+        var closing = forwards.values.map { $0.close() }
         forwards.removeAll()
-        udp.close()
-        dns.close()
-        dhcp.close()
+        closing.append(udp.close())
+        closing.append(dns.close())
+        closing.append(dhcp.close())
+        closing.append(tcp.close())
+        // Report what the last window was still holding. A flood that stopped
+        // has a count nobody has seen yet, and close is the last chance to say
+        // so.
+        log.flush()
+        closing.append(link.close())
+        // `Stack.shutdown()` is documented by `Stack` itself as mandatory, and
+        // this is the line that was missing. Its maintenance timer is a NIO
+        // `RepeatedTask`, which reschedules itself through the loop's own queue:
+        // dropping every reference to the gateway does not stop it, only
+        // `cancel()` does. Without this, every gateway ever started leaves a
+        // timer firing forever, holding the `Reassembler` and the `ARPCache` it
+        // sweeps alive with it -- and once the caller shuts its group down, that
+        // reschedule lands on a dead loop, which is what NIO was warning about.
+        closing.append(stack.shutdown())
         let loop = eventLoop
-        return link.close().flatMap { loop.submit {} }.flatMap { loop.submit {} }
+        // Every host socket this gateway opened, awaited -- not just the wire.
+        // The services each own real sockets on this loop and closing one is
+        // asynchronous, so a `close()` that waited only on the wire reported
+        // "done" with several closes still in flight. A caller that shuts its
+        // group down on that report leaves them scheduling onto a dead loop.
+        return EventLoopFuture.andAllSucceed(closing, on: loop)
+            .flatMap { loop.submit {} }.flatMap { loop.submit {} }
     }
 }

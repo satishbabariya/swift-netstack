@@ -67,6 +67,13 @@ public final class WireLinkEndpoint: LinkEndpoint, @unchecked Sendable {
     public private(set) var inboundDropped = 0
     public private(set) var outboundDropped = 0
 
+    /// Where rejected frames are reported, if anywhere.
+    ///
+    /// A `var` set after construction rather than an `init` parameter, because
+    /// the wire is built by `WireBootstrap` before the clock and logger that
+    /// `Gateway` configures exist. Nothing reads it off the loop.
+    public var log: RateLimitedLogger?
+
     /// Adopt a channel that already delivers whole frames as `ByteBuffer`s.
     ///
     /// The channel is the parameter rather than a socket path so that a test can
@@ -101,6 +108,11 @@ public final class WireLinkEndpoint: LinkEndpoint, @unchecked Sendable {
             let frame = packet.frame
             guard frame.readableBytes > 0, frame.readableBytes <= maximumFrame else {
                 outboundDropped += 1
+                // The only event here this stack causes itself, so it is the
+                // only one logged as an error: a frame longer than the MTU
+                // reached the wire, which means something above chose a segment
+                // size the link cannot carry.
+                log?.record(.outboundFrameRejected, ["bytes": .stringConvertible(frame.readableBytes), "limit": .stringConvertible(maximumFrame)])
                 continue
             }
             channel.write(frame, promise: nil)
@@ -117,6 +129,7 @@ public final class WireLinkEndpoint: LinkEndpoint, @unchecked Sendable {
         eventLoop.preconditionInEventLoop()
         guard frame.readableBytes > 0, frame.readableBytes <= maximumFrame else {
             inboundDropped += 1
+            log?.record(.inboundFrameRejected, ["bytes": .stringConvertible(frame.readableBytes), "limit": .stringConvertible(maximumFrame)])
             return
         }
         assert(dispatcher != nil || !hasAttached, "dispatcher was deallocated while still attached to this link")

@@ -201,3 +201,111 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
         context.writeAndFlush(data, promise: nil)
     }
 }
+
+@Test func aGatewayReportsWhatItRefusedThroughItsLoggerAndItsStatistics() async throws {
+    // The wiring test. Everything in `ObservabilityTests` checks the limiter in
+    // isolation, where it works whether or not a single line of it is connected
+    // to anything -- so this drives a real refusal through a real gateway and
+    // looks for it in both places it is supposed to appear.
+    //
+    // The refusal chosen is the one an operator is most likely to hit and least
+    // likely to diagnose: a gateway configured with no upstream resolver
+    // answers REFUSED to every name it does not own, and before this it did so
+    // in complete silence. The guest sees "DNS is broken", the host sees
+    // nothing at all, and the cause is one missing line of configuration.
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let (logger, lines) = makeLogger()
+
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group,
+        configuration: .init(upstreamResolvers: [], logger: logger)
+    ).get()
+
+    let discover = frame(
+        from: .any, to: .broadcast, sourcePort: DHCPServer.clientPort,
+        destinationPort: DHCPServer.serverPort,
+        payload: dhcpDiscover(hardware: gwGuestMAC, transaction: 11), destinationMAC: .broadcast)
+    _ = discover.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    let offer = try #require(await awaitUDP(pair[1], fromPort: DHCPServer.serverPort))
+    let leased = try #require(DHCPCodec.parse(offer)).yourAddress
+
+    // A name this gateway does not own, asked for twenty times. One line, not
+    // twenty -- and the twenty are all inside the default window, so this is
+    // also the rate limit doing its job on a real datapath rather than in a
+    // unit test holding a `ManualClock`.
+    for transaction in 0..<20 {
+        var query = ByteBuffer()
+        query.writeInteger(UInt16(0x3000 + transaction), endianness: .big)
+        query.writeInteger(UInt16(0x0100), endianness: .big)
+        query.writeInteger(UInt16(1), endianness: .big)
+        query.writeBytes([UInt8](repeating: 0, count: 6))
+        for label in ["example", "com"] {
+            query.writeInteger(UInt8(label.utf8.count))
+            query.writeBytes(Array(label.utf8))
+        }
+        query.writeInteger(UInt8(0))
+        query.writeInteger(UInt16(1), endianness: .big)
+        query.writeInteger(UInt16(1), endianness: .big)
+
+        let ask = frame(
+            from: leased, to: IPv4Address("192.168.127.1")!, sourcePort: UInt16(41000 + transaction),
+            destinationPort: 53, payload: query, destinationMAC: MACAddress("5a:94:ef:e4:0c:ee")!)
+        _ = ask.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+        _ = await awaitUDP(pair[1], fromPort: 53)
+    }
+
+    let stats = try await gateway.statistics().get()
+    // The counter has no window and counts every one, which is exactly why the
+    // statistics exist alongside the log rather than instead of it.
+    #expect(stats.dnsRefusedNoUpstream == 20)
+    #expect(stats.dhcpLeases == 1)
+    #expect(stats.dnsAnsweredLocally == 0)
+
+    let refusals = lines.withLockedValue { $0.filter { $0.message == "dnsRefusedNoUpstream" } }
+    #expect(refusals.count == 1, "twenty refusals produced \(refusals.count) log lines")
+    // The name reached the line, sanitized. Without the metadata an operator
+    // knows something was refused but not what, which for a resolver is most of
+    // what they needed.
+    #expect(refusals.first?.metadata["name"].map(String.init(describing:)) == "example.com")
+    #expect(refusals.first?.level == .warning)
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}
+
+@Test func closingAGatewayShutsDownItsStackRatherThanLeavingATimerRunning() async throws {
+    // `Stack` documents `shutdown()` as mandatory, and for a reason worth
+    // repeating here: the maintenance timer is a NIO `RepeatedTask`, which
+    // reschedules itself through the event loop's own queue. Dropping every
+    // reference to the stack does not stop it. Only `cancel()` does.
+    //
+    // So a `Gateway` that closed everything else and forgot this left a timer
+    // firing forever, holding the `Reassembler` and the `ARPCache` it sweeps
+    // alive with it -- once per gateway, for the life of the process. Nothing
+    // failed, no test noticed, and the only outward sign was NIO complaining
+    // about a task scheduled on a dead loop *after* the group shut down, which
+    // reads like a test-teardown race and was dismissed as one.
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: .init()
+    ).get()
+
+    // The floor: without this the assertion below passes for a gateway whose
+    // timer never started, which is a different bug that would make this test
+    // vacuous rather than failing.
+    let runningBefore = try await gateway.eventLoop.submit { gateway.stack.isRunningForTesting }.get()
+    #expect(runningBefore, "the stack's maintenance timer was never started")
+
+    _ = try? await gateway.close().get()
+
+    let runningAfter = try await gateway.eventLoop.submit { gateway.stack.isRunningForTesting }.get()
+    #expect(!runningAfter, "the gateway closed but left its stack's maintenance timer running")
+
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

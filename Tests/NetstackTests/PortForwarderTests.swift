@@ -139,6 +139,7 @@ private func pfGuestSegment(
 
     try? await dialler.close()
     holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -170,6 +171,7 @@ private func pfGuestSegment(
 
     try? await first.close()
     holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -201,6 +203,7 @@ private func pfGuestSegment(
     #expect(!dialler.isActive, "the host's connection outlived the guest's refusal")
 
     holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()

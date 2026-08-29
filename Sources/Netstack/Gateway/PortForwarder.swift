@@ -42,6 +42,9 @@ public final class PortForwarder: @unchecked Sendable {
     public var establishedCount: Int { live }
     public private(set) var refusedForLimit = 0
 
+    /// Where refusals are reported, if anywhere. `Gateway.forward` sets this.
+    public var log: RateLimitedLogger?
+
     /// Where the listening socket ended up, which is how a caller learns the
     /// port when it asked for zero.
     public var listeningAddress: SocketAddress? { listener?.localAddress }
@@ -80,6 +83,12 @@ public final class PortForwarder: @unchecked Sendable {
     private func accept(_ inbound: Channel) -> EventLoopFuture<Void> {
         guard live < maximumConnections else {
             refusedForLimit += 1
+            // Shares the guest side's event and its window deliberately. The
+            // connections refused here come from the host rather than from the
+            // guest, but they are refused by the same limit for the same
+            // reason, and an operator chasing "connections are being dropped"
+            // wants both under one name with the direction said in the line.
+            log?.record(.tcpRefusedByLimit, ["direction": .string("host-to-guest"), "limit": .stringConvertible(maximumConnections)])
             // Closed rather than queued. A host connection this gateway will not
             // serve should fail now: the dialler learns immediately, and nothing
             // is held here waiting for room that may never come.
@@ -130,9 +139,16 @@ public final class PortForwarder: @unchecked Sendable {
         return inbound.eventLoop.makeSucceededVoidFuture()
     }
 
-    public func close() {
-        listener?.close(promise: nil)
-        listener = nil
+    /// Stop accepting, and complete when the listening socket is closed.
+    ///
+    /// Connections already spliced through it are deliberately left alone --
+    /// withdrawing a forward means "accept no more", not "cut off work in
+    /// progress" -- so this future covers the listener and nothing else.
+    @discardableResult
+    public func close() -> EventLoopFuture<Void> {
+        guard let listener else { return stack.eventLoop.makeSucceededVoidFuture() }
+        self.listener = nil
+        return listener.close().recover { _ in () }
     }
 }
 

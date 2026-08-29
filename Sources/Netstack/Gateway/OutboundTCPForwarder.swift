@@ -38,6 +38,12 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     private var forwarder: TCPForwarder?
     private var live = 0
 
+    /// The channels of every spliced connection, so `close` can actually close
+    /// them. Keyed by the identity of the `ConnectionSlot` that owns the pair,
+    /// because that is the object both `closeFuture` callbacks already share and
+    /// the one that guarantees a single removal however many of them fire.
+    private var spliced: [ObjectIdentifier: (guest: Channel, host: Channel)] = [:]
+
     /// Connections currently spliced to a host socket.
     public var establishedCount: Int { live }
 
@@ -46,6 +52,11 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
 
     /// Connections refused because the destination did not accept.
     public private(set) var refusedForDial = 0
+
+    /// Where refusals are reported, if anywhere. `Gateway` sets this; a
+    /// hand-assembled arrangement opts in by setting it too.
+    public var log: RateLimitedLogger?
+
 
     /// `keepAlive` is on by default here, which is the opposite of
     /// `TCPEndpoint`'s default and deliberately so.
@@ -74,13 +85,33 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     }
 
     /// Called by `ConnectionSlot` when a spliced connection ends.
-    fileprivate func releaseConnection() {
+    fileprivate func releaseConnection(_ slot: ObjectIdentifier) {
         live -= 1
+        spliced.removeValue(forKey: slot)
+    }
+
+    /// Stop accepting, and close every connection already carried.
+    ///
+    /// Unlike `PortForwarder.close`, this does tear down live connections, and
+    /// the difference is not an inconsistency: withdrawing one published port
+    /// leaves the gateway running, so work in progress through it should
+    /// continue. This runs when the gateway itself is going away, and the guest
+    /// on the other end of every one of these connections is going with it. A
+    /// host socket left open then belongs to nothing and is closed by nothing.
+    @discardableResult
+    public func close() -> EventLoopFuture<Void> {
+        forwarder = nil
+        let closing = spliced.values.flatMap {
+            [$0.guest.close().recover { _ in () }, $0.host.close().recover { _ in () }]
+        }
+        spliced.removeAll()
+        return EventLoopFuture.andAllSucceed(closing, on: eventLoop)
     }
 
     private func handle(_ request: ForwarderRequest) {
         guard live < maximumConnections else {
             refusedForLimit += 1
+            log?.record(.tcpRefusedByLimit, ["limit": .stringConvertible(self.maximumConnections), "destination": .string("\(request.destination):\(request.destinationPort)")])
             request.refuse()
             return
         }
@@ -139,6 +170,7 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
                     // The guest hears "nothing is there" now, rather than after
                     // a handshake and a wait.
                     self.refusedForDial += 1
+                    self.log?.record(.tcpDialFailed, ["destination": .string("\(request.destination):\(request.destinationPort)")])
                     slot.release()
                     request.refuse()
                 case .success(let outbound):
@@ -187,6 +219,7 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         // drift upward until it stopped limiting anything. The same object is
         // what every earlier failure path releases, so a slot is returned once
         // however far the connection got.
+        spliced[ObjectIdentifier(slot)] = (guest: guestChannel, host: outbound)
         guestChannel.closeFuture.whenComplete { _ in slot.release() }
         outbound.closeFuture.whenComplete { _ in slot.release() }
 
@@ -213,6 +246,6 @@ private final class ConnectionSlot: @unchecked Sendable {
     func release() {
         guard !released else { return }
         released = true
-        forwarder?.releaseConnection()
+        forwarder?.releaseConnection(ObjectIdentifier(self))
     }
 }

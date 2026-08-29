@@ -292,6 +292,11 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     #expect(Array(reply[22..<28]) == wireMAC.bytes, "the gateway answered with the wrong hardware address")
     #expect(Array(reply[28..<32]) == IPv4Address("192.168.127.1")!.bytes)
 
+    // `Stack` documents `shutdown()` as mandatory: its maintenance timer is a
+    // NIO `RepeatedTask` that reschedules itself through the loop's queue, so
+    // dropping the stack does not stop it and the next firing lands on a loop
+    // this test is about to shut down.
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await link.close().get()
     close(pair[1])
     try? await group.shutdownGracefully()

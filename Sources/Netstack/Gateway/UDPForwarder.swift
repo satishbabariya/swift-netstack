@@ -73,6 +73,11 @@ public final class UDPForwarder: @unchecked Sendable {
     /// mutation.
     public private(set) var openedSockets = 0
 
+    /// Where refusals are reported, if anywhere. `Gateway` sets this; a
+    /// hand-assembled arrangement opts in by setting it too.
+    public var log: RateLimitedLogger?
+
+
     public var flowCount: Int { flows.count }
 
     public init(
@@ -127,6 +132,7 @@ public final class UDPForwarder: @unchecked Sendable {
         reclaimIdle()
         guard flows.count + opening.count < maximumFlows else {
             refusedForLimit += 1
+            log?.record(.udpRefusedByLimit, ["limit": .stringConvertible(maximumFlows)])
             return true
         }
         open(key, firstDatagram: datagram)
@@ -195,10 +201,18 @@ public final class UDPForwarder: @unchecked Sendable {
         }
     }
 
-    public func close() {
+    /// Close, and complete when every flow's host socket is closed.
+    ///
+    /// One future per flow rather than fire-and-forget: each of these is a host
+    /// socket, and a caller shutting its group down when this completes has to
+    /// be able to trust that "completes" means the sockets are gone. See
+    /// `DNSServer.close`.
+    @discardableResult
+    public func close() -> EventLoopFuture<Void> {
         stack.transportDemuxer.clearProtocolHandler(.udp, ownedBy: self)
-        for flow in flows.values { flow.channel.close(promise: nil) }
+        let closing = flows.values.map { $0.channel.close().recover { _ in () } }
         flows.removeAll()
+        return EventLoopFuture.andAllSucceed(closing, on: stack.eventLoop)
     }
 }
 

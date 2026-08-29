@@ -404,6 +404,7 @@ private func awaitReply(_ fd: Int32) async -> ByteBuffer? {
         "the guest's own transaction id did not come back")
 
     try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -431,6 +432,7 @@ private func awaitReply(_ fd: Int32) async -> ByteBuffer? {
     #expect(seen.first != 0xBEEF, "the guest's id was forwarded verbatim")
 
     try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -460,6 +462,7 @@ private func awaitReply(_ fd: Int32) async -> ByteBuffer? {
     #expect(unmatched == 1)
 
     try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()

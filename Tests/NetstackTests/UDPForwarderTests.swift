@@ -136,6 +136,7 @@ private final class UppercasingUDPEcho: ChannelInboundHandler, @unchecked Sendab
     #expect(reply.1 == port, "the reply came from the wrong port")
 
     try? await echo.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -181,6 +182,7 @@ private final class UppercasingUDPEcho: ChannelInboundHandler, @unchecked Sendab
     #expect(replies.first?.0 == udpGateway)
     #expect(holder.forwarder?.flowCount == 0, "a flow was opened for a datagram the gateway owns")
 
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -213,6 +215,7 @@ private final class UppercasingUDPEcho: ChannelInboundHandler, @unchecked Sendab
     #expect(refused > 0, "nothing was refused: the limit was never reached")
 
     try? await echo.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
@@ -249,6 +252,7 @@ private final class UppercasingUDPEcho: ChannelInboundHandler, @unchecked Sendab
     #expect(opened == 1, "four datagrams of one conversation opened \(opened) sockets")
 
     try? await echo.close()
+    _ = try? await holder.stack?.shutdown().get()
     _ = try? await holder.link?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()

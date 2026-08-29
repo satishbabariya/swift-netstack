@@ -80,6 +80,11 @@ public final class DNSServer: @unchecked Sendable {
     public private(set) var refusedForNoUpstream = 0
     public private(set) var unmatchedReplies = 0
 
+    /// Where refusals are reported, if anywhere. `Gateway` sets this; a
+    /// hand-assembled arrangement opts in by setting it too.
+    public var log: RateLimitedLogger?
+
+
     public static let port: UInt16 = 53
 
     public init(
@@ -161,13 +166,18 @@ public final class DNSServer: @unchecked Sendable {
 
     private func forward(_ query: DNSQuery, payload: ByteBuffer, to source: IPv4Address, port: UInt16) {
         guard let channel = upstreamChannel, let server = upstream.first else {
+            // Logged at a higher level than the rest, and named so it reads
+            // as what it nearly always is: nobody configured an upstream, and
+            // every query the guest makes is being refused because of it.
             refusedForNoUpstream += 1
+            log?.record(.dnsRefusedNoUpstream, ["name": .string(sanitizedForLog(query.question.name))])
             refuse(query, payload: payload, to: source, port: port)
             return
         }
         expirePending()
         guard pending.count < maximumPending else {
             refusedForLimit += 1
+            log?.record(.dnsRefusedByLimit, ["outstanding": .stringConvertible(maximumPending), "name": .string(sanitizedForLog(query.question.name))])
             refuse(query, payload: payload, to: source, port: port)
             return
         }
@@ -219,6 +229,7 @@ public final class DNSServer: @unchecked Sendable {
     fileprivate func deliverUpstream(_ payload: ByteBuffer) {
         guard let reply = DNSCodec.parseQuery(replyAsQuery: payload) else {
             unmatchedReplies += 1
+            log?.record(.dnsUnmatchedReply)
             return
         }
         guard let entry = pending[reply.id], entry.question == reply.question else {
@@ -227,6 +238,7 @@ public final class DNSServer: @unchecked Sendable {
             // cache-poisoning opening: sixteen bits is a number an attacker can
             // simply try.
             unmatchedReplies += 1
+            log?.record(.dnsUnmatchedReply)
             return
         }
         pending.removeValue(forKey: reply.id)
@@ -236,11 +248,22 @@ public final class DNSServer: @unchecked Sendable {
         try? endpoint.send(outgoing, to: entry.source, port: entry.port)
     }
 
-    public func close() {
+    /// Close, and complete when the **upstream socket** is closed too.
+    ///
+    /// The future is the whole point. `upstreamChannel` is a real host socket on
+    /// a real event loop, and closing it is asynchronous: a caller that shuts
+    /// its `EventLoopGroup` down as soon as this returns kills the loop with the
+    /// close still in progress, and NIO's channel teardown then schedules its
+    /// last step -- `removeHandlers` -- onto a loop that is gone.
+    @discardableResult
+    public func close() -> EventLoopFuture<Void> {
         endpoint.close()
-        upstreamChannel?.close(promise: nil)
-        upstreamChannel = nil
         pending.removeAll()
+        guard let channel = upstreamChannel else {
+            return stack.eventLoop.makeSucceededVoidFuture()
+        }
+        upstreamChannel = nil
+        return channel.close().recover { _ in () }
     }
 }
 

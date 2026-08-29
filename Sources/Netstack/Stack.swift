@@ -101,6 +101,15 @@ public final class Stack {
     private let allocator: ByteBufferAllocator
     private var maintenanceTask: RepeatedTask?
 
+    /// Whether the maintenance timer is still running.
+    ///
+    /// Exists because the timer is otherwise unobservable from outside: it
+    /// reschedules itself through the loop's queue and holds no reference
+    /// anything can see, which is exactly the property that makes forgetting
+    /// `shutdown()` a leak nobody notices. A test can watch this; nothing else
+    /// should.
+    public var isRunningForTesting: Bool { maintenanceTask != nil }
+
     public init(
         link: LinkEndpoint,
         configuration: Configuration,

@@ -106,6 +106,12 @@ public final class ControlPlane: @unchecked Sendable {
     ) -> EventLoopFuture<(status: HTTPResponseStatus, body: String)> {
         let loop = gateway.eventLoop
         switch (method, path) {
+        case (.GET, "/stats"):
+            // Read on the gateway's own loop, which `handle` is already on, so
+            // the numbers in one response are numbers that coexisted. See
+            // `Gateway.Statistics`.
+            return loop.makeSucceededFuture((.ok, gateway.statisticsOnLoop().json))
+
         case (.GET, "/services/forwarder/all"):
             let ports = gateway.forwardedPorts
             let json = "[" + ports.map { "{\"local\":\":\($0)\"}" }.joined(separator: ",") + "]"

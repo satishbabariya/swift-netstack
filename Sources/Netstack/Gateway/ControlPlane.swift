@@ -112,6 +112,21 @@ public final class ControlPlane: @unchecked Sendable {
             // `Gateway.Statistics`.
             return loop.makeSucceededFuture((.ok, gateway.statisticsOnLoop().json))
 
+        case (.GET, "/cam"):
+            // Upstream serves the switch's learned address table here. A gateway
+            // on a single wire has no switch and no table, and says so with an
+            // empty object rather than a 404: the route exists, the table is
+            // empty, and a tool polling it should not have to tell those apart.
+            let table = gateway.networkSwitch?.addressTable ?? [:]
+            let entries = table.map { "\"\($0.key.description)\":\($0.value)" }.sorted()
+            return loop.makeSucceededFuture((.ok, "{" + entries.joined(separator: ",") + "}"))
+
+        case (.GET, "/leases"):
+            // Upstream's, and the one a caller needs to find a guest before it
+            // can forward a port to it.
+            let leases = gateway.dhcp.allLeases.map { "\"\($0.value.description)\":\"\($0.key.description)\"" }.sorted()
+            return loop.makeSucceededFuture((.ok, "{" + leases.joined(separator: ",") + "}"))
+
         case (.GET, "/services/forwarder/all"):
             let ports = gateway.forwardedPorts
             let json = "[" + ports.map { "{\"local\":\":\($0)\"}" }.joined(separator: ",") + "]"

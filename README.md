@@ -54,6 +54,8 @@ POST /services/forwarder/expose   {"local":":8080","remote":"192.168.127.2:80"}
 POST /services/forwarder/unexpose {"local":":8080"}
 GET  /services/forwarder/all
 GET  /stats
+GET  /leases
+GET  /cam
 ```
 
 It listens on a unix socket because anything that can reach it can publish any
@@ -84,6 +86,28 @@ which is what `vfkit` and `qemu` do.
 | `WireBootstrap.connectingDatagramSocket` | The same, dialled rather than served. |
 | `WireBootstrap.adoptingStreamSocket` | A stream descriptor already connected. A four-byte big-endian length in front of each frame. |
 | `WireBootstrap.listeningStreamSocket` | qemu's `-netdev socket`, bess, stdio. One guest; a second connection is closed. |
+| `WireBootstrap.switchedStreamSocket` | The same, but every guest that connects gets a port on a `NetworkSwitch`. |
+
+### Several guests
+
+`Gateway.start(switchListeningOnStreamSocketAt:)` serves a whole network rather
+than one VM: every guest that connects gets a port on a `NetworkSwitch`, DHCP
+gives each its own address, and guests reach each other across the fabric
+without the gateway's stack seeing the traffic at all.
+
+The forwarding rules are upstream's. A frame for another guest is forwarded and
+not delivered up; a broadcast is both; **an unknown unicast destination is
+dropped rather than flooded**. That last one is worth knowing because it is not
+what a physical switch does — flooding would let any guest make the switch
+replicate a frame to every port by naming an address nobody owns, and on this
+network every station announces itself by DHCP before it can use an address.
+
+What is *not* upstream's is the bound. Upstream's CAM is a map that gains an
+entry for every source address it sees, and the source address is a field the
+guest writes, so a guest emitting random ones grows it without limit. Here the
+limit is **per port**, which matters more than that it exists: a global cap
+would let one flooding guest fill the table and lock every other guest out of
+it, where a per-port cap means a guest can only exhaust its own share.
 
 ### As a program
 
@@ -109,7 +133,7 @@ that instead.
 | | |
 |---|---|
 | **Core** | RFC 1071 checksums, IPv4/MAC/subnet types, `PacketBuffer` with reserved headroom, injected clock |
-| **Link** | `LinkEndpoint` protocol, recording + loopback wires, Ethernet II, `NIC` with promiscuous and spoofing modes, ARP cache + responder |
+| **Link** | `LinkEndpoint` protocol, recording + loopback wires, Ethernet II, `NIC` with promiscuous and spoofing modes, ARP cache + responder, and a learning `NetworkSwitch` carrying several guests on one gateway |
 | **Wire** | Datagram and length-prefixed transports over real sockets, adopted from a descriptor or dialled to a path |
 | **Network** | IPv4 parse/emit, route table with spoof-aware source selection, limited broadcast, egress fragmentation, ingress reassembly with timeout and memory bounds, ICMPv4 |
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
@@ -197,7 +221,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-698 tests, plus a differential harness in `differential/` that drives gVisor's
+712 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

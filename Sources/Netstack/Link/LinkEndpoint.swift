@@ -38,3 +38,30 @@ public protocol LinkEndpoint: AnyObject {
     /// Transmit. Batched because most wires amortise a syscall across frames.
     func write(_ packets: [PacketBuffer])
 }
+
+
+/// What `Gateway` needs from whatever is under it.
+///
+/// Two things satisfy this: a `WireLinkEndpoint`, which is one guest on one
+/// wire, and a `NetworkSwitch`, which is a whole network of them. The gateway
+/// above cannot tell them apart and has no reason to -- it terminates flows,
+/// and where a frame entered is the link layer's business.
+///
+/// It exists rather than `Gateway` simply holding a `LinkEndpoint` because a
+/// gateway also has to close its link and report what the link dropped, and
+/// neither is something every link endpoint has (a loopback wire in a test drops
+/// nothing and closes nothing).
+///
+/// `Sendable` for the reason everything else in this package is: the object is
+/// confined to one event loop and reached only from it. The conformance lets
+/// `Gateway` carry a link into the `@Sendable` closures its assembly runs on
+/// that loop, which is the only place it crosses a boundary the compiler can
+/// see.
+public protocol GatewayLink: LinkEndpoint, Sendable {
+    /// Frames the link would not carry, in each direction.
+    var inboundDropped: Int { get }
+    var outboundDropped: Int { get }
+    /// Where the link reports what it refused.
+    var log: RateLimitedLogger? { get set }
+    func close() -> EventLoopFuture<Void>
+}

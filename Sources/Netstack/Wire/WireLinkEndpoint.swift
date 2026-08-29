@@ -25,7 +25,7 @@ import NIOPosix
 /// Both are silent. A link drops; it does not report. Anything that needs to
 /// know a frame did not arrive is a protocol above this one, and TCP already
 /// does.
-public final class WireLinkEndpoint: LinkEndpoint, @unchecked Sendable {
+public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     public let mtu: UInt32
     public let linkAddress: MACAddress
     /// No offloads. Every checksum on this wire is computed and verified in

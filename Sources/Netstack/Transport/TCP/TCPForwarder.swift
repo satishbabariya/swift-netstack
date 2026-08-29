@@ -8,7 +8,11 @@ import NIOCore
 /// Doing neither is also a decision — the SYN goes unanswered and the peer
 /// retries or gives up — and it is what happens to a request the handler simply
 /// drops on the floor.
-public final class ForwarderRequest {
+/// `@unchecked Sendable` because a request is confined to the stack's event
+/// loop -- it is created there, settled there, and never handed anywhere else.
+/// The compiler cannot see that; the alternative is a lock on the datapath,
+/// which this package does not have anywhere.
+public final class ForwarderRequest: @unchecked Sendable {
     /// Where the peer is dialling from and to.
     public let source: IPv4Address
     public let sourcePort: UInt16

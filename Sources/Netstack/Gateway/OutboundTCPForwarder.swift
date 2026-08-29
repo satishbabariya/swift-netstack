@@ -35,6 +35,8 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     private let maximumConnections: Int
     private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
     private let dialTimeout: TimeAmount
+    private let nat: [IPv4Address: IPv4Address]
+    private let allowsLinkLocal: Bool
     private var forwarder: TCPForwarder?
     private var live = 0
 
@@ -52,6 +54,12 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
 
     /// Connections refused because the destination did not accept.
     public private(set) var refusedForDial = 0
+
+    /// Connections to link-local addresses refused because `allowsLinkLocal` is
+    /// off. Counted separately because it means something entirely different
+    /// from the two above: not a busy gateway or an absent server, but a guest
+    /// reaching for something it was deliberately not given.
+    public private(set) var refusedForLinkLocal = 0
 
     /// Where refusals are reported, if anywhere. `Gateway` sets this; a
     /// hand-assembled arrangement opts in by setting it too.
@@ -72,8 +80,11 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     public init(
         stack: Stack, maximumInFlight: Int = 512, maximumConnections: Int = 1024,
         keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
-        dialTimeout: TimeAmount = .seconds(5)
+        dialTimeout: TimeAmount = .seconds(5), nat: [IPv4Address: IPv4Address] = [:],
+        allowsLinkLocal: Bool = false
     ) {
+        self.nat = nat
+        self.allowsLinkLocal = allowsLinkLocal
         self.stack = stack
         self.eventLoop = stack.eventLoop
         self.maximumConnections = max(1, maximumConnections)
@@ -109,6 +120,21 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     }
 
     private func handle(_ request: ForwarderRequest) {
+        // Link-local is refused before anything else is spent on it.
+        //
+        // 169.254.169.254 is the cloud instance metadata service, and on a host
+        // running in EC2, GCP or Azure it hands credentials to whatever asks
+        // from that host. A gateway that dials on a guest's behalf is exactly a
+        // way for the guest to ask, and the guest is assumed hostile. Upstream
+        // defaults this off too, behind `Ec2MetadataAccess`.
+        guard allowsLinkLocal || !request.destination.isLinkLocal else {
+            refusedForLinkLocal += 1
+            log?.record(
+                .tcpRefusedLinkLocal,
+                ["destination": .string("\(request.destination):\(request.destinationPort)")])
+            request.refuse()
+            return
+        }
         guard live < maximumConnections else {
             refusedForLimit += 1
             log?.record(.tcpRefusedByLimit, ["limit": .stringConvertible(self.maximumConnections), "destination": .string("\(request.destination):\(request.destinationPort)")])
@@ -126,9 +152,14 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         // fast the test's dials completed rather than of anything in the code.
         live += 1
         let slot = ConnectionSlot(forwarder: self)
+        // Address translation: a guest reaching the gateway's host address is
+        // reaching the host, and the host's own services are on its loopback --
+        // not on an address in the guest's subnet, where a dial would find
+        // nothing. Upstream's `NAT`, and its default maps exactly this one.
+        let translated = nat[request.destination] ?? request.destination
         guard
             let destination = try? SocketAddress(
-                ipAddress: request.destination.description, port: Int(request.destinationPort))
+                ipAddress: translated.description, port: Int(request.destinationPort))
         else {
             slot.release()
             request.refuse()

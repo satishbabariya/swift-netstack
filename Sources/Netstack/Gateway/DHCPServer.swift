@@ -34,6 +34,12 @@ public final class DHCPServer {
     private let gateway: IPv4Address
     private let subnet: IPv4Subnet
     private let leaseSeconds: UInt32
+    /// Addresses pinned to a hardware address by configuration. Upstream's
+    /// `DHCPStaticLeases`.
+    private let staticLeases: [MACAddress: IPv4Address]
+    /// Offered as DHCP option 119, so a guest can resolve short names.
+    /// Upstream's `DNSSearchDomains`.
+    private let searchDomains: [String]
     private let mtu: UInt16
 
     /// Hardware address to leased address. Bounded by the pool: see the type
@@ -62,14 +68,23 @@ public final class DHCPServer {
     public static let serverPort: UInt16 = 67
     public static let clientPort: UInt16 = 68
 
-    public init(stack: Stack, leaseSeconds: UInt32 = 3600, mtu: UInt16 = 1500) throws {
+    public init(
+        stack: Stack, leaseSeconds: UInt32 = 3600, mtu: UInt16 = 1500,
+        staticLeases: [MACAddress: IPv4Address] = [:], searchDomains: [String] = []
+    ) throws {
+        self.staticLeases = staticLeases
+        self.searchDomains = searchDomains
         self.stack = stack
         self.gateway = stack.configuration.gatewayAddress
         self.subnet = stack.configuration.subnet
         self.leaseSeconds = leaseSeconds
         self.mtu = mtu
         self.endpoint = UDPEndpoint(stack: stack)
+        // The pool excludes every statically-assigned address as well as the
+        // gateway's own, so a guest with no static lease is never handed one
+        // that belongs to a guest that has one.
         self.pool = Self.addresses(in: subnet, excluding: gateway)
+            .filter { !Set(staticLeases.values).contains($0) }
         // Bound to `.any`, not to the gateway's address. A client that does not
         // have an address yet broadcasts to 255.255.255.255, so a binding on the
         // gateway's own address matches nothing that a DHCP client ever sends.
@@ -141,6 +156,16 @@ public final class DHCPServer {
 
     private func lease(for hardware: MACAddress) -> IPv4Address? {
         if let existing = leases[hardware] { return existing }
+        // A static lease is the operator saying where this guest lives, so it is
+        // honoured whether or not the address is inside the pool and whether or
+        // not something else already holds it. That last part is deliberate:
+        // silently handing out a different address would make a fixed address
+        // that is merely misconfigured look like one that works, and the point of
+        // asking for a fixed address is that something else is relying on it.
+        if let fixed = staticLeases[hardware] {
+            leases[hardware] = fixed
+            return fixed
+        }
         // Ascending, first free. A guest that comes back after a reboot with the
         // same hardware address gets the same entry above; this is only for one
         // it has not seen.
@@ -148,6 +173,28 @@ public final class DHCPServer {
         guard let free = pool.first(where: { !taken.contains($0) }) else { return nil }
         leases[hardware] = free
         return free
+    }
+
+    /// RFC 3397's list of domain names, uncompressed.
+    ///
+    /// Compression is permitted and deliberately not used: the pointers are
+    /// offsets into the option's own data, several clients have historically got
+    /// that wrong, and the saving on two or three domains is a handful of bytes
+    /// in a packet that has room.
+    static func encodeSearchList(_ domains: [String]) -> [UInt8] {
+        var out: [UInt8] = []
+        for domain in domains {
+            for label in domain.split(separator: ".") {
+                // A label longer than 63 bytes cannot be encoded at all: the
+                // length byte's top two bits mean "pointer". Skipped rather than
+                // truncated, because a truncated label is a different name.
+                guard label.utf8.count <= 63 else { continue }
+                out.append(UInt8(label.utf8.count))
+                out.append(contentsOf: Array(label.utf8))
+            }
+            out.append(0)
+        }
+        return out
     }
 
     private func reply(_ type: DHCPMessage.MessageType, to request: DHCPMessage, address: IPv4Address) {
@@ -170,6 +217,13 @@ public final class DHCPServer {
                 (6, gateway.bytes),
                 (26, withUnsafeBytes(of: mtu.bigEndian) { Array($0) }),
             ]
+            // RFC 3397 option 119: each domain encoded as DNS labels, one after
+            // another. Sent only when there are some -- an empty option is not
+            // the same as an absent one, and some clients treat a zero-length
+            // 119 as "no search list" overriding what they had.
+            if !searchDomains.isEmpty {
+                options.append((119, Self.encodeSearchList(searchDomains)))
+            }
         }
 
         let frame = DHCPCodec.serialize(message, options: options, allocator: ByteBufferAllocator())

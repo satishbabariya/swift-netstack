@@ -34,7 +34,17 @@ let gateway = try await Gateway.start(
 
 The guest then boots, asks for an address by DHCP, is told the gateway is its
 router and its resolver, and can open TCP connections and send UDP datagrams to
-anywhere the host can reach. To publish one of its ports on the host:
+anywhere the host can reach. `host.containers.internal` resolves to a **host
+address** inside the subnet (`192.168.127.254`) which the gateway answers ARP
+for and rewrites to `127.0.0.1` when it dials — that translation is what makes
+the host's own services reachable, since they are on its loopback rather than on
+any address the guest could route to.
+
+**Guests cannot reach 169.254.0.0/16 by default.** 169.254.169.254 is the cloud
+instance metadata service, which hands credentials to whatever asks from the
+host, and a gateway that dials on a guest's behalf is a way for the guest to
+ask. Set `allowsLinkLocal` if you need it; upstream spells the same switch
+`Ec2MetadataAccess` and also defaults it off. To publish one of its ports on the host:
 
 ```swift
 let leased = gateway.leasedAddress(for: guestMAC)!
@@ -176,7 +186,7 @@ that instead.
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
-| **Gateway** | DHCP server, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
+| **Gateway** | DHCP server with static leases and search domains, address translation for reaching the host, link-local blocking, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 | **Observability** | `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
 
 **Not yet implemented:** IPv6.
@@ -258,7 +268,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-724 tests, plus a differential harness in `differential/` that drives gVisor's
+732 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

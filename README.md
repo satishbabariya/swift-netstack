@@ -361,8 +361,12 @@ gateway and host addresses, the NAT entry, link-local being off, the two
 to happen: `Gateway.Configuration` gained eight parameters in a day, each one in
 the middle of an initialiser these samples call.
 
-`scripts/falsify.sh --all` deletes each guard in `scripts/guards.tsv` in turn and
-requires that the named test notices. `CAUGHT` is the guard being guarded;
+`scripts/falsify.sh --all` deletes each of the seventeen guards in
+`scripts/guards.tsv` in turn and requires that the named test notices — the
+bounds on half-open connections, established connections, UDP flows in both
+directions, reassembly entries and fragments, outstanding DNS queries, log
+lines, capture bytes, CAM entries per port, and the control plane's request
+timeout. `CAUGHT` is the guard being guarded;
 `SURVIVED` means it is only described. It keeps the three outcomes apart —
 including `NOT-BUILT`, a mutation that does not compile and therefore says
 nothing — because a falsification that reports the wrong one is worse than not

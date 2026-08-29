@@ -274,3 +274,49 @@ private func request(
     close(guestSide)
     try? await group.shutdownGracefully()
 }
+
+@Test func aZoneCanBeAddedOverTheApiAndProtectedOnesRefused() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let before = try request("GET", "/services/dns/all", body: nil, to: api)
+    #expect(before.status == 200)
+    // The gateway's own configuration made this zone, and it is protected.
+    #expect(before.body.contains("containers.internal"), "unexpected zones: \(before.body)")
+    #expect(before.body.contains("\"protected\":true"))
+
+    let added = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"svc.test.\",\"records\":[{\"name\":\"api\",\"ip\":\"10.1.2.3\"}]}", to: api)
+    #expect(added.status == 200, "adding a zone failed: \(added.body)")
+
+    let after = try request("GET", "/services/dns/all", body: nil, to: api)
+    #expect(after.body.contains("svc.test"), "the zone is not listed: \(after.body)")
+    #expect(after.body.contains("10.1.2.3"))
+
+    // The trailing dot is upstream's spelling and must not survive into the
+    // name this gateway compares against, or nothing ever matches it.
+    #expect(!after.body.contains("svc.test."), "the zone name kept its trailing dot")
+
+    let hijack = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"containers.internal.\",\"defaultIP\":\"6.6.6.6\"}", to: api)
+    #expect(hijack.status == 409, "a protected zone was replaced over the API")
+
+    // A zone with neither records nor a default answers NXDOMAIN for everything
+    // under it, which is a way to break resolution that looks like a way to
+    // configure it. Upstream refuses it and so does this.
+    let empty = try request("POST", "/services/dns/add", body: "{\"name\":\"empty.test.\"}", to: api)
+    #expect(empty.status == 400)
+
+    let root = try request(
+        "POST", "/services/dns/add", body: "{\"name\":\".\",\"defaultIP\":\"6.6.6.6\"}", to: api)
+    #expect(root.status == 400, "the root zone was accepted")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}

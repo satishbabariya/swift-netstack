@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 import NIOPosix
 
@@ -47,6 +48,99 @@ public final class DNSServer: @unchecked Sendable {
         }
     }
 
+    /// A name this gateway answers, and everything under it.
+    ///
+    /// Upstream's `types.Zone`, and the model is worth stating because it is not
+    /// the obvious one: a zone's record names are **relative to the zone**, so
+    /// the record `gateway` in the zone `containers.internal` answers
+    /// `gateway.containers.internal`. A zone with a `defaultAddress` answers
+    /// every name under it that no record matches, which is the wildcard; a zone
+    /// without one answers those NXDOMAIN, because a name inside a zone this
+    /// gateway owns and does not have is not a question for the internet.
+    public struct Zone: Sendable {
+        public struct Record: Sendable {
+            /// Relative to the zone, lowercased. Empty matches the zone apex.
+            public var name: String
+            public var address: IPv4Address?
+            /// Matched against the relative name when `name` does not equal it.
+            ///
+            /// The pattern comes from whoever configured the gateway, never from
+            /// the guest -- upstream's `/add` cannot carry one either, because
+            /// Go's `regexp.Regexp` will not decode from JSON. That is the line
+            /// that matters: a backtracking engine on a pattern an attacker
+            /// chooses is a denial of service, and on a pattern an operator
+            /// chooses it is a configuration decision. What the guest supplies
+            /// is the subject, and DNS already caps that at 255 bytes.
+            public var pattern: String?
+
+            public init(name: String, address: IPv4Address? = nil, pattern: String? = nil) {
+                self.name = name.lowercased()
+                self.address = address
+                self.pattern = pattern
+            }
+        }
+
+        /// Lowercased, with no trailing dot. Upstream spells zone names as
+        /// fully-qualified with the dot; it is stripped on the way in so that
+        /// every comparison here is against one spelling.
+        public var name: String
+        public var records: [Record]
+        /// Answered for any name in the zone no record matches. Upstream's
+        /// `DefaultIP`.
+        public var defaultAddress: IPv4Address?
+        /// A protected zone cannot be replaced over the control API. The zones
+        /// built from `Gateway.Configuration.dnsRecords` are protected, so a
+        /// guest-reachable API cannot take `gateway.containers.internal` away
+        /// from the guests that depend on it.
+        public var isProtected: Bool
+
+        public init(
+            name: String, records: [Record] = [], defaultAddress: IPv4Address? = nil,
+            isProtected: Bool = false
+        ) {
+            var normalised = name.lowercased()
+            while normalised.hasSuffix(".") { normalised.removeLast() }
+            self.name = normalised
+            self.records = records
+            self.defaultAddress = defaultAddress
+            self.isProtected = isProtected
+        }
+
+        /// The address this zone gives `name`, which must be inside it.
+        func answer(for name: String) -> IPv4Address? {
+            let relative: String
+            if name == self.name {
+                relative = ""
+            } else if name.hasSuffix("." + self.name) {
+                relative = String(name.dropLast(self.name.count + 1))
+            } else {
+                return nil
+            }
+            for record in records {
+                if !record.name.isEmpty, record.name == relative, let address = record.address {
+                    return address
+                }
+                if let pattern = record.pattern, let address = record.address,
+                    Zone.matches(pattern, relative)
+                {
+                    return address
+                }
+            }
+            return defaultAddress
+        }
+
+        /// Whether `subject` is inside this zone at all.
+        func contains(_ name: String) -> Bool {
+            name == self.name || name.hasSuffix("." + self.name)
+        }
+
+        private static func matches(_ pattern: String, _ subject: String) -> Bool {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+            let range = NSRange(subject.startIndex..., in: subject)
+            return regex.firstMatch(in: subject, range: range) != nil
+        }
+    }
+
     private struct Pending {
         let source: IPv4Address
         let port: UInt16
@@ -58,7 +152,9 @@ public final class DNSServer: @unchecked Sendable {
     private let stack: Stack
     private let endpoint: UDPEndpoint
     private let allocator = ByteBufferAllocator()
-    private let records: [String: IPv4Address]
+    private var records: [String: IPv4Address]
+    /// Zones, most specific first. See `zone(owning:)`.
+    private var zones: [Zone]
     private let upstream: [SocketAddress]
     private let maximumPending: Int
     private let timeout: TimeAmount
@@ -93,6 +189,18 @@ public final class DNSServer: @unchecked Sendable {
     ) throws {
         self.stack = stack
         self.records = Dictionary(records.map { ($0.name, $0.address) }, uniquingKeysWith: { first, _ in first })
+        // Every configured record's parent zone, owned and protected. This is
+        // what makes `anything.containers.internal` this gateway's to answer --
+        // and to say no to -- rather than a question for a public resolver, and
+        // protecting them keeps the control API from taking a name the guests
+        // depend on away from them.
+        var derived: [String: Zone] = [:]
+        for record in records {
+            guard let dot = record.name.firstIndex(of: ".") else { continue }
+            let zone = String(record.name[record.name.index(after: dot)...])
+            derived[zone] = Zone(name: zone, isProtected: true)
+        }
+        self.zones = Self.ordered(Array(derived.values))
         self.upstream = upstream
         self.maximumPending = max(1, maximumPending)
         self.timeout = timeout
@@ -139,29 +247,88 @@ public final class DNSServer: @unchecked Sendable {
         // not a question for the internet. Forwarding it would leak the guest's
         // internal names to a public resolver, and would wait out a timeout to
         // return the same answer.
-        if isOwnedZone(query.question.name) {
+        if let owner = zone(owning: query.question.name) {
             answeredLocally += 1
-            if let reply = DNSCodec.failure(
-                to: query, in: payload, code: DNSCodec.responseCodeNameError, allocator: allocator)
+            // A zone with a default address answers everything under it; one
+            // without says the name does not exist. Either way the question does
+            // not leave this process: forwarding a name from a zone this gateway
+            // owns leaks the guest's internal names to a public resolver, and
+            // waits out a timeout to return the same answer.
+            let reply: ByteBuffer?
+            if query.question.klass == DNSQuestion.classIN, query.question.type == DNSQuestion.typeA,
+                let address = owner.answer(for: query.question.name)
             {
-                try? endpoint.send(reply, to: source, port: port)
+                reply = DNSCodec.answer(
+                    to: query, in: payload, address: address, ttl: ttl, allocator: allocator)
+            } else {
+                reply = DNSCodec.failure(
+                    to: query, in: payload, code: DNSCodec.responseCodeNameError, allocator: allocator)
             }
+            if let reply { try? endpoint.send(reply, to: source, port: port) }
             return
         }
 
         forward(query, payload: payload, to: source, port: port)
     }
 
-    private func isOwnedZone(_ name: String) -> Bool {
-        // Every static record's parent zone. With `gateway.containers.internal`
-        // configured, `anything.containers.internal` is this gateway's to answer
-        // -- and to say no to.
-        for owned in records.keys {
-            guard let dot = owned.firstIndex(of: ".") else { continue }
-            let zone = String(owned[owned.index(after: dot)...])
-            if name == zone || name.hasSuffix("." + zone) { return true }
+    /// The zone that owns `name`, most specific first.
+    ///
+    /// Most specific rather than first-configured, which is where this departs
+    /// from upstream: upstream walks its zone list in order and takes the first
+    /// suffix match, so with both `containers.internal` and
+    /// `sub.containers.internal` configured, which one answers
+    /// `x.sub.containers.internal` depends on the order they were added. The
+    /// more specific zone is the authoritative one -- that is what delegation
+    /// means -- and making it depend on insertion order turns a DNS question
+    /// into a configuration accident.
+    private func zone(owning name: String) -> Zone? {
+        zones.first { $0.contains(name) }
+    }
+
+    /// Longest zone name first, so `zone(owning:)` can take the first match.
+    private static func ordered(_ zones: [Zone]) -> [Zone] {
+        zones.sorted { first, second in
+            first.name.count == second.name.count
+                ? first.name < second.name : first.name.count > second.name.count
         }
-        return false
+    }
+
+    /// Every zone this gateway answers for. Upstream serves this on
+    /// `GET /services/dns/all`.
+    public var allZones: [Zone] { zones }
+
+    /// Add a zone, or merge into one that exists. Upstream's
+    /// `POST /services/dns/add`.
+    ///
+    /// Merging rather than replacing is upstream's behaviour and the useful one:
+    /// a tool adding one name to a zone should not have to know, or resend,
+    /// every name already in it. A record whose relative name is already present
+    /// is replaced, which is how the same call updates an address.
+    ///
+    /// Returns false for a protected zone, which is the only refusal: the zones
+    /// built from the gateway's own configuration are the guests' route to the
+    /// host, and an API that could redirect them is an API that can cut every
+    /// guest off from the thing it was pointed at.
+    @discardableResult
+    public func addZone(_ zone: Zone) -> Bool {
+        stack.eventLoop.preconditionInEventLoop()
+        guard !zone.name.isEmpty else { return false }
+        if let index = zones.firstIndex(where: { $0.name == zone.name }) {
+            guard !zones[index].isProtected else { return false }
+            var merged = zones[index]
+            for record in zone.records {
+                if let existing = merged.records.firstIndex(where: { $0.name == record.name }) {
+                    merged.records[existing] = record
+                } else {
+                    merged.records.append(record)
+                }
+            }
+            if let address = zone.defaultAddress { merged.defaultAddress = address }
+            zones[index] = merged
+            return true
+        }
+        zones = Self.ordered(zones + [zone])
+        return true
     }
 
     private func forward(_ query: DNSQuery, payload: ByteBuffer, to source: IPv4Address, port: UInt16) {

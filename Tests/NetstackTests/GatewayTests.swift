@@ -562,3 +562,68 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+@Test func theStatisticsAccountForWhatArrivedRatherThanOnlyWhatSucceeded() async throws {
+    // Every counter here names a place a packet is dropped and nothing is said,
+    // which is the state an operator cannot debug: the guest insists it sent
+    // something and the gateway behaves as though it did not. Upstream reports
+    // gVisor's whole counter tree for the same reason.
+    //
+    // Checked as a relationship rather than as fixed numbers, because the exact
+    // totals depend on how much DHCP and ARP chatter a gateway does at startup:
+    // what has to hold is that arrivals are accounted for, not that there were
+    // exactly nine of them.
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: .init()
+    ).get()
+
+    let discover = frame(
+        from: .any, to: .broadcast, sourcePort: DHCPServer.clientPort,
+        destinationPort: DHCPServer.serverPort, payload: dhcpDiscover(hardware: gwGuestMAC, transaction: 81),
+        destinationMAC: .broadcast)
+    _ = discover.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    _ = try #require(await awaitUDP(pair[1], fromPort: DHCPServer.serverPort))
+
+    // A packet for a protocol nothing has registered for: not an error, and
+    // exactly the kind of thing that used to vanish without trace.
+    var odd = ByteBuffer()
+    odd.writeBytes([UInt8](repeating: 0x5A, count: 16))
+    var packet = PacketBuffer(allocator: ByteBufferAllocator(), payload: odd)
+    IPv4Header(
+        source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+        protocolNumber: IPProtocol(rawValue: 253), payloadLength: odd.readableBytes
+    ).prepend(to: &packet)
+    EthernetHeader(
+        destination: MACAddress("5a:94:ef:e4:0c:ee")!, source: gwGuestMAC, etherType: .ipv4
+    ).prepend(to: &packet)
+    let unknown = Array(packet.frame.readableBytesView)
+    _ = unknown.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+
+    var stats = try await gateway.statistics().get()
+    for _ in 0..<200 where stats.ipv4UnknownProtocol == 0 {
+        try? await Task.sleep(nanoseconds: 5_000_000)
+        stats = try await gateway.statistics().get()
+    }
+
+    #expect(stats.bytesReceived > 0, "nothing was counted as received")
+    #expect(stats.bytesSent > 0, "nothing was counted as sent")
+    #expect(stats.ipv4Received > 0, "no IPv4 packets were counted")
+    // Everything that arrived is accounted for by one outcome or another. This
+    // is the property worth having: a packet that is dropped for a reason
+    // nobody counted makes the total not add up.
+    let accounted =
+        stats.ipv4Malformed + stats.ipv4NotForThisStack + stats.ipv4Expired
+        + stats.ipv4AwaitingFragments + stats.ipv4Delivered + stats.ipv4UnknownProtocol
+    #expect(
+        accounted == stats.ipv4Received,
+        "\(stats.ipv4Received) packets arrived and \(accounted) were accounted for")
+    #expect(stats.ipv4Delivered > 0, "the DHCP request was never delivered")
+    #expect(stats.ipv4UnknownProtocol == 1, "the unregistered protocol was not counted")
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

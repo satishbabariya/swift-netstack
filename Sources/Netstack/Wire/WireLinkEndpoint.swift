@@ -67,6 +67,11 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     public private(set) var inboundDropped = 0
     public private(set) var outboundDropped = 0
 
+    /// Bytes carried, counted for frames that were actually accepted -- a
+    /// rejected frame is not traffic that crossed.
+    public private(set) var bytesReceived = 0
+    public private(set) var bytesSent = 0
+
     /// Where rejected frames are reported, if anywhere.
     ///
     /// A `var` set after construction rather than an `init` parameter, because
@@ -116,6 +121,7 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
                 continue
             }
             channel.write(frame, promise: nil)
+            bytesSent += frame.readableBytes
             wrote = true
             // See `flushPerFrame`. The batch is the point of taking an array,
             // and on a datagram wire the batch is exactly what must not happen.
@@ -132,6 +138,7 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
             log?.record(.inboundFrameRejected, ["bytes": .stringConvertible(frame.readableBytes), "limit": .stringConvertible(maximumFrame)])
             return
         }
+        bytesReceived += frame.readableBytes
         assert(dispatcher != nil || !hasAttached, "dispatcher was deallocated while still attached to this link")
         dispatcher?.deliverInbound(PacketBuffer(received: frame))
     }

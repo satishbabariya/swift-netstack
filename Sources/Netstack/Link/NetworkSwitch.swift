@@ -107,6 +107,14 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
     private var retiredInbound = 0
     private var retiredOutbound = 0
 
+    /// Bytes across the whole fabric, including what crossed between guests and
+    /// never reached the gateway at all -- which on a busy network is most of it,
+    /// and is exactly what a switch's own counters are for.
+    public var bytesReceived: Int { retiredReceived + ports.values.reduce(0) { $0 + $1.bytesReceived } }
+    public var bytesSent: Int { retiredSent + ports.values.reduce(0) { $0 + $1.bytesSent } }
+    private var retiredReceived = 0
+    private var retiredSent = 0
+
     /// The number of ports currently connected.
     public var portCount: Int { ports.count }
 
@@ -159,6 +167,8 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         claimed.removeValue(forKey: id)
         retiredInbound += link.inboundDropped
         retiredOutbound += link.outboundDropped
+        retiredReceived += link.bytesReceived
+        retiredSent += link.bytesSent
         for (address, port) in cam where port == id {
             cam.removeValue(forKey: address)
             notifications?.send(.init(kind: .connectionClosed, macAddress: address))
@@ -343,6 +353,8 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         for link in ports.values {
             retiredInbound += link.inboundDropped
             retiredOutbound += link.outboundDropped
+            retiredReceived += link.bytesReceived
+            retiredSent += link.bytesSent
         }
         let closing = ports.values.map { $0.close() }
         ports.removeAll()

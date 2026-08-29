@@ -166,7 +166,15 @@ those bounds exist because removing one and running the tests found nothing.
 ```
 swift test
 NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
+NETSTACK_THROUGHPUT=1 swift test -c release --filter Throughput
 ```
+
+The third is a **benchmark, not a gate**: it pushes 32 MiB through the whole
+gateway to a real loopback listener and prints a rate. It measured **618 Mbit/s
+in a release build** (85 in debug) on an Apple-silicon laptop, and a good part of
+that is the test itself — one `send` syscall per 1400-byte segment, serialised
+with the work being measured. It asserts only that every byte arrived: a
+throughput number from a run that lost data is a number about something else.
 
 637 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The

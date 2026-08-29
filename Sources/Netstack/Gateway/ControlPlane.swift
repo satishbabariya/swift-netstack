@@ -405,7 +405,7 @@ public final class ControlPlane: @unchecked Sendable {
 /// Matching the reference implementation's leniency is the interoperable
 /// choice, and it is leniency about spelling rather than about meaning: an
 /// unknown field is still ignored and a missing one is still an error.
-func jsonField(_ fields: [String: Any], _ name: String) -> Any? {
+public func jsonField(_ fields: [String: Any], _ name: String) -> Any? {
     if let exact = fields[name] { return exact }
     let wanted = name.lowercased()
     for (key, value) in fields where key.lowercased() == wanted { return value }

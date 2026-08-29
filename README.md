@@ -189,6 +189,14 @@ netstack-gateway --listen-vfkit /tmp/net.sock --dns 1.1.1.1:53 \
                  --pcap /tmp/net.pcap
 ```
 
+`--config` takes the same configuration `gvproxy` does, **as JSON rather than
+YAML**: the field names, nesting and meanings are upstream's exactly, so a YAML
+file converts with any one-line tool, and a YAML parser would be a dependency
+every program linking this library carries for a flag only the executable has. A
+YAML file is refused *as YAML* rather than as unparseable. The file is also the
+only way to reach DNS zones, static leases, NAT and virtual addresses — no flag
+says those. Flags win over the file.
+
 **The flag names are `gvproxy`'s**, so a command line moves across unchanged —
 which means `--listen` is the *control* endpoint and the guest wire is
 `--listen-vfkit` (datagram) or `--listen-qemu` (length-prefixed stream). An
@@ -327,7 +335,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-763 tests, plus a differential harness in `differential/` that drives gVisor's
+764 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

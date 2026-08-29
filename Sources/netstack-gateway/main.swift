@@ -13,6 +13,7 @@ import NIOPosix
 // for the other kind of host.
 
 struct Options {
+    var configPath: String?
     var listenPath: String?
     var listenStream: String?
     var controlPath: String?
@@ -50,6 +51,7 @@ struct Options {
             // them the other way round, so a command line moved across from
             // gvproxy would have pointed the control API at the VM's socket and
             // the VM at the control socket. Nothing would have said so.
+            case "--config": options.configPath = try value(flag)
             case "--listen": options.controlPath = try value(flag).replacingOccurrences(of: "unix://", with: "")
             case "--listen-vfkit": options.listenPath = try value(flag)
             case "--listen-qemu": options.listenStream = try value(flag)
@@ -85,12 +87,11 @@ struct Options {
             }
             index += 1
         }
-        guard options.listenPath != nil || options.listenStream != nil else {
-            throw OptionError.noWire
-        }
-        guard options.listenPath == nil || options.listenStream == nil else {
-            throw OptionError.conflictingWires
-        }
+        // Deliberately NOT checked here. The configuration file is read after
+        // parsing, and a file that is missing, malformed or YAML has to be
+        // reported as that rather than as "no guest wire" -- which is what
+        // happened, because this check fired first and every config mistake came
+        // back wearing the same message.
         return options
     }
 }
@@ -136,6 +137,7 @@ netstack-gateway — a userspace network for a VM, over a socket.
 
 Flag names are gvproxy's, so a command line moves across unchanged.
 
+  --config <path>            Configuration file, in gvproxy's shape as JSON
   --listen <path>            Unix socket for the HTTP control API
   --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
   --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
@@ -150,7 +152,10 @@ Flag names are gvproxy's, so a command line moves across unchanged.
   --debug                    Shorthand for --log-level debug
   --log-level <level>        trace|debug|info|notice|warning|error (default notice)
 
-Not gvproxy's, because it takes them from a configuration file this does not read:
+Also settable in the configuration file, which is the only way to reach zones,
+static leases, NAT and virtual addresses. Flags win over the file.
+
+Not gvproxy's, because it takes them from the configuration file:
 
   --dns <address:port>       Resolver for names this gateway does not own
   --forward <h:addr:g>       Publish guest addr:g on host port h, repeatable
@@ -160,7 +165,7 @@ different wires, and a socket is one or the other.
 """
 
 let arguments = Array(CommandLine.arguments.dropFirst())
-let options: Options
+var options: Options
 do {
     options = try Options.parse(arguments)
 } catch let error as OptionError {
@@ -172,10 +177,39 @@ do {
     exit(2)
 }
 
-guard let gatewayAddress = IPv4Address(options.gateway), let subnet = IPv4Subnet(cidr: options.subnet),
-    let hostAddress = IPv4Address(options.host)
-else {
+// A flag that was left at its default loses to the file; one that was given
+// wins. Comparing against the default is how that is decided without a second
+// optional per setting.
+let gatewayAddress = options.gateway == "192.168.127.1" ? (file.gatewayAddress ?? IPv4Address("192.168.127.1")!) : IPv4Address(options.gateway)
+let hostAddress = options.host == "192.168.127.254" ? (file.hostAddress ?? IPv4Address("192.168.127.254")!) : IPv4Address(options.host)
+let subnet = options.subnet == "192.168.127.0/24" ? (file.subnet ?? IPv4Subnet(cidr: "192.168.127.0/24")!) : IPv4Subnet(cidr: options.subnet)
+guard let gatewayAddress, let subnet, let hostAddress else {
     FileHandle.standardError.write(Data("error: --gatewayIP, --hostIP or --subnet is not an address\n".utf8))
+    exit(2)
+}
+
+// The file first, then the flags over it. gvproxy documents the same order --
+// "configuration file with command line override" -- and it is the order that
+// makes a file useful: a shared file plus one flag for what differs.
+var file = FileConfiguration()
+if let path = options.configPath {
+    do {
+        file = try FileConfiguration(contentsOf: path)
+    } catch {
+        FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+        exit(2)
+    }
+}
+if file.debug, options.logLevel == "notice" { options.logLevel = "debug" }
+
+// The wire is checked now: after the file has had its chance to be wrong about
+// something more specific.
+if options.listenPath == nil, options.listenStream == nil {
+    FileHandle.standardError.write(Data("error: \(OptionError.noWire)\n\n\(usage)\n".utf8))
+    exit(2)
+}
+if options.listenPath != nil, options.listenStream != nil {
+    FileHandle.standardError.write(Data("error: \(OptionError.conflictingWires)\n".utf8))
     exit(2)
 }
 
@@ -207,9 +241,17 @@ LoggingSystem.bootstrap { label in
 
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 let configuration = Gateway.Configuration(
-    gatewayAddress: gatewayAddress, subnet: subnet, hostAddress: hostAddress,
-    allowsLinkLocal: options.allowsLinkLocal, captureFile: options.captureFile,
-    notificationSocketPath: options.notifySocket, mtu: options.mtu, upstreamResolvers: resolvers,
+    gatewayAddress: gatewayAddress, subnet: subnet,
+    linkAddress: file.linkAddress ?? MACAddress("5a:94:ef:e4:0c:ee")!,
+    hostAddress: hostAddress, nat: file.nat,
+    gatewayVirtualAddresses: file.virtualAddresses,
+    allowsLinkLocal: options.allowsLinkLocal || (file.allowsLinkLocal ?? false),
+    captureFile: options.captureFile ?? file.captureFile,
+    notificationSocketPath: options.notifySocket,
+    mtu: options.mtu == 1500 ? (file.mtu ?? 1500) : options.mtu,
+    dnsRecords: nil, upstreamResolvers: resolvers,
+    dhcpStaticLeases: file.staticLeases, dnsSearchDomains: file.searchDomains,
+    maximumHalfOpenConnections: file.maximumHalfOpen ?? 512,
     logger: Logger(label: "netstack"))
 
 do {
@@ -225,7 +267,18 @@ do {
         ? Gateway.start(listeningOnStreamSocketAt: path, group: group, configuration: configuration)
         : Gateway.start(listeningOnDatagramSocketAt: path, group: group, configuration: configuration)).wait()
 
-    for forward in options.forwards {
+    // Zones from the file, added before any guest can ask.
+    //
+    // Copied into a local first: `file` is main-actor isolated as a top-level
+    // binding, and the closure below runs on the event loop.
+    let configuredZones = file.zones
+    if !configuredZones.isEmpty {
+        try gateway.eventLoop.submit {
+            for zone in configuredZones { gateway.dns.addZone(zone) }
+        }.wait()
+    }
+
+    for forward in options.forwards + file.forwards {
         guard let address = IPv4Address(forward.guest) else { continue }
         _ = try gateway.forward(hostPort: forward.host, toGuest: address, port: forward.guestPort).wait()
         print("netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on 127.0.0.1:\(forward.host)")

@@ -794,7 +794,9 @@ struct Sender {
             }
         }
         retire(previousUna: previousUna, advanced: advanced, timestampSample: timestampSample)
-        congestionControl.acked(bytes: advanced, flightSize: flightBefore)
+        congestionControl.acked(
+            bytes: advanced, flightSize: flightBefore, now: clock.now(),
+            smoothedRoundTrip: estimator.smoothed)
 
         if inFlight.isEmpty {
             // RFC 6298 §5.2.

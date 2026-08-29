@@ -690,14 +690,29 @@ without requiring them in the same step — is strictly better and is the right
 thing to build if this ever needs to compare timing again; it is a larger change
 to the instrument than to the stack, and it was not needed to get the gate clean.
 
-**Also measured while here, and not implemented:** gVisor answers the FIRST
-full-sized segment after a handshake at once, where "every second full-sized
+**Also measured while here, and deliberately NOT implemented:** gVisor answers the
+FIRST full-sized segment after a handshake at once, where "every second full-sized
 segment" alone would hold it — Linux's quick-ACK mode. RFC 9293 neither requires
 nor forbids it, and the argument for it is real: delaying the first
-acknowledgement of a connection delays the sender's congestion window opening,
-and slow start is when the window most needs to move. Adding it here was tried and
-reverted, because it invalidated five expectations that had just been re-derived
-for the delay — one justified change turning into churn that obscures both.
+acknowledgement of a connection delays the sender's congestion window opening, and
+slow start is when the window most needs to move.
+
+It was tried and reverted once, because it invalidated five expectations that had
+just been re-derived for the delay. The reason it stays out is stronger than that
+timing accident, though, and worth stating so it is a decision rather than a
+backlog item:
+
+**Nothing here can verify it.** The differential now runs with delayed
+acknowledgements off, so it does not compare acknowledgement timing at all; the
+vectors pin timing against a fixed peer, so they would only reflect whatever rule
+was written into them. The benefit is real-world throughput at connection start,
+which no instrument in this repository measures. Implementing it would mean
+churning the delayed-acknowledgement vectors for a change whose value could only
+be asserted, not shown.
+
+That is a poor trade in a project whose whole method is that a property nothing
+can falsify is a property nobody should claim. It belongs with the throughput gate
+(M7), where a measurement exists to justify it.
 
 ## Persist: widened, and withdrawn again with a reason
 

@@ -417,6 +417,25 @@ final class TCPReassembler {
             dataEnd = min(dataEnd, recordedFin - rcvNxt)
         }
 
+        // Recorded for SACK reporting, not for reassembly, and recorded for the
+        // ARRIVING SEGMENT rather than for whatever of it turns out to be novel.
+        //
+        // RFC 2018 §4 requires the first block to be "the contiguous block of
+        // data containing the segment which TRIGGERED this ACK". A segment
+        // wholly duplicating a run this receiver already holds triggered the
+        // acknowledgement just as much as a novel one did, so its run goes to
+        // the front too. Recording only novel pieces looked equivalent and is
+        // not: the differential found gVisor moving a block to the front on a
+        // pure duplicate, and re-reading the RFC showed gVisor right.
+        //
+        // `dataStart > 0` is the out-of-order test. A segment at or below
+        // RCV.NXT is in order for at least part of its length, so it is
+        // delivered rather than held, and there is no block for it to be in.
+        if dataStart > 0, dataEnd > dataStart {
+            recentTouches.insert(rcvNxt + dataStart, at: 0)
+            if recentTouches.count > Self.recentTouchesKept { recentTouches.removeLast() }
+        }
+
         let pieces = novelRanges(dataStart: dataStart, dataEnd: dataEnd, rcvNxt: rcvNxt)
         return admit(pieces: pieces, of: segment, dataStart: dataStart, rcvNxt: rcvNxt)
     }
@@ -565,13 +584,6 @@ final class TCPReassembler {
             let entry = Entry(sequence: rcvNxt + piece.start, bytes: copy, charge: charge)
             queue.insert(entry, at: insertionIndex(forOffset: piece.start, rcvNxt: rcvNxt))
             accountedBytes += charge
-            // Recorded for SACK reporting, not for reassembly. RFC 2018 §4 makes
-            // the block containing the most recently received segment the
-            // required first one and asks for the rest in the order they were
-            // most recently reported; this is the only place that knows the
-            // order things arrived in by the time the endpoint asks.
-            recentTouches.insert(entry.sequence, at: 0)
-            if recentTouches.count > Self.recentTouchesKept { recentTouches.removeLast() }
         }
 
         return delivered

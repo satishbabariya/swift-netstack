@@ -537,7 +537,8 @@ struct DifferentialRun {
         return DifferentialDivergence(
             step: step, frameIndex: index, swiftBytes: swift, goBytes: go,
             recognised: Self.recognise(swift: normalizedSwift, go: normalizedGo)
-                ?? Self.recogniseScaledWindow(swift: normalizedSwift, go: normalizedGo),
+                ?? Self.recogniseScaledWindow(swift: normalizedSwift, go: normalizedGo)
+                ?? Self.recogniseSackAfterEstablished(swift: normalizedSwift, go: normalizedGo),
             description: "step \(step) frame \(index): swift=\(normalizedSwift) go=\(normalizedGo)")
     }
 
@@ -604,6 +605,64 @@ struct DifferentialRun {
     /// a wrong sequence, a wrong flag, a missing frame — which is what a real
     /// window defect looks like when it affects behaviour rather than only
     /// advertisement.
+    /// gVisor attaches SACK blocks only while its endpoint is ESTABLISHED; this
+    /// stack attaches them whenever it holds something out of order.
+    ///
+    /// **This one has a source line rather than an inference.** `connect.go`'s
+    /// `sendRaw`:
+    ///
+    /// ```go
+    /// if e.EndpointState() == StateEstablished && e.rcv.pendingRcvdSegments.Len() > 0 && (flags&header.TCPFlagAck != 0) {
+    ///     sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
+    /// }
+    /// ```
+    ///
+    /// So after the harness's `close` -- `Shutdown(Write)`, which leaves the
+    /// connection in FIN-WAIT and still receiving -- gVisor's FIN and every
+    /// acknowledgement after it carry no blocks, while this stack goes on
+    /// reporting what it holds.
+    ///
+    /// **Which stack is right: this one, and not by much.** RFC 2018 puts no
+    /// state restriction on the option, and a receiver in FIN-WAIT-2 is still
+    /// receiving -- data arrives, is reassembled, and is delivered -- so
+    /// reporting what it holds is exactly as useful there as anywhere else, and
+    /// withholding it makes the peer retransmit data that arrived. gVisor's
+    /// condition also covers CLOSE-WAIT, where it costs nothing because no more
+    /// data is coming. The difference is small and it is real, and matching it
+    /// would mean copying a limitation.
+    ///
+    /// **What this masks.** A defect that adds or drops SACK blocks and changes
+    /// nothing else about a frame, on a connection past ESTABLISHED. The
+    /// blocks' contents, ordering and count are compared exactly everywhere
+    /// else -- which is every frame of every sequence up to the `close` step --
+    /// and by `TCPSackTests`, which does not go through gVisor at all.
+    ///
+    /// An earlier attempt made this stack match gVisor instead, by dropping the
+    /// reassembly queue on close. It was reverted: the queue is also what a
+    /// later in-order arrival is delivered from, and a sequence two runs later
+    /// showed gVisor acknowledging data it had queued before closing -- which
+    /// is to say the mechanism guessed at was not the one gVisor has.
+    static func recogniseSackAfterEstablished(swift: VectorPacket, go: VectorPacket) -> String? {
+        guard case .tcp(var swiftLine) = swift, case .tcp(let goLine) = go else { return nil }
+        guard swiftLine.options.contains(where: { $0.hasPrefix("sack ") }),
+            !goLine.options.contains(where: { $0.hasPrefix("sack ") })
+        else { return nil }
+        swiftLine.options.removeAll { $0.hasPrefix("sack ") }
+        if swiftLine == goLine { return "sack-outside-established" }
+        // Two recognised differences can land on the same frame, and a chain of
+        // alternatives cannot see that: each rule requires "and nothing else
+        // differs", so a FIN that carries both an unmatched SACK option and an
+        // unmatched window is reported as a defect by both. Composing here
+        // rather than making the chain a pipeline keeps every rule's own bound
+        // exactly as strict as it reads -- this one still refuses anything the
+        // window rule would also refuse, and says in its label that it took two
+        // rules to explain one frame.
+        if let window = recogniseScaledWindow(swift: .tcp(swiftLine), go: go) {
+            return "sack-outside-established+\(window)"
+        }
+        return nil
+    }
+
     static func recogniseScaledWindow(swift: VectorPacket, go: VectorPacket) -> String? {
         guard case .tcp(var swiftLine) = swift, case .tcp(let goLine) = go else { return nil }
         guard swiftLine.window != goLine.window else { return nil }

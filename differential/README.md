@@ -746,55 +746,94 @@ behaviour, so this needs settling before persist can be compared frame for frame
 in a range that does not overlap the one above it, and assert
 `coverage.enteredPersist` is non-zero before reading anything else into the result.
 
-## SACK: the constraint that was lifted, found four defects, and went back
+## SACK: the last generator constraint, lifted twice
 
-`sackOK` was the last option the generator withheld. It was lifted once the
-receiver half of RFC 2018 landed — negotiation plus reporting what is held out
-of order — and it is back in place, because the lift does not survive the
-*sender* half being absent.
+`sackOK` was the last option the generator withheld. It was lifted once when
+SACK's receiver half landed, went back, and is now lifted for good. There are no
+option constraints left.
 
-**What the lift found, in one run, that eleven unit tests had not:**
+**The first lift found four defects in the receiver half** that eleven unit
+tests had not:
 
 1. **Data segments overflowed the options area.** Options come out of the
    payload (RFC 6691), and SACK is added at the egress point, after a segment
-   has been cut. The payload budget charged the timestamp only. A full-sized
-   segment plus a timestamp plus blocks put the header past 40 bytes, the
-   four-bit data offset wrapped, and the frame went out unparseable — reported
-   here, in as many words, as "Swift emitted an undecodable frame".
+   has been cut. The payload budget charged the timestamp only, so the header
+   passed 40 bytes, the four-bit data offset wrapped, and the frame went out
+   unparseable — reported here, in as many words, as "Swift emitted an
+   undecodable frame".
 2. **The per-segment budget fixed the wrong problem.** A segment is cut once and
    may be retransmitted much later, when more blocks are being reported than
-   when it was sized. Charging the options present at cutting time overflows on
-   the retransmission instead. The budget has to be the connection's worst case,
-   which is what gVisor's `endpoint.maxOptionSize` also computes.
+   when it was sized. The budget has to be the connection's worst case, which is
+   what gVisor's `endpoint.maxOptionSize` computes too.
 3. **Blocks were still reported after close** — and the first fix for that was
-   wrong too. Dropping the queue on close matched gVisor's silence, but a later
+   wrong. Dropping the queue on close matched gVisor's silence, but a later
    sequence showed gVisor still acknowledging data it had queued before closing,
-   which contradicts the explanation the fix was built on. Reverted rather than
-   kept: matching an observation without a mechanism is what this file exists to
-   stop. The post-close question returns with RFC 6675.
+   which contradicts the explanation the fix was built on. Reverted; see the
+   recogniser below for what gVisor actually does.
 4. **Block ordering disagreed from the second out-of-order arrival onward.** RFC
    2018 §4 requires the run containing the newest segment first and asks for the
    rest in the order they were most recently reported. The first version did the
-   MUST and skipped the SHOULD, with a comment saying to revisit if the
-   differential ever showed a divergence. It did, immediately.
+   MUST and skipped the SHOULD.
 
 **Why it went back.** With `sackOK` negotiated, gVisor's *sender* switches to
-SACK-based recovery. On the third duplicate acknowledgement the two stacks make
-different choices: this one inflates cwnd by RFC 5681 §3.2 and sends, gVisor
-computes `pipe` by RFC 6675 and does not. That is a real behavioural difference
-in a path this comparison exists to cover — not an option mismatch to normalise
-away — so the constraint stands until the sender half exists. All four findings
-above are now carried by unit tests in `TCPSackTests.swift`, so nothing rests on
-a run that no longer happens.
+SACK-based recovery, and on the third duplicate acknowledgement the two stacks
+made different choices. That is a behavioural difference in a path this
+comparison exists to cover, so the constraint stood until the sender half
+existed.
 
-**RACK is off in the harness** (`tcpip.TCPRecovery(0)`), which is a
-configuration difference in the same family as Nagle and delayed ACKs above.
-With SACK negotiated gVisor enables RACK-TLP (RFC 8985), whose tail loss probe
-fires around 200 ms after the last transmission — so gVisor retransmits a FIN
-once before its RTO would have, and this stack waits out the full RTO. gVisor's
-behaviour is better and the setting records a gap rather than denying one. It
-has no effect while `sackOK` is withheld, since RACK follows SACK; it is here so
-the next lift does not have to rediscover it.
+**The second lift found five more**, all in code the sender half touched:
+
+1. **Bare duplicate acknowledgements still entered fast recovery.** RFC 6675 §2
+   redefines "duplicate" on a SACK connection: an ACK counts only if it carries
+   previously unknown SACK information. gVisor's `isDupAck` opens with exactly
+   that test. Without it this stack retransmitted and inflated its window where
+   gVisor did neither.
+2. **SMSS was the negotiated MSS rather than the payload size.** RFC 5681
+   defines SMSS excluding options, so the initial window of ten segments was a
+   few hundred bytes wider than ten segments — invisible until a write landed
+   just past the boundary and produced one extra short segment on the opening
+   burst.
+3. **The timestamp option was packed tight instead of aligned.** `NOP NOP TS` is
+   twelve bytes and `TS` alone is ten; with SACK beside it the difference moved
+   the reserved options area from 40 to 36 and every data segment from 1420
+   bytes to 1424.
+4. **A short retransmission was charged by its length.** Under a window
+   collapsed to one segment by a timeout, a first segment that had been
+   window-limited to 1380 bytes left 40 bytes of slack, and a 26-byte
+   retransmission went out into it — two packets from a window that RFC 5681
+   §3.1 had just collapsed to one. gVisor and Linux count this window in
+   segments; this stack now charges a whole segment per retransmission, for the
+   reason that what a path carries is packets.
+5. **Block ordering ignored duplicate arrivals.** §4's MUST is about "the
+   segment which triggered this ACK", and a segment wholly duplicating a held
+   run triggered it just as much as a novel one. Recording only novel pieces
+   looked equivalent and was not.
+
+**A generator constraint had to widen with them.** The write cap is "one initial
+congestion window", computed as ten segments less the options each carries. It
+named the timestamp alone, so enabling SACK left it forty bytes per segment too
+generous — and the step that acknowledges the whole write then acknowledged data
+that had not been sent. RFC 9293 §3.10.7.4 answers that with an ACK and gVisor
+stays silent, which is a real difference on an acknowledgement the generator
+never meant to produce.
+
+**RACK is off in the harness** (`tcpip.TCPRecovery(0)`), a configuration
+difference in the same family as Nagle and delayed ACKs above. With SACK
+negotiated gVisor enables RACK-TLP (RFC 8985), whose tail loss probe fires
+around 200 ms after the last transmission — so gVisor retransmits a FIN once
+before its RTO would have, and this stack waits out the full RTO. gVisor's
+behaviour is better; the setting records the gap rather than denying it, and
+RACK is the next TCP feature.
+
+**One recognised difference came out of it**, and it is the only one with a
+source line rather than an inference behind it. `connect.go`'s `sendRaw`
+attaches blocks only while the endpoint is ESTABLISHED, so gVisor stops
+reporting after `Shutdown(Write)` and this stack does not. RFC 2018 puts no
+state restriction on the option and a receiver in FIN-WAIT-2 is still receiving,
+so this stack is right and matching gVisor would mean copying a limitation. See
+`Differential.recogniseSackAfterEstablished`, which is also the first recogniser
+to compose with another: the frames it appears on carry the window difference
+too, and a chain of alternatives cannot see that one frame needs two rules.
 
 ## Known gaps in this stack, visible from here
 

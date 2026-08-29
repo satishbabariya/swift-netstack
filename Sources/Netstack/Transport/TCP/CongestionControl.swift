@@ -18,10 +18,25 @@ protocol CongestionControl {
     /// The slow-start threshold, in bytes. At or above it, the algorithm is in
     /// congestion avoidance.
     var slowStartThreshold: Int { get }
+    /// SMSS, in bytes.
+    ///
+    /// Exposed rather than kept a second time by the sender, which needs it for
+    /// RFC 6675's loss test. Two copies of a number the peer influences is two
+    /// chances to disagree, and the algorithm is where it already lives.
+    var segmentSize: Int { get }
     /// A non-duplicate acknowledgement advanced the window by `bytes`.
     mutating func acked(bytes: Int, flightSize: Int)
     /// Loss inferred from duplicate acknowledgements (fast retransmit).
     mutating func lossDetected(flightSize: Int)
+    /// Loss inferred from SACK information, RFC 6675.
+    ///
+    /// Separate from `lossDetected` because the window must **not** be
+    /// inflated. RFC 5681 §3.2 adds `3*SMSS` to stand in for the segments the
+    /// duplicate acknowledgements said had left the network -- an estimate,
+    /// made because a Reno sender cannot see what arrived. A SACK sender can:
+    /// it computes `pipe` from the scoreboard and bounds itself by that, so
+    /// inflating as well would count the same departures twice.
+    mutating func lossDetectedWithScoreboard(flightSize: Int)
     /// The retransmission timer expired.
     mutating func timeout(flightSize: Int)
 }
@@ -38,7 +53,7 @@ struct Reno: CongestionControl, Sendable, Equatable {
     /// otherwise divide by zero in congestion avoidance and produce an empty
     /// window on timeout -- a `congestionWindow` of zero wedges the connection
     /// permanently, since no amount of acknowledgement can grow it.
-    private let segmentSize: Int
+    let segmentSize: Int
     private var cwnd: Int
     private var ssthresh: Int
 
@@ -105,6 +120,14 @@ struct Reno: CongestionControl, Sendable, Equatable {
         // The three duplicate ACKs that signalled the loss are three segments
         // that have left the network, so the window is inflated by them.
         cwnd = ssthresh.addingSaturating(segmentSize.multipliedSaturating(by: 3))
+    }
+
+    mutating func lossDetectedWithScoreboard(flightSize: Int) {
+        // RFC 6675 §5: the threshold is reduced exactly as in §3.2, and cwnd is
+        // set to it. The difference from `lossDetected` is the missing
+        // inflation, and the reason is in the protocol's own comment.
+        ssthresh = reducedThreshold(flightSize: flightSize)
+        cwnd = ssthresh
     }
 
     mutating func timeout(flightSize: Int) {

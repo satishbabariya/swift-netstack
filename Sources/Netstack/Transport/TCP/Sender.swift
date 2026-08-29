@@ -156,6 +156,15 @@ struct Sender {
         /// never cleared, and keying eligibility on it would make a segment
         /// retransmitted in an earlier episode ineligible in this one.
         var presumedLost: Bool
+        /// Reported by the peer as having arrived, via an RFC 2018 SACK block.
+        ///
+        /// Advisory, and that word carries weight: the peer is permitted to
+        /// discard SACKed data it has not yet delivered, so this is not an
+        /// acknowledgement and cannot retire the record. It is only ever used
+        /// to decide what NOT to send -- what is not in the pipe, and what is
+        /// not worth retransmitting -- which is the direction in which a wrong
+        /// answer costs bandwidth rather than correctness.
+        var sacked: Bool
     }
 
     /// The congestion-control algorithm, readable so a caller (and the tests)
@@ -206,6 +215,20 @@ struct Sender {
     /// a partial acknowledgement. That is the conservative direction, and it is
     /// what RFC 6298 §5.4 on its own guarantees.
     private var lostBytes = 0
+
+    /// Bytes in flight the peer has selectively acknowledged. Excluded from
+    /// `pipe`, because they are no longer in the network.
+    private var sackedBytes = 0
+
+    /// SND.NXT at the moment SACK-based recovery began, RFC 6675's
+    /// RecoveryPoint. Non-nil exactly while an episode is running.
+    ///
+    /// The point of remembering it: an episode ends when everything that was
+    /// outstanding when it started has been acknowledged, NOT on the first
+    /// acknowledgement that advances. Without it a single partial ACK ends
+    /// recovery, the window is restored, and the next hole starts a second
+    /// episode that halves the threshold again -- one loss event charged twice.
+    private var recoveryPoint: SequenceNumber?
 
     private var estimator: RTTEstimator
     private var timerDeadline: NIODeadline?
@@ -299,7 +322,14 @@ struct Sender {
     /// presumed lost has gone out again, and in that interval counting the
     /// presumed-lost bytes as in flight would leave a window of one segment
     /// with no room in it for the very retransmissions it exists to carry.
-    var pipeSize: Int { outstanding - lostBytes }
+    var pipeSize: Int { max(0, outstanding - lostBytes - sackedBytes) }
+
+    /// Bytes in flight the peer has reported as arrived. For tests, and for
+    /// anything asking why `pipe` is smaller than the flight size.
+    var selectivelyAcknowledgedBytes: Int { sackedBytes }
+
+    /// Whether RFC 6675 recovery is running.
+    var inScoreboardRecovery: Bool { recoveryPoint != nil }
 
     /// Bytes presumed lost by the retransmission timer and still awaiting their
     /// retransmission. Non-zero exactly while a timeout episode is running.
@@ -450,7 +480,7 @@ struct Sender {
         // `drainPresumedLost`).
         let window = max(0, min(congestionControl.congestionWindow, tcb.sndWnd))
 
-        out.append(contentsOf: drainPresumedLost(tcb: &tcb, window: window))
+        out.append(contentsOf: drainPresumedLost(tcb: &tcb, window: window, segmentSize: max(1, mss)))
 
         // SND.NXT must be exactly where this type left it. If it is not,
         // something else has taken sequence space -- a FIN, most likely -- and
@@ -473,7 +503,17 @@ struct Sender {
         // `pipeSize`, which by construction EXCLUDES the presumed-lost bytes,
         // so without this guard the room the drain could not use for a whole
         // segment would be spent on a short new one instead.
-        guard lostBytes == 0 else { return out }
+        //
+        // RFC 6675 recovery is the exception, and it is not a relaxation of the
+        // rule so much as the rule with better information. The paragraph above
+        // holds new data back because the sender cannot tell how much of the
+        // window the path is still carrying; that is exactly what the peer's
+        // report answers. `pipeSize` already excludes both the presumed-lost
+        // bytes and the SACKed ones, so `window - pipeSize` IS §5's
+        // `cwnd - pipe`, and sending into it is step (C) rather than a raid on
+        // the room the retransmissions need -- the drain above has already had
+        // its pick of that room.
+        guard lostBytes == 0 || recoveryPoint != nil else { return out }
 
         let segmentSize = max(1, mss)
         var usable = window - pipeSize
@@ -545,7 +585,9 @@ struct Sender {
                     sequence: sequence, flags: pushes ? [.ack, .psh] : .ack,
                     payload: gather(offset: offset, length: length)))
             inFlight.append(
-                InFlight(sequence: sequence, length: length, transmissions: 1, sentAt: clock.now(), pushes: pushes, presumedLost: false))
+                InFlight(
+                    sequence: sequence, length: length, transmissions: 1, sentAt: clock.now(), pushes: pushes,
+                    presumedLost: false, sacked: false))
             tcb.sndNxt = sequence + length
             outstanding += length
             offset += length
@@ -597,7 +639,8 @@ struct Sender {
     /// condition on the duplicate branch below.
     mutating func acknowledged(
         upTo ack: SequenceNumber, tcb: inout TCB, segmentLength: Int = 0, advertisedWindow: Int,
-        echoedTimestamp: UInt32? = nil, timestampClockNow: UInt32? = nil
+        echoedTimestamp: UInt32? = nil, timestampClockNow: UInt32? = nil,
+        selectiveAcknowledgements: [SACKBlock] = []
     ) -> Bool {
         // As in `segmentsToTransmit`, and for the same reason. The one that
         // matters here is the `advanced == 0` return: an acknowledgement that
@@ -621,8 +664,23 @@ struct Sender {
         // and send at will.
         guard ack.isInRange(from: tcb.sndUna, throughAndIncluding: tcb.sndNxt) else { return false }
 
+        // Before anything decides what this acknowledgement means. The blocks
+        // describe data that is in flight NOW, indexed by sequence number, and
+        // `retire` below both removes records and renumbers a partial one --
+        // so a scoreboard update run afterwards would be matching the peer's
+        // report against a different set of records than the peer saw.
+        let learnedFromScoreboard = recordSelectiveAcknowledgements(selectiveAcknowledgements, tcb: tcb)
+
         let advanced = ack - tcb.sndUna
         let flightBefore = outstanding
+
+        // RFC 6675 §4's `IsLost`, ahead of §3.2's duplicate-ACK counting below.
+        // The two are alternatives, not stages: when the peer reports what it
+        // holds there is no need to infer it from a count, and running both
+        // would halve the threshold twice for one loss. This returns false when
+        // nothing is SACKed, so a connection without the option reaches the
+        // counter unchanged.
+        _ = detectLossFromScoreboard(tcb: &tcb, flightSize: flightBefore)
 
         if advanced == 0 {
             // `!answeringOnlyAProbe` is the fourth condition, and it is here
@@ -647,7 +705,23 @@ struct Sender {
             // Once the window has reopened and real data is in flight behind an
             // unacknowledged probe byte, duplicates mean what they always mean
             // and this must not swallow them.
-            if segmentLength == 0, !windowChanged, flightBefore > 0, !(probeOutstanding && flightBefore == 1) {
+            // The last two conditions are RFC 6675's, not RFC 5681's.
+            //
+            // §2 redefines "duplicate acknowledgement" for a SACK connection:
+            // an ACK counts only "if the ACK contains previously unknown SACK
+            // information". A peer that repeats an acknowledgement without
+            // telling this sender anything new about what it holds has reported
+            // nothing, and counting those would fast-retransmit on a peer
+            // simply keeping quiet. gVisor's `isDupAck` opens with exactly this
+            // test, and it is what a stack sending bare duplicates observably
+            // does NOT provoke from it.
+            //
+            // `recoveryPoint == nil` keeps the counter out of an episode that is
+            // already running, where the response to a duplicate is the drain,
+            // not another reduction.
+            if segmentLength == 0, !windowChanged, flightBefore > 0, !(probeOutstanding && flightBefore == 1),
+                !(tcb.sackPermitted && !learnedFromScoreboard), recoveryPoint == nil
+            {
                 duplicates += 1
                 // RFC 5681 §3.2: the THIRD duplicate is the loss signal. The
                 // first two are ordinary reordering.
@@ -667,8 +741,18 @@ struct Sender {
                 // clears the run in the other direction; this is the same rule
                 // seen from the other side.
                 if duplicates == 3, lostBytes == 0 {
-                    congestionControl.lossDetected(flightSize: flightBefore)
-                    fastRetransmitPending = true
+                    if tcb.sackPermitted {
+                        // Same threshold, different response. RFC 6675 §5 enters
+                        // recovery here too -- `shouldEnterRecovery` is
+                        // `DupAckCount >= 3 || IsLost(SND.UNA)` -- but a SACK
+                        // sender bounds itself with `pipe` afterwards, so the
+                        // window must not also be inflated by the three segments
+                        // the duplicates stood for.
+                        enterScoreboardRecovery(tcb: &tcb, flightSize: flightBefore)
+                    } else {
+                        congestionControl.lossDetected(flightSize: flightBefore)
+                        fastRetransmitPending = true
+                    }
                 }
             } else {
                 // Not a duplicate by §3.2's definition, so it does not extend
@@ -683,6 +767,15 @@ struct Sender {
 
         duplicates = 0
         fastRetransmitPending = false
+        // RFC 6675 §5's exit: the episode ends when the cumulative
+        // acknowledgement passes what was outstanding when it began, not on the
+        // first one that advances. A partial acknowledgement inside an episode
+        // is the ordinary case -- it is the hole being filled -- and treating it
+        // as the end would restore the window and let the next hole open a
+        // second episode, charging one loss event to the threshold twice.
+        if let point = recoveryPoint, !ack.lessThan(point) {
+            recoveryPoint = nil
+        }
         // A probe's byte is always the one at SND.UNA (`persistApplies` only
         // lets a probe exist while it is the sole outstanding record), so any
         // acknowledgement that advances SND.UNA at all has retired it.
@@ -803,10 +896,36 @@ struct Sender {
         // `where !presumedLost` rather than a blanket assignment, so a second
         // expiry inside an episode re-marks only what the first one's drain has
         // already sent and does not double-count what it has not.
-        for index in inFlight.indices where !inFlight[index].presumedLost {
+        //
+        // The scoreboard is discarded here, and the alternative was considered
+        // and rejected rather than overlooked.
+        //
+        // Keeping it would spare the peer retransmissions of data it has
+        // already reported -- which is what Linux does, and what RFC 6675 §5.1
+        // permits. It also **stalls**. A peer is entitled to discard SACKed
+        // data it has not yet delivered; if it does, its cumulative
+        // acknowledgement never passes the hole, the next expiry finds the same
+        // records still marked as arrived, declines to resend them again, and
+        // the connection makes no progress for as long as the peer is willing
+        // to wait. Escaping that needs a second rule about how many timeouts a
+        // SACK mark survives, and a rule with a counter in it is one more thing
+        // to get wrong.
+        //
+        // A timeout is the signal that nothing is known about the pipe. Acting
+        // on it means exactly that, including about what the peer said was in
+        // it. The cost is a possible retransmission of data the peer holds,
+        // once, on a path that has just stopped delivering entirely.
+        sackedBytes = 0
+        for index in inFlight.indices {
+            inFlight[index].sacked = false
+            guard !inFlight[index].presumedLost else { continue }
             inFlight[index].presumedLost = true
             lostBytes += inFlight[index].length
         }
+        // The episode is over as a SACK episode: the timer's judgement replaces
+        // it, and a RecoveryPoint left standing would suppress entry into the
+        // next one.
+        recoveryPoint = nil
 
         // §5.4's retransmission is unconditional -- it is not gated on the
         // window, the way `fastRetransmitPending`'s is not. It is also the only
@@ -971,7 +1090,9 @@ struct Sender {
         let pushes = bytesRemainingInWrite(from: sent) <= 1
         let payload = gather(offset: sent, length: 1)
         inFlight.append(
-            InFlight(sequence: sequence, length: 1, transmissions: 1, sentAt: clock.now(), pushes: pushes, presumedLost: false))
+            InFlight(
+                sequence: sequence, length: 1, transmissions: 1, sentAt: clock.now(), pushes: pushes,
+                presumedLost: false, sacked: false))
         tcb.sndNxt = sequence + 1
         outstanding += 1
         probeOutstanding = true
@@ -1121,7 +1242,7 @@ struct Sender {
     /// `theWindowGrowsOnlyOnAcknowledgementsWhileTheBurstRecovers` pins the
     /// exact cwnd and ssthresh at every step of an episode, so both of those
     /// are test failures and not matters of taste.
-    private mutating func drainPresumedLost(tcb: inout TCB, window: Int) -> [Segment] {
+    private mutating func drainPresumedLost(tcb: inout TCB, window: Int, segmentSize: Int) -> [Segment] {
         var out: [Segment] = []
         var index = 0
 
@@ -1138,7 +1259,26 @@ struct Sender {
             // `min(cwnd, SND.WND)` into the network. Under a window too small
             // for one segment the drain stops and the timer's own unconditional
             // retransmission is what keeps the connection moving.
-            guard window - pipeSize >= inFlight[index].length else { break }
+            //
+            // A retransmission is charged a **whole segment's worth of window**
+            // even when it is short, and that is the second half of the test.
+            // A window is an estimate of what the path can carry, and what a
+            // path carries is packets: a 26-byte retransmission occupies a slot
+            // exactly as a 1420-byte one does. Charging it by its length lets a
+            // window collapsed to a single segment -- which is what RFC 5681
+            // §3.1 collapses it to, on the strongest possible evidence that the
+            // path could not carry what it had -- send two packets, because the
+            // first one happened to be short. gVisor and Linux both count this
+            // window in segments for the same reason; the differential is where
+            // the difference became visible, on a scenario whose first segment
+            // was window-limited to 1380 bytes and left 40 bytes of slack.
+            //
+            // `min(segmentSize, window)` rather than `segmentSize`, so a peer
+            // advertising less than one segment still gets its retransmissions:
+            // the charge is "a segment, or the whole window if that is smaller",
+            // not "a segment, or nothing".
+            let charge = max(inFlight[index].length, min(segmentSize, window))
+            guard window - pipeSize >= charge else { break }
             guard let segment = retransmit(index, tcb: &tcb) else { break }
             out.append(segment)
             index += 1
@@ -1211,6 +1351,126 @@ struct Sender {
         return 0
     }
 
+    // MARK: - RFC 6675, the scoreboard
+
+    /// RFC 6675's DupThresh. Three, the same number RFC 5681 §3.2 counts to,
+    /// and for the same reason: fewer than three reordered segments are common
+    /// enough on a healthy path that treating them as loss would collapse the
+    /// window on nothing.
+    private static let duplicateThreshold = 3
+
+    /// Mark the in-flight records the peer says it has.
+    ///
+    /// Whole records only. A block that covers part of a record leaves it
+    /// unmarked, which is the conservative direction: an unmarked record is
+    /// counted in `pipe` and may be retransmitted, so the cost of missing a
+    /// partial arrival is bandwidth, while the cost of marking one that has not
+    /// wholly arrived is a hole nothing ever fills. Records and blocks both come
+    /// from segment boundaries, so a partial overlap means the peer is
+    /// describing a segmentation this sender did not use -- and then guessing at
+    /// its edges is exactly the wrong response.
+    /// Returns whether anything was newly marked -- RFC 6675 §2's "previously
+    /// unknown SACK information", which is what decides whether the
+    /// acknowledgement carrying it counts as a duplicate at all.
+    @discardableResult
+    private mutating func recordSelectiveAcknowledgements(_ blocks: [SACKBlock], tcb: TCB) -> Bool {
+        guard !blocks.isEmpty else { return false }
+        var learned = false
+        for index in inFlight.indices where !inFlight[index].sacked {
+            let record = inFlight[index]
+            let end = record.sequence + record.length
+            // Above SND.UNA, and within what has been sent. A block outside
+            // that is either stale or forged; either way there is no record it
+            // can legitimately describe, and the loop simply does not find one.
+            for block in blocks
+            where !record.sequence.lessThan(block.left) && !block.right.lessThan(end) && record.length > 0 {
+                inFlight[index].sacked = true
+                sackedBytes += record.length
+                learned = true
+                break
+            }
+        }
+        return learned
+    }
+
+    /// RFC 6675 §4's `IsLost`, applied to every record, in one pass.
+    ///
+    /// Returns whether an episode is running because of the scoreboard. Nothing
+    /// reads it any more -- RFC 6675 §2's redefinition of "duplicate" took over
+    /// the job of standing the counter down, and it is a better test because it
+    /// is about what the peer said rather than about what this method concluded
+    /// -- but it is kept because it is the honest answer to the question the
+    /// name asks, and a caller that needs it should not have to re-derive it.
+    ///
+    /// ## The pass runs backwards, and that is what makes it one pass
+    ///
+    /// `IsLost(S)` asks about what has been SACKed **above** S: more than
+    /// DupThresh discontiguous runs, or more than `(DupThresh - 1) * SMSS`
+    /// bytes. Asked forwards, each record would rescan everything above it --
+    /// quadratic in the number of in-flight segments, which the peer's window
+    /// and this sender's own cap put in the hundreds. Walking from the top
+    /// down, both quantities are running totals of what has already been
+    /// visited, so each record is O(1).
+    private mutating func detectLossFromScoreboard(tcb: inout TCB, flightSize: Int) -> Bool {
+        guard sackedBytes > 0, !inFlight.isEmpty else { return false }
+
+        let segmentSize = max(1, congestionControl.segmentSize)
+        // Not saturating arithmetic and not needing to be: the multiplier is
+        // two and the segment size is already clamped to a sane range by the
+        // MSS negotiation, so the product cannot approach the limit the way a
+        // peer-supplied window can.
+        let byteThreshold = (Self.duplicateThreshold - 1) * segmentSize
+        var sackedAbove = 0
+        var runsAbove = 0
+        var aboveWasSacked = false
+        var newlyLost = false
+
+        for index in stride(from: inFlight.count - 1, through: 0, by: -1) {
+            let record = inFlight[index]
+            if record.sacked {
+                sackedAbove += record.length
+                // A run is a maximal stretch of SACKed records. Counting the
+                // START of each is what makes "discontiguous" mean what the RFC
+                // means by it: three separate arrivals above a hole are strong
+                // evidence, three adjacent segments of one arrival are not.
+                if !aboveWasSacked { runsAbove += 1 }
+                aboveWasSacked = true
+                continue
+            }
+            aboveWasSacked = false
+            guard !record.presumedLost else { continue }
+            guard runsAbove > Self.duplicateThreshold || sackedAbove > byteThreshold else { continue }
+            inFlight[index].presumedLost = true
+            lostBytes += record.length
+            newlyLost = true
+        }
+
+        guard newlyLost else { return recoveryPoint != nil }
+        enterScoreboardRecovery(tcb: &tcb, flightSize: flightSize)
+        return true
+    }
+
+    /// Begin an RFC 6675 recovery episode, once.
+    ///
+    /// RecoveryPoint is SND.NXT at entry, so everything outstanding now has to
+    /// be acknowledged before another reduction can be charged -- §5, and the
+    /// same rule RFC 6582 states for NewReno. Re-entering would charge one loss
+    /// event to the threshold twice.
+    ///
+    /// The record at SND.UNA is marked lost on the way in. Entry means this
+    /// sender has decided the hole is real; without the mark the drain has
+    /// nothing to send and the episode would run with the window reduced and no
+    /// retransmission in it -- the worst of both.
+    private mutating func enterScoreboardRecovery(tcb: inout TCB, flightSize: Int) {
+        guard recoveryPoint == nil else { return }
+        recoveryPoint = tcb.sndNxt
+        congestionControl.lossDetectedWithScoreboard(flightSize: flightSize)
+        if let first = inFlight.first, !first.presumedLost, !first.sacked {
+            inFlight[0].presumedLost = true
+            lostBytes += first.length
+        }
+    }
+
     // MARK: - Internals
 
     private mutating func armTimer() {
@@ -1241,6 +1501,13 @@ struct Sender {
             // acknowledgement covered it. Either way it stops being owed, and
             // `lostBytes` has to lose it here or the episode never ends.
             if entry.presumedLost { lostBytes -= entry.length }
+            // Same reasoning as `presumedLost` above, for the same reason: the
+            // counter is a running total over the records, so a record leaving
+            // has to take its contribution with it. A cumulative acknowledgement
+            // routinely covers data the peer had already SACKed -- that is what
+            // filling the hole looks like -- so this is the ordinary path, not
+            // an edge case.
+            if entry.sacked { sackedBytes -= entry.length }
             retired += 1
         }
         if retired > 0 { inFlight.removeFirst(retired) }
@@ -1255,6 +1522,7 @@ struct Sender {
                 partial.length -= consumed
                 outstanding -= consumed
                 if partial.presumedLost { lostBytes -= consumed }
+                if partial.sacked { sackedBytes -= consumed }
                 inFlight[0] = partial
             }
         }

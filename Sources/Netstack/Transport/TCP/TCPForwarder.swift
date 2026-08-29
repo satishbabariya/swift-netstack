@@ -106,7 +106,11 @@ public final class TCPForwarder {
     }
 
     private func install() {
-        stack.transportDemuxer.setProtocolHandler(.tcp) { [weak self] header, payload in
+        // The ports are handed in and deliberately not used: a TCP segment
+        // arrives whole, so this parses the header anyway -- for the flags, the
+        // sequence number and the options -- and reading the ports from
+        // anywhere but that parse would be two sources for one fact.
+        stack.transportDemuxer.setProtocolHandler(.tcp) { [weak self] header, payload, _, _ in
             guard let self else { return false }
             return self.handle(header: header, payload: payload)
         }

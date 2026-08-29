@@ -22,6 +22,7 @@ struct Options {
     var mtu: UInt32 = 1500
     var logLevel = "notice"
     var captureFile: String?
+    var notifySocket: String?
     var forwards: [(host: Int, guest: String, guestPort: UInt16)] = []
 
     /// Hand-rolled rather than a dependency. The whole surface is six flags, and
@@ -46,6 +47,7 @@ struct Options {
             case "--subnet": options.subnet = try value(flag)
             case "--log-level": options.logLevel = try value(flag)
             case "--capture-file": options.captureFile = try value(flag)
+            case "--notify": options.notifySocket = try value(flag)
             case "--mtu":
                 let text = try value(flag)
                 guard let mtu = UInt32(text), mtu >= 576, mtu <= 65535 else {
@@ -107,6 +109,7 @@ netstack-gateway — a userspace network for a VM, over a socket.
   --mtu <bytes>           Link MTU (default 1500)
   --log-level <level>     trace|debug|info|notice|warning|error (default notice)
   --capture-file <path>   Write every frame to a pcap file (capped at 64 MiB)
+  --notify <path>         Unix socket told when guests arrive and leave
   --forward <h:addr:g>    Publish guest addr:g on host port h, repeatable
 
 Exactly one of --listen or --listen-stream is required: they are two different
@@ -160,7 +163,8 @@ LoggingSystem.bootstrap { label in
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 let configuration = Gateway.Configuration(
     gatewayAddress: gatewayAddress, subnet: subnet, captureFile: options.captureFile,
-    mtu: options.mtu, upstreamResolvers: resolvers, logger: Logger(label: "netstack"))
+    notificationSocketPath: options.notifySocket, mtu: options.mtu, upstreamResolvers: resolvers,
+    logger: Logger(label: "netstack"))
 
 do {
     // The wire is a socket this process creates and listens on: the VM connects

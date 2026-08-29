@@ -46,6 +46,10 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     /// An address that moved from one port to another: a guest reconnecting, or
     /// one guest claiming another's address.
     case switchAddressMoved
+    /// A notification dropped because the supervisor was not keeping up.
+    case notificationDropped
+    /// A notification the notification socket would not take.
+    case notificationFailed
 
     /// What a first occurrence is worth. A guest can cause every one of these,
     /// so none of them is an error -- they are the stack working as designed

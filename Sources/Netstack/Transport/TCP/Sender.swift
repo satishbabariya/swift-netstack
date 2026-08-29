@@ -263,6 +263,9 @@ struct Sender {
         var sawReordering = false
         /// The smallest round trip seen, which the window is a fraction of.
         var minimumRoundTrip: TimeAmount?
+        /// §6.3's reordering timer: when the earliest segment still inside its
+        /// window stops being inside it.
+        var reorderDeadline: NIODeadline?
     }
 
     private var rack = RACK()
@@ -274,6 +277,7 @@ struct Sender {
     /// -- and inferring that from whether a segment was marked confuses "the
     /// window is open" with "this segment happened to be inside it".
     var rackEnabledForTesting: Bool { rackEnabled }
+    var rackStateForTesting: (send: NIODeadline?, rtt: TimeAmount, window: TimeAmount, minRTT: TimeAmount?) { (rack.mostRecentSend, rack.roundTrip, rack.reorderWindow, rack.minimumRoundTrip) }
     var reorderWindowForTesting: TimeAmount { rack.reorderWindow }
     var sawReorderingForTesting: Bool { rack.sawReordering }
 
@@ -439,6 +443,22 @@ struct Sender {
     /// or was not taken — Karn's tests, and RFC 7323 §4.1's timestamp sampling —
     /// has to read this instead.
     var smoothedRoundTrip: TimeAmount { estimator.smoothed }
+
+    /// RFC 8985 §6.3's reordering timer: when to look again, or `nil` when
+    /// nothing is waiting out its window.
+    ///
+    /// ## Why detection on acknowledgements alone is not enough
+    ///
+    /// `RACK_detect_loss` runs when an acknowledgement arrives, and a segment
+    /// whose window has not passed at that moment is left alone -- correctly, it
+    /// may still be reordering. But if that acknowledgement was the last one,
+    /// nothing runs detection again, and the segment waits for the
+    /// retransmission timer: an RTO in place of a round trip. This deadline is
+    /// what the endpoint arms so the question gets asked once more.
+    ///
+    /// The caller owns the actual timer; this type only says when, exactly as
+    /// for persist.
+    var rackReorderDeadline: NIODeadline? { rack.reorderDeadline }
 
     /// When the next zero-window probe should go out, or `nil` when this sender
     /// is not in RFC 9293 §3.8.6.1's persist condition. The caller owns the
@@ -1554,6 +1574,10 @@ struct Sender {
         else { return false }
         updateReorderWindow()
         let now = clock.now()
+        // Recomputed from scratch on every pass. Keeping a stale deadline would
+        // leave a timer armed for a segment that has since been acknowledged,
+        // and the endpoint would wake to do nothing.
+        rack.reorderDeadline = nil
 
         var newlyLost = false
         for index in inFlight.indices {
@@ -1581,7 +1605,18 @@ struct Sender {
                 || (mostRecentSend == record.sentAt && end.lessThan(mostRecentEnd))
             guard sentAfter else { continue }
             let deadline = record.sentAt + rack.roundTrip + rack.reorderWindow
-            guard now >= deadline else { continue }
+            guard now >= deadline else {
+                // Still inside its window. Remember the LATEST such deadline, so
+                // one timer covers every segment waiting: an earlier one would
+                // fire and find nothing to do for the segments behind it, and
+                // the endpoint would have to re-arm on each.
+                if let existing = rack.reorderDeadline {
+                    if deadline > existing { rack.reorderDeadline = deadline }
+                } else {
+                    rack.reorderDeadline = deadline
+                }
+                continue
+            }
             inFlight[index].presumedLost = true
             lostBytes += record.length
             newlyLost = true
@@ -1589,6 +1624,15 @@ struct Sender {
         guard newlyLost else { return false }
         enterScoreboardRecovery(tcb: &tcb, flightSize: flightSize)
         return true
+    }
+
+    /// The reordering timer expired: look again.
+    ///
+    /// Returns whether anything was newly declared lost, so the caller knows
+    /// whether there is a retransmission to send.
+    @discardableResult
+    mutating func rackReorderTimerFired(tcb: inout TCB) -> Bool {
+        detectLossByTime(tcb: &tcb, flightSize: outstanding)
     }
 
     /// §7.2's window: a quarter of the smallest round trip seen, capped at the

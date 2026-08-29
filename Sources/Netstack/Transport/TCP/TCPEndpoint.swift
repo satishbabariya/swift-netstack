@@ -824,6 +824,29 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// each algorithm is covered where the algorithm is, and a test that
     /// inferred which one was in use from a window figure would be re-testing
     /// that behaviour to answer a question about wiring.
+    var rackStateForTesting: (send: NIODeadline?, rtt: TimeAmount, window: TimeAmount, minRTT: TimeAmount?)? {
+        connections.values.first?.sender.rackStateForTesting
+    }
+
+    var sackedForTesting: Int? {
+        guard let connection = connections.values.first else { return nil }
+        return connection.sender.selectivelyAcknowledgedBytes
+    }
+
+    var rackDeadlineForTesting: NIODeadline? {
+        connections.values.first?.sender.rackReorderDeadline
+    }
+
+    var presumedLostForTesting: Int? {
+        guard let connection = connections.values.first else { return nil }
+        return connection.sender.presumedLostBytes
+    }
+
+    var flightForTesting: Int? {
+        guard let connection = connections.values.first else { return nil }
+        return connection.sender.flightSize
+    }
+
     var usesRackForTesting: Bool {
         guard let connection = connections.values.first else { return false }
         return connection.sender.rackEnabledForTesting
@@ -1027,6 +1050,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         }
         armRetransmitTimer(on: connection)
         armPersistTimer(on: connection)
+        armRackTimer(on: connection)
         // Re-armed on every arriving segment, which is what makes "idle" mean
         // idle: any sign of life from the peer pushes the first probe out by a
         // full interval, and clears the probes already spent.
@@ -1570,6 +1594,38 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         let peer = connection.peer
         connection.timers.schedulePersist(after: delay) { [weak self] in
             self?.persistTimerFired(peer: peer)
+        }
+    }
+
+    /// Arm, re-arm or cancel RFC 8985 §6.3's reordering timer.
+    ///
+    /// Armed wherever the persist timer is, and from the same places, so that
+    /// "the connection did something" has one meaning across every timer here.
+    private func armRackTimer(on connection: Connection) {
+        guard let deadline = connection.sender.rackReorderDeadline else {
+            connection.timers.cancelRackReorder()
+            return
+        }
+        let now = stack.clock.now()
+        let delay = deadline > now ? deadline - now : .nanoseconds(0)
+        // A weak reference to the CONNECTION rather than a lookup by peer, which
+        // the other timers use. Both work; this one needs the connection's TCB
+        // inout, and re-finding it by four-tuple would be a second way of asking
+        // the same question.
+        connection.timers.scheduleRackReorder(after: delay) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            // Re-checked against the clock before acting, as the persist and
+            // retransmit bodies are: this is re-armed on every arriving segment,
+            // so it can be reached with the deadline already moved.
+            guard connection.sender.rackReorderTimerFired(tcb: &connection.tcb) else {
+                self.armRackTimer(on: connection)
+                return
+            }
+            // Something was newly declared lost, so there is a retransmission to
+            // send -- through the same path everything else leaves by.
+            _ = self.transmit(on: connection)
+            self.armRetransmitTimer(on: connection)
+            self.armRackTimer(on: connection)
         }
     }
 

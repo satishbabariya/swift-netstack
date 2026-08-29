@@ -165,6 +165,13 @@ limit is **per port**, which matters more than that it exists: a global cap
 would let one flooding guest fill the table and lock every other guest out of
 it, where a per-port cap means a guest can only exhaust its own share.
 
+That holds for *taking* addresses as well as inventing them. An address arriving
+on a new port moves — a switch that refused would make a reconnecting guest
+unreachable forever — but a move is an acquisition by the destination port and
+respects that port's limit like any other. Without that check a guest could
+exceed its share by claiming addresses another guest already held, one at a
+time and without limit, removing the victim's entries as it went.
+
 ### As a program
 
 For hosts that cannot link a Swift library, `netstack-gateway` is upstream's
@@ -291,7 +298,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-752 tests, plus a differential harness in `differential/` that drives gVisor's
+755 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

@@ -252,3 +252,133 @@ private func makeSwitch(ports count: Int, addressesPerPort: Int = 16) throws -> 
     #expect(try fixture.written(0).isEmpty, "the frame was sent back out of the port it came in on")
     #expect(try fixture.written(1).isEmpty)
 }
+
+@Test func theSwitchesBookkeepingSurvivesGuestsFightingOverAddresses() throws {
+    // The packet fuzzer drives a `Stack`, which has no switch under it, so none
+    // of this is reached by it. And what is here is the kind of thing that
+    // drifts: the per-port bound is enforced against a counter, not by counting
+    // the table, so the counter and the table can disagree -- and when they do,
+    // the bound is being enforced against a number that is not the truth.
+    //
+    // The traffic is what guests that do not trust each other would generate:
+    // the same handful of addresses claimed from every port, in a random order,
+    // mixed with addresses nobody has used before.
+    let fixture = try makeSwitch(ports: 4, addressesPerPort: 3)
+    var state: UInt64 = 0xD1CE
+    func next() -> UInt64 {
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        return state
+    }
+
+    // A small pool, so the same address is claimed by different ports often --
+    // which is the case the accounting has to get right.
+    let contested = (0..<6).map { MACAddress(bytes: [0x0a, 0, 0, 0, 0x55, UInt8($0)])! }
+
+    // The first drift is remembered and asserted once. Asserting inside the
+    // loop found the bug immediately and then reported it 3987 times, which
+    // buries the one number that matters -- which frame it first went wrong on.
+    var firstDrift: Int?
+    for iteration in 0..<4000 {
+        let port = Int(next() % 4)
+        let source: MACAddress
+        if next() % 4 == 0 {
+            source = MACAddress(bytes: [0x0a, 0, 0, 0, 0x66, UInt8(next() % 256)])!
+        } else {
+            source = contested[Int(next() % UInt64(contested.count))]
+        }
+        let destination = next() % 3 == 0 ? MACAddress.broadcast : contested[Int(next() % 6)]
+        try fixture.deliver(ethernetFrame(to: destination, from: source), toPort: port)
+        for index in 0..<4 { _ = try fixture.written(index) }
+
+        if firstDrift == nil, !fixture.netSwitch.accountingHoldsForTesting {
+            firstDrift = iteration
+        }
+    }
+    #expect(firstDrift == nil, "the switch's bookkeeping drifted at frame \(firstDrift ?? -1)")
+
+    // The table is bounded by construction: ports times the per-port limit.
+    #expect(
+        fixture.netSwitch.addressTable.count <= 4 * 3,
+        "the table holds \(fixture.netSwitch.addressTable.count) against a bound of 12")
+
+    // And it still switches. A test that only checked invariants would pass for
+    // a switch that had stopped forwarding entirely.
+    _ = try fixture.written(0)
+    _ = try fixture.written(1)
+    try fixture.deliver(ethernetFrame(to: swGateway, from: swGuestA), toPort: 0)
+    #expect(fixture.upstream.frames.count > 0, "the switch stopped delivering to the gateway")
+}
+
+@Test func removingAPortUnderContentionLeavesTheCountsConsistent() throws {
+    // Ports come and go while addresses move between them, and `removePort` has
+    // to unwind exactly what `learn` recorded. Getting it wrong leaves a count
+    // for a port that is gone, which makes the total wrong for every port that
+    // arrives afterwards -- and port ids are reused.
+    let fixture = try makeSwitch(ports: 3, addressesPerPort: 4)
+    let shared = MACAddress("0a:00:00:00:77:01")!
+    var firstDrift: Int?
+
+    for round in 0..<200 {
+        let port = round % 3
+        try fixture.deliver(ethernetFrame(to: .broadcast, from: shared), toPort: port)
+        try fixture.deliver(
+            ethernetFrame(
+                to: .broadcast, from: MACAddress(bytes: [0x0a, 0, 0, 0, 0x88, UInt8(round % 256)])!),
+            toPort: port)
+        for index in 0..<3 { _ = try fixture.written(index) }
+        if firstDrift == nil, !fixture.netSwitch.accountingHoldsForTesting { firstDrift = round }
+    }
+    #expect(firstDrift == nil, "the counts drifted at round \(firstDrift ?? -1)")
+
+    _ = fixture.netSwitch.removePort(fixture.ids[1])
+    #expect(fixture.netSwitch.accountingHoldsForTesting, "removing a port left the counts wrong")
+    #expect(fixture.netSwitch.claimedCountForTesting(fixture.ids[1]) == 0)
+    for (_, port) in fixture.netSwitch.addressTable {
+        #expect(port != fixture.ids[1], "an entry survived the port it was learned on")
+    }
+}
+
+@Test func anAddressCannotBeStolenOntoAPortThatIsAlreadyFull() throws {
+    // The bound this type documents -- a guest can only exhaust its own share --
+    // was false until this. A guest could not exceed its share by inventing
+    // addresses, because a new address is refused once the port is full. But it
+    // could by *taking* addresses another guest already held: a move was an
+    // acquisition that checked nothing, so a port at its limit of three could
+    // hold six, or sixty.
+    //
+    // That is the more useful of the two attacks, because it removes the other
+    // guest's entries as it takes them: the victim stops being reachable.
+    let fixture = try makeSwitch(ports: 2, addressesPerPort: 2)
+    let victim = MACAddress("0a:00:00:00:aa:aa")!
+    let mine = [MACAddress("0a:00:00:00:bb:01")!, MACAddress("0a:00:00:00:bb:02")!]
+
+    // Port 1 owns an address.
+    try fixture.deliver(ethernetFrame(to: .broadcast, from: victim), toPort: 1)
+    // Port 0 fills its own quota.
+    for address in mine {
+        try fixture.deliver(ethernetFrame(to: .broadcast, from: address), toPort: 0)
+    }
+    #expect(fixture.netSwitch.claimedCountForTesting(fixture.ids[0]) == 2)
+
+    // Port 0 now claims the victim's address. It is full, so it cannot.
+    try fixture.deliver(ethernetFrame(to: .broadcast, from: victim), toPort: 0)
+
+    #expect(
+        fixture.netSwitch.addressTable[victim] == fixture.ids[1],
+        "a full port took an address off another port")
+    #expect(fixture.netSwitch.claimedCountForTesting(fixture.ids[0]) == 2, "the port went over its limit")
+    #expect(fixture.netSwitch.accountingHoldsForTesting)
+
+    // The floor, and the behaviour that must survive the fix: a move onto a port
+    // with room still happens, or a guest that reconnects is unreachable forever.
+    _ = fixture.netSwitch.removePort(fixture.ids[0])
+    let roomy = try makeSwitch(ports: 2, addressesPerPort: 2)
+    try roomy.deliver(ethernetFrame(to: .broadcast, from: victim), toPort: 1)
+    try roomy.deliver(ethernetFrame(to: .broadcast, from: victim), toPort: 0)
+    #expect(
+        roomy.netSwitch.addressTable[victim] == roomy.ids[0],
+        "a move onto a port with room was refused")
+    #expect(roomy.netSwitch.addressesMoved == 1)
+}

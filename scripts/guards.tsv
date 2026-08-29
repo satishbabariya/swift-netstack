@@ -1,9 +1,13 @@
-# One guard per line: file, test filter, anchor, replacement. Tabs separate
-# them and \n is a newline, because the anchors span lines.
+# One guard per line: file, test filter, anchor, replacement, separated by TABS.
+#
+# A newline inside an anchor is written as a literal backslash-n and expanded by
+# the runner. It has to be: a real newline here splits the row, and the reader
+# then takes half an anchor and a stray fragment as two malformed entries. That
+# happened, and it reported NO-ANCHOR on rows that were fine.
 #
 # `scripts/falsify.sh --all` deletes each guard in turn and requires that the
-# named test notices. A SURVIVED line means the guard is described rather than
-# guarded, which is the thing this repository keeps finding by hand.
+# named test notices. SURVIVED means the guard is described rather than guarded
+# -- or, as often, that the mutation and the test are about different things.
 Sources/Netstack/Link/NetworkSwitch.swift	anAddressCannotBeStolenOntoAPortThatIsAlreadyFull	            guard claimed[port, default: 0] < maximumAddressesPerPort else {\n                addressesRefused += 1	            guard true else {\n                addressesRefused += 1
 Sources/Netstack/Link/NetworkSwitch.swift	anUnknownUnicastIsDroppedRatherThanFlooded	                unknownUnicastDropped += 1\n                log?.record(.switchUnknownUnicast, ["destination": .string(destination.description)])\n            }\n        }\n        if destination == linkAddress	                unknownUnicastDropped += 1\n                flood(packet, from: port)\n            }\n        }\n        if destination == linkAddress
 Sources/Netstack/Gateway/DHCPServer.swift	aStaticLeaseIsHonouredAndKeptOutOfThePool	            .filter { !Set(staticLeases.values).contains($0) }	
@@ -11,5 +15,13 @@ Sources/Netstack/Gateway/OutboundTCPForwarder.swift	aGuestIsRefusedTheInstanceMe
 Sources/Netstack/Gateway/OutboundTCPForwarder.swift	slotsAreReturnedExactlyOnceAcrossManyConnections	        guard !released else { return }	
 Sources/Netstack/Observability/NetstackLog.swift	suppressionHoldsEverythingAfterTheFirstWithinTheWindow	        guard now >= bucket.windowEnds else {	        guard true || now >= bucket.windowEnds else {
 Sources/Netstack/Observability/PacketCapture.swift	theRecordHeaderCountsAgainstTheLimitToo	        guard written + 16 + kept <= maximumBytes else {	        guard written + kept <= maximumBytes else {
-Sources/Netstack/Network/IPv4Protocol.swift	theStatisticsAccountForWhatArrivedRatherThanOnlyWhatSucceeded	            counters.unknownProtocol += 1\n            return	            return
+Sources/Netstack/Network/IPv4Protocol.swift	theStatisticsAccountForWhatArrivedRatherThanOnlyWhatSucceeded	            counters.unknownProtocol += 1	            counters.unknownProtocol += 0
 Sources/Netstack/Gateway/ICMPForwarder.swift	aPingToAnUnreachableAddressGoesUnansweredRatherThanFaked	        if header.destination == stack.configuration.gatewayAddress { return decline() }	        if true { return decline() }
+Sources/Netstack/Transport/TCP/TCPForwarder.swift	aFloodOfSynsIsBoundedAndTheExcessIsDroppedRatherThanReset	        guard inFlight.count < maximumInFlight else {	        guard true else {
+Sources/Netstack/Gateway/UDPForwarder.swift	aGuestCannotOpenMoreFlowsThanTheLimitAllows	        guard flows.count + opening.count < maximumFlows else {	        guard true else {
+Sources/Netstack/Gateway/UDPPortForwarder.swift	udpFlowsAreBoundedAndIdleOnesAreReclaimed	        guard flows.count < maximumFlows else {	        guard true else {
+Sources/Netstack/Gateway/DNSServer.swift	aQueryWithNoUpstreamIsRefusedRatherThanDropped	            to: query, in: payload, code: DNSCodec.responseCodeRefused, allocator: allocator)\n        else { return }	            to: query, in: payload, code: DNSCodec.responseCodeRefused, allocator: allocator)\n        else { return }\n        if true { return }
+Sources/Netstack/Network/Reassembler.swift	pendingCountIsBoundedIndependentlyOfTheByteCap	            if pending.count >= maximumPendingDatagrams {	            if false {
+Sources/Netstack/Network/Reassembler.swift	rejectsFragmentsBeyondThePerDatagramCap	        guard entry.received.count < maximumFragmentsPerDatagram else { return nil }	        guard true else { return nil }
+Sources/Netstack/Gateway/ControlPlane.swift	everyMutatedRequestIsAnsweredOrClosedRatherThanHeld	                        IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)	                        IdleStateHandler(readTimeout: .hours(1)), name: Self.idleName)
+Sources/Netstack/Gateway/PortForwarder.swift	hostSideSlotsAreReturnedExactlyOnceAcrossManyConnections	        guard !released else { return }	

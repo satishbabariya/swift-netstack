@@ -203,7 +203,7 @@ that instead.
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
-| **Gateway** | DHCP server with static leases and search domains, address translation for reaching the host, link-local blocking, host-to-guest forwarding over TCP, UDP and unix sockets, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
+| **Gateway** | ICMP echo forwarding over unprivileged sockets, DHCP server with static leases and search domains, address translation for reaching the host, link-local blocking, host-to-guest forwarding over TCP, UDP and unix sockets, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 | **Observability** | notifications to a supervisor when the network is ready and guests arrive or leave, pcap capture of every frame, bounded so a guest cannot fill the host's disk, `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
 
 **Not yet implemented:** IPv6.
@@ -227,13 +227,18 @@ shape of the curve to outweigh the rounding — the comparison would report
 arithmetic units rather than behaviour. What stands behind CUBIC here is unit
 tests against the RFC's own formulas.
 
-**One behaviour worth knowing before you trust it:** a ping *through* the
-gateway is answered *by* the gateway, for any address at all. A guest that pings
-8.8.8.8 gets a reply whether or not 8.8.8.8 is reachable, so `ping` is a test of
-the guest's own stack rather than of the path. This matches upstream's default —
-gVisor's stack does the same — and upstream's alternative is a separate mode
-that proxies echo through an unprivileged ICMP socket, which is not implemented
-here.
+**Ping goes where it says it does.** An echo request for the gateway's own
+address is answered by the gateway — that is the router answering a question
+about itself — and everything else is sent for real over an unprivileged ICMP
+socket, `nat` applied, with the reply carried back. A guest that pings an
+unreachable address gets no reply, which is the answer.
+
+This is upstream's behaviour: it installs its ICMP forwarder unconditionally.
+An earlier version of this file claimed the opposite — that answering every ping
+locally *matched* upstream's default — and that was wrong. Loopback and
+broadcast are never forwarded, matching upstream. If the host will not open an
+unprivileged ICMP socket, the gateway answers locally as it did before, because
+a ping that works badly beats a network that fails to start.
 
 ## Design
 
@@ -298,7 +303,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-757 tests, plus a differential harness in `differential/` that drives gVisor's
+759 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

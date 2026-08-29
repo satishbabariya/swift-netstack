@@ -95,6 +95,19 @@ public final class IPv4Protocol {
         handlers[whole.protocolNumber]?(whole, payload)
     }
 
+    /// Offered every echo request before this stack answers one itself.
+    ///
+    /// Returning true means the request has been taken: something else will
+    /// produce the reply, or there will not be one. Returning false leaves the
+    /// local answer below, which is what a ping to the gateway's own address
+    /// wants.
+    ///
+    /// A hook rather than a protocol handler because echo is not delivered to
+    /// `handlers[.icmp]` -- that path carries ICMP *errors* up to a transport,
+    /// and giving echo to it would mean every reader of ICMP errors had to know
+    /// to ignore echo.
+    public var echoRequestHandler: ((IPv4Header, ICMPv4Header, ByteBuffer) -> Bool)?
+
     private func handleICMP(_ header: IPv4Header, _ payload: ByteBuffer) {
         var packet = PacketBuffer(received: payload)
         guard let icmp = ICMPv4Header.parse(&packet) else { return }
@@ -107,6 +120,11 @@ public final class IPv4Protocol {
             return
         }
 
+        // Offered to the forwarder first. If it takes the request, the reply
+        // comes from the address that was actually pinged -- or does not come at
+        // all, which is the answer a ping is for.
+        if echoRequestHandler?(header, icmp, packet.payload) == true { return }
+
         let reply = ICMPv4.echoReply(to: icmp, payload: packet.payload, allocator: allocator)
         // Answer from the address that was pinged, which under promiscuous mode
         // need not be one of ours.
@@ -117,10 +135,11 @@ public final class IPv4Protocol {
         // reachable, so `ping` stops being a reachability test and becomes a
         // test of whether the guest's own stack works.
         //
-        // This matches upstream gvisor-tap-vsock's default -- gVisor's stack
-        // does the same -- and upstream's alternative is a separate mode that
-        // proxies echo through an unprivileged ICMP socket. That mode is not
-        // implemented here; if it is added, this is the branch it replaces.
+        // This is the fallback now, not the policy. `ICMPForwarder` takes echo
+        // requests for addresses that are not this gateway's and sends them for
+        // real, which is upstream's behaviour and is installed by default there.
+        // What is left here answers a ping addressed to the gateway itself, and
+        // answers everything if no forwarder is installed.
         try? send(payload: reply, to: header.source, from: header.destination, protocolNumber: .icmp)
     }
 

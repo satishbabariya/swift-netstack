@@ -621,48 +621,64 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // table, run again on every single admission once at the cap. With the
     // table held near its cap by a sustained flood (as this input does),
     // that made total admission cost O(pendingCount * fragments), not
-    // O(fragments). This does not assert a specific complexity class
-    // directly — Swift Testing has no profiler hook for that — but a
-    // generous wall-clock ceiling is a real regression guard here: the O(n)
-    // version of this same workload was measured at ~9 seconds; the
-    // O(1)-amortized version this replaces it with finishes in well under
-    // one, a ~20x difference that only widens as the flood grows.
-    let clock = ManualClock()
-    // A LITERAL cap, deliberately not `(8 + Reassembler.perFragmentOverhead) * 3000`.
-    // Provenance: each of these datagrams is one 8-byte fragment charged
-    // `perFragmentOverhead` on top, so 8 + 176 = 184 per entry, and
-    // 184 * 3000 = 552_000 sizes the table for exactly 3000 entries — the
-    // original 8-byte-payload x 3000 intent. Writing the cap in terms of
-    // `perFragmentOverhead` made the count assertion below self-satisfying
-    // the same way `reassemblyMemoryLimitBoundsRealRetentionUnderAFloodOfMinimalFragments`
-    // was before `13add6e`: zero the charge and the cap collapses to 24_000
-    // while the entry cost collapses to 8, so 3000 entries still fit and the
-    // bound never moves. Verified — the derived form passed with the charge
-    // set to 0.
-    let reassembler = Reassembler(
-        clock: clock, timeout: .seconds(3600), memoryLimit: 552_000, maximumPendingDatagrams: 1_000_000)
-
-    let elapsed = ContinuousClock().measure {
-        for id in 0..<50_000 {
-            var header = IPv4Header(
-                source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
-                protocolNumber: .udp, payloadLength: 8)
-            header.identification = UInt16(id % 65536)
-            header.flags = [.moreFragments]
-            _ = reassembler.process(header: header, payload: ByteBuffer(bytes: Array(repeating: UInt8(0), count: 8)))
+    // O(fragments).
+    //
+    // ## Measured against itself, not against a stopwatch
+    //
+    // This asserted a wall-clock ceiling of five seconds first, on the
+    // reasoning that the O(n) version took about nine seconds and the fixed
+    // one well under one. That worked on one machine and failed on CI, where
+    // the good version took 5.6 seconds — the ceiling had stopped separating
+    // the two implementations and started measuring the host.
+    //
+    // The property in this test's name is a RATIO, so the test is one too: the
+    // same flood is run against a table ten times larger, and an admission cost
+    // that scales with the table size shows up as roughly ten times the work.
+    // Machine speed cancels out, and a bound of four times leaves room for
+    // cache effects and a noisy CI box while still failing an O(n) scan by a
+    // wide margin.
+    func flood(entries: Int) -> Duration {
+        // A LITERAL charge, deliberately not derived from
+        // `Reassembler.perFragmentOverhead`. Provenance: each of these
+        // datagrams is one 8-byte fragment charged `perFragmentOverhead` on
+        // top, so 8 + 176 = 184 per entry. Deriving it made the count
+        // assertion below self-satisfying the same way
+        // `reassemblyMemoryLimitBoundsRealRetentionUnderAFloodOfMinimalFragments`
+        // was before `13add6e`: zero the charge and the cap collapses with the
+        // entry cost, so the same number of entries still fits and the bound
+        // never moves. Verified — the derived form passed with the charge set
+        // to 0.
+        let reassembler = Reassembler(
+            clock: ManualClock(), timeout: .seconds(3600), memoryLimit: 184 * entries,
+            maximumPendingDatagrams: 1_000_000)
+        let elapsed = ContinuousClock().measure {
+            for id in 0..<50_000 {
+                var header = IPv4Header(
+                    source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,
+                    protocolNumber: .udp, payloadLength: 8)
+                header.identification = UInt16(id % 65536)
+                header.flags = [.moreFragments]
+                _ = reassembler.process(
+                    header: header, payload: ByteBuffer(bytes: Array(repeating: UInt8(0), count: 8)))
+            }
         }
+        // The byte cap is doing its job regardless of how it got there. An
+        // EXACT count, not `<= entries`: an upper bound alone is satisfied by a
+        // reassembler that evicted everything — verified, by changing
+        // `enforceMemoryLimit`'s loop to `while heldBytes > 0` so that every
+        // admission emptied the table, at which point the upper bound still
+        // passed. The accounting is pure integer arithmetic, so equality is
+        // deterministic and pins both directions at once.
+        #expect(reassembler.pendingCount == entries)
+        return elapsed
     }
 
-    #expect(elapsed < .seconds(5))
-    // The byte cap is doing its job regardless of how it got there. An
-    // EXACT count, not `<= 3000`: an upper bound alone is satisfied by a
-    // reassembler that evicted everything — verified, by changing
-    // `enforceMemoryLimit`'s loop to `while heldBytes > 0` so that every
-    // admission emptied the table, at which point `<= 3000` still passed.
-    // The accounting here is pure integer arithmetic (552_000 / 184 = 3000
-    // exactly, no allocator involved), so equality is deterministic and
-    // pins both directions at once.
-    #expect(reassembler.pendingCount == 3000)
+    let small = flood(entries: 300)
+    let large = flood(entries: 3000)
+
+    #expect(
+        large < small * 4,
+        "admission cost scaled with the table: \(small) for 300 entries, \(large) for 3000")
 }
 
 @Test func rejectsEmptyFragments() {

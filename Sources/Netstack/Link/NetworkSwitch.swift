@@ -83,6 +83,9 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
     /// Addresses that moved from one port to another. See `learn`.
     public private(set) var addressesMoved = 0
 
+    /// Where a guest arriving and leaving is reported. `Gateway` sets this.
+    public var notifications: NotificationSender?
+
     public var log: RateLimitedLogger? {
         didSet {
             // Handed down, so a port's own rejected frames land in the same
@@ -158,6 +161,7 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         retiredOutbound += link.outboundDropped
         for (address, port) in cam where port == id {
             cam.removeValue(forKey: address)
+            notifications?.send(.init(kind: .connectionClosed, macAddress: address))
         }
         return link.close()
     }
@@ -258,6 +262,15 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         }
         cam[address] = port
         claimed[port, default: 0] += 1
+        // Only on first sight, never on a move: a move is the same guest
+        // arriving somewhere else, and telling a supervisor a connection was
+        // established when one merely relocated is a different event.
+        //
+        // Bounded without needing its own bound, and worth saying why: an
+        // address is only learned once per port, and a port may claim
+        // `maximumAddressesPerPort` of them, so the number of these a guest can
+        // cause is `ports x limit` for the life of the switch.
+        notifications?.send(.init(kind: .connectionEstablished, macAddress: address))
     }
 
     /// Destination and source, read without consuming the frame.

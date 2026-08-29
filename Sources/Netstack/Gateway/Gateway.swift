@@ -60,6 +60,9 @@ public final class Gateway: @unchecked Sendable {
         public var captureFile: String?
         /// The cap on that file. Reaching it stops the capture.
         public var captureMaximumBytes: Int
+        /// A unix socket to tell about guests arriving and leaving. Upstream's
+        /// notification socket; `nil` means send nothing at all.
+        public var notificationSocketPath: String?
         public var mtu: UInt32
         /// Names this gateway answers itself. The zone of each is also owned:
         /// with `gateway.containers.internal` here, any other name under
@@ -111,6 +114,7 @@ public final class Gateway: @unchecked Sendable {
             allowsLinkLocal: Bool = false,
             captureFile: String? = nil,
             captureMaximumBytes: Int = 64 * 1024 * 1024,
+            notificationSocketPath: String? = nil,
             mtu: UInt32 = 1500,
             dnsRecords: [DNSServer.StaticRecord]? = nil,
             upstreamResolvers: [SocketAddress] = [],
@@ -134,6 +138,7 @@ public final class Gateway: @unchecked Sendable {
             self.allowsLinkLocal = allowsLinkLocal
             self.captureFile = captureFile
             self.captureMaximumBytes = captureMaximumBytes
+            self.notificationSocketPath = notificationSocketPath
             self.mtu = mtu
             // The two names upstream publishes, so a guest written against
             // gvisor-tap-vsock finds what it expects. Both resolve to the
@@ -178,6 +183,8 @@ public final class Gateway: @unchecked Sendable {
     /// an embedder assembling extra pieces can share the same window rather
     /// than opening a second, unbounded one alongside it.
     public let log: RateLimitedLogger
+    /// Where this gateway reports guests arriving and leaving, if anywhere.
+    public let notifications: NotificationSender?
 
     /// Live forwards, keyed by the host port they publish on. A dictionary
     /// rather than an array because the control plane addresses them by that
@@ -198,10 +205,12 @@ public final class Gateway: @unchecked Sendable {
     private init(
         link: GatewayLink, stack: Stack, dhcp: DHCPServer, dns: DNSServer,
         tcp: OutboundTCPForwarder, udp: UDPForwarder,
-        keepAlive: TCPEndpoint.KeepAliveConfiguration?, log: RateLimitedLogger
+        keepAlive: TCPEndpoint.KeepAliveConfiguration?, log: RateLimitedLogger,
+        notifications: NotificationSender?
     ) {
         self.keepAlive = keepAlive
         self.log = log
+        self.notifications = notifications
         self.link = link
         self.stack = stack
         self.dhcp = dhcp
@@ -356,15 +365,31 @@ public final class Gateway: @unchecked Sendable {
             let log = RateLimitedLogger(
                 logger: configuration.logger, clock: stack.clock, window: configuration.logWindow)
             link.log = log
+
+            var notifications: NotificationSender?
+            if let path = configuration.notificationSocketPath {
+                let sender = NotificationSender(socketPath: path, eventLoop: link.eventLoop)
+                sender.log = log
+                (link as? NetworkSwitch)?.notifications = sender
+                notifications = sender
+            }
             dhcp.log = log
             dns.log = log
             tcp.log = log
             udp.log = log
             return Gateway(
                 link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp,
-                keepAlive: configuration.keepAlive, log: log)
+                keepAlive: configuration.keepAlive, log: log, notifications: notifications)
         }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in
             gateway.dns.startForwarding(group: group).map { _ in gateway }
+        }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in
+            // `ready` last, and on the loop: a supervisor that acts on it -- by
+            // starting the VM, usually -- must not do so before the services it
+            // will talk to are listening.
+            gateway.eventLoop.submit {
+                gateway.notifications?.send(.init(kind: .ready))
+                return gateway
+            }
         }
     }
 

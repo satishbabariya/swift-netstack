@@ -22,7 +22,7 @@ private func swgTemporaryPath(_ tag: String) -> String {
     "/tmp/netstack-switched-\(tag)-\(UInt32.random(in: 0...UInt32.max)).sock"
 }
 
-private func swgDial(_ path: String) -> Int32 {
+func swgDial(_ path: String) -> Int32 {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     #expect(fd >= 0)
     var address = sockaddr_un()
@@ -45,7 +45,7 @@ private func swgDial(_ path: String) -> Int32 {
 }
 
 /// One frame, with the four-byte big-endian length this wire puts in front.
-private func swgSend(_ fd: Int32, _ frame: [UInt8]) {
+func swgSend(_ fd: Int32, _ frame: [UInt8]) {
     var out = [UInt8]()
     let length = UInt32(frame.count)
     out.append(contentsOf: [
@@ -84,7 +84,7 @@ private func swgAwaitFrame(
     return nil
 }
 
-private func swgArpRequest(from hardware: MACAddress, sender: IPv4Address, target: IPv4Address) -> [UInt8] {
+func swgArpRequest(from hardware: MACAddress, sender: IPv4Address, target: IPv4Address) -> [UInt8] {
     var frame = [UInt8]()
     frame.append(contentsOf: MACAddress.broadcast.bytes)
     frame.append(contentsOf: hardware.bytes)

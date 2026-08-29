@@ -193,7 +193,7 @@ that instead.
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | DHCP server with static leases and search domains, address translation for reaching the host, link-local blocking, host-to-guest forwarding over TCP, UDP and unix sockets, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
-| **Observability** | pcap capture of every frame, bounded so a guest cannot fill the host's disk, `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
+| **Observability** | notifications to a supervisor when the network is ready and guests arrive or leave, pcap capture of every frame, bounded so a guest cannot fill the host's disk, `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
 
 **Not yet implemented:** IPv6.
 
@@ -257,6 +257,12 @@ forges a log entry an operator reads as authentic.
 Counters, unlike log lines, have no window: `Gateway.statistics()` counts every
 occurrence and is where a monitoring system should read from.
 
+`notificationSocketPath` tells a supervisor — the thing that started the VM —
+when the gateway is ready and when a guest arrives or leaves, one JSON object
+per connection in upstream's shape. The queue is bounded and **drops** when
+full rather than blocking: a supervisor that stops reading its socket must not
+be able to slow down, and eventually stop, the network.
+
 `captureFile` writes every frame to a pcap Wireshark can open, and is bounded
 for the same reason — a capture is the one guest-reachable resource that spends
 the **host's disk**. Reaching the limit stops the capture rather than rotating
@@ -280,7 +286,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-744 tests, plus a differential harness in `differential/` that drives gVisor's
+748 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

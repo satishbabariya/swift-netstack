@@ -183,11 +183,24 @@ For hosts that cannot link a Swift library, `netstack-gateway` is upstream's
 `gvproxy` in the same shape:
 
 ```
-netstack-gateway --listen /tmp/net.sock --dns 1.1.1.1:53 \
-                 --control /tmp/net-control.sock \
+netstack-gateway --listen-vfkit /tmp/net.sock --dns 1.1.1.1:53 \
+                 --listen /tmp/net-control.sock \
                  --forward 8080:192.168.127.2:80 \
-                 --capture-file /tmp/net.pcap
+                 --pcap /tmp/net.pcap
 ```
+
+**The flag names are `gvproxy`'s**, so a command line moves across unchanged —
+which means `--listen` is the *control* endpoint and the guest wire is
+`--listen-vfkit` (datagram) or `--listen-qemu` (length-prefixed stream). An
+earlier version of this program had `--listen` as the wire, so a `gvproxy`
+command line would have pointed the control API at the VM's socket and the VM at
+the control socket, with nothing saying so.
+
+`--listen-bess`, `--listen-stdio` and `--listen-vpnkit` are recognised and
+refused by name rather than falling through to "unknown option": bess is
+`SOCK_SEQPACKET`, stdio is a pipe, and vpnkit needs hyperkit's handshake. The
+difference between "you typed it wrong" and "this does not do that yet" is worth
+a sentence.
 
 `--log-level` picks how much it says; the default is `notice`, which is every
 refusal and nothing else. It is the only place in the package that bootstraps
@@ -314,7 +327,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-761 tests, plus a differential harness in `differential/` that drives gVisor's
+763 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

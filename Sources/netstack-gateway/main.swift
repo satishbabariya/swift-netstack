@@ -23,11 +23,17 @@ struct Options {
     var logLevel = "notice"
     var captureFile: String?
     var notifySocket: String?
+    var host = "192.168.127.254"
+    var allowsLinkLocal = false
     var forwards: [(host: Int, guest: String, guestPort: UInt16)] = []
 
-    /// Hand-rolled rather than a dependency. The whole surface is six flags, and
-    /// an argument parser would be a package this library does not otherwise
-    /// need in the dependency graph of everything that links it.
+    /// Hand-rolled rather than a dependency: an argument parser would be a
+    /// package in the dependency graph of everything that links this library.
+    ///
+    /// The names are gvproxy's, because a program that is upstream's shape and
+    /// spells its flags differently is a program somebody has to translate for
+    /// -- and the translation is silent when the same name means two different
+    /// things, which `--listen` did.
     static func parse(_ arguments: [String]) throws -> Options {
         var options = Options()
         var index = 0
@@ -39,15 +45,25 @@ struct Options {
         while index < arguments.count {
             let flag = arguments[index]
             switch flag {
-            case "--listen": options.listenPath = try value(flag)
-            case "--listen-stream": options.listenStream = try value(flag)
-            case "--control": options.controlPath = try value(flag)
+            // gvproxy's spellings. `--listen` is the CONTROL endpoint there and
+            // the guest wire is `--listen-vfkit` or `--listen-qemu`; this had
+            // them the other way round, so a command line moved across from
+            // gvproxy would have pointed the control API at the VM's socket and
+            // the VM at the control socket. Nothing would have said so.
+            case "--listen": options.controlPath = try value(flag).replacingOccurrences(of: "unix://", with: "")
+            case "--listen-vfkit": options.listenPath = try value(flag)
+            case "--listen-qemu": options.listenStream = try value(flag)
+            case "--listen-stdio", "--listen-bess", "--listen-vpnkit":
+                throw OptionError.unsupportedWire(flag)
             case "--dns": options.upstreamResolver = try value(flag)
-            case "--gateway": options.gateway = try value(flag)
+            case "--gatewayIP": options.gateway = try value(flag)
+            case "--hostIP": options.host = try value(flag)
             case "--subnet": options.subnet = try value(flag)
             case "--log-level": options.logLevel = try value(flag)
-            case "--capture-file": options.captureFile = try value(flag)
-            case "--notify": options.notifySocket = try value(flag)
+            case "--debug": options.logLevel = "debug"
+            case "--pcap": options.captureFile = try value(flag)
+            case "--notification": options.notifySocket = try value(flag)
+            case "--ec2-metadata-access": options.allowsLinkLocal = true
             case "--mtu":
                 let text = try value(flag)
                 guard let mtu = UInt32(text), mtu >= 576, mtu <= 65535 else {
@@ -70,7 +86,7 @@ struct Options {
             index += 1
         }
         guard options.listenPath != nil || options.listenStream != nil else {
-            throw OptionError.missingValue("--listen or --listen-stream")
+            throw OptionError.noWire
         }
         guard options.listenPath == nil || options.listenStream == nil else {
             throw OptionError.conflictingWires
@@ -83,7 +99,15 @@ enum OptionError: Error, CustomStringConvertible {
     case missingValue(String)
     case badValue(String, String)
     case unknown(String)
+    /// A wire upstream has and this does not, named so the failure says which
+    /// rather than "unknown option".
+    case unsupportedWire(String)
     case conflictingWires
+    /// No guest wire at all. Its own case rather than a missing value, because
+    /// `--listen` is present and valid and still leaves nothing for a guest to
+    /// connect to -- which is the mistake somebody moving a gvproxy command line
+    /// across is most likely to make.
+    case noWire
     case help
 
     var description: String {
@@ -91,7 +115,17 @@ enum OptionError: Error, CustomStringConvertible {
         case .missingValue(let flag): return "\(flag) needs a value"
         case .badValue(let flag, let text): return "\(flag) does not accept \(text)"
         case .unknown(let flag): return "unknown option \(flag)"
-        case .conflictingWires: return "--listen and --listen-stream are two different wires; pick one"
+        case .unsupportedWire(let flag):
+            return
+                "\(flag) is not supported: bess is SOCK_SEQPACKET, stdio is a pipe, and vpnkit needs "
+                + "hyperkit's handshake. Use --listen-vfkit for a datagram socket or --listen-qemu for a "
+                + "stream one."
+        case .conflictingWires:
+            return "--listen-vfkit and --listen-qemu are two different wires; pick one"
+        case .noWire:
+            return
+                "no guest wire: pass --listen-vfkit <path> for a datagram socket or --listen-qemu "
+                + "<path> for a stream one. (--listen is the control API, as in gvproxy.)"
         case .help: return usage
         }
     }
@@ -100,20 +134,29 @@ enum OptionError: Error, CustomStringConvertible {
 let usage = """
 netstack-gateway — a userspace network for a VM, over a socket.
 
-  --listen <path>         Datagram socket to serve (vfkit, Virtualization.framework)
-  --listen-stream <path>  Stream socket with length-prefixed frames (qemu -netdev socket)
-  --control <path>        Unix socket for the forwarding control API
-  --dns <address:port>    Resolver to forward names this gateway does not own
-  --gateway <address>     The gateway's own address (default 192.168.127.1)
-  --subnet <cidr>         The subnet leased to guests (default 192.168.127.0/24)
-  --mtu <bytes>           Link MTU (default 1500)
-  --log-level <level>     trace|debug|info|notice|warning|error (default notice)
-  --capture-file <path>   Write every frame to a pcap file (capped at 64 MiB)
-  --notify <path>         Unix socket told when guests arrive and leave
-  --forward <h:addr:g>    Publish guest addr:g on host port h, repeatable
+Flag names are gvproxy's, so a command line moves across unchanged.
 
-Exactly one of --listen or --listen-stream is required: they are two different
-wires, and a socket is one or the other.
+  --listen <path>            Unix socket for the HTTP control API
+  --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
+  --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
+  --gatewayIP <address>      The gateway's own address (default 192.168.127.1)
+  --hostIP <address>         The address that means the host (default .254)
+  --subnet <cidr>            The subnet leased to guests (default 192.168.127.0/24)
+  --mtu <bytes>              Link MTU (default 1500)
+  --pcap <path>              Write every frame to a pcap file (capped at 64 MiB)
+  --notification <path>      Socket told when the network is ready and guests join
+  --ec2-metadata-access      Let guests reach 169.254.0.0/16. Off by default: that
+                             is where the cloud instance metadata service lives.
+  --debug                    Shorthand for --log-level debug
+  --log-level <level>        trace|debug|info|notice|warning|error (default notice)
+
+Not gvproxy's, because it takes them from a configuration file this does not read:
+
+  --dns <address:port>       Resolver for names this gateway does not own
+  --forward <h:addr:g>       Publish guest addr:g on host port h, repeatable
+
+Exactly one of --listen-vfkit or --listen-qemu is required: they are two
+different wires, and a socket is one or the other.
 """
 
 let arguments = Array(CommandLine.arguments.dropFirst())
@@ -129,8 +172,10 @@ do {
     exit(2)
 }
 
-guard let gatewayAddress = IPv4Address(options.gateway), let subnet = IPv4Subnet(cidr: options.subnet) else {
-    FileHandle.standardError.write(Data("error: --gateway or --subnet is not an address\n".utf8))
+guard let gatewayAddress = IPv4Address(options.gateway), let subnet = IPv4Subnet(cidr: options.subnet),
+    let hostAddress = IPv4Address(options.host)
+else {
+    FileHandle.standardError.write(Data("error: --gatewayIP, --hostIP or --subnet is not an address\n".utf8))
     exit(2)
 }
 
@@ -162,7 +207,8 @@ LoggingSystem.bootstrap { label in
 
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 let configuration = Gateway.Configuration(
-    gatewayAddress: gatewayAddress, subnet: subnet, captureFile: options.captureFile,
+    gatewayAddress: gatewayAddress, subnet: subnet, hostAddress: hostAddress,
+    allowsLinkLocal: options.allowsLinkLocal, captureFile: options.captureFile,
     notificationSocketPath: options.notifySocket, mtu: options.mtu, upstreamResolvers: resolvers,
     logger: Logger(label: "netstack"))
 

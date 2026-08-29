@@ -83,6 +83,10 @@ path rather than a port, and who may reach the guest is decided by filesystem
 permissions. A host port is only unique **within** a protocol: `8080/tcp` and
 `8080/udp` are two different forwards and both can be published at once.
 
+Every connection has a **request timeout**: a peer that sends half a request
+otherwise holds it forever, because the server is waiting for the rest and the
+peer is waiting for an answer and neither is wrong.
+
 It listens on a unix socket because anything that can reach it can publish any
 guest port on the host, and a unix socket puts that behind the filesystem where
 an operator can see and set who may use it. `":8080"` — upstream's spelling with
@@ -287,7 +291,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-750 tests, plus a differential harness in `differential/` that drives gVisor's
+752 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

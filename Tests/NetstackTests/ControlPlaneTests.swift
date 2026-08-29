@@ -490,3 +490,172 @@ private func boundPort(in body: String) -> Int? {
     close(guestSide)
     try? await group.shutdownGracefully()
 }
+
+/// A raw request, written verbatim, so a test can send something no well-behaved
+/// client would.
+private func rawRequest(_ text: String, to address: SocketAddress) throws -> String {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    #expect(fd >= 0)
+    defer { close(fd) }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    addr.sin_port = UInt16(address.port!).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+    _ = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    var deadline = timeval(tv_sec: 3, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
+    let out = Array(text.utf8)
+    _ = out.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    var response = ""
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let received: Int = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
+        if received <= 0 { break }
+        response += String(decoding: buffer[0..<received], as: UTF8.self)
+    }
+    return response
+}
+
+@Test func theControlPlaneAnswersRequestsNoWellBehavedClientWouldSend() async throws {
+    // The framer in front of NIO's HTTP decoder is hand-written, and it decides
+    // where one message ends. Anything it disagrees with the decoder about is a
+    // desync: the framer holds bytes the decoder is waiting for, or forwards
+    // bytes the decoder reads as a second request.
+    //
+    // Every case here must produce an answer. A hang is the failure mode that
+    // matters -- the framer holding a body nobody will ever complete -- and it
+    // is why these use a read deadline rather than blocking.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    // Chunked, which carries no Content-Length at all.
+    let chunked = try rawRequest(
+        "POST /services/forwarder/all HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        to: api)
+    #expect(!chunked.isEmpty, "a chunked request was never answered")
+
+    // Two Content-Lengths that disagree: the classic smuggling primitive, where
+    // one parser believes the first and another the second.
+    let conflicting = try rawRequest(
+        "POST /services/forwarder/all HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\nhello",
+        to: api)
+    #expect(!conflicting.isEmpty, "a request with two Content-Lengths was never answered")
+
+    // A length that is not a number, and one that is negative.
+    let garbage = try rawRequest(
+        "POST /services/forwarder/all HTTP/1.1\r\nHost: h\r\nContent-Length: nonsense\r\n\r\n", to: api)
+    #expect(!garbage.isEmpty, "a request with a non-numeric Content-Length was never answered")
+
+    let negative = try rawRequest(
+        "POST /services/forwarder/all HTTP/1.1\r\nHost: h\r\nContent-Length: -1\r\n\r\n", to: api)
+    #expect(!negative.isEmpty, "a request with a negative Content-Length was never answered")
+
+    // A body shorter than it claims: the connection ends before the framer has
+    // what it is waiting for.
+    let short = try rawRequest(
+        "POST /services/forwarder/all HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\nshort", to: api)
+    #expect(short.isEmpty || short.contains("HTTP/1.1"), "a truncated body produced something odd")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+/// Send raw bytes and report what the server did: answered, closed, or neither.
+private enum RawOutcome { case answered, closed, hung }
+
+private func rawProbe(_ bytes: [UInt8], to address: SocketAddress) -> RawOutcome {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { return .closed }
+    defer { close(fd) }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    addr.sin_port = UInt16(address.port!).bigEndian
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+    guard
+        withUnsafePointer(to: &addr, {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }) == 0
+    else { return .closed }
+    var deadline = timeval(tv_sec: 3, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
+    _ = bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    let received: Int = buffer.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
+    if received > 0 { return .answered }
+    if received == 0 { return .closed }
+    return .hung
+}
+
+@Test func everyMutatedRequestIsAnsweredOrClosedRatherThanHeld() async throws {
+    // The property that matters for a hand-written framer sitting in front of
+    // somebody else's parser: whatever arrives, the connection ends. A request
+    // the framer holds and the decoder is waiting for produces neither an answer
+    // nor a close, and the peer waits forever -- which is what four ordinary
+    // malformed requests did before this, and what makes a framing disagreement
+    // a denial of service rather than a parse error.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    // A short timeout so the test does not spend the default ten seconds on
+    // every truncated request. The mechanism is what is under test; the default
+    // value is a separate choice, documented where it is set.
+    holder.plane?.requestTimeout = .milliseconds(120)
+    let api = holder.plane!.listeningAddress!
+
+    let corpus: [String] = [
+        "GET /stats HTTP/1.1\r\nHost: h\r\n\r\n",
+        "POST /services/forwarder/expose HTTP/1.1\r\nHost: h\r\nContent-Length: 44\r\n\r\n"
+            + "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\"}",
+        "POST /services/dns/add HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "GET /services/forwarder/all HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n",
+    ]
+
+    var state: UInt64 = 0xA11CE
+    func next() -> UInt64 {
+        state ^= state << 13
+        state ^= state >> 7
+        state ^= state << 17
+        return state
+    }
+
+    var hung = 0
+    for _ in 0..<120 {
+        var bytes = Array(corpus[Int(next() % UInt64(corpus.count))].utf8)
+        for _ in 0...(next() % 3) {
+            guard !bytes.isEmpty else { break }
+            switch next() % 4 {
+            case 0: bytes[Int(next() % UInt64(bytes.count))] = UInt8(truncatingIfNeeded: next())
+            case 1: bytes = Array(bytes.prefix(Int(next() % UInt64(bytes.count))))
+            case 2: bytes += (0..<Int(next() % 32)).map { _ in UInt8(truncatingIfNeeded: next()) }
+            default:
+                // Splice in a second request, which is the smuggling shape: the
+                // framer must hold it rather than let the decoder read it.
+                bytes += Array("GET /stats HTTP/1.1\r\nHost: h\r\n\r\n".utf8)
+            }
+        }
+        if rawProbe(bytes, to: api) == .hung { hung += 1 }
+    }
+
+    #expect(hung == 0, "\(hung) of 120 mutated requests were neither answered nor closed")
+
+    // The floor: a well-formed request is still answered, so the above is not
+    // satisfied by a server that closes everything.
+    #expect(rawProbe(Array(corpus[0].utf8), to: api) == .answered)
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}

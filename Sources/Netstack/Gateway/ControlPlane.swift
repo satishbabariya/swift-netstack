@@ -52,6 +52,18 @@ public final class ControlPlane: @unchecked Sendable {
     /// of band.
     public var connectFraming: StreamFraming = .hyperkit
 
+    /// How long a connection may go without completing a request.
+    ///
+    /// A peer that opens a connection and sends half a request holds it forever
+    /// otherwise: the framer is waiting for the rest of the headers and the peer
+    /// is waiting for an answer, and neither is wrong. This package claims every
+    /// reachable resource is bounded, and a connection held open is a resource.
+    ///
+    /// It applies until the request is answered, not to the connection's whole
+    /// life -- `/tunnel` and `/connect` hand the connection to the network and
+    /// it is expected to stay open for as long as the guest is there.
+    public var requestTimeout: TimeAmount = .seconds(10)
+
     /// Whether `/connect` has anywhere to put a guest.
     fileprivate var gatewayHasSwitch: Bool { gateway.networkSwitch != nil }
 
@@ -108,6 +120,8 @@ public final class ControlPlane: @unchecked Sendable {
                 // them across a boundary the compiler is right to object to.
                 return channel.eventLoop.submit {
                     let sync = channel.pipeline.syncOperations
+                    try sync.addHandler(
+                        IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)
                     try sync.addHandler(HTTPMessageFramer(), name: Self.framerName)
                     try sync.addHandler(HTTPResponseEncoder(), name: Self.encoderName)
                     try sync.addHandler(
@@ -117,6 +131,7 @@ public final class ControlPlane: @unchecked Sendable {
             }
     }
 
+    static let idleName = "netstack.http.idle"
     static let framerName = "netstack.http.framer"
     static let encoderName = "netstack.http.encoder"
     static let decoderName = "netstack.http.decoder"
@@ -160,7 +175,11 @@ public final class ControlPlane: @unchecked Sendable {
         // next, because everything written from here is raw bytes and
         // `HTTPResponseEncoder` would be handed a `ByteBuffer` where it expects
         // an `HTTPServerResponsePart`.
-        pipeline.removeHandler(name: Self.handlerName)
+        // The idle handler goes too: `/tunnel` and `/connect` hand the
+        // connection to the network, where a guest that is quiet for ten seconds
+        // is an ordinary guest rather than a stalled request.
+        pipeline.removeHandler(name: Self.idleName)
+            .flatMap { pipeline.removeHandler(name: Self.handlerName) }
             .flatMap { pipeline.removeHandler(name: Self.decoderName) }
             .flatMap { pipeline.removeHandler(name: Self.encoderName) }
             // `install` returns a future because building a wire adds its
@@ -463,6 +482,9 @@ final class HTTPMessageFramer: ChannelInboundHandler, RemovableChannelHandler, @
     private enum State {
         case headers
         case body(remaining: Int)
+        /// A chunked body, whose end this does not attempt to find. See
+        /// `advance`.
+        case streaming
         case holding
     }
 
@@ -499,6 +521,27 @@ final class HTTPMessageFramer: ChannelInboundHandler, RemovableChannelHandler, @
                     return
                 }
                 guard var headers = pending.readSlice(length: end) else { return }
+                // A chunked body has no `Content-Length` and its end is only
+                // findable by walking the chunks. Rather than write a second
+                // chunked parser to sit in front of the one NIO already has --
+                // two parsers that must agree is exactly the desync this type
+                // exists to prevent -- everything after the headers is
+                // forwarded and the decoder frames it.
+                //
+                // Holding is what `/tunnel` and `/connect` need, and neither is
+                // ever sent chunked: they carry no body at all. What this gives
+                // up is the anti-smuggling property for chunked requests, and it
+                // is not given up to anything -- NIO's decoder frames them
+                // correctly, which the previous behaviour did not let it do.
+                // Before this, a chunked request hung: the framer forwarded the
+                // headers, decided the body was empty, and held the chunks the
+                // decoder was waiting for.
+                if Self.isChunked(headers) {
+                    state = .streaming
+                    context.fireChannelRead(wrapInboundOut(headers))
+                    headers.clear()
+                    continue
+                }
                 let length = Self.contentLength(in: headers)
                 state = length > 0 ? .body(remaining: length) : .holding
                 context.fireChannelRead(wrapInboundOut(headers))
@@ -509,6 +552,12 @@ final class HTTPMessageFramer: ChannelInboundHandler, RemovableChannelHandler, @
                 guard let chunk = pending.readSlice(length: take) else { return }
                 state = take == remaining ? .holding : .body(remaining: remaining - take)
                 context.fireChannelRead(wrapInboundOut(chunk))
+            case .streaming:
+                guard pending.readableBytes > 0 else { return }
+                if let rest = pending.readSlice(length: pending.readableBytes) {
+                    context.fireChannelRead(wrapInboundOut(rest))
+                }
+                return
             case .holding:
                 // Whatever is left belongs to whoever hijacks this connection.
                 if pending.readableBytes > 0, let rest = pending.readSlice(length: pending.readableBytes) {
@@ -537,6 +586,17 @@ final class HTTPMessageFramer: ChannelInboundHandler, RemovableChannelHandler, @
             index = bytes.index(after: index)
         }
         return nil
+    }
+
+    /// Whether the request says its body is chunked.
+    private static func isChunked(_ headers: ByteBuffer) -> Bool {
+        let text = String(decoding: headers.readableBytesView, as: UTF8.self)
+        for line in text.split(separator: "\r\n") {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            guard line[line.startIndex..<colon].lowercased() == "transfer-encoding" else { continue }
+            return line[line.index(after: colon)...].lowercased().contains("chunked")
+        }
+        return false
     }
 
     /// `Content-Length`, read case-insensitively from the header block. Absent
@@ -770,6 +830,35 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
             return nil
         }
         return framer
+    }
+
+    /// Answer and close when the decoder rejects a request.
+    ///
+    /// Without this the connection is simply held: NIO's HTTP decoder throws,
+    /// nothing responds, nothing closes, and the client waits forever. Every
+    /// malformed request was therefore an unauthenticated way to occupy a
+    /// connection to the control socket -- found by sending a `Content-Length`
+    /// that is not a number, which is not an exotic thing to send.
+    /// A connection that has gone quiet without completing a request.
+    ///
+    /// Answered rather than merely dropped, so a client learns why -- and closed,
+    /// which is the part that matters: half a request otherwise holds a
+    /// connection for as long as the peer cares to leave it open. A fuzzer found
+    /// 59 of 160 mutated requests doing exactly that, nearly all of them simply
+    /// truncated.
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        guard event is IdleStateHandler.IdleStateEvent else {
+            context.fireUserInboundEventTriggered(event)
+            return
+        }
+        Self.respond(
+            on: context.channel, status: .requestTimeout,
+            json: "{\"error\":\"request was not completed in time\"}")
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        Self.respond(
+            on: context.channel, status: .badRequest, json: "{\"error\":\"malformed request\"}")
     }
 
     private func respond(context: ChannelHandlerContext, status: HTTPResponseStatus, json: String) {

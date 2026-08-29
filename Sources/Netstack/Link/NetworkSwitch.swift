@@ -166,6 +166,34 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         return link.close()
     }
 
+    /// How many addresses a port is recorded as holding.
+    ///
+    /// The per-port bound is enforced against this rather than by counting the
+    /// CAM, so the two can disagree -- and if they do, the bound is being
+    /// enforced against a number that is not the truth. That is what
+    /// `accountingHoldsForTesting` checks.
+    public func claimedCountForTesting(_ port: Int) -> Int { claimed[port, default: 0] }
+
+    /// Whether the bookkeeping still describes the table.
+    ///
+    /// Three things that must all hold together: no port is recorded as holding
+    /// a negative number of addresses, the recorded counts add up to the number
+    /// of entries actually in the CAM, and no port is over its limit. A drift in
+    /// any of them means the per-port bound is being enforced against the wrong
+    /// number, which is a bound that has quietly stopped bounding.
+    public var accountingHoldsForTesting: Bool {
+        eventLoop.preconditionInEventLoop()
+        var perPort: [Int: Int] = [:]
+        for port in cam.values { perPort[port, default: 0] += 1 }
+        for (port, count) in claimed {
+            if count < 0 { return false }
+            if count > maximumAddressesPerPort { return false }
+            if count != perPort[port, default: 0] { return false }
+        }
+        for (port, count) in perPort where claimed[port, default: 0] != count { return false }
+        return true
+    }
+
     /// The learned address table, as an operator would read it. Upstream serves
     /// the same thing on `GET /cam`.
     public var addressTable: [MACAddress: Int] {
@@ -243,6 +271,27 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
     private func learn(_ address: MACAddress, on port: Int) {
         if let existing = cam[address] {
             guard existing != port else { return }
+            // A move is an ACQUISITION by the destination port, and has to
+            // respect that port's limit like any other.
+            //
+            // It did not, and the bound this type documents was therefore false:
+            // a guest could not exceed its share by inventing addresses, but it
+            // could by *taking* addresses another guest already held, one move at
+            // a time, with no limit at all. That is the more useful attack of the
+            // two -- it removes the other guest's entries as it goes -- and it
+            // was the one that was not bounded.
+            //
+            // Found by checking the bookkeeping after every frame rather than at
+            // the end: `claimed` and the CAM disagreed within a few hundred
+            // frames of guests contending for the same addresses.
+            guard claimed[port, default: 0] < maximumAddressesPerPort else {
+                addressesRefused += 1
+                log?.record(
+                    .switchAddressRefused,
+                    ["port": .stringConvertible(port),
+                     "limit": .stringConvertible(maximumAddressesPerPort)])
+                return
+            }
             cam[address] = port
             claimed[existing, default: 1] -= 1
             claimed[port, default: 0] += 1

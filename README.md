@@ -111,7 +111,7 @@ that instead.
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 
-**Not yet implemented:** RACK's reordering timer, the tail loss probe, and IPv6.
+**Not yet implemented:** the tail loss probe, and IPv6.
 
 RACK itself (RFC 8985's time-based loss detection) is there and opt-in
 (`TCPEndpoint.rack`), alongside CUBIC and for the same reason: the differential

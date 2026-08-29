@@ -422,3 +422,83 @@ private func block(_ index: Int, count: Int = 1) -> SACKBlock {
     }
     fixture.drain()
 }
+
+@Test func theReorderingTimerLooksAgainWhenNoFurtherAcknowledgementComes() throws {
+    // §6.3, and the reason detection on acknowledgements alone is not enough.
+    //
+    // A segment whose window has not passed when an acknowledgement arrives is
+    // left alone — correctly, it may still be reordering. But if that was the
+    // LAST acknowledgement, nothing runs detection again, and the segment waits
+    // for the retransmission timer: an RTO in place of a round trip. The timer
+    // is what asks once more.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        endpoint.rack = true
+        try withExtendedLifetime(endpoint) {
+            // A guest that offers SACK, so the gateway will report and act on it.
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .sackPermitted]))
+            _ = fixture.drainSegments()
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            // Four segments, sent twenty milliseconds apart so send order is
+            // visible, then a selective acknowledgement of the last one only.
+            // Full-sized writes, not short ones. A short segment with data
+            // already outstanding is held by Nagle, so a fixture that wrote 1400
+            // bytes at a time put ONE segment on the wire and then nothing --
+            // and a test about loss detection needs a flight to lose part of.
+            // 1420 is the MSS less the options every segment carries.
+            // The block below is built from the segments that ACTUALLY went out
+            // rather than from an assumed size. A segment's payload is the MSS
+            // less whatever options it carries, and that varies -- so a block
+            // computed from a guessed boundary matches no record, nothing is
+            // marked, and the test reports that RACK found no loss when what
+            // happened is that the fixture described a segment that does not
+            // exist.
+            var sent: [(header: TCPHeader, payload: ByteBuffer)] = []
+            for _ in 0..<4 {
+                try endpoint.send(tcpPayload(1420))
+                sent += fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+                // Two milliseconds apart, INSIDE the reordering window that a
+                // fifty-millisecond round trip gives. That is the whole setup: a
+                // segment outside its window is caught by the acknowledgement
+                // itself and the timer has nothing to do, which is what an
+                // earlier version of this test arranged and then asserted
+                // against.
+                fixture.advance(by: .milliseconds(2))
+            }
+            #expect(sent.count >= 3, "the fixture put \(sent.count) segments on the wire")
+            let last = try #require(sent.last)
+            fixture.advance(by: .milliseconds(50))
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack],
+                    options: [
+                        .selectiveAcknowledgement([
+                            SACKBlock(
+                                left: last.header.sequence,
+                                right: last.header.sequence + last.payload.readableBytes)
+                        ])
+                    ]))
+            let immediate = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(
+                immediate.isEmpty,
+                "the acknowledgement itself caught the loss: there is nothing left for the timer to do")
+
+            // Nothing further arrives. Without the timer the next thing on this
+            // wire is the retransmission timer, a second away; with it, the
+            // reordering window expires first.
+            fixture.advance(by: .milliseconds(120))
+            let afterTimer = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+
+            #expect(
+                !afterTimer.isEmpty,
+                "the reordering window expired with no acknowledgement and nothing looked again")
+        }
+    }
+    fixture.drain()
+}

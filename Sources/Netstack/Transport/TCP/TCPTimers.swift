@@ -49,6 +49,7 @@ final class TCPTimers {
     private var timeWaitTask: Scheduled<Void>?
     private var delayedAckTask: Scheduled<Void>?
     private var keepAliveTask: Scheduled<Void>?
+    private var rackTask: Scheduled<Void>?
 
     init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
         self.eventLoop = eventLoop
@@ -151,6 +152,23 @@ final class TCPTimers {
         keepAliveTask = nil
     }
 
+    /// RFC 8985 §6.3's reordering timer.
+    ///
+    /// Its own slot, like every other timer here. This one is the shortest --
+    /// a fraction of a round trip -- and sharing a handle with the retransmit
+    /// timer would mean each cancelled the other on a connection that is doing
+    /// both, which is every connection recovering from a loss.
+    func scheduleRackReorder(after delay: TimeAmount, _ body: @escaping () -> Void) {
+        rackTask?.cancel()
+        let box = TimerBody(run: body)
+        rackTask = eventLoop.scheduleTask(deadline: clock.now() + delay) { box.run() }
+    }
+
+    func cancelRackReorder() {
+        rackTask?.cancel()
+        rackTask = nil
+    }
+
     func startTimeWait(_ body: @escaping () -> Void) {
         timeWaitTask?.cancel()
         timeWaitTask = nil
@@ -165,6 +183,7 @@ final class TCPTimers {
         cancelPersist()
         cancelDelayedAck()
         cancelKeepAlive()
+        cancelRackReorder()
         timeWaitTask?.cancel()
         timeWaitTask = nil
     }

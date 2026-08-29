@@ -55,6 +55,11 @@ public final class Gateway: @unchecked Sendable {
         /// which hands credentials to whatever asks from the host. Upstream
         /// spells the same switch `Ec2MetadataAccess` and also defaults it off.
         public var allowsLinkLocal: Bool
+        /// Write every frame in and out to a pcap file at this path. Upstream's
+        /// `CaptureFile`. Bounded -- see `PacketCapture`.
+        public var captureFile: String?
+        /// The cap on that file. Reaching it stops the capture.
+        public var captureMaximumBytes: Int
         public var mtu: UInt32
         /// Names this gateway answers itself. The zone of each is also owned:
         /// with `gateway.containers.internal` here, any other name under
@@ -104,6 +109,8 @@ public final class Gateway: @unchecked Sendable {
             nat: [IPv4Address: IPv4Address]? = nil,
             gatewayVirtualAddresses: [IPv4Address]? = nil,
             allowsLinkLocal: Bool = false,
+            captureFile: String? = nil,
+            captureMaximumBytes: Int = 64 * 1024 * 1024,
             mtu: UInt32 = 1500,
             dnsRecords: [DNSServer.StaticRecord]? = nil,
             upstreamResolvers: [SocketAddress] = [],
@@ -125,6 +132,8 @@ public final class Gateway: @unchecked Sendable {
             self.nat = nat ?? [hostAddress: IPv4Address("127.0.0.1")!]
             self.gatewayVirtualAddresses = gatewayVirtualAddresses ?? [hostAddress]
             self.allowsLinkLocal = allowsLinkLocal
+            self.captureFile = captureFile
+            self.captureMaximumBytes = captureMaximumBytes
             self.mtu = mtu
             // The two names upstream publishes, so a guest written against
             // gvisor-tap-vsock finds what it expects. Both resolve to the
@@ -282,9 +291,24 @@ public final class Gateway: @unchecked Sendable {
     /// through -- which it does for anything addressed to the gateway -- there
     /// is something bound for the datagram to reach.
     private static func assemble(
-        on link: GatewayLink, group: EventLoopGroup, configuration: Configuration
+        on wire: GatewayLink, group: EventLoopGroup, configuration: Configuration
     ) -> EventLoopFuture<Gateway> {
-        link.eventLoop.submit {
+        wire.eventLoop.submit {
+            // Wrapped before anything attaches to it, so the capture sees every
+            // frame rather than every frame after the first. A capture that
+            // fails to open is not a reason to refuse to start a network: it is
+            // reported and the gateway runs without one.
+            var link = wire
+            if let path = configuration.captureFile {
+                if let capture = try? PacketCapture(
+                    path: path, snapshotLength: Int(configuration.mtu) + EthernetHeader.length,
+                    maximumBytes: configuration.captureMaximumBytes)
+                {
+                    link = CapturingLink(wrapping: wire, capture: capture)
+                } else {
+                    configuration.logger.error("could not open the capture file at \(path)")
+                }
+            }
             let stack = Stack(
                 link: link,
                 configuration: Stack.Configuration(

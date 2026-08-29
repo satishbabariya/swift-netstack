@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 import NIOPosix
 import Testing
@@ -380,6 +381,43 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     #expect(reachable, "nothing answers ARP for the address guests are given for the host")
 
     _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}
+
+@Test func aGatewayWithACaptureFileRecordsTheTrafficThatCrossesIt() async throws {
+    // End to end, because the capture is wrapped around the link during assembly
+    // and a wrapper applied after something has already attached would see
+    // nothing. The unit tests cover the file format; this covers the wiring.
+    let path = "/tmp/netstack-gateway-capture-\(UInt32.random(in: 0...UInt32.max)).pcap"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: .init(captureFile: path)
+    ).get()
+
+    let discover = frame(
+        from: .any, to: .broadcast, sourcePort: DHCPServer.clientPort,
+        destinationPort: DHCPServer.serverPort, payload: dhcpDiscover(hardware: gwGuestMAC, transaction: 71),
+        destinationMAC: .broadcast)
+    _ = discover.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    _ = try #require(await awaitUDP(pair[1], fromPort: DHCPServer.serverPort))
+
+    // Closed rather than flushed: `close()` is what an embedder calls, and a
+    // capture that only reaches the disk when something else asks it to is a
+    // capture that is empty exactly when it is wanted.
+    _ = try? await gateway.close().get()
+
+    let data = try [UInt8](Data(contentsOf: URL(fileURLWithPath: path)))
+    #expect(data.count > 24, "the capture file has only a header")
+    let magic = UInt32(data[0]) | UInt32(data[1]) << 8 | UInt32(data[2]) << 16 | UInt32(data[3]) << 24
+    #expect(magic == 0xa1b2_c3d4)
+    // Both directions: the guest's DISCOVER went in and the offer came back out.
+    let captured = data.count
+    #expect(captured >= 24 + 2 * 16, "expected at least the request and the reply: \(captured) bytes")
+
     close(pair[1])
     try? await group.shutdownGracefully()
 }

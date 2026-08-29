@@ -71,11 +71,32 @@ to the gateway and something has to be bound for those datagrams to reach.
 
 ### Wires
 
+Two shapes, and two directions. **Adopting** takes a descriptor the host already
+has — Virtualization.framework hands one end of a `socketpair` to the VM and
+keeps the other. **Listening** binds a path and waits for the guest to dial it,
+which is what `vfkit` and `qemu` do.
+
 | Wire | Use it for |
 |---|---|
-| `WireBootstrap.adoptingDatagramSocket` | Virtualization.framework, vfkit, upstream's `unixgram`. One datagram is one ethernet frame; the kernel keeps the boundaries. |
-| `WireBootstrap.connectingDatagramSocket` | The same, dialled to a path rather than adopted. |
-| `WireBootstrap.adoptingStreamSocket` | qemu's `-netdev socket`, bess, stdio. A four-byte big-endian length in front of each frame. |
+| `WireBootstrap.adoptingDatagramSocket` | Virtualization.framework. One datagram is one ethernet frame; the kernel keeps the boundaries. |
+| `WireBootstrap.listeningDatagramSocket` | vfkit, upstream's `unixgram`. The peer is learned from the first frame. |
+| `WireBootstrap.connectingDatagramSocket` | The same, dialled rather than served. |
+| `WireBootstrap.adoptingStreamSocket` | A stream descriptor already connected. A four-byte big-endian length in front of each frame. |
+| `WireBootstrap.listeningStreamSocket` | qemu's `-netdev socket`, bess, stdio. One guest; a second connection is closed. |
+
+### As a program
+
+For hosts that cannot link a Swift library, `netstack-gateway` is upstream's
+`gvproxy` in the same shape:
+
+```
+netstack-gateway --listen /tmp/net.sock --dns 1.1.1.1:53 \
+                 --control /tmp/net-control.sock \
+                 --forward 8080:192.168.127.2:80
+```
+
+Everything it does is available as an API, and a Swift host process should use
+that instead.
 
 ## What is implemented
 

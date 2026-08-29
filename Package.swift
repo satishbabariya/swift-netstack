@@ -5,7 +5,8 @@ let package = Package(
     name: "swift-netstack",
     platforms: [.macOS("14.0")],
     products: [
-        .library(name: "Netstack", targets: ["Netstack"])
+        .library(name: "Netstack", targets: ["Netstack"]),
+        .executable(name: "netstack-gateway", targets: ["netstack-gateway"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -20,6 +21,14 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+        .executableTarget(
+            name: "netstack-gateway",
+            dependencies: [
+                "Netstack",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ]
         ),
         .testTarget(

@@ -184,3 +184,42 @@ final class DatagramEnvelopeHandler: ChannelDuplexHandler {
         context.write(wrapOutboundOut(AddressedEnvelope(remoteAddress: remote, data: unwrapOutboundIn(data))), promise: promise)
     }
 }
+
+/// The envelope dance for a **bound** datagram socket, whose peer is not known
+/// until something sends to it.
+///
+/// A connected socket is told its peer; a bound one is not, and there is nothing
+/// to tell it with. So the peer is learned from the first datagram that arrives
+/// and replies go to whoever last sent — the same rule upstream's `unixgram`
+/// transport uses, and correct for the one thing this wire carries: a single
+/// guest on a single ethernet segment.
+///
+/// **A write before anything has arrived is dropped**, and dropping is the only
+/// honest option: there is no address to send to. In practice a gateway never
+/// speaks first — it answers a guest's DHCP, its ARP, its SYN — so the case is
+/// one a working setup does not reach, and a link that queued for a peer it might
+/// never learn would be holding frames against a guest that never booted.
+final class LearnedPeerHandler: ChannelDuplexHandler {
+    typealias InboundIn = AddressedEnvelope<ByteBuffer>
+    typealias InboundOut = ByteBuffer
+    typealias OutboundIn = ByteBuffer
+    typealias OutboundOut = AddressedEnvelope<ByteBuffer>
+
+    private var peer: SocketAddress?
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let envelope = unwrapInboundIn(data)
+        peer = envelope.remoteAddress
+        context.fireChannelRead(wrapInboundOut(envelope.data))
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        guard let peer else {
+            promise?.fail(StackError.notConnected)
+            return
+        }
+        context.write(
+            wrapOutboundOut(AddressedEnvelope(remoteAddress: peer, data: unwrapOutboundIn(data))),
+            promise: promise)
+    }
+}

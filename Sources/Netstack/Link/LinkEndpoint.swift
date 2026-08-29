@@ -61,6 +61,11 @@ public protocol GatewayLink: LinkEndpoint, Sendable {
     /// Frames the link would not carry, in each direction.
     var inboundDropped: Int { get }
     var outboundDropped: Int { get }
+    /// Bytes that crossed, in each direction. Upstream reports the same two on
+    /// `GET /stats` and they are the first thing anyone asks of a network that
+    /// is not working: whether anything is moving at all.
+    var bytesReceived: Int { get }
+    var bytesSent: Int { get }
     /// Where the link reports what it refused.
     var log: RateLimitedLogger? { get set }
     func close() -> EventLoopFuture<Void>

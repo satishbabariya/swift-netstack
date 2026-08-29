@@ -172,6 +172,8 @@ public final class CapturingLink: GatewayLink, @unchecked Sendable {
     public var eventLoop: EventLoop { wrapped.eventLoop }
     public var inboundDropped: Int { wrapped.inboundDropped }
     public var outboundDropped: Int { wrapped.outboundDropped }
+    public var bytesReceived: Int { wrapped.bytesReceived }
+    public var bytesSent: Int { wrapped.bytesSent }
 
     public var log: RateLimitedLogger? {
         get { wrapped.log }

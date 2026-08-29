@@ -271,7 +271,13 @@ metadata, sanitized, because a DNS name containing a newline is how a guest
 forges a log entry an operator reads as authentic.
 
 Counters, unlike log lines, have no window: `Gateway.statistics()` counts every
-occurrence and is where a monitoring system should read from.
+occurrence and is where a monitoring system should read from. They include
+`BytesSent`/`BytesReceived` — upstream's spelling, so a tool written against
+gvisor-tap-vsock finds them — and the IPv4 layer's own outcomes, which **add
+up**: every packet that arrived is counted under exactly one of delivered,
+malformed, not-for-this-stack, expired, awaiting-fragments, or
+unknown-protocol. Each of those is a place a packet is dropped and nothing is
+said, which is the state an operator cannot debug.
 
 `notificationSocketPath` tells a supervisor — the thing that started the VM —
 when the gateway is ready and when a guest arrives or leaves, one JSON object
@@ -303,7 +309,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-759 tests, plus a differential harness in `differential/` that drives gVisor's
+760 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

@@ -16,6 +16,28 @@ extension Gateway {
     /// monitoring system can handle correctly across a restart; a rate computed
     /// here would be a rate over a window this type does not get to choose.
     public struct Statistics: Sendable, Equatable {
+        /// Bytes that crossed the wire, in each direction. Upstream reports the
+        /// same two, and they are the first thing anyone asks of a network that
+        /// is not working: whether anything is moving at all.
+        public var bytesReceived: Int
+        public var bytesSent: Int
+
+        /// What happened to the packets that reached the IPv4 layer. Each is a
+        /// place a packet is dropped and nothing is said, which is the state an
+        /// operator cannot debug.
+        public var ipv4Received: Int
+        public var ipv4Malformed: Int
+        public var ipv4NotForThisStack: Int
+        public var ipv4Expired: Int
+        public var ipv4AwaitingFragments: Int
+        public var ipv4Delivered: Int
+        public var ipv4UnknownProtocol: Int
+
+        /// Echo requests sent to a real destination rather than answered here.
+        public var icmpForwarded: Int
+        /// Echo requests that got no answer before their deadline.
+        public var icmpTimedOut: Int
+
         /// Frames from the guest that this wire would not carry.
         public var inboundFramesRejected: Int
         /// Frames this stack could not put on the wire.
@@ -79,7 +101,19 @@ extension Gateway {
     /// The same snapshot for a caller already on the event loop.
     public func statisticsOnLoop() -> Statistics {
         eventLoop.preconditionInEventLoop()
+        let ipv4 = stack.ipv4.counters
         return Statistics(
+            bytesReceived: link.bytesReceived,
+            bytesSent: link.bytesSent,
+            ipv4Received: ipv4.received,
+            ipv4Malformed: ipv4.malformed,
+            ipv4NotForThisStack: ipv4.notForThisStack,
+            ipv4Expired: ipv4.expired,
+            ipv4AwaitingFragments: ipv4.awaitingFragments,
+            ipv4Delivered: ipv4.delivered,
+            ipv4UnknownProtocol: ipv4.unknownProtocol,
+            icmpForwarded: icmp.forwarded,
+            icmpTimedOut: icmp.timedOut,
             inboundFramesRejected: link.inboundDropped,
             outboundFramesRejected: link.outboundDropped,
             tcpEstablished: tcp.establishedCount,
@@ -113,6 +147,19 @@ extension Gateway.Statistics {
     /// somebody's graph.
     public var json: String {
         let fields: [(String, Int)] = [
+            // Upstream's spelling for these two, so a tool written against
+            // gvisor-tap-vsock finds them under the names it expects.
+            ("BytesReceived", bytesReceived),
+            ("BytesSent", bytesSent),
+            ("ipv4_received", ipv4Received),
+            ("ipv4_malformed", ipv4Malformed),
+            ("ipv4_not_for_this_stack", ipv4NotForThisStack),
+            ("ipv4_expired", ipv4Expired),
+            ("ipv4_awaiting_fragments", ipv4AwaitingFragments),
+            ("ipv4_delivered", ipv4Delivered),
+            ("ipv4_unknown_protocol", ipv4UnknownProtocol),
+            ("icmp_forwarded", icmpForwarded),
+            ("icmp_timed_out", icmpTimedOut),
             ("inbound_frames_rejected", inboundFramesRejected),
             ("outbound_frames_rejected", outboundFramesRejected),
             ("tcp_established", tcpEstablished),

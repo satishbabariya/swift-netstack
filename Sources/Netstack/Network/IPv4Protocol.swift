@@ -29,6 +29,35 @@ public final class IPv4Protocol {
     /// is far more headroom than that needs.
     public private(set) var identificationCounter: UInt16 = 0
 
+    /// What happened to the packets that arrived.
+    ///
+    /// Every one of these is a place a packet is dropped and nothing is said,
+    /// which is the state an operator cannot debug: the guest insists it sent
+    /// something and the gateway behaves as though it did not. Upstream reports
+    /// gVisor's whole counter tree for the same reason; these are the subset
+    /// that names a decision this stack actually makes.
+    public struct Counters: Sendable, Equatable {
+        /// Frames that reached the IPv4 layer.
+        public var received = 0
+        /// Rejected by `IPv4Header.parse`: too short, wrong version, bad header
+        /// checksum, or a length that does not describe the packet.
+        public var malformed = 0
+        /// Addressed to somebody else, on a NIC that is not promiscuous.
+        public var notForThisStack = 0
+        /// Arrived with no time left.
+        public var expired = 0
+        /// Held by the reassembler, waiting for the rest of the datagram.
+        public var awaitingFragments = 0
+        /// Handed to a transport, or answered here in the case of echo.
+        public var delivered = 0
+        /// A protocol nothing has registered for. Not an error -- a guest may
+        /// send anything -- but a rising count is usually a guest doing
+        /// something the gateway was never set up to carry.
+        public var unknownProtocol = 0
+    }
+
+    public private(set) var counters = Counters()
+
     /// Accept and deliver packets addressed to a host other than this NIC.
     /// Mirrors `NIC.acceptsAnyDestination`, since the two must agree: a frame
     /// the link layer refuses never reaches here, but a frame it does accept
@@ -64,7 +93,11 @@ public final class IPv4Protocol {
 
     public func handleInbound(_ packet: PacketBuffer, _ ethernet: EthernetHeader) {
         var packet = packet
-        guard let header = IPv4Header.parse(&packet) else { return }
+        counters.received += 1
+        guard let header = IPv4Header.parse(&packet) else {
+            counters.malformed += 1
+            return
+        }
 
         // The NIC's own Ethernet-layer filter only checks the frame's MAC
         // destination, which is ours whenever the frame was switched to us —
@@ -73,26 +106,41 @@ public final class IPv4Protocol {
         // receives frames MAC-addressed to it but IP-addressed to that far
         // host; ordinary unicast to someone else's IP must still be dropped
         // unless this NIC is deliberately promiscuous.
-        guard nic.acceptsAnyDestination || nic.hasAddress(header.destination) else { return }
+        guard nic.acceptsAnyDestination || nic.hasAddress(header.destination) else {
+            counters.notForThisStack += 1
+            return
+        }
 
         // A packet arriving with no time left is dead. We are a terminating
         // gateway, not a router, so nothing is forwarded and nothing is
         // decremented — but a zero TTL is still malformed, so it is dropped
         // before it is trusted for anything, including the opportunistic ARP
         // learning below.
-        guard header.ttl > 0 else { return }
+        guard header.ttl > 0 else {
+            counters.expired += 1
+            return
+        }
 
         // Learn the sender's link address from any packet that arrives, so a
         // reply does not need an ARP round trip.
         arpCache.record(header.source, ethernet.source)
 
-        guard let (whole, payload) = reassembler.process(header: header, payload: packet.payload) else { return }
+        guard let (whole, payload) = reassembler.process(header: header, payload: packet.payload) else {
+            counters.awaitingFragments += 1
+            return
+        }
 
         if whole.protocolNumber == .icmp {
+            counters.delivered += 1
             handleICMP(whole, payload)
             return
         }
-        handlers[whole.protocolNumber]?(whole, payload)
+        guard let handler = handlers[whole.protocolNumber] else {
+            counters.unknownProtocol += 1
+            return
+        }
+        counters.delivered += 1
+        handler(whole, payload)
     }
 
     /// Offered every echo request before this stack answers one itself.

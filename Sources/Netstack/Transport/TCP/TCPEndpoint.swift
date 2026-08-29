@@ -162,6 +162,38 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// what lets its sender retransmit the hole rather than everything after it.
     static let offersSelectiveAcknowledgement = true
 
+    /// RFC 1122 §4.2.3.6's keep-alive, and it is **off unless a caller turns it
+    /// on**, which the RFC states as a MUST.
+    ///
+    /// The reason is not politeness. A keep-alive probe on an idle connection
+    /// can tear down a connection that is merely quiet -- a path outage shorter
+    /// than the probe budget kills a session that would have recovered -- and it
+    /// costs traffic on links that charge for it. The RFC's own words: "TCP
+    /// keep-alives are an optional TCP mechanism, and it is not required".
+    ///
+    /// A gateway is one of the places it earns its cost. A guest that goes away
+    /// without closing leaves an endpoint and a host socket held for as long as
+    /// the connection is nominally established, and nothing else ever notices:
+    /// there is no data to retransmit, so the retransmit timer never runs.
+    public var keepAlive: KeepAliveConfiguration?
+
+    /// How a keep-alive behaves once enabled.
+    public struct KeepAliveConfiguration: Sendable {
+        /// How long a connection must be idle before the first probe. RFC 1122
+        /// §4.2.3.6 requires this to default to no less than two hours.
+        public var idle: TimeAmount
+        /// The gap between probes once they start.
+        public var interval: TimeAmount
+        /// How many unanswered probes end the connection.
+        public var count: Int
+
+        public init(idle: TimeAmount = .hours(2), interval: TimeAmount = .seconds(75), count: Int = 9) {
+            self.idle = idle
+            self.interval = interval
+            self.count = max(1, count)
+        }
+    }
+
     /// What the Timestamps option costs a data segment, in bytes.
     ///
     /// Ten bytes of option plus two of padding to a four-byte boundary. It comes
@@ -274,6 +306,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// arrives before the timer fires can send the acknowledgement early —
         /// and then the timer must not send a second one saying the same thing.
         var delayedAckPending = false
+        /// Unanswered keep-alive probes since the last sign of life.
+        var keepAliveProbes = 0
 
         /// New in-order bytes received since the last acknowledgement went out.
         ///
@@ -658,6 +692,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // waits for the peer to send something before it starts probing, which
         // is precisely the wedge the probe exists to break.
         armPersistTimer(on: connection)
+        // A write is a sign of life and puts data in flight, so the keep-alive
+        // stands down and the retransmit timer takes over the question.
+        connection.keepAliveProbes = 0
+        armKeepAliveTimer(on: connection)
     }
 
     /// Close every connection, release the **listening** port, and keep every
@@ -727,6 +765,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             // their applications", which is the counterweight to persist itself
             // having no give-up rule.
             armPersistTimer(on: connection)
+            // Past ESTABLISHED, so `armKeepAliveTimer` cancels rather than
+            // arms. Called anyway rather than cancelling directly, so there is
+            // one place that decides when a keep-alive should run.
+            armKeepAliveTimer(on: connection)
         }
         if let boundID {
             stack.transportDemuxer.unregister(boundID, protocolNumber: .tcp)
@@ -950,6 +992,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         }
         armRetransmitTimer(on: connection)
         armPersistTimer(on: connection)
+        // Re-armed on every arriving segment, which is what makes "idle" mean
+        // idle: any sign of life from the peer pushes the first probe out by a
+        // full interval, and clears the probes already spent.
+        connection.keepAliveProbes = 0
+        armKeepAliveTimer(on: connection)
 
         switch connection.tcb.state {
         case .closeWait, .closing, .lastAck, .timeWait, .closed:
@@ -1488,6 +1535,86 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         connection.timers.schedulePersist(after: delay) { [weak self] in
             self?.persistTimerFired(peer: peer)
         }
+    }
+
+    /// Arm, re-arm or cancel the keep-alive timer for a connection.
+    ///
+    /// Called wherever the persist timer is armed, and from the same places, so
+    /// that "the connection did something" has exactly one meaning here.
+    ///
+    /// ## What counts as idle, and why it is not "nothing arrived"
+    ///
+    /// The timer is armed only when there is **nothing outstanding**. With data
+    /// in flight the retransmit timer is already asking the same question and
+    /// asking it far more often; running both means the keep-alive fires during
+    /// a transfer that is merely slow, and its probe -- a segment below SND.NXT
+    /// -- draws a duplicate acknowledgement that the sender counts toward fast
+    /// retransmit. A keep-alive that can cause a spurious retransmission is
+    /// worse than none.
+    private func armKeepAliveTimer(on connection: Connection) {
+        guard let configuration = keepAlive else {
+            connection.timers.cancelKeepAlive()
+            return
+        }
+        switch connection.tcb.state {
+        case .established, .closeWait:
+            break
+        case .closed, .listen, .synSent, .synReceived, .finWait1, .finWait2, .closing, .lastAck, .timeWait:
+            connection.timers.cancelKeepAlive()
+            return
+        }
+        guard connection.sender.flightSize == 0 else {
+            connection.timers.cancelKeepAlive()
+            return
+        }
+        let delay = connection.keepAliveProbes == 0 ? configuration.idle : configuration.interval
+        let peer = connection.peer
+        connection.timers.scheduleKeepAlive(after: delay) { [weak self] in
+            self?.keepAliveTimerFired(peer: peer)
+        }
+    }
+
+    /// RFC 1122 §4.2.3.6's probe: a segment carrying no data at `SND.NXT - 1`.
+    ///
+    /// The sequence number is the whole trick and it is worth stating. A segment
+    /// at SND.NXT would be new data the peer has not seen, and one below
+    /// SND.UNA would be out of window; `SND.NXT - 1` is a byte the peer has
+    /// **already acknowledged**, so it is unambiguously a duplicate and every
+    /// TCP answers it with an acknowledgement. The RFC's alternative -- one
+    /// garbage byte -- exists for implementations that ignore an empty segment,
+    /// and is not sent here: it puts a byte into the peer's stream that the
+    /// application would have to be trusted to discard.
+    ///
+    /// The `keepAlive` check here is not the same one `armKeepAliveTimer` makes,
+    /// though falsification found that removing either alone changes nothing --
+    /// each masks the other. What separates them is a caller turning keep-alive
+    /// **off on a live connection**: every established connection already has a
+    /// timer armed, and nothing re-arms it until a segment arrives, so without
+    /// this check the scheduled probe still goes out on a connection whose owner
+    /// has said it should not be probed.
+    private func keepAliveTimerFired(peer: Peer) {
+        guard let connection = connections[peer], let configuration = keepAlive else { return }
+        switch connection.tcb.state {
+        case .established, .closeWait:
+            break
+        case .closed, .listen, .synSent, .synReceived, .finWait1, .finWait2, .closing, .lastAck, .timeWait:
+            return
+        }
+
+        if connection.keepAliveProbes >= configuration.count {
+            // Out of probes. The peer is gone, and holding the connection open
+            // holds an endpoint -- and on a gateway, the host socket spliced to
+            // it -- for a peer that will never answer. A reset is what tells
+            // anything downstream, since there is nobody left to send a FIN to.
+            emit([.rst, .ack], sequence: connection.tcb.sndNxt, on: connection)
+            connection.timers.cancelAll()
+            remove(connection)
+            reportClosed(connection)
+            return
+        }
+        connection.keepAliveProbes += 1
+        emit([.ack], sequence: connection.tcb.sndNxt + (-1), on: connection)
+        armKeepAliveTimer(on: connection)
     }
 
     /// RFC 9293 §3.8.6.1's zero-window probe, out through the single egress

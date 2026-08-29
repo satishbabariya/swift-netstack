@@ -1,4 +1,5 @@
 import Foundation
+import NIOConcurrencyHelpers
 import Testing
 
 // The program's flags are gvproxy's, and that is a claim worth a test rather
@@ -47,28 +48,39 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     process.standardError = pipe
     guard (try? process.run()) != nil else { return nil }
 
-    // A deadline, because every argument here is meant to be rejected -- and if
-    // one is ever *accepted*, the program does what it is for and waits for a
-    // guest forever. `readDataToEndOfFile` then never returns and the suite
-    // stops rather than fails.
+    // A watchdog rather than a deadline on the read, and the difference is why
+    // this failed on CI and not here.
     //
-    // Found by mutating `--listen` back to meaning the guest wire: the argument
-    // the test uses to check the error message became a valid one, the gateway
-    // started, and the harness hung for ten minutes with nothing to point at.
-    let deadline = DispatchTime.now() + .seconds(10)
-    let finished = DispatchSemaphore(value: 0)
-    var data = Data()
-    DispatchQueue.global().async {
-        data = pipe.fileHandleForReading.readDataToEndOfFile()
-        finished.signal()
-    }
-    if finished.wait(timeout: deadline) == .timedOut {
+    // The first version read the pipe on `DispatchQueue.global()` and waited on
+    // a semaphore. Swift Testing runs tests in parallel on that same pool, so on
+    // a runner with few cores the read was simply never scheduled inside its ten
+    // seconds and every invocation was reported as hung -- a test that fails
+    // where the machine is small, which is the worst kind.
+    //
+    // The read happens on this thread now, so the ordinary path does not depend
+    // on the pool at all. The watchdog only has to run when the child really
+    // does hang, and being late then costs nothing.
+    //
+    // It is needed because every argument here is meant to be REJECTED: if one
+    // is ever accepted, the gateway does what it is for and waits for a guest
+    // forever.
+    // Whether the watchdog actually fired, which is the only reliable signal.
+    // Asking `process.isRunning` after the pipe closes is not: the child has
+    // closed stdout but may not have been reaped yet, so it reads as running and
+    // every invocation looked hung.
+    let fired = NIOLockedValueBox(false)
+    let watchdog = DispatchWorkItem {
+        guard process.isRunning else { return }
+        fired.withLockedValue { $0 = true }
         process.terminate()
-        _ = finished.wait(timeout: .now() + .seconds(2))
-        Issue.record("netstack-gateway \(arguments.joined(separator: " ")) did not exit")
-        return (0, String(decoding: data, as: UTF8.self))
     }
+    DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(10), execute: watchdog)
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
+    watchdog.cancel()
+    if fired.withLockedValue({ $0 }) {
+        Issue.record("netstack-gateway \(arguments.joined(separator: " ")) did not exit")
+    }
     return (process.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 

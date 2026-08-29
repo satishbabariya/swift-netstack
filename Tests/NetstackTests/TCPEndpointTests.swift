@@ -166,7 +166,10 @@ private final class DataRecorder {
     private(set) var closedCount = 0
 
     func attach(to endpoint: TCPEndpoint) {
-        endpoint.onData = { [self] buffer in bytes += Array(buffer.readableBytesView) }
+        endpoint.onData = { [self, weak endpoint] in
+            guard let endpoint else { return }
+            bytes += Array(endpoint.read().readableBytesView)
+        }
         endpoint.onEstablished = { [self] in establishedCount += 1 }
         endpoint.onClosed = { [self] in closedCount += 1 }
     }
@@ -2036,6 +2039,52 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             #expect(
                 endpoint.smoothedRoundTripForTesting < .seconds(1),
                 "an echo ahead of our own clock is not a round trip: \(endpoint.smoothedRoundTripForTesting)")
+        }
+    }
+    fixture.drain()
+}
+
+
+@Test func anApplicationThatNeverReadsStopsThePeerInsteadOfLosingData() throws {
+    // The property backpressure exists for, and the one the stack could not have
+    // before `read`: an application that ignores `onData` used to have its data
+    // acknowledged to the peer and then dropped — the stack promising a delivery
+    // it had not made. Now the bytes wait, the advertised window shrinks by what
+    // is held, and the peer is told to stop.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            // No onData handler at all: nothing ever reads.
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            var offset = UInt32(0)
+            var lastWindow = UInt16(TCPEndpoint.receiveWindowBytes)
+            for _ in 0..<210 {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1 + offset, ack: gatewayISS + 1, flags: [.ack, .psh]),
+                    payload: tcpPayload(1000))
+                offset += 1000
+                fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+                if let window = fixture.drainSegments().last?.header.window { lastWindow = window }
+            }
+
+            // The wire field caps at 65535, and the buffer holds 256 KiB, so the
+            // advertised window only starts to fall once more than
+            // `rcvWndMax - 65535` is held. That is the number this loop is sized
+            // to pass, and stating it is the difference between a test that
+            // watches the window shrink and one that happens not to fill enough.
+            #expect(lastWindow < UInt16(TCPEndpoint.receiveWindowBytes), "the window shrank as the buffer filled")
+
+            // The positive control, and it has to be taken BEFORE the read: after
+            // it, "nothing is held" is true of a stack that dropped everything
+            // and of one that delivered it correctly.
+            let held = endpoint.heldBytesForTesting
+            #expect(held > 0, "the bytes are held, not dropped")
+            let taken = endpoint.read()
+            #expect(taken.readableBytes == held, "and reading gives back exactly what was held")
         }
     }
     fixture.drain()

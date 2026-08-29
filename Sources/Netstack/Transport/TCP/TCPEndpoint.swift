@@ -282,6 +282,36 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// last timer".
         var unacknowledgedBytesSinceAck = 0
 
+        /// Bytes delivered in order and not yet taken by the application.
+        ///
+        /// **This is what makes the advertised window mean something.** Before
+        /// it existed, `onData` was called synchronously and the reassembler's
+        /// space was freed in the same pass, so the window described a buffer
+        /// that never held anything — honest in the narrow sense that the stack
+        /// really did have all that room, and useless in the sense that an
+        /// application which ignored `onData` had its data acknowledged and
+        /// dropped. The peer was told the bytes arrived; nobody had them.
+        ///
+        /// Held as a single `ByteBuffer` rather than a queue of them: the
+        /// application reads a byte count, not a segment list, and the segment
+        /// boundaries carry no meaning above the stack.
+        var receiveBuffer = ByteBuffer()
+
+        /// True while `process` is running for this connection.
+        ///
+        /// A read that happens inside `onData` is a read the arriving segment
+        /// caused, and that segment is usually about to be acknowledged anyway.
+        /// Emitting a window update there produces two frames carrying the same
+        /// acknowledgement number and the same window — the second saying
+        /// nothing the first did not. The update waits and rides the
+        /// acknowledgement instead, which is what `read`'s own comment says it
+        /// should do.
+        var inProcessPass = false
+
+        /// A window update that `read` deferred because it happened inside a
+        /// processing pass. Cleared by whatever acknowledgement carries it.
+        var windowUpdatePending = false
+
         /// When the FIN should next be retransmitted. An **absolute** deadline
         /// rather than a delay, so that re-arming the timer on every arriving
         /// segment cannot push it further out -- a peer that sends anything at
@@ -327,7 +357,77 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     private var timeWaitSequence: UInt64 = 0
 
     /// In-order bytes from the peer, oldest first.
-    public var onData: ((ByteBuffer) -> Void)?
+    /// Called when in-order bytes have arrived and `read` will return some.
+    ///
+    /// **A readiness signal, not a delivery**, and the change is deliberate. It
+    /// used to carry the bytes, which meant an application that ignored it had
+    /// them acknowledged to the peer and then dropped — the stack promising
+    /// delivery it had not made. Now the bytes wait in the connection's receive
+    /// buffer, the advertised window shrinks by what is held, and an application
+    /// that never reads stops the peer rather than losing its data.
+    ///
+    /// Fired once per batch of arriving segments, not once per segment: an
+    /// application reads whatever is there, and a second signal for the same
+    /// readiness only costs it a wasted call.
+    public var onData: (() -> Void)?
+
+    /// Take up to `maximum` bytes of in-order data, and reopen the window by
+    /// what was taken.
+    ///
+    /// Returns an empty buffer when nothing has arrived. The window update this
+    /// causes is not sent here — it rides the next acknowledgement, or the
+    /// window-update path if the window was closed, which is the same rule a
+    /// peer's own reads follow.
+    @discardableResult
+    public func read(maximum: Int = Int.max) -> ByteBuffer {
+        guard let connection = connections.values.first else { return ByteBuffer() }
+        let count = min(maximum, connection.receiveBuffer.readableBytes)
+        guard count > 0 else { return ByteBuffer() }
+        let taken = connection.receiveBuffer.readSlice(length: count) ?? ByteBuffer()
+        connection.receiveBuffer.discardReadBytes()
+        connection.tcb.setHeldBytes(connection.receiveBuffer.readableBytes)
+        // Taking bytes reopens the window, and the peer has to be told — but not
+        // on every read.
+        //
+        // RFC 1122 §4.2.3.3's silly-window-syndrome avoidance, from the receiver
+        // side: a window update is worth a segment only when it opens the window
+        // by something worth sending into. Announcing every byte as it is read
+        // produces one frame per read and invites the peer to answer each with a
+        // one-byte segment, which is the syndrome itself — the connection ends up
+        // carrying more header than data.
+        //
+        // The threshold is the conventional one: two segments, or half the
+        // buffer, whichever is smaller. Below it the update rides the next
+        // ordinary acknowledgement, which costs nothing extra.
+        //
+        // The exception is a window that was CLOSED. There is no next ordinary
+        // acknowledgement in that case — the peer has stopped sending and is
+        // waiting on a probe — so an update that waits for one waits for the
+        // persist timer instead, and the connection resumes a probe interval
+        // late for no reason.
+        // Measured as what this read FREED, not as the difference between the
+        // buffer's capacity and the last advertised window. Those two are not
+        // comparable: the advertisement is capped by the 16-bit field whenever
+        // no window scale is negotiated, so subtracting one from the other says
+        // the window opened by 196 KiB on a connection where nothing was ever
+        // held. That comparison fired on every read and produced an update
+        // frame each time — the syndrome this rule exists to prevent, caused by
+        // the rule meant to prevent it.
+        let threshold = min(2 * connection.mss, connection.tcb.rcvWndMax / 2)
+        let wasClosed = connection.tcb.rcvWnd == 0
+        let worthAnnouncing = wasClosed ? count > 0 : count >= threshold
+        let canAnnounce =
+            connection.tcb.state == .established || connection.tcb.state == .finWait1
+            || connection.tcb.state == .finWait2
+        if worthAnnouncing, canAnnounce {
+            if connection.inProcessPass {
+                connection.windowUpdatePending = true
+            } else {
+                emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+            }
+        }
+        return taken
+    }
     /// A connection reached ESTABLISHED.
     public var onEstablished: (() -> Void)?
     /// A connection's stream is over: the peer's FIN was reached, or the block
@@ -655,6 +755,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     /// Drive one segment through the state machine and act on what it returns.
     private func process(segment: TCPSegment, on connection: Connection) {
+        connection.inProcessPass = true
+        defer { connection.inProcessPass = false }
         let stateBefore = connection.tcb.state
         // The challenge-ACK budget comes from the STACK, not from the connection:
         // every connection this endpoint holds, and every connection every other
@@ -667,6 +769,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
         var wantsAck = false
         var wantsDelayableAck = false
+        var delivered = false
         var deleted = false
         for action in actions {
             switch action {
@@ -682,8 +785,15 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                     acknowledgement: ack ?? SequenceNumber(0), window: 0)
             case .sendFin:
                 emitFin(on: connection)
-            case .deliver(let buffer):
-                onData?(buffer)
+            case .deliver(var buffer):
+                // Into the buffer, then signal. `onData` is a readiness
+                // notification now, not a delivery: the bytes stay here until
+                // `read` takes them, and the window shrinks by exactly what is
+                // held. An application that ignores the signal stops the peer
+                // instead of losing data.
+                connection.receiveBuffer.writeBuffer(&buffer)
+                connection.tcb.setHeldBytes(connection.receiveBuffer.readableBytes)
+                delivered = true
             case .startTimeWait:
                 armTimeWaitTimer(on: connection)
             case .deleteTCB:
@@ -692,6 +802,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 break
             }
         }
+
+        // Signal AFTER the action loop, once, however many segments were
+        // delivered. Calling it per segment would make an application that reads
+        // on every signal do so more often than there is reason to, and the
+        // signal carries no payload for it to miss.
+        if delivered { onData?() }
 
         // `onData` is application code and may have closed this endpoint out
         // from under us. Everything below touches connection state that
@@ -714,6 +830,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // bit and the current RCV.NXT, so a bare acknowledgement alongside them
         // would be a second frame saying the same thing.
         let transmitted = transmit(on: connection)
+        // A deferred window update is satisfied by anything that carries the
+        // current window, which every segment this endpoint sends does.
+        if transmitted > 0 || wantsAck { connection.windowUpdatePending = false }
+        if connection.windowUpdatePending {
+            connection.windowUpdatePending = false
+            emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
+        }
         if wantsAck, transmitted == 0 {
             emit([.ack], sequence: connection.tcb.sndNxt, on: connection)
             connection.delayedAckPending = false
@@ -1014,6 +1137,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard let sample = connection.handshake.sample(at: stack.clock.now()) else { return }
         connection.sender.measureHandshakeRoundTrip(sample)
     }
+
+    /// Bytes delivered in order and not yet read, for tests.
+    var heldBytesForTesting: Int { connections.values.first?.receiveBuffer.readableBytes ?? 0 }
+
+    /// The same number, named for the assertion it serves: everything the peer
+    /// sent and this stack accepted is still here to be read.
+    var deliveredSoFarForTesting: Int { heldBytesForTesting }
 
     /// The first connection's smoothed round-trip estimate, for tests.
     ///

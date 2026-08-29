@@ -751,13 +751,37 @@ in a range that does not overlap the one above it, and assert
 Not comparison nuisances — real limitations, recorded because the
 differential is where they became visible.
 
-- **There is no receive-side backpressure at all.** `onData` is called
-  synchronously and the space is freed in the same pass, so the advertised
-  window is honest about what this stack holds — it simply never holds
-  anything. **An application that ignores `onData` is acknowledged and its
-  data dropped.** That is an interface consequence (the specified surface
-  has no `read()`), and it is the reason the harness has to drain gVisor's
-  buffer to make the window field comparable at all. M5.
+- **~~There is no receive-side backpressure at all.~~ Closed in M6.** `onData`
+  used to be called synchronously with the space freed in the same pass, so the
+  advertised window described a buffer that never held anything — honest in the
+  narrow sense that the stack really did have all that room, and useless in the
+  sense that an application which ignored `onData` had its data acknowledged and
+  then dropped. The peer was told the bytes arrived; nobody had them.
+
+  It was an *interface* consequence, so the fix changed the interface rather than
+  adding to it. `onData` is a readiness signal now; `read` takes the bytes;
+  delivered-but-unread bytes sit on the connection and the receiver subtracts
+  them from RCV.WND, so the advertised window finally describes what the
+  connection will accept. `TCB.heldBytes` carries the count, which keeps
+  `Receiver` the single writer of RCV.WND — the ownership rule two Criticals came
+  from breaking.
+
+  Three things fell out of it that the plan did not predict, each caught by a
+  test rather than by review:
+
+  - **Reading emitted an acknowledgement per read.** RFC 1122 §4.2.3.3's
+    silly-window-syndrome avoidance is required here, and the first attempt at it
+    was itself the syndrome: it compared the buffer's capacity against the last
+    *advertised* window, which the 16-bit field caps whenever no scale is
+    negotiated — so it read "the window opened by 196 KiB" on a connection where
+    nothing was ever held, and fired on every read. Measured as bytes *freed*
+    instead, which compares like with like.
+  - **The update still duplicated the acknowledgement about to be sent.** A read
+    inside `onData` is a read the arriving segment caused, and that segment is
+    usually acknowledged in the same pass. The update is deferred and rides it.
+  - **Segment boundaries stopped surviving above the stack**, and should: two
+    segments delivered in one pass are one read, because an application reads a
+    byte count and not a segment list.
 - **~~After a timeout, only the earliest unacknowledged segment is
   retransmitted, once per timeout.~~ Closed in M5.** RFC 6298 §5.4 asks for no
   more, so this stack was conformant and unusable at the same time: recovering an

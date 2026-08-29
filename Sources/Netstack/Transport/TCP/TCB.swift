@@ -215,6 +215,20 @@ struct TCB: Equatable, Sendable {
     /// built on TS.Recent being narrow.
     private(set) var lastAckSent = SequenceNumber(0)
 
+    /// Bytes delivered in order and not yet taken by the application.
+    ///
+    /// Lives here, rather than being read out of `TCPEndpoint`, so that
+    /// `Receiver` stays the single writer of RCV.WND — the ownership rule Plan 2
+    /// settled and which two Criticals came from breaking. The endpoint owns the
+    /// buffer and reports its size; the receiver owns the window and subtracts
+    /// it. Neither reaches into the other.
+    private(set) var heldBytes = 0
+
+    /// Called by the endpoint when its receive buffer grows or drains.
+    mutating func setHeldBytes(_ count: Int) {
+        heldBytes = max(0, count)
+    }
+
     /// Called by the endpoint at its single egress point for every segment it
     /// sends with the ACK bit set.
     mutating func recordAckSent(_ ack: SequenceNumber) {

@@ -177,6 +177,14 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// there is no data to retransmit, so the retransmit timer never runs.
     public var keepAlive: KeepAliveConfiguration?
 
+    /// Which congestion-control algorithm new connections on this endpoint use.
+    ///
+    /// Reno by default: it is the one the differential harness validates against
+    /// gVisor. Changing it after a connection exists does not affect that
+    /// connection -- the algorithm is chosen when the sender is built, and
+    /// rebuilding one that held a retransmit queue would drop it.
+    public var congestionControl: CongestionControlAlgorithm = .reno
+
     /// How a keep-alive behaves once enabled.
     public struct KeepAliveConfiguration: Sendable {
         /// How long a connection must be idle before the first probe. RFC 1122
@@ -799,6 +807,18 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         return connection.sender.congestionControl.congestionWindow
     }
 
+    /// Whether the single connection this endpoint holds is running CUBIC.
+    ///
+    /// A type test rather than a behavioural one, and deliberately: what needs
+    /// checking here is that the SELECTION reached the sender. The behaviour of
+    /// each algorithm is covered where the algorithm is, and a test that
+    /// inferred which one was in use from a window figure would be re-testing
+    /// that behaviour to answer a question about wiring.
+    var usesCubicForTesting: Bool {
+        guard let connection = connections.values.first else { return false }
+        return connection.sender.congestionControl is Cubic
+    }
+
     /// Whether the single connection this endpoint holds has a zero-window probe
     /// scheduled, or nil if it holds none or more than one.
     ///
@@ -1220,7 +1240,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             "the sender is being rebuilt with data already queued, which would drop it")
         let nagleDisabled = connection.sender.nagleDisabled
         connection.sender = Sender(
-            congestionControl: Reno(maximumSegmentSize: size), clock: stack.clock,
+            congestionControl: congestionControl.make(maximumSegmentSize: size), clock: stack.clock,
             maximumBufferedBytes: Self.sendBufferBytes)
         connection.sender.nagleDisabled = nagleDisabled
     }
@@ -1751,7 +1771,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             receiver: Receiver(reassembler: TCPReassembler()),
             sender: {
                 var sender = Sender(
-                    congestionControl: Reno(maximumSegmentSize: mss), clock: stack.clock,
+                    congestionControl: congestionControl.make(maximumSegmentSize: mss), clock: stack.clock,
                     maximumBufferedBytes: Self.sendBufferBytes)
                 sender.nagleDisabled = nagleDisabled
                 return sender
@@ -1809,7 +1829,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard let advertised = peerSegmentSize(in: header) else { return }
         connection.mss = negotiatedSegmentSize(advertised)
         connection.sender = Sender(
-            congestionControl: Reno(maximumSegmentSize: connection.mss), clock: stack.clock,
+            congestionControl: congestionControl.make(maximumSegmentSize: connection.mss), clock: stack.clock,
             maximumBufferedBytes: Self.sendBufferBytes)
     }
 

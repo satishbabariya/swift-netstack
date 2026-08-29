@@ -21,7 +21,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // one doubling.
     var reno = Reno(maximumSegmentSize: mss)
     for _ in 0..<10 {
-        reno.acked(bytes: mss, flightSize: initialWindow)
+        reno.acked(bytes: mss, flightSize: initialWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     }
     #expect(reno.congestionWindow == 29_200, "14_600 doubled")
     #expect(reno.slowStartThreshold == Int.max, "no loss, so the threshold is untouched")
@@ -34,7 +34,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // a delayed or lost-ACK-recovered cumulative acknowledgement doubles the
     // window in one step and produces a burst the path never agreed to.
     var reno = Reno(maximumSegmentSize: mss)
-    reno.acked(bytes: initialWindow, flightSize: initialWindow)
+    reno.acked(bytes: initialWindow, flightSize: initialWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     #expect(reno.congestionWindow == 16_060, "14_600 + 1_460, not 29_200")
 }
 
@@ -50,16 +50,16 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // 1_460 -> 2_920 -> 4_380 -> 5_840 -> 7_300: still below the threshold each
     // time the ACK arrives, so still slow start.
     for expected in [2_920, 4_380, 5_840, 7_300] {
-        reno.acked(bytes: mss, flightSize: reno.congestionWindow)
+        reno.acked(bytes: mss, flightSize: reno.congestionWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
         #expect(reno.congestionWindow == expected)
     }
 
     // cwnd == ssthresh now, so this ACK is congestion avoidance:
     // 1_460 * 1_460 / 7_300 = 292 exactly. Slow start would have said 8_760.
-    reno.acked(bytes: mss, flightSize: reno.congestionWindow)
+    reno.acked(bytes: mss, flightSize: reno.congestionWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     #expect(reno.congestionWindow == 7_592, "+292, not +1_460")
     // 1_460 * 1_460 / 7_592 = 280.
-    reno.acked(bytes: mss, flightSize: reno.congestionWindow)
+    reno.acked(bytes: mss, flightSize: reno.congestionWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     #expect(reno.congestionWindow == 7_872, "+280: the increment shrinks as the window grows")
 }
 
@@ -73,7 +73,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // carry, and the sender leaves loss recovery still overshooting.
     var reno = Reno(maximumSegmentSize: mss)
     for _ in 0..<10 {
-        reno.acked(bytes: mss, flightSize: initialWindow)
+        reno.acked(bytes: mss, flightSize: initialWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     }
     let flightSize = 6 * mss  // 8_760
     #expect(reno.congestionWindow == 29_200)
@@ -94,7 +94,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // way, so ssthresh is the only place the error would show.
     var reno = Reno(maximumSegmentSize: mss)
     for _ in 0..<10 {
-        reno.acked(bytes: mss, flightSize: initialWindow)
+        reno.acked(bytes: mss, flightSize: initialWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     }
     #expect(reno.congestionWindow == 29_200)
     #expect(reno.congestionWindow > 6 * mss)
@@ -109,7 +109,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // restarts slow start from one MSS -- halving instead keeps an estimate
     // we have just learned is wrong.
     var reno = Reno(maximumSegmentSize: 1460)
-    reno.acked(bytes: 14_600, flightSize: 14_600)
+    reno.acked(bytes: 14_600, flightSize: 14_600, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     let beforeTimeout = reno.congestionWindow
     #expect(beforeTimeout > 1460)  // without this the test is vacuous
     reno.timeout(flightSize: 14_600)
@@ -155,9 +155,9 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     #expect(reno.congestionWindow == 1)
     #expect(reno.slowStartThreshold == 2)
 
-    reno.acked(bytes: 10, flightSize: 10)  // slow start: cwnd 1 < ssthresh 2
+    reno.acked(bytes: 10, flightSize: 10, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))  // slow start: cwnd 1 < ssthresh 2
     #expect(reno.congestionWindow == 2)
-    reno.acked(bytes: 10, flightSize: 10)  // congestion avoidance: 1*1/2 = 0
+    reno.acked(bytes: 10, flightSize: 10, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))  // congestion avoidance: 1*1/2 = 0
     #expect(reno.congestionWindow == 3, "the increment floor keeps the window moving")
 }
 
@@ -171,7 +171,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     #expect(reno.slowStartThreshold == 50)
     #expect(reno.congestionWindow == 62, "50 + 3 * 4, and 62 > 16 = SMSS^2")
 
-    reno.acked(bytes: 4, flightSize: 62)
+    reno.acked(bytes: 4, flightSize: 62, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     #expect(reno.congestionWindow == 63, "16 / 62 truncates to 0, floored to 1")
 }
 
@@ -180,8 +180,8 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     var reno = Reno(maximumSegmentSize: mss)
     #expect(reno.congestionWindow == initialWindow, "positive control: the window is non-zero to begin with")
 
-    reno.acked(bytes: 0, flightSize: initialWindow)
-    reno.acked(bytes: -5, flightSize: initialWindow)
+    reno.acked(bytes: 0, flightSize: initialWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
+    reno.acked(bytes: -5, flightSize: initialWindow, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
     #expect(reno.congestionWindow == initialWindow, "unchanged")
     #expect(reno.slowStartThreshold == Int.max, "unchanged")
 }
@@ -191,7 +191,7 @@ private let initialWindow = 10 * mss  // 14_600; see Reno's initialisation comme
     // requirements have to be reachable through the abstraction or the
     // protocol is decoration.
     func drive(_ control: inout some CongestionControl) {
-        control.acked(bytes: 1460, flightSize: 14_600)
+        control.acked(bytes: 1460, flightSize: 14_600, now: .uptimeNanoseconds(0), smoothedRoundTrip: .milliseconds(100))
         control.lossDetected(flightSize: 14_600)
     }
     var reno = Reno(maximumSegmentSize: mss)

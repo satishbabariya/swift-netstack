@@ -66,12 +66,22 @@ to the gateway and something has to be bound for those datagrams to reach.
 | **Wire** | Datagram and length-prefixed transports over real sockets, adopted from a descriptor or dialled to a path |
 | **Network** | IPv4 parse/emit, route table with spoof-aware source selection, limited broadcast, egress fragmentation, ingress reassembly with timeout and memory bounds, ICMPv4 |
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
-| **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno, RFC 6675 SACK-based loss recovery, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
+| **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding |
 
-**Not yet implemented:** CUBIC, RACK-TLP, IPv6, and the HTTP control plane
-upstream exposes for managing forwards at runtime.
+**Not yet implemented:** RACK-TLP, IPv6, and the HTTP control plane upstream
+exposes for managing forwards at runtime.
+
+**Reno is the default and CUBIC is opt-in** (`TCPEndpoint.congestionControl`),
+and the reason is evidence rather than preference: Reno is compared
+frame-for-frame against gVisor by the differential harness and CUBIC is not.
+gVisor's CUBIC keeps its window in whole segments where this one keeps a real
+number of them, so the two round differently on every acknowledgement, and the
+generator's connections never stay in congestion avoidance long enough for the
+shape of the curve to outweigh the rounding — the comparison would report
+arithmetic units rather than behaviour. What stands behind CUBIC here is unit
+tests against the RFC's own formulas.
 
 **One behaviour worth knowing before you trust it:** a ping *through* the
 gateway is answered *by* the gateway, for any address at all. A guest that pings

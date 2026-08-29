@@ -1,3 +1,5 @@
+import NIOCore
+
 /// What the sender needs from a congestion-control algorithm.
 ///
 /// Windows are in **bytes**, not segments. TCP's send decision is a byte
@@ -25,7 +27,14 @@ protocol CongestionControl {
     /// chances to disagree, and the algorithm is where it already lives.
     var segmentSize: Int { get }
     /// A non-duplicate acknowledgement advanced the window by `bytes`.
-    mutating func acked(bytes: Int, flightSize: Int)
+    ///
+    /// `now` and `smoothedRoundTrip` are carried because an algorithm whose
+    /// window is a function of TIME needs both, and neither can be reached from
+    /// here: the clock belongs to the stack and the round trip to the sender's
+    /// estimator. Reno ignores them -- its window is a function of
+    /// acknowledgements alone -- which is exactly why they are parameters rather
+    /// than state every algorithm has to carry whether it uses them or not.
+    mutating func acked(bytes: Int, flightSize: Int, now: NIODeadline, smoothedRoundTrip: TimeAmount)
     /// Loss inferred from duplicate acknowledgements (fast retransmit).
     mutating func lossDetected(flightSize: Int)
     /// Loss inferred from SACK information, RFC 6675.
@@ -39,6 +48,26 @@ protocol CongestionControl {
     mutating func lossDetectedWithScoreboard(flightSize: Int)
     /// The retransmission timer expired.
     mutating func timeout(flightSize: Int)
+}
+
+/// Which algorithm an endpoint uses.
+///
+/// Reno is the default, and the reason is evidence rather than preference: it is
+/// the one the differential harness compares frame-for-frame against gVisor, and
+/// CUBIC is not -- see `Cubic`'s own comment for why that comparison cannot be
+/// made as things stand. A caller on a path where Reno's one-segment-per-round-
+/// trip growth is the bottleneck should choose CUBIC knowing that what stands
+/// behind it is unit tests against the RFC's arithmetic.
+public enum CongestionControlAlgorithm: Sendable {
+    case reno
+    case cubic
+
+    func make(maximumSegmentSize: Int) -> any CongestionControl {
+        switch self {
+        case .reno: return Reno(maximumSegmentSize: maximumSegmentSize)
+        case .cubic: return Cubic(maximumSegmentSize: maximumSegmentSize)
+        }
+    }
 }
 
 /// RFC 5681 Reno: slow start, congestion avoidance, fast retransmit.
@@ -76,7 +105,7 @@ struct Reno: CongestionControl, Sendable, Equatable {
     var congestionWindow: Int { cwnd }
     var slowStartThreshold: Int { ssthresh }
 
-    mutating func acked(bytes: Int, flightSize: Int) {
+    mutating func acked(bytes: Int, flightSize: Int, now: NIODeadline, smoothedRoundTrip: TimeAmount) {
         // Nothing acknowledged means nothing learned about the path.
         guard bytes > 0 else { return }
 

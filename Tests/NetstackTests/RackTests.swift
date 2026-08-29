@@ -502,3 +502,218 @@ private func block(_ index: Int, count: Int = 1) -> SACKBlock {
     }
     fixture.drain()
 }
+
+@Test func aTailProbeDrawsAnAcknowledgementWhenNothingElseWill() throws {
+    // RFC 8985 §7, and the reason RACK alone is not enough at the end of a
+    // transfer.
+    //
+    // RACK needs an acknowledgement to work from. When the LAST segments of a
+    // transfer are lost there is nothing left to draw one: the peer has nothing
+    // to acknowledge and the sender has nothing to send. The probe is a segment
+    // sent for the sole purpose of provoking a reply, after roughly two round
+    // trips rather than the RTO's second or more.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        endpoint.rack = true
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .sackPermitted]))
+            _ = fixture.drainSegments()
+            fixture.advance(by: .milliseconds(50))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            // One segment, which the guest never acknowledges. With a fifty
+            // millisecond handshake the probe is due in about a hundred and
+            // fifty — two round trips plus the delayed-acknowledgement
+            // allowance a lone segment earns — and the retransmission timeout
+            // is a second away.
+            try endpoint.send(tcpPayload(1420))
+            let first = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(first.count == 1, "the fixture did not put one segment on the wire")
+
+            fixture.advance(by: .milliseconds(400))
+            let probes = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(!probes.isEmpty, "nothing was sent before the retransmission timeout")
+            #expect(
+                probes.first?.header.sequence == first.first?.header.sequence,
+                "the probe was not the last segment sent again")
+            #expect(fixture.clock.now() < .uptimeNanoseconds(1_000_000_000), "positive control: this is well before the RTO")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func onlyOneTailProbeGoesOutPerTail() throws {
+    // One, not a ladder. The probe exists to draw an acknowledgement, and a peer
+    // that did not answer the first is not going to answer the second any sooner
+    // than the retransmission timeout will find out — so a second probe is a
+    // segment spent on nothing, against a peer that may be gone.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        endpoint.rack = true
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .sackPermitted]))
+            _ = fixture.drainSegments()
+            fixture.advance(by: .milliseconds(50))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            try endpoint.send(tcpPayload(1420))
+            _ = fixture.drainSegments()
+
+            // Long enough for several probe intervals, but short of the
+            // retransmission timeout, whose retransmissions would be
+            // indistinguishable from probes here.
+            fixture.advance(by: .milliseconds(900))
+            let sent = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(sent.count == 1, "\(sent.count) segments went out where one probe belonged")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func noProbeIsSentWhileARetransmissionIsAlreadyInFlight() throws {
+    // In recovery there is already a segment on the wire doing the same job, and
+    // a probe would be a second one sent to learn something the first will
+    // report.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        endpoint.rack = true
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .sackPermitted]))
+            _ = fixture.drainSegments()
+            fixture.advance(by: .milliseconds(50))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            var sent: [(header: TCPHeader, payload: ByteBuffer)] = []
+            for _ in 0..<4 {
+                try endpoint.send(tcpPayload(1420))
+                sent += fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+                fixture.advance(by: .milliseconds(20))
+            }
+            let last = try #require(sent.last)
+
+            // A selective acknowledgement that puts the sender in recovery.
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack],
+                    options: [
+                        .selectiveAcknowledgement([
+                            SACKBlock(
+                                left: last.header.sequence,
+                                right: last.header.sequence + last.payload.readableBytes)
+                        ])
+                    ]))
+            let recovery = fixture.drainSegments().filter { $0.payload.readableBytes > 0 }
+            #expect(!recovery.isEmpty, "the fixture did not enter recovery")
+
+            // No probe: the retransmission is the thing that will report back.
+            #expect(
+                endpoint.tailProbeDeadlineForTesting == nil,
+                "a probe was armed while a retransmission was already in flight")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func afterAProbeHasGoneOutNoFurtherProbeIsArmed() throws {
+    // Two guards decide this — one before the timer is armed, one before it
+    // sends — and falsification found they mask each other: removing the arming
+    // guard alone changes nothing observable, because the sending guard still
+    // refuses.
+    //
+    // What separates them is the timer itself. Without the arming guard the
+    // endpoint re-arms after every expiry, waking on a schedule to do nothing,
+    // for as long as the tail is unacknowledged. That is not wrong output, it is
+    // wasted work — and it is invisible to any test that only looks at what went
+    // on the wire.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        endpoint.rack = true
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .sackPermitted]))
+            _ = fixture.drainSegments()
+            fixture.advance(by: .milliseconds(50))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            try endpoint.send(tcpPayload(1420))
+            _ = fixture.drainSegments()
+            #expect(endpoint.tailProbeDeadlineForTesting != nil, "no probe was armed for the tail")
+
+            fixture.advance(by: .milliseconds(400))
+            _ = fixture.drainSegments()
+
+            #expect(
+                endpoint.tailProbeDeadlineForTesting == nil,
+                "another probe was armed after one had already gone out")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aLoneSegmentGetsTheDelayedAcknowledgementAllowance() throws {
+    // §7.2: the probe waits two round trips, plus a delayed-acknowledgement
+    // allowance when a single segment is outstanding — because a lone segment is
+    // exactly what a receiver holds back waiting for a second one, and probing
+    // before that hold expires provokes the reply the receiver was about to send
+    // anyway.
+    //
+    // Measured as a difference between one segment outstanding and two, so the
+    // assertion does not depend on the round trip the fixture happens to
+    // produce.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        endpoint.rack = true
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS, flags: [.syn],
+                    options: [.maximumSegmentSize(1460), .sackPermitted]))
+            _ = fixture.drainSegments()
+            fixture.advance(by: .milliseconds(50))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS + 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+
+            try endpoint.send(tcpPayload(1420))
+            _ = fixture.drainSegments()
+            let lone = try #require(endpoint.tailProbeDeadlineForTesting)
+
+            // A second segment, sent in the same instant so the deadline moves
+            // only by the allowance and not by the send time. Deliberately
+            // larger than one segment: a write of exactly the payload size is
+            // short by whatever the options take, and Nagle holds a short
+            // segment while data is outstanding -- so the fixture would still
+            // have ONE segment in flight and both deadlines would agree.
+            try endpoint.send(tcpPayload(4000))
+            _ = fixture.drainSegments()
+            let pair = try #require(endpoint.tailProbeDeadlineForTesting)
+
+            #expect(
+                lone > pair,
+                "a lone segment did not get the delayed-acknowledgement allowance: \(lone) vs \(pair)")
+            #expect(
+                (lone - pair) == .milliseconds(200),
+                "the allowance is \(lone - pair), not the 200 ms §7.2 asks for")
+        }
+    }
+    fixture.drain()
+}

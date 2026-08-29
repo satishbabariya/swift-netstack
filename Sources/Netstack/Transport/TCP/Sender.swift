@@ -266,6 +266,11 @@ struct Sender {
         /// §6.3's reordering timer: when the earliest segment still inside its
         /// window stops being inside it.
         var reorderDeadline: NIODeadline?
+        /// §7.2's tail loss probe: whether one has already gone out for the
+        /// current tail. One, not a ladder -- the probe exists to draw an
+        /// acknowledgement, and a peer that did not answer the first is not
+        /// going to answer the second any sooner than the RTO will find out.
+        var probeSent = false
     }
 
     private var rack = RACK()
@@ -443,6 +448,43 @@ struct Sender {
     /// or was not taken — Karn's tests, and RFC 7323 §4.1's timestamp sampling —
     /// has to read this instead.
     var smoothedRoundTrip: TimeAmount { estimator.smoothed }
+
+    /// RFC 8985 §7's tail loss probe: when to prod the peer, or `nil` when
+    /// there is nothing to prod it about.
+    ///
+    /// ## What it is for, which is not what a retransmission timer is for
+    ///
+    /// RACK needs an acknowledgement to work from. When the last segments of a
+    /// transfer are lost there is nothing left to draw one: the peer has nothing
+    /// to acknowledge and the sender has nothing to send. The probe is a segment
+    /// sent for the sole purpose of provoking a reply, after roughly two round
+    /// trips rather than the RTO's second or more -- and the reply, whatever it
+    /// says, is what lets RACK see the hole.
+    ///
+    /// **Not armed during recovery.** In recovery there is already a
+    /// retransmission in flight doing the same job, and a probe would be a
+    /// second segment sent to learn something the first will report.
+    var tailProbeDeadline: NIODeadline? {
+        guard rackEnabled, !rack.probeSent, recoveryPoint == nil, lostBytes == 0 else { return nil }
+        guard let last = inFlight.last, outstanding > 0 else { return nil }
+        let smoothed = estimator.smoothed
+        guard smoothed > .zero else { return nil }
+        // §7.2: twice the smoothed round trip, plus a delayed-acknowledgement
+        // allowance when a single segment is outstanding -- because a lone
+        // segment is exactly what a receiver holds back waiting for a second
+        // one. Never past the retransmission timeout, which is the deadline this
+        // is trying to beat.
+        var interval = TimeAmount.nanoseconds(smoothed.nanoseconds * 2)
+        if inFlight.count == 1 { interval = interval + Self.delayedAckAllowance }
+        let timeout = estimator.retransmissionTimeout
+        if interval > timeout { interval = timeout }
+        return last.sentAt + interval
+    }
+
+    /// RFC 8985 §7.2's `WCDelAckT`: the worst-case delayed acknowledgement a
+    /// receiver may impose. RFC 9293 §3.8.6.3 caps it at 500 ms; 200 is what
+    /// every stack in practice uses and what the RFC's own text suggests.
+    private static let delayedAckAllowance = TimeAmount.milliseconds(200)
 
     /// RFC 8985 §6.3's reordering timer: when to look again, or `nil` when
     /// nothing is waiting out its window.
@@ -856,6 +898,10 @@ struct Sender {
 
         duplicates = 0
         fastRetransmitPending = false
+        // New data acknowledged: this is a different tail, so it gets its own
+        // probe. Without the reset a connection gets one probe for its whole
+        // life, which is one more than none and far fewer than it needs.
+        rack.probeSent = false
         // RFC 6675 §5's exit: the episode ends when the cumulative
         // acknowledgement passes what was outstanding when it began, not on the
         // first one that advances. A partial acknowledgement inside an episode
@@ -1624,6 +1670,28 @@ struct Sender {
         guard newlyLost else { return false }
         enterScoreboardRecovery(tcb: &tcb, flightSize: flightSize)
         return true
+    }
+
+    /// The tail loss probe timer expired: send something to draw an
+    /// acknowledgement.
+    ///
+    /// New data if there is any -- a probe that carries useful bytes costs
+    /// nothing beyond the segment itself -- and otherwise the last segment
+    /// again. Returns nil when the connection has moved on and there is nothing
+    /// left to probe about, which is reachable because the endpoint re-arms this
+    /// on every arriving segment.
+    mutating func tailProbeTimerFired(tcb: inout TCB, mss: Int) -> Segment? {
+        guard rackEnabled, !rack.probeSent, outstanding > 0 else { return nil }
+        rack.probeSent = true
+        // New data first. `segmentsToTransmit` applies the window and Nagle, so
+        // a probe that would not have been allowed as data is not smuggled out
+        // as a probe.
+        let fresh = segmentsToTransmit(tcb: &tcb, mss: mss)
+        if let first = fresh.first { return first }
+        // Nothing new: the last segment again, which is what RFC 8985 §7.3 calls
+        // for and is the only thing guaranteed to be answerable.
+        guard !inFlight.isEmpty else { return nil }
+        return retransmit(inFlight.count - 1, tcb: &tcb)
     }
 
     /// The reordering timer expired: look again.

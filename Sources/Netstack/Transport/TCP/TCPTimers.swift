@@ -50,6 +50,7 @@ final class TCPTimers {
     private var delayedAckTask: Scheduled<Void>?
     private var keepAliveTask: Scheduled<Void>?
     private var rackTask: Scheduled<Void>?
+    private var tailProbeTask: Scheduled<Void>?
 
     init(eventLoop: EventLoop, clock: NetstackClock, timeWaitDuration: TimeAmount = .seconds(60)) {
         self.eventLoop = eventLoop
@@ -169,6 +170,18 @@ final class TCPTimers {
         rackTask = nil
     }
 
+    /// RFC 8985 §7's tail loss probe.
+    func scheduleTailProbe(after delay: TimeAmount, _ body: @escaping () -> Void) {
+        tailProbeTask?.cancel()
+        let box = TimerBody(run: body)
+        tailProbeTask = eventLoop.scheduleTask(deadline: clock.now() + delay) { box.run() }
+    }
+
+    func cancelTailProbe() {
+        tailProbeTask?.cancel()
+        tailProbeTask = nil
+    }
+
     func startTimeWait(_ body: @escaping () -> Void) {
         timeWaitTask?.cancel()
         timeWaitTask = nil
@@ -184,6 +197,7 @@ final class TCPTimers {
         cancelDelayedAck()
         cancelKeepAlive()
         cancelRackReorder()
+        cancelTailProbe()
         timeWaitTask?.cancel()
         timeWaitTask = nil
     }

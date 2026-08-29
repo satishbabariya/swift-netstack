@@ -49,7 +49,17 @@ jobs:
         working-directory: differential/harness
 
       - name: Test
-        run: swift test
+        # `set -o pipefail`, because piping into `tee` otherwise hands the
+        # step `tee`'s exit status and a failing suite would go green. GitHub's
+        # default shell is `bash -e`, which does not set it.
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee /tmp/swift-test.log
+
+      # The README states a test count. It was maintained by hand and was wrong
+      # within a day.
+      - name: Check the README's test count
+        run: ./scripts/check-test-count.sh /tmp/swift-test.log
 
       # Deletes each guard in `scripts/guards.tsv` and requires that the named
       # test notices. Guards drift out from under their tests as code around

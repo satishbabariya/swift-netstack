@@ -340,7 +340,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-764 tests, plus a differential harness in `differential/` that drives gVisor's
+765 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three
@@ -353,6 +353,13 @@ are checked: a canary that traps on a 17-byte frame is caught, and removing the
 reassembler's table bound is caught. It also asserts how deep the mutants get,
 because the first version reached the TCP parser **zero** times — the corpus
 segment carried a placeholder checksum — and looked like it was working.
+
+The Swift samples above are compiled as part of the test target
+(`READMESamplesTests.swift`), and the concrete values this file states — the
+gateway and host addresses, the NAT entry, link-local being off, the two
+`containers.internal` names — are asserted there. Both were stale claims waiting
+to happen: `Gateway.Configuration` gained eight parameters in a day, each one in
+the middle of an initialiser these samples call.
 
 `scripts/falsify.sh --all` deletes each guard in `scripts/guards.tsv` in turn and
 requires that the named test notices. `CAUGHT` is the guard being guarded;

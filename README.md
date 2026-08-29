@@ -56,6 +56,8 @@ GET  /services/forwarder/all
 GET  /stats
 GET  /leases
 GET  /cam
+GET  /services/dns/all
+POST /services/dns/add      {"name":"svc.test.","records":[{"name":"api","ip":"10.1.2.3"}]}
 ```
 
 It listens on a unix socket because anything that can reach it can publish any
@@ -87,6 +89,26 @@ which is what `vfkit` and `qemu` do.
 | `WireBootstrap.adoptingStreamSocket` | A stream descriptor already connected. A four-byte big-endian length in front of each frame. |
 | `WireBootstrap.listeningStreamSocket` | qemu's `-netdev socket`, bess, stdio. One guest; a second connection is closed. |
 | `WireBootstrap.switchedStreamSocket` | The same, but every guest that connects gets a port on a `NetworkSwitch`. |
+
+### Names
+
+A **zone** is a name this gateway answers and everything under it, and its
+record names are **relative** to it: the record `api` in the zone `svc.test`
+answers `api.svc.test`. A zone with a `defaultIP` answers every name under it
+that no record matches; one without answers those `NXDOMAIN`, because a name
+inside a zone this gateway owns and does not have is not a question for a public
+resolver — forwarding it would leak the guest's internal names and wait out a
+timeout to return the same answer.
+
+Zones from `Configuration.dnsRecords` are **protected**: the control API cannot
+replace them, because the guests were told `gateway.containers.internal` is how
+they reach the host and an API that could point that name elsewhere is one that
+can cut every guest off from it.
+
+Where a name falls in two zones, **the more specific one answers**. Upstream
+takes the first suffix match in its list, so the answer depends on which zone was
+added first; the more specific zone is the authoritative one, and making that
+depend on insertion order turns a DNS question into a configuration accident.
 
 ### Several guests
 
@@ -139,7 +161,7 @@ that instead.
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
 | **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
-| **Gateway** | DHCP server, DNS server with owned zones and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
+| **Gateway** | DHCP server, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 | **Observability** | `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
 
 **Not yet implemented:** IPv6.
@@ -221,7 +243,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-712 tests, plus a differential harness in `differential/` that drives gVisor's
+718 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three

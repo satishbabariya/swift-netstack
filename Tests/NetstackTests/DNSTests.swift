@@ -468,3 +468,194 @@ private func awaitReply(_ fd: Int32) async -> ByteBuffer? {
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+@Test func aZoneWithADefaultAddressAnswersEveryNameUnderIt() async throws {
+    // Upstream's `DefaultIP`, which is the wildcard. Without a zone, a name this
+    // gateway does not have goes to a real resolver; with a zone and no default,
+    // it is NXDOMAIN; with a default, it is the default. All three are different
+    // answers and this checks the third against the second.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await zoneGateway(group: group, guestSide: &guestSide)
+    let server = try #require(holder.server)
+
+    let wildcard = IPv4Address("10.9.8.7")!
+    let added = try await holder.stack!.eventLoop.submit {
+        server.addZone(DNSServer.Zone(name: "apps.test", defaultAddress: wildcard))
+    }.get()
+    #expect(added)
+
+    let answer = try #require(await zoneAsk(guestSide, "anything.apps.test", id: 0x51))
+    #expect(answer.code == 0, "a name in a wildcard zone was not answered")
+    #expect(answer.address == wildcard)
+
+    // The apex too, not only names below it.
+    let apex = try #require(await zoneAsk(guestSide, "apps.test", id: 0x52))
+    #expect(apex.address == wildcard)
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func aRecordInAZoneIsNamedRelativeToIt() async throws {
+    // The part of upstream's model that is not the obvious one: a zone's record
+    // names are relative, so `gateway` in `containers.internal` answers
+    // `gateway.containers.internal`. Reading them as absolute makes every record
+    // added through the API silently unreachable.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await zoneGateway(group: group, guestSide: &guestSide)
+    let server = try #require(holder.server)
+
+    let host = IPv4Address("10.1.1.1")!
+    let fallback = IPv4Address("10.2.2.2")!
+    _ = try await holder.stack!.eventLoop.submit {
+        server.addZone(
+            DNSServer.Zone(
+                name: "svc.test", records: [.init(name: "api", address: host)],
+                defaultAddress: fallback))
+    }.get()
+
+    let exact = try #require(await zoneAsk(guestSide, "api.svc.test", id: 0x61))
+    #expect(exact.address == host, "the relative record did not answer")
+    // And the default is still what everything else gets, so the record above is
+    // being matched rather than merely reached.
+    let other = try #require(await zoneAsk(guestSide, "other.svc.test", id: 0x62))
+    #expect(other.address == fallback)
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func theZonesFromTheGatewaysOwnConfigurationCannotBeTakenOverAtRuntime() async throws {
+    // The one refusal `addZone` has. The guests were told this gateway is their
+    // resolver and `gateway.containers.internal` is how they reach the host; an
+    // API that could point that name somewhere else is an API that can cut every
+    // guest off from the thing it was pointed at.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await zoneGateway(group: group, guestSide: &guestSide)
+    let server = try #require(holder.server)
+
+    let hijack = try await holder.stack!.eventLoop.submit {
+        server.addZone(
+            DNSServer.Zone(name: "containers.internal", defaultAddress: IPv4Address("6.6.6.6")!))
+    }.get()
+    #expect(!hijack, "a protected zone was replaced")
+
+    // The floor: an unprotected zone still goes in, so the refusal above is the
+    // protection working rather than `addZone` refusing everything.
+    let ordinary = try await holder.stack!.eventLoop.submit {
+        server.addZone(DNSServer.Zone(name: "other.test", defaultAddress: IPv4Address("6.6.6.6")!))
+    }.get()
+    #expect(ordinary)
+
+    let answer = try #require(await zoneAsk(guestSide, "gateway.containers.internal", id: 0x71))
+    #expect(answer.address == dnsGateway, "the protected name stopped resolving to the gateway")
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func addingAZoneThatExistsMergesRatherThanReplacing() async throws {
+    // Upstream merges, and the reason is the caller: a tool adding one name
+    // should not have to know, or resend, every name already there.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await zoneGateway(group: group, guestSide: &guestSide)
+    let server = try #require(holder.server)
+
+    _ = try await holder.stack!.eventLoop.submit {
+        server.addZone(
+            DNSServer.Zone(name: "merge.test", records: [.init(name: "one", address: IPv4Address("10.0.0.1")!)]))
+        server.addZone(
+            DNSServer.Zone(name: "merge.test", records: [.init(name: "two", address: IPv4Address("10.0.0.2")!)]))
+    }.get()
+
+    let first = try #require(await zoneAsk(guestSide, "one.merge.test", id: 0x81))
+    #expect(first.address == IPv4Address("10.0.0.1")!, "the first record was lost by the second call")
+    let second = try #require(await zoneAsk(guestSide, "two.merge.test", id: 0x82))
+    #expect(second.address == IPv4Address("10.0.0.2")!)
+
+    // And the same name again updates rather than duplicating.
+    _ = try await holder.stack!.eventLoop.submit {
+        server.addZone(
+            DNSServer.Zone(name: "merge.test", records: [.init(name: "one", address: IPv4Address("10.0.0.9")!)]))
+    }.get()
+    let updated = try #require(await zoneAsk(guestSide, "one.merge.test", id: 0x83))
+    #expect(updated.address == IPv4Address("10.0.0.9")!, "re-adding a record did not update it")
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+@Test func theMoreSpecificZoneAnswersRegardlessOfTheOrderTheyWereAdded() async throws {
+    // Where this departs from upstream. Upstream walks its zone list in order and
+    // takes the first suffix match, so which zone answers depends on which was
+    // added first -- a DNS question decided by a configuration accident. The more
+    // specific zone is the authoritative one; that is what delegation means.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await zoneGateway(group: group, guestSide: &guestSide)
+    let server = try #require(holder.server)
+
+    let broad = IPv4Address("10.5.0.1")!
+    let narrow = IPv4Address("10.5.0.2")!
+    _ = try await holder.stack!.eventLoop.submit {
+        // Broad first, so first-match order would give the wrong answer.
+        server.addZone(DNSServer.Zone(name: "deep.test", defaultAddress: broad))
+        server.addZone(DNSServer.Zone(name: "inner.deep.test", defaultAddress: narrow))
+    }.get()
+
+    let answer = try #require(await zoneAsk(guestSide, "host.inner.deep.test", id: 0x91))
+    #expect(answer.address == narrow, "the broader zone answered for a name the narrower one owns")
+    let outside = try #require(await zoneAsk(guestSide, "host.deep.test", id: 0x92))
+    #expect(outside.address == broad)
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
+
+/// A zone fixture with no upstream at all: these tests are about what the
+/// gateway answers itself, and a resolver behind it would make a wrong answer
+/// look like a forwarded one.
+private func zoneGateway(group: EventLoopGroup, guestSide: inout Int32) async throws -> DNSHolder {
+    var pair: [Int32] = [0, 0]
+    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    guestSide = pair[1]
+    let link = try await WireBootstrap.adoptingDatagramSocket(
+        pair[0], group: group, linkAddress: dnsGatewayMAC, mtu: 1500
+    ).get()
+    let holder = DNSHolder()
+    holder.link = link
+    try await link.eventLoop.submit {
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: dnsGateway, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!))
+        stack.start()
+        stack.arpCache.record(dnsGuest, dnsGuestMAC)
+        holder.stack = stack
+        holder.server = try DNSServer(
+            stack: stack, records: [.init(name: "gateway.containers.internal", address: dnsGateway)])
+    }.get()
+    return holder
+}
+
+/// Ask over the wire and read the A record back.
+private func zoneAsk(_ fd: Int32, _ name: String, id: UInt16) async -> (address: IPv4Address?, code: UInt16?)? {
+    askOverWire(fd, dnsQuery(name, id: id))
+    guard let reply = await awaitReply(fd) else { return nil }
+    return (answeredAddress(reply), responseCode(reply))
+}

@@ -112,6 +112,36 @@ public final class ControlPlane: @unchecked Sendable {
             // `Gateway.Statistics`.
             return loop.makeSucceededFuture((.ok, gateway.statisticsOnLoop().json))
 
+        case (.GET, "/services/dns/all"):
+            let zones = gateway.dns.allZones.map { zone -> String in
+                let records = zone.records.map { record -> String in
+                    var fields = ["\"name\":\"\(record.name)\""]
+                    if let address = record.address { fields.append("\"ip\":\"\(address)\"") }
+                    if let pattern = record.pattern {
+                        fields.append("\"regexp\":\"\(ControlPlane.escaped(pattern))\"")
+                    }
+                    return "{" + fields.joined(separator: ",") + "}"
+                }
+                var fields = ["\"name\":\"\(zone.name)\"", "\"records\":[" + records.joined(separator: ",") + "]"]
+                if let address = zone.defaultAddress { fields.append("\"defaultIP\":\"\(address)\"") }
+                fields.append("\"protected\":\(zone.isProtected)")
+                return "{" + fields.joined(separator: ",") + "}"
+            }
+            return loop.makeSucceededFuture((.ok, "[" + zones.joined(separator: ",") + "]"))
+
+        case (.POST, "/services/dns/add"):
+            guard let body, let zone = ZoneRequest(body)?.zone else {
+                return loop.makeSucceededFuture(
+                    (.badRequest, "{\"error\":\"expected a zone with a name and at least one record or a defaultIP\"}"))
+            }
+            guard gateway.dns.addZone(zone) else {
+                // The only refusal. A protected zone is one the gateway's own
+                // configuration created, and the guests were pointed at it.
+                return loop.makeSucceededFuture(
+                    (.conflict, "{\"error\":\"cannot modify protected zone \(zone.name)\"}"))
+            }
+            return loop.makeSucceededFuture((.ok, "{}"))
+
         case (.GET, "/cam"):
             // Upstream serves the switch's learned address table here. A gateway
             // on a single wire has no switch and no table, and says so with an
@@ -160,6 +190,64 @@ public final class ControlPlane: @unchecked Sendable {
         default:
             return loop.makeSucceededFuture((.notFound, "{\"error\":\"no such route\"}"))
         }
+    }
+}
+
+extension ControlPlane {
+    /// Enough JSON string escaping for the values this API emits, which are
+    /// names and patterns rather than arbitrary text. Quotes and backslashes
+    /// because they end the string, and control characters because a name that
+    /// carried one would produce output no parser has to accept.
+    fileprivate static func escaped(_ text: String) -> String {
+        var out = String()
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out
+    }
+}
+
+/// `{"name": "my.zone.", "records": [{"name": "host", "ip": "1.2.3.4"}], "defaultIP": "1.2.3.4"}`
+/// -- upstream's `types.Zone` on the wire.
+private struct ZoneRequest {
+    let zone: DNSServer.Zone
+
+    init?(_ body: ByteBuffer) {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)),
+            let fields = object as? [String: Any],
+            let name = fields["name"] as? String
+        else { return nil }
+        // Upstream's validation, and each rule is one an operator can hit by
+        // accident: the root zone would make this gateway authoritative for the
+        // whole internet, and a zone with neither records nor a default answers
+        // NXDOMAIN for everything under it -- which is a way to break name
+        // resolution that looks like a way to configure it.
+        var trimmed = name.lowercased()
+        while trimmed.hasSuffix(".") { trimmed.removeLast() }
+        guard !trimmed.isEmpty, trimmed.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" })
+        else { return nil }
+
+        var records: [DNSServer.Zone.Record] = []
+        for entry in (fields["records"] as? [[String: Any]]) ?? [] {
+            guard let recordName = entry["name"] as? String, !recordName.isEmpty else { return nil }
+            let address = (entry["ip"] as? String).flatMap(IPv4Address.init)
+            let pattern = entry["regexp"] as? String
+            guard address != nil || pattern != nil else { return nil }
+            records.append(
+                DNSServer.Zone.Record(name: recordName, address: address, pattern: pattern))
+        }
+        let defaultAddress = (fields["defaultIP"] as? String).flatMap(IPv4Address.init)
+        guard !records.isEmpty || defaultAddress != nil else { return nil }
+        zone = DNSServer.Zone(name: trimmed, records: records, defaultAddress: defaultAddress)
     }
 }
 

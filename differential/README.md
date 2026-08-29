@@ -868,13 +868,35 @@ that had not been sent. RFC 9293 §3.10.7.4 answers that with an ACK and gVisor
 stays silent, which is a real difference on an acknowledgement the generator
 never meant to produce.
 
-**RACK is off in the harness** (`tcpip.TCPRecovery(0)`), a configuration
-difference in the same family as Nagle and delayed ACKs above. With SACK
-negotiated gVisor enables RACK-TLP (RFC 8985), whose tail loss probe fires
-around 200 ms after the last transmission — so gVisor retransmits a FIN once
-before its RTO would have, and this stack waits out the full RTO. gVisor's
-behaviour is better; the setting records the gap rather than denying it, and
-RACK is the next TCP feature.
+**RACK is off in the harness** (`tcpip.TCPRecovery(0)`), and this stack has
+RACK-TLP, so the reason is not "one side does not implement it". Two lifts have
+been attempted.
+
+**The first** found every divergence in the same shape — one stack sending a
+retransmission exactly one step before the other, of the same segment — and it
+was blamed on the residual RTO difference this file recorded. That was correct,
+and that difference is now **fixed**: see *The residual disagreement: closed, by
+RFC 7323 Appendix G* above.
+
+**The second, after the fix, still does not hold**, and the reason is now precise
+rather than inferred. gVisor **replaces** its retransmission timer with the probe
+timer while a probe is armed: `schedulePTO` disables `resendTimer`, and
+`probeTimerExpired` re-enables it. So with RACK on, the first retransmission of a
+flight is owned by a different timer than it is here, where both run side by side
+and the retransmission timer wins. RACK's loss detection and its reordering timer
+agree frame for frame across two thousand sequences; what differs is *which timer
+fires first*.
+
+Adopting gVisor's structure would change when the RTO fires on every connection
+with RACK enabled. That is a bigger decision than parity and is not one to take
+by default, so it is recorded rather than chased — with the mechanism named, so
+the next attempt starts from it rather than from the same measurements.
+
+**Two things the attempts left behind**, both argued on the RFC rather than on
+matching: the probe's deadline is capped at the retransmission timer's own
+*deadline* rather than at the RTO *interval*; and the probe is armed as an
+interval from *now* rather than as a deadline off the last send, which is what
+§7.5.1's "upon transmission of new data or receipt of an ACK" asks for.
 
 **One recognised difference came out of it**, and it is the only one with a
 source line rather than an inference behind it. `connect.go`'s `sendRaw`

@@ -465,8 +465,23 @@ struct Sender {
     /// retransmission in flight doing the same job, and a probe would be a
     /// second segment sent to learn something the first will report.
     var tailProbeDeadline: NIODeadline? {
+        guard let interval = tailProbeInterval else { return nil }
+        return clock.now() + interval
+    }
+
+    /// How long from NOW the probe should wait.
+    ///
+    /// §7.5.1 arms the timer "upon transmission of new data or receipt of an
+    /// ACK", and the PTO is a duration measured from that moment -- not from
+    /// when the last segment happened to go out. The difference shows on any
+    /// connection whose peer is still sending: an acknowledgement re-arms the
+    /// probe, and a deadline anchored to an older send time fires sooner than
+    /// the RFC asks, sometimes much sooner.
+    ///
+    /// Measured against gVisor, which arms from the same two events.
+    var tailProbeInterval: TimeAmount? {
         guard rackEnabled, !rack.probeSent, recoveryPoint == nil, lostBytes == 0 else { return nil }
-        guard let last = inFlight.last, outstanding > 0 else { return nil }
+        guard inFlight.last != nil, outstanding > 0 else { return nil }
         let smoothed = estimator.smoothed
         guard smoothed > .zero else { return nil }
         // §7.2: twice the smoothed round trip, plus a delayed-acknowledgement
@@ -476,14 +491,17 @@ struct Sender {
         // is trying to beat.
         var interval = TimeAmount.nanoseconds(smoothed.nanoseconds * 2)
         if inFlight.count == 1 { interval = interval + Self.delayedAckAllowance }
-        var deadline = last.sentAt + interval
         // Capped at the RETRANSMISSION TIMER'S OWN DEADLINE, not at the RTO
         // interval. The two differ whenever the timer was armed before this
         // segment went out -- which is the ordinary case for a flight -- and the
         // probe exists to beat that timer, so a probe scheduled past it is a
         // probe that never happens.
-        if let timer = timerDeadline, deadline > timer { deadline = timer }
-        return deadline
+        let now = clock.now()
+        if let timer = timerDeadline {
+            let remaining = timer > now ? timer - now : .nanoseconds(0)
+            if interval > remaining { interval = remaining }
+        }
+        return interval
     }
 
     /// RFC 8985 §7.2's `WCDelAckT`: the worst-case delayed acknowledgement a

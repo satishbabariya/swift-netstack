@@ -251,12 +251,26 @@ public final class Gateway: @unchecked Sendable {
     /// wants to read where a forward actually landed.
     public func forwarderForTesting(hostPort: Int) -> PortForwarder? { forwards[hostPort] }
 
+    /// Close everything, and complete when the gateway is **finished with the
+    /// event loop** rather than when the wire's channel reports closed.
+    ///
+    /// The difference matters to any caller that shuts its `EventLoopGroup` down
+    /// afterwards, which is every test here and most embedders. Channel teardown
+    /// defers its last step -- `removeHandlers`, which is what breaks the
+    /// channel/pipeline retain cycle -- to a later tick, so work is still queued
+    /// when the close future fires. Shutting the group down at that moment
+    /// leaves that work scheduling onto a dead loop, which NIO currently warns
+    /// about and says it will turn into a crash.
+    ///
+    /// One extra hop is enough and no more: the deferred blocks were queued
+    /// before this hop, and a loop runs its queue in order.
     public func close() -> EventLoopFuture<Void> {
         for forwarder in forwards.values { forwarder.close() }
         forwards.removeAll()
         udp.close()
         dns.close()
         dhcp.close()
-        return link.close()
+        let loop = eventLoop
+        return link.close().flatMap { loop.submit {} }.flatMap { loop.submit {} }
     }
 }

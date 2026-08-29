@@ -171,10 +171,12 @@ NETSTACK_THROUGHPUT=1 swift test -c release --filter Throughput
 
 The third is a **benchmark, not a gate**: it pushes 32 MiB through the whole
 gateway to a real loopback listener and prints a rate. It measured **618 Mbit/s
-in a release build** (85 in debug) on an Apple-silicon laptop, and a good part of
-that is the test itself — one `send` syscall per 1400-byte segment, serialised
-with the work being measured. It asserts only that every byte arrived: a
-throughput number from a run that lost data is a number about something else.
+in a release build** (85 in debug) on an Apple-silicon laptop. Profiling that run
+says the socket calls dominate it: `write`, `sendto`, `recvfrom` and `read`
+together take around forty times the samples that `TCPHeader.serialize` and
+`TCPHeader.parse` do, so the benchmark measures its own harness at least as much
+as the stack. It asserts only that every byte arrived — a throughput number from
+a run that lost data is a number about something else.
 
 637 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. The

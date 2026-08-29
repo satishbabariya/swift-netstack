@@ -33,6 +33,7 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     private let stack: Stack
     private let eventLoop: EventLoop
     private let maximumConnections: Int
+    private let keepAlive: TCPEndpoint.KeepAliveConfiguration?
     private var forwarder: TCPForwarder?
     private var live = 0
 
@@ -45,10 +46,25 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     /// Connections refused because the destination did not accept.
     public private(set) var refusedForDial = 0
 
-    public init(stack: Stack, maximumInFlight: Int = 512, maximumConnections: Int = 1024) {
+    /// `keepAlive` is on by default here, which is the opposite of
+    /// `TCPEndpoint`'s default and deliberately so.
+    ///
+    /// RFC 1122 wants keep-alive off because a probe costs traffic and can tear
+    /// down a connection that is merely quiet. Neither applies to the guest side
+    /// of a gateway: the probe travels over a unix socket, so it costs nothing,
+    /// and the connection it might tear down is one whose peer is a VM this
+    /// process can see the state of. What it buys is the case nothing else
+    /// covers -- a guest that goes away without closing leaves an endpoint and
+    /// the host socket spliced to it held forever, because with no data
+    /// outstanding the retransmit timer never runs.
+    public init(
+        stack: Stack, maximumInFlight: Int = 512, maximumConnections: Int = 1024,
+        keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration()
+    ) {
         self.stack = stack
         self.eventLoop = stack.eventLoop
         self.maximumConnections = max(1, maximumConnections)
+        self.keepAlive = keepAlive
         forwarder = TCPForwarder(stack: stack, maximumInFlight: maximumInFlight) { [weak self] request in
             self?.handle(request)
         }
@@ -105,6 +121,7 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             outbound.close(promise: nil)
             return
         }
+        endpoint.keepAlive = keepAlive
         let guestChannel = NetstackStreamChannel(
             eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
         guestChannel.installCallbacks()

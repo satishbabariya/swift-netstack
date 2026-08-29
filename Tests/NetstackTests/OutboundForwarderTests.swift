@@ -236,3 +236,58 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
         context.writeAndFlush(wrapOutboundOut(out), promise: nil)
     }
 }
+
+@Test func aGuestThatVanishesWithoutClosingIsGivenUpOnAndItsHostSocketReleased() async throws {
+    // The case keep-alive exists for here, and the reason it defaults ON for
+    // forwarded connections where RFC 1122 defaults it off: with no data
+    // outstanding the retransmit timer never runs, so a guest that stops
+    // answering holds an endpoint and the host socket spliced to it forever.
+    //
+    // The probe costs nothing on this wire -- it travels over a unix socket --
+    // which is what makes the RFC's reason for defaulting it off not apply.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide)
+    // A budget measured in milliseconds, so the test does not measure the
+    // default two hours.
+    try await holder.link!.eventLoop.submit {
+        holder.forwarder = OutboundTCPForwarder(
+            stack: holder.stack!,
+            keepAlive: .init(idle: .milliseconds(20), interval: .milliseconds(10), count: 2))
+    }.get()
+
+    let listener = try await ServerBootstrap(group: group)
+        .childChannelInitializer { channel in channel.eventLoop.makeSucceededVoidFuture() }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+
+    send(guestSide, guestFrame(
+        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
+    let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+    let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
+    send(guestSide, guestFrame(
+        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+        acknowledgement: answer.header.sequence.value &+ 1, flags: [.ack]))
+    _ = await awaitSegments(guestSide) { _ in true }
+
+    // The guest now vanishes: it answers nothing, including the probes.
+    let reset = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.rst) } }
+    #expect(
+        reset.contains { $0.header.flags.contains(.rst) },
+        "the connection was held open for a guest that stopped answering")
+
+    // And the slot it held is back.
+    for _ in 0..<200 {
+        let live = try await holder.link!.eventLoop.submit { holder.forwarder?.establishedCount ?? -1 }.get()
+        if live == 0 { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    let live = try await holder.link!.eventLoop.submit { holder.forwarder?.establishedCount ?? -1 }.get()
+    #expect(live == 0, "the host socket was not released")
+
+    try? await listener.close()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

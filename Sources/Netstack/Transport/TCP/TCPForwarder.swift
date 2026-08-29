@@ -87,7 +87,7 @@ public final class TCPForwarder {
     }
 
     deinit {
-        // Housekeeping, and NOT what makes a dropped forwarder safe.
+        // Ownership-checked, and NOT what makes a dropped forwarder safe.
         //
         // The `[weak self]` capture is what does that: with it, a handler left
         // installed sees `self == nil`, returns false, and the segment falls
@@ -97,12 +97,18 @@ public final class TCPForwarder {
         // did not fail, including against a test written specifically to catch
         // it.
         //
-        // What it buys is releasing the closure the demuxer still holds. That is
-        // a small leak per forwarder created, not a correctness matter, and
-        // saying so here is the point: a reader who assumes a test guards this
-        // line will be wrong, and would rather learn it from the comment than
-        // from a falsification that quietly passes.
-        stack.transportDemuxer.setProtocolHandler(.tcp, nil)
+        // What it buys is releasing the closure the demuxer still holds -- a
+        // small leak per forwarder created rather than a correctness matter.
+        //
+        // **The `ownedBy` is not decoration, and the earlier version of this
+        // line was a defect.** It cleared the slot unconditionally, so replacing
+        // a forwarder -- install the new one, release the old one -- had the old
+        // one's teardown remove the NEW one's handler. Nothing errored; the
+        // datapath simply stopped being intercepted, which presents as a gateway
+        // that has silently stopped forwarding. The comment here used to say
+        // removing this line changes no observable behaviour, and a test that
+        // replaced a forwarder found otherwise.
+        stack.transportDemuxer.clearProtocolHandler(.tcp, ownedBy: self)
     }
 
     private func install() {
@@ -110,7 +116,7 @@ public final class TCPForwarder {
         // arrives whole, so this parses the header anyway -- for the flags, the
         // sequence number and the options -- and reading the ports from
         // anywhere but that parse would be two sources for one fact.
-        stack.transportDemuxer.setProtocolHandler(.tcp) { [weak self] header, payload, _, _ in
+        stack.transportDemuxer.setProtocolHandler(.tcp, ownedBy: self) { [weak self] header, payload, _, _ in
             guard let self else { return false }
             return self.handle(header: header, payload: payload)
         }

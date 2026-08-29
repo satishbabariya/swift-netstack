@@ -15,6 +15,9 @@ public final class TransportDemuxer {
 
     private var registrations: [Key: Registration] = [:]
     private var protocolHandlers: [UInt8: (IPv4Header, ByteBuffer, UInt16, UInt16) -> Bool] = [:]
+    /// Who installed each handler, so a departing owner cannot uninstall
+    /// somebody else's. See `clearProtocolHandler(_:ownedBy:)`.
+    private var protocolHandlerOwners: [UInt8: ObjectIdentifier] = [:]
     private var nextEphemeral: UInt16 = 49152
 
     public init() {}
@@ -72,6 +75,35 @@ public final class TransportDemuxer {
         _ protocolNumber: IPProtocol, _ handler: ((IPv4Header, ByteBuffer, UInt16, UInt16) -> Bool)?
     ) {
         protocolHandlers[protocolNumber.rawValue] = handler
+        protocolHandlerOwners[protocolNumber.rawValue] = nil
+    }
+
+    /// Install a handler and record who owns it.
+    public func setProtocolHandler(
+        _ protocolNumber: IPProtocol, ownedBy owner: AnyObject,
+        _ handler: @escaping (IPv4Header, ByteBuffer, UInt16, UInt16) -> Bool
+    ) {
+        protocolHandlers[protocolNumber.rawValue] = handler
+        protocolHandlerOwners[protocolNumber.rawValue] = ObjectIdentifier(owner)
+    }
+
+    /// Remove a handler **only if `owner` is the one that installed it**.
+    ///
+    /// The unconditional form is a hazard whenever two owners' lifetimes
+    /// overlap, which is the ordinary shape of replacing one: the replacement
+    /// installs its handler, the original is then released, and its teardown
+    /// removes the replacement's. Nothing errors -- the datapath simply stops
+    /// being intercepted, which presents as a gateway that has silently stopped
+    /// forwarding.
+    ///
+    /// Found by a test that replaced a forwarder to shorten its keep-alive: the
+    /// connection that followed was never answered, and the comment on the
+    /// forwarder's own teardown said removing that line "changes no observable
+    /// behaviour". It does.
+    public func clearProtocolHandler(_ protocolNumber: IPProtocol, ownedBy owner: AnyObject) {
+        guard protocolHandlerOwners[protocolNumber.rawValue] == ObjectIdentifier(owner) else { return }
+        protocolHandlers[protocolNumber.rawValue] = nil
+        protocolHandlerOwners[protocolNumber.rawValue] = nil
     }
 
     /// Whether something has already taken over a protocol's datapath.

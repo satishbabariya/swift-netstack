@@ -295,32 +295,71 @@ public final class ControlPlane: @unchecked Sendable {
             return loop.makeSucceededFuture((.ok, "{" + leases.joined(separator: ",") + "}"))
 
         case (.GET, "/services/forwarder/all"):
-            let ports = gateway.forwardedPorts
-            let json = "[" + ports.map { "{\"local\":\":\($0)\"}" }.joined(separator: ",") + "]"
-            return loop.makeSucceededFuture((.ok, json))
+            // Each entry names its protocol, because a host port is only unique
+            // within one: 8080/tcp and 8080/udp are different forwards and both
+            // may be published at once. Upstream's own listing carries the same
+            // field for the same reason.
+            var entries = gateway.forwardedPorts.map { "{\"local\":\":\($0)\",\"protocol\":\"tcp\"}" }
+            entries += gateway.forwardedUDPPorts.map { "{\"local\":\":\($0)\",\"protocol\":\"udp\"}" }
+            entries += gateway.forwardedUnixPaths.map {
+                "{\"local\":\"\(ControlPlane.escaped($0))\",\"protocol\":\"unix\"}"
+            }
+            return loop.makeSucceededFuture((.ok, "[" + entries.joined(separator: ",") + "]"))
 
         case (.POST, "/services/forwarder/expose"):
             guard let body, let request = ExposeRequest(body) else {
                 return loop.makeSucceededFuture(
                     (.badRequest, "{\"error\":\"expected local and remote as host:port\"}"))
             }
-            return gateway.forward(
-                hostPort: request.hostPort, toGuest: request.guestAddress, port: request.guestPort,
-                host: request.hostInterface
-            ).map { forwarder -> (status: HTTPResponseStatus, body: String) in
-                let bound = forwarder.listeningAddress?.port ?? request.hostPort
-                return (.ok, "{\"local\":\":\(bound)\"}")
-            }.flatMapError { error in
-                loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+            switch request.transport {
+            case .tcp:
+                return gateway.forward(
+                    hostPort: request.hostPort, toGuest: request.guestAddress, port: request.guestPort,
+                    host: request.hostInterface
+                ).map { forwarder -> (status: HTTPResponseStatus, body: String) in
+                    let bound = forwarder.listeningAddress?.port ?? request.hostPort
+                    return (.ok, "{\"local\":\":\(bound)\",\"protocol\":\"tcp\"}")
+                }.flatMapError { error in
+                    loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+                }
+            case .udp:
+                return gateway.forwardUDP(
+                    hostPort: request.hostPort, toGuest: request.guestAddress, port: request.guestPort,
+                    host: request.hostInterface
+                ).map { forwarder -> (status: HTTPResponseStatus, body: String) in
+                    let bound = forwarder.listeningAddress?.port ?? request.hostPort
+                    return (.ok, "{\"local\":\":\(bound)\",\"protocol\":\"udp\"}")
+                }.flatMapError { error in
+                    loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+                }
+            case .unix:
+                return gateway.forward(
+                    unixSocketPath: request.socketPath, toGuest: request.guestAddress,
+                    port: request.guestPort
+                ).map { _ -> (status: HTTPResponseStatus, body: String) in
+                    (.ok, "{\"local\":\"\(ControlPlane.escaped(request.socketPath))\",\"protocol\":\"unix\"}")
+                }.flatMapError { error in
+                    loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+                }
             }
 
         case (.POST, "/services/forwarder/unexpose"):
-            guard let body, let port = UnexposeRequest(body)?.hostPort else {
+            guard let body, let request = UnexposeRequest(body) else {
                 return loop.makeSucceededFuture((.badRequest, "{\"error\":\"expected local as :port\"}"))
             }
-            guard gateway.stopForwarding(hostPort: port) else {
+            // Dispatched on the protocol, because a host port is only unique
+            // within one: withdrawing ":8080" without saying which would take
+            // down whichever table happened to be looked at first.
+            let stopped: Bool
+            switch request.transport {
+            case .tcp: stopped = gateway.stopForwarding(hostPort: request.hostPort)
+            case .udp: stopped = gateway.stopForwardingUDP(hostPort: request.hostPort)
+            case .unix: stopped = gateway.stopForwarding(unixSocketPath: request.socketPath)
+            }
+            guard stopped else {
                 return loop.makeSucceededFuture(
-                    (.notFound, "{\"error\":\"no forward on port \(port)\"}"))
+                    (.notFound,
+                     "{\"error\":\"no \(request.transport.rawValue) forward on \(ControlPlane.escaped(request.local))\"}"))
             }
             return loop.makeSucceededFuture((.ok, "{}"))
 
@@ -547,10 +586,26 @@ private struct TunnelRequest {
     }
 }
 
-/// `{"local": ":8080", "remote": "192.168.127.2:80"}`, in upstream's shape.
+/// The transports a forward can be published on. Upstream's
+/// `types.TransportProtocol`, less `npipe`, which is a Windows named pipe and
+/// has no meaning on the platforms this package targets.
+enum ForwardTransport: String {
+    case tcp
+    case udp
+    case unix
+}
+
+/// `{"local": ":8080", "remote": "192.168.127.2:80", "protocol": "tcp"}`, in
+/// upstream's shape.
+///
+/// `protocol` is optional and defaults to `tcp`, which is upstream's default and
+/// keeps every request written before this existed working unchanged.
 private struct ExposeRequest {
+    let transport: ForwardTransport
     let hostInterface: String
     let hostPort: Int
+    /// For `unix`, `local` is a filesystem path rather than a host and port.
+    let socketPath: String
     let guestAddress: IPv4Address
     let guestPort: UInt16
 
@@ -559,19 +614,35 @@ private struct ExposeRequest {
             let fields = object as? [String: Any],
             let local = fields["local"] as? String, let remote = fields["remote"] as? String
         else { return nil }
+        let transport = ForwardTransport(rawValue: (fields["protocol"] as? String) ?? "tcp")
+        guard let transport else { return nil }
+        self.transport = transport
+
+        guard let (guestHost, guestText) = ExposeRequest.split(remote),
+            let address = IPv4Address(guestHost), let guest = UInt16(guestText)
+        else { return nil }
+        guestAddress = address
+        guestPort = guest
+
+        if transport == .unix {
+            // A path, not an address. Rejected if it is empty or relative: a
+            // relative path is resolved against whatever directory this process
+            // happens to be in, which is not something the caller can know.
+            guard local.hasPrefix("/") else { return nil }
+            socketPath = local
+            hostInterface = ""
+            hostPort = 0
+            return
+        }
+        socketPath = ""
         // `":8080"` means loopback, `"0.0.0.0:8080"` means everywhere. The empty
         // host is upstream's spelling and it is also the safe one, which is why
         // it maps to loopback rather than to the wildcard.
         guard let (host, port) = ExposeRequest.split(local), let hostPort = Int(port), hostPort >= 0,
             hostPort <= 65535
         else { return nil }
-        guard let (guestHost, guestPort) = ExposeRequest.split(remote),
-            let address = IPv4Address(guestHost), let guest = UInt16(guestPort)
-        else { return nil }
         hostInterface = host.isEmpty ? "127.0.0.1" : host
         self.hostPort = hostPort
-        guestAddress = address
-        self.guestPort = guest
     }
 
     /// Split on the LAST colon, so an address containing one is not cut in the
@@ -584,25 +655,34 @@ private struct ExposeRequest {
     }
 }
 
-/// `{"local": ":8080"}`.
+/// `{"local": ":8080", "protocol": "tcp"}`.
 private struct UnexposeRequest {
+    let transport: ForwardTransport
     let hostPort: Int
+    let socketPath: String
+    let local: String
 
     init?(_ body: ByteBuffer) {
         guard let object = try? JSONSerialization.jsonObject(with: Data(body.readableBytesView)),
             let fields = object as? [String: Any],
-            let local = fields["local"] as? String,
-            let (_, port) = ExposeRequest.split(local), let hostPort = Int(port)
+            let local = fields["local"] as? String
         else { return nil }
+        guard let transport = ForwardTransport(rawValue: (fields["protocol"] as? String) ?? "tcp")
+        else { return nil }
+        self.transport = transport
+        self.local = local
+        if transport == .unix {
+            guard local.hasPrefix("/") else { return nil }
+            socketPath = local
+            hostPort = 0
+            return
+        }
+        socketPath = ""
+        guard let (_, port) = ExposeRequest.split(local), let hostPort = Int(port) else { return nil }
         self.hostPort = hostPort
     }
 }
 
-/// `RemovableChannelHandler` because `/tunnel` and `/connect` take the
-/// connection off HTTP, and removing this handler is the first step. Without the
-/// conformance the removal fails with "Unremovable handler" and the hijack
-/// closes the connection instead -- which looks exactly like a route that is
-/// not wired up.
 private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart

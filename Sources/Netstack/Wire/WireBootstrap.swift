@@ -1,3 +1,5 @@
+import Foundation
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 
@@ -108,6 +110,76 @@ public enum WireBootstrap {
         }
     }
 
+    /// Bind a unix datagram socket at `path` and serve whoever sends to it.
+    ///
+    /// This is the shape vfkit and qemu expect: they are given a path and dial
+    /// it, so the gateway is the one that listens. Every `connecting…` entry
+    /// point above is the other way round, for a host that already knows where
+    /// the guest is.
+    ///
+    /// The peer is **learned from the first datagram** rather than configured,
+    /// because a bound datagram socket has no peer until something sends to it
+    /// and there is nothing to configure it with. Replies go to whoever last
+    /// sent, which is the same rule upstream's `unixgram` transport uses and is
+    /// correct for the one thing this wire carries: a single guest.
+    public static func listeningDatagramSocket(
+        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
+    ) -> EventLoopFuture<WireLinkEndpoint> {
+        let frameSize = Int(mtu) + EthernetHeader.length
+        do {
+            try FileManager.default.removeItem(atPath: path)
+        } catch {
+            // Absent is the ordinary case and not an error. Anything else -- a
+            // path that exists and cannot be removed -- surfaces from the bind
+            // below, where the message names the path.
+        }
+        do {
+            let local = try SocketAddress(unixDomainSocketPath: path)
+            return DatagramBootstrap(group: group)
+                .channelOption(.recvAllocator, value: FixedSizeRecvByteBufferAllocator(capacity: frameSize))
+                .bind(to: local)
+                .flatMap { channel in
+                    configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false, learnsPeer: true)
+                }
+        } catch {
+            return group.any().makeFailedFuture(error)
+        }
+    }
+
+    /// Bind a unix stream socket at `path` and serve the first guest to connect.
+    ///
+    /// The returned future completes when that connection arrives, not when the
+    /// socket is bound -- there is no link until there is a guest, and a link
+    /// with no wire behind it would be a thing callers could write to and lose.
+    ///
+    /// One guest. A second connection is closed rather than served: this wire
+    /// carries one ethernet segment, and two guests on it would need a switch
+    /// that learns which addresses are behind which socket.
+    public static func listeningStreamSocket(
+        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
+    ) -> EventLoopFuture<WireLinkEndpoint> {
+        try? FileManager.default.removeItem(atPath: path)
+        let arrived = group.any().makePromise(of: WireLinkEndpoint.self)
+        let accepted = NIOLockedValueBox(false)
+        ServerBootstrap(group: group)
+            .serverChannelOption(.backlog, value: 1)
+            .childChannelInitializer { channel in
+                let first = accepted.withLockedValue { taken -> Bool in
+                    defer { taken = true }
+                    return !taken
+                }
+                guard first else { return channel.close() }
+                return configure(
+                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true
+                ).map { link in
+                    arrived.succeed(link)
+                }
+            }
+            .bind(unixDomainSocketPath: path)
+            .whenFailure { arrived.fail($0) }
+        return arrived.futureResult
+    }
+
     /// Build the link and install the pipeline, on the channel's own loop.
     ///
     /// The link is constructed **before** the handlers that reference it, and
@@ -116,13 +188,15 @@ public enum WireBootstrap {
     /// cycle around a wire that is never released.
     private static func configure(
         channel: Channel, linkAddress: MACAddress, mtu: UInt32, framed: Bool, remote: SocketAddress? = nil,
-        flushPerFrame: Bool = false
+        flushPerFrame: Bool = false, learnsPeer: Bool = false
     ) -> EventLoopFuture<WireLinkEndpoint> {
         let link = WireLinkEndpoint(
             channel: channel, linkAddress: linkAddress, mtu: mtu, flushPerFrame: flushPerFrame)
         return channel.eventLoop.submit {
             let sync = channel.pipeline.syncOperations
-            if let remote {
+            if learnsPeer {
+                try sync.addHandler(LearnedPeerHandler())
+            } else if let remote {
                 try sync.addHandler(DatagramEnvelopeHandler(remote: remote))
             }
             if framed {

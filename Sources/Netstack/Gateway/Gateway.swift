@@ -124,6 +124,35 @@ public final class Gateway: @unchecked Sendable {
         }
     }
 
+    /// Bind a unix datagram socket and serve whoever sends to it -- the shape
+    /// vfkit expects, where the gateway listens and the VM dials.
+    public static func start(
+        listeningOnDatagramSocketAt path: String, group: EventLoopGroup,
+        configuration: Configuration = Configuration()
+    ) -> EventLoopFuture<Gateway> {
+        WireBootstrap.listeningDatagramSocket(
+            atPath: path, group: group, linkAddress: configuration.linkAddress, mtu: configuration.mtu
+        ).flatMap { link in
+            assemble(on: link, group: group, configuration: configuration)
+        }
+    }
+
+    /// Bind a unix stream socket and serve the first guest to connect -- qemu's
+    /// `-netdev socket,connect=`.
+    ///
+    /// The returned future completes when that guest arrives, not when the
+    /// socket is bound: there is no link until there is a wire behind it.
+    public static func start(
+        listeningOnStreamSocketAt path: String, group: EventLoopGroup,
+        configuration: Configuration = Configuration()
+    ) -> EventLoopFuture<Gateway> {
+        WireBootstrap.listeningStreamSocket(
+            atPath: path, group: group, linkAddress: configuration.linkAddress, mtu: configuration.mtu
+        ).flatMap { link in
+            assemble(on: link, group: group, configuration: configuration)
+        }
+    }
+
     /// Start on a stream socket carrying length-prefixed frames -- qemu's
     /// `-netdev socket`.
     public static func start(

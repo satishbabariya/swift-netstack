@@ -93,6 +93,28 @@ implementation. Whichever side of this you're touching next, do not
 introduce CUBIC (or any other congestion control) on either stack without
 updating this note and re-justifying the comparison.
 
+**Update: the Swift stack now HAS CUBIC** (`CongestionControlAlgorithm.cubic`,
+RFC 9438), and it is opt-in with Reno the default precisely so this comparison
+keeps working. That is not the whole reason, though, and the rest is worth
+stating because it says what it would take to lift this constraint the way the
+option constraints were lifted.
+
+gVisor keeps its congestion window in **whole segments**; this stack keeps a
+real number of them, because RFC 9438's growth rule adds
+`(W_cubic(t + RTT) - cwnd) / cwnd` per acknowledgement, which is a fraction of a
+segment on any window worth having and vanishes if rounded away at each step.
+Pinning both to CUBIC would therefore diverge on rounding at every
+acknowledgement — and the generator's connections, capped at one initial
+congestion window of data, never stay in congestion avoidance long enough for
+the shape of the curve to outweigh that. The comparison would report arithmetic
+units rather than behaviour, which is the same difference this file records for
+the advertised window.
+
+Lifting it needs the generator to sustain a transfer for tens of round trips,
+and a decision about the units. Until then CUBIC's evidence is `CubicTests`,
+which checks the formulas against the RFC's own arithmetic — weaker, and said so
+there too.
+
 ## Spoofing and promiscuous mode are both on
 
 The harness calls both `SetSpoofing(1, true)` and

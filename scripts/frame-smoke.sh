@@ -659,7 +659,7 @@ stream_smoke() {
     [[ -S "$WIRE" ]] || { echo "FAIL: the stream wire never appeared"; return 1; }
 
     EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
-import os, socket, struct, sys
+import os, socket, struct, sys, time
 
 expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
 guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
@@ -723,13 +723,31 @@ try:
     # used to be taken once and never released: the second connection was
     # accepted and closed, so a guest could not reboot without the gateway being
     # restarted alongside it.
+    #
+    # Retried, because the release happens when the gateway notices the close and
+    # a guest that reconnects instantly can beat it there. Bounded, because the
+    # bug being guarded against never releases at all: no number of attempts
+    # helps it.
     s.close()
-    held = b""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(10)
-    s.connect(os.environ["WIRE"])
-    s.sendall(struct.pack(">I", len(frame)) + frame)
-    await_reply("after the guest reconnected")
+    reconnected = False
+    for _ in range(20):
+        held = b""
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        try:
+            s.connect(os.environ["WIRE"])
+            s.sendall(struct.pack(">I", len(frame)) + frame)
+            if next_frame() is not None:
+                reconnected = True
+                break
+        except OSError:
+            pass
+        s.close()
+        time.sleep(0.25)
+    if not reconnected:
+        print("FAIL: the wire was never given to the returning guest, after 20 attempts",
+              "over five seconds, for", described)
+        sys.exit(1)
     print("ok: qemu  the wire was taken over again by a returning guest for", described)
 finally:
     s.close()

@@ -377,7 +377,10 @@ connection to the host address** and gets its bytes echoed back by a real
 listener on the loopback — the forwarder, the NAT rewrite and the splice in one
 question. It **exposes a host port into the guest** and requires bytes sent the
 instant the host connects to come back — which is how the silent data loss in
-`write0` was found, after 768 library tests had passed over it. It asks for **a name the gateway does not own**, which is every name a guest
+`write0` was found, after 768 library tests had passed over it. It sends **a UDP datagram to the host** and requires the reply to come back to
+the port it was sent from — nothing in a datagram says which conversation it
+belongs to, so that is the part with somewhere to go wrong. It asks for **a name
+the gateway does not own**, which is every name a guest
 actually asks for, and requires the answer a fake upstream on the loopback gave
 — the forwarding path is the resolver's whole job, and a check that needs the
 real internet is a check that fails for reasons of its own. And it drives

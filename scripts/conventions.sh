@@ -81,6 +81,29 @@ if [[ -n "$tcp" ]]; then
     fail "a public type under Transport/TCP outside the allowed surface" $tcp
 fi
 
+# 5. Every recognised differential difference is documented.
+#
+# The gate asserts an exact set of labels -- a fourth appearing, or a third
+# disappearing, fails it. But nothing connected that set to the prose, and
+# `differential/README.md` said "the one difference that is recognised" for some
+# time after there were three, with `sack-outside-established` described
+# nowhere at all.
+#
+# The labels are read out of the test's own assertion rather than listed here,
+# so this cannot drift from what the gate actually enforces.
+labels=$(sed -n '/Set(recognisedCounts.keys) == \[/,/\]/p' Tests/NetstackTests/TCPDifferentialTests.swift \
+    | grep -oE '"[a-z-]+(\+[a-z-]+)?"' | tr -d '"')
+if [[ -z "$labels" ]]; then
+    fail "could not read the recognised-difference labels out of TCPDifferentialTests" \
+        "the assertion this reads may have been reworded"
+else
+    for label in $labels; do
+        if ! grep -q -- "$label" differential/README.md; then
+            fail "the gate recognises '$label' and differential/README.md does not describe it"
+        fi
+    done
+fi
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

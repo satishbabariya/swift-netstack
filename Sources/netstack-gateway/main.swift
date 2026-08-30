@@ -141,8 +141,10 @@ let usage = """
       --listen <path>            Unix socket for the HTTP control API
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
       --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
-      --gatewayIP <address>      The gateway's own address (default 192.168.127.1)
-      --hostIP <address>         The address that means the host (default .254)
+      --gatewayIP <address>      The gateway's own address (default: the first
+                                 usable address of the subnet)
+      --hostIP <address>         The address that means the host (default: the
+                                 last usable address of the subnet)
       --subnet <cidr>            The subnet leased to guests (default 192.168.127.0/24)
       --mtu <bytes>              Link MTU (default 1500)
       --pcap <path>              Write every frame to a pcap file (capped at 64 MiB)

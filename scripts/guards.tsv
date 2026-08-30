@@ -25,3 +25,5 @@ Sources/Netstack/Network/Reassembler.swift	pendingCountIsBoundedIndependentlyOfT
 Sources/Netstack/Network/Reassembler.swift	rejectsFragmentsBeyondThePerDatagramCap	        guard entry.received.count < maximumFragmentsPerDatagram else { return nil }	        guard true else { return nil }
 Sources/Netstack/Gateway/ControlPlane.swift	everyMutatedRequestIsAnsweredOrClosedRatherThanHeld	                        IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)	                        IdleStateHandler(readTimeout: .hours(1)), name: Self.idleName)
 Sources/Netstack/Gateway/PortForwarder.swift	hostSideSlotsAreReturnedExactlyOnceAcrossManyConnections	        guard !released else { return }	
+Sources/Netstack/Core/IPv4Subnet.swift	usableAddressesAreTheEndsOfTheSubnetRatherThanOfTheLastOctet	        IPv4Address(broadcast.raw &- 1)	        IPv4Address((address.raw & 0xFFFF_FF00) | 254)
+Sources/Netstack/Gateway/Gateway.swift	aGatewayGivenOnlyASubnetPlacesItselfAndTheHostOnIt	        let hostAddress = hostAddress ?? subnet.lastUsable	        let hostAddress = hostAddress ?? IPv4Address("192.168.127.254")!

@@ -104,11 +104,21 @@ public final class Gateway: @unchecked Sendable {
         /// `RateLimitedLogger`.
         public var logWindow: TimeAmount
 
+        /// `gatewayAddress` and `hostAddress` are derived from `subnet` when they
+        /// are not given: the first usable address and the last, which is what
+        /// upstream's `--gatewayIP` and `--hostIP` document as their defaults.
+        ///
+        /// They used to default to fixed addresses on the default subnet, which
+        /// meant that changing `subnet` alone produced a gateway whose published
+        /// names resolved to addresses the guest could not route to --
+        /// `host.containers.internal` answering 192.168.127.254 on a 10.7.0.0/24
+        /// network -- while everything else looked configured and the control
+        /// API answered perfectly.
         public init(
-            gatewayAddress: IPv4Address = IPv4Address("192.168.127.1")!,
+            gatewayAddress: IPv4Address? = nil,
             subnet: IPv4Subnet = IPv4Subnet(cidr: "192.168.127.0/24")!,
             linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:ee")!,
-            hostAddress: IPv4Address = IPv4Address("192.168.127.254")!,
+            hostAddress: IPv4Address? = nil,
             nat: [IPv4Address: IPv4Address]? = nil,
             gatewayVirtualAddresses: [IPv4Address]? = nil,
             allowsLinkLocal: Bool = false,
@@ -129,6 +139,8 @@ public final class Gateway: @unchecked Sendable {
             logger: Logger = Logger(label: "netstack"),
             logWindow: TimeAmount = .seconds(10)
         ) {
+            let gatewayAddress = gatewayAddress ?? subnet.firstUsable
+            let hostAddress = hostAddress ?? subnet.lastUsable
             self.gatewayAddress = gatewayAddress
             self.subnet = subnet
             self.linkAddress = linkAddress

@@ -238,7 +238,19 @@ acknowledgement number by their own ISS, which preserves deliberate errors
 exactly: a step that acknowledges five bytes too many still does, against
 whichever ISS the stack under test chose.
 
-### The one difference that is recognised, and why it is asserted
+### The three differences that are recognised, and why they are asserted
+
+Each is **pinned, not permitted**: matched against an exact signature, counted,
+and asserted. A run in which one *stops* appearing fails as loudly as one in
+which a fourth appears — a recognised difference that quietly goes away is a
+change in behaviour nobody decided on.
+
+The labels below are the ones `TCPDifferentialTests` asserts by name.
+`scripts/conventions.sh` checks that every label the test recognises is
+described here, because this file said "the one difference" for some time after
+there were three.
+
+#### `syn-ack-initial-window`
 
 **The SYN-ACK's advertised window: gVisor 29184, this stack 65535.**
 
@@ -260,6 +272,46 @@ side can move:
 - Lowering this stack to 29184 was measured and is **worse**: gVisor
   advertises 65535 on every frame after the handshake, so the divergence
   would move from one frame per connection to all of them.
+
+#### `scaled-advertised-window`
+
+**Every frame after the handshake, once a window scale is in effect.** The two
+stacks' receive accounting differs by construction: this one has no receive
+socket buffer at all — `TCPEndpoint` hands in-order bytes to `onData` and frees
+the space in the same pass — while gVisor holds them until the application
+reads. The harness reads and discards at every step to keep that gap as small as
+it can be, and a scaled window still lands on a different multiple.
+
+Bounded **below** rather than counted exactly: at least one per sequence, since
+how many frames a sequence emits is the generator's choice. Zero would mean the
+windows had started matching, which is a real change worth investigating rather
+than a quiet improvement.
+
+#### `sack-outside-established+scaled-advertised-window`
+
+**This stack reports SACK blocks after ESTABLISHED and gVisor does not.**
+gVisor's `sendRaw` restricts the option to ESTABLISHED; RFC 2018 puts no state
+restriction on it, and a receiver in FIN-WAIT-2 is still receiving — data
+arrives, is reassembled, and is delivered — so reporting what it holds is as
+useful there as anywhere else, and withholding it makes the peer retransmit data
+that already arrived.
+
+**This stack is right, and not by much.** Matching gVisor would mean copying a
+limitation. An earlier attempt did try to match it, by dropping the reassembly
+queue on close; it was reverted, because the queue is also what a later in-order
+arrival is delivered from, and a sequence two runs later showed gVisor
+acknowledging data it had queued before closing. The mechanism guessed at was
+not the one gVisor has.
+
+The label is compound because the frames it appears on carry both differences,
+and saying so is more honest than reporting one and hiding the other. Bounded
+below rather than counted: it needs a sequence that both closes and is still
+holding something out of order, which is common but not universal.
+
+**What it masks:** a defect that adds or drops SACK blocks and changes nothing
+else about a frame, on a connection past ESTABLISHED. Blocks are compared
+exactly everywhere else — every frame up to the `close` step — and by
+`TCPSackTests`, which does not go through gVisor at all.
 
 ### What gVisor is configured to, and why
 

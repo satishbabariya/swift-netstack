@@ -18,6 +18,7 @@ struct Options {
     var configPath: String?
     var listenPath: String?
     var listenStream: String?
+    var listenSwitch: String?
     var controlPath: String?
     var upstreamResolver: String?
     var gateway: String?
@@ -57,6 +58,7 @@ struct Options {
             case "--listen": options.controlPath = try value(flag).replacingOccurrences(of: "unix://", with: "")
             case "--listen-vfkit": options.listenPath = try value(flag)
             case "--listen-qemu": options.listenStream = try value(flag)
+            case "--listen-switch": options.listenSwitch = try value(flag)
             case "--listen-stdio", "--listen-bess", "--listen-vpnkit":
                 throw OptionError.unsupportedWire(flag)
             case "--dns": options.upstreamResolver = try value(flag)
@@ -124,11 +126,12 @@ enum OptionError: Error, CustomStringConvertible {
                 + "hyperkit's handshake. Use --listen-vfkit for a datagram socket or --listen-qemu for a "
                 + "stream one."
         case .conflictingWires:
-            return "--listen-vfkit and --listen-qemu are two different wires; pick one"
+            return "--listen-vfkit, --listen-qemu and --listen-switch are different wires; pick one"
         case .noWire:
             return
-                "no guest wire: pass --listen-vfkit <path> for a datagram socket or --listen-qemu "
-                + "<path> for a stream one. (--listen is the control API, as in gvproxy.)"
+                "no guest wire: pass --listen-vfkit <path> for a datagram socket, --listen-qemu "
+                + "<path> for a stream one, or --listen-switch <path> for a stream socket that "
+                + "carries several guests. (--listen is the control API, as in gvproxy.)"
         case .help: return usage
         }
     }
@@ -142,7 +145,11 @@ let usage = """
       --config <path>            Configuration file, in gvproxy's shape as JSON
       --listen <path>            Unix socket for the HTTP control API
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
-      --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
+      --listen-qemu <path>       Stream socket with length-prefixed frames (qemu),
+                                 carrying one guest
+      --listen-switch <path>     The same framing, carrying every guest that
+                                 connects, each on its own port of a switch.
+                                 Guests reach each other directly
       --gatewayIP <address>      The gateway's own address (default: the first
                                  usable address of the subnet)
       --hostIP <address>         The address that means the host (default: the
@@ -242,11 +249,12 @@ if let text = options.subnet {
 
 // The wire is checked now: after the file has had its chance to be wrong about
 // something more specific.
-if options.listenPath == nil, options.listenStream == nil {
+let wires = [options.listenPath, options.listenStream, options.listenSwitch].compactMap { $0 }
+if wires.isEmpty {
     FileHandle.standardError.write(Data("error: \(OptionError.noWire)\n\n\(usage)\n".utf8))
     exit(2)
 }
-if options.listenPath != nil, options.listenStream != nil {
+if wires.count > 1 {
     FileHandle.standardError.write(Data("error: \(OptionError.conflictingWires)\n".utf8))
     exit(2)
 }
@@ -329,14 +337,20 @@ do {
     // to it. That is the shape vfkit and qemu expect -- they are given a path and
     // dial it -- and it is why this waits for a connection rather than adopting a
     // descriptor the way an embedding host does.
-    let path = options.listenPath ?? options.listenStream!
-    let stream = options.listenStream != nil
+    let path = wires[0]
 
     print("netstack-gateway: waiting for a guest on \(path)")
-    let gateway = try
-        (stream
-        ? Gateway.start(listeningOnStreamSocketAt: path, group: group, configuration: configuration)
-        : Gateway.start(listeningOnDatagramSocketAt: path, group: group, configuration: configuration)).wait()
+    let starting: EventLoopFuture<Gateway>
+    if options.listenSwitch != nil {
+        starting = Gateway.start(
+            switchListeningOnStreamSocketAt: path, group: group, configuration: configuration)
+    } else if options.listenStream != nil {
+        starting = Gateway.start(listeningOnStreamSocketAt: path, group: group, configuration: configuration)
+    } else {
+        starting = Gateway.start(
+            listeningOnDatagramSocketAt: path, group: group, configuration: configuration)
+    }
+    let gateway = try starting.wait()
 
     // Zones from the file, added before any guest can ask.
     //

@@ -250,3 +250,76 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// The guest limit, under the condition it exists for.
+//
+// `maximumGuests` was checked against the switch's port count -- and the port
+// appears a tick after the admission, because the pipeline is configured through
+// a `submit`. So every connection in a burst read the same count of zero and
+// every one was admitted: the limit was checkable and not enforced, in a package
+// whose threat model is that the guest is hostile.
+//
+// One at a time never showed it. A burst is not a contrived case here; it is
+// what a supervisor restarting a pod of VMs does.
+@Test func guestsArrivingAtOnceAreBoundedByTheLimitRatherThanAllAdmitted() async throws {
+    let path = temporaryPath("switch")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let netSwitch = try await WireBootstrap.switchedStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500, maximumGuests: 2
+    ).get()
+
+    // Dialled without waiting in between, so every connection is accepted before
+    // any of them finishes being configured. That window is the whole bug.
+    let dialled = (0..<6).map { _ in dial(path, type: .stream) }
+
+    // Given time to settle: the assertion is about where it settles, and an
+    // immediate read would pass with the bug simply by looking too early.
+    var ports = 0
+    for _ in 0..<200 {
+        ports = try await netSwitch.eventLoop.submit { netSwitch.portCount }.get()
+        if ports >= 2 { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    ports = try await netSwitch.eventLoop.submit { netSwitch.portCount }.get()
+
+    #expect(ports == 2, "six guests arrived at once and \(ports) were given ports where 2 was the limit")
+
+    for descriptor in dialled { close(descriptor) }
+    _ = try? await netSwitch.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
+// And a guest that leaves gives its place back, so the limit is a limit on
+// guests present rather than on guests ever seen.
+@Test func aGuestLeavingTheSwitchReturnsItsPlace() async throws {
+    let path = temporaryPath("switch")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let netSwitch = try await WireBootstrap.switchedStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500, maximumGuests: 1
+    ).get()
+
+    func portsSettleAt(_ wanted: Int) async throws -> Int {
+        var ports = 0
+        for _ in 0..<200 {
+            ports = try await netSwitch.eventLoop.submit { netSwitch.portCount }.get()
+            if ports == wanted { return ports }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return ports
+    }
+
+    let first = dial(path, type: .stream)
+    #expect(try await portsSettleAt(1) == 1)
+    close(first)
+    #expect(try await portsSettleAt(0) == 0, "the departed guest kept its port")
+
+    let second = dial(path, type: .stream)
+    #expect(try await portsSettleAt(1) == 1, "the freed place was not given to the next guest")
+
+    close(second)
+    _ = try? await netSwitch.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

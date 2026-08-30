@@ -116,10 +116,17 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     #expect(missing.output.contains("no guest wire"), "unhelpful error: \(missing.output)")
     #expect(missing.output.contains("--listen is the control API"), "the error does not say what --listen is")
 
-    // Two wires is a choice, not a combination.
-    guard let both = run(["--listen-vfkit", "/tmp/a.sock", "--listen-qemu", "/tmp/b.sock"]) else { return }
-    #expect(both.status != 0)
-    #expect(both.output.contains("two different wires"))
+    // Two wires is a choice, not a combination -- and there are three now, so
+    // every pair of them has to be, not just the pair that was written first.
+    for pair in [
+        ["--listen-vfkit", "/tmp/a.sock", "--listen-qemu", "/tmp/b.sock"],
+        ["--listen-vfkit", "/tmp/a.sock", "--listen-switch", "/tmp/b.sock"],
+        ["--listen-qemu", "/tmp/a.sock", "--listen-switch", "/tmp/b.sock"],
+    ] {
+        guard let both = run(pair) else { return }
+        #expect(both.status != 0, "\(pair) was accepted as one wire")
+        #expect(both.output.contains("different wires"), "unhelpful error: \(both.output)")
+    }
 
     // A wire upstream has and this does not says which, rather than "unknown
     // option" -- the difference between "you typed it wrong" and "this does not

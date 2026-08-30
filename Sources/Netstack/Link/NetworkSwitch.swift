@@ -351,8 +351,22 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
     }
 
     /// Close every port.
+    ///
+    /// Callable from anywhere. `WireBootstrap.switchedStreamSocket` hands this
+    /// object to a caller who is not on its loop -- there is nowhere else for
+    /// them to be -- and everything below is loop-confined state, so a bare
+    /// `preconditionInEventLoop` here turned the ordinary use into a trap. On
+    /// the loop it still runs inline, because deferring would reorder it against
+    /// the caller's own closing work: `Gateway` closes this from its own close.
     @discardableResult
     public func close() -> EventLoopFuture<Void> {
+        guard eventLoop.inEventLoop else {
+            return eventLoop.flatSubmit { self.closeOnLoop() }
+        }
+        return closeOnLoop()
+    }
+
+    private func closeOnLoop() -> EventLoopFuture<Void> {
         eventLoop.preconditionInEventLoop()
         for link in ports.values {
             retiredInbound += link.inboundDropped

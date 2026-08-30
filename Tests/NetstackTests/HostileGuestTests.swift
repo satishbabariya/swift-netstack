@@ -217,7 +217,7 @@ private func udpFrame(
 private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
     for _ in 0..<limit {
         var back = [UInt8](repeating: 0, count: 4096)
-        if back.withUnsafeMutableBytes({ recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }) <= 0 { return }
+        if back.withUnsafeMutableBytes({ recv(fd, $0.baseAddress, $0.count, dontWait) }) <= 0 { return }
     }
 }
 

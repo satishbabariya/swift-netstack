@@ -84,7 +84,7 @@ private func drainSegments(_ fd: Int32) -> [(header: TCPHeader, payload: ByteBuf
     var out: [(header: TCPHeader, payload: ByteBuffer)] = []
     for _ in 0..<64 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         guard read > 0 else { break }
         var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
         guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }

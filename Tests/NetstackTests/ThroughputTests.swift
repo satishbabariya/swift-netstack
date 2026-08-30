@@ -140,7 +140,7 @@ private func benchFrame(
     var gatewayISS: UInt32 = 0
     var back = [UInt8](repeating: 0, count: 4096)
     for _ in 0..<800 where gatewayISS == 0 {
-        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
             guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }
@@ -183,7 +183,7 @@ private func benchFrame(
             // gateway applying backpressure, which is the thing working rather
             // than the thing failing.
             for _ in 0..<64 {
-                if back.withUnsafeMutableBytes({ recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }) <= 0 {
+                if back.withUnsafeMutableBytes({ recv(pair[1], $0.baseAddress, $0.count, dontWait) }) <= 0 {
                     break
                 }
             }
@@ -195,7 +195,7 @@ private func benchFrame(
         // does not fill and stall the wire for a reason that is not the stack's.
         if sent % (64 * payloadSize) == 0 {
             for _ in 0..<64 {
-                if back.withUnsafeMutableBytes({ recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }) <= 0 {
+                if back.withUnsafeMutableBytes({ recv(pair[1], $0.baseAddress, $0.count, dontWait) }) <= 0 {
                     break
                 }
             }
@@ -206,7 +206,7 @@ private func benchFrame(
     var delivered = 0
     for _ in 0..<4000 where delivered < sent {
         for _ in 0..<256 {
-            if back.withUnsafeMutableBytes({ recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }) <= 0 {
+            if back.withUnsafeMutableBytes({ recv(pair[1], $0.baseAddress, $0.count, dontWait) }) <= 0 {
                 break
             }
         }

@@ -57,7 +57,7 @@ func frame(
 private func awaitUDP(_ fd: Int32, fromPort: UInt16) async -> ByteBuffer? {
     for _ in 0..<400 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
             guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }
@@ -175,7 +175,7 @@ private func awaitUDP(_ fd: Int32, fromPort: UInt16) async -> ByteBuffer? {
     var sawSynAck = false
     for _ in 0..<400 where !sawSynAck {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             var reply = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
             guard let ethernet = EthernetHeader.parse(&reply), ethernet.etherType == .ipv4 else { continue }
@@ -462,7 +462,7 @@ private func gwEchoRequest(from source: IPv4Address, to destination: IPv4Address
 private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identifier: UInt16)? {
     for _ in 0..<300 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
             guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,

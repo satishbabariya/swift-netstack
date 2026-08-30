@@ -86,7 +86,7 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     var back = [UInt8](repeating: 0, count: 4096)
     var read = 0
     for _ in 0..<400 where read == 0 {
-        let n = back.withUnsafeMutableBytes { recv(guest, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let n = back.withUnsafeMutableBytes { recv(guest, $0.baseAddress, $0.count, dontWait) }
         if n > 0 { read = n } else { try await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(read == 74, "the gateway's answer did not reach the guest: \(read)")
@@ -166,7 +166,7 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     var probe = [UInt8](repeating: 0, count: 16)
     var closed = false
     for _ in 0..<400 where !closed {
-        let n = probe.withUnsafeMutableBytes { recv(second, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let n = probe.withUnsafeMutableBytes { recv(second, $0.baseAddress, $0.count, dontWait) }
         if n == 0 { closed = true } else { try await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(closed, "a second guest was left connected to a wire that carries one")

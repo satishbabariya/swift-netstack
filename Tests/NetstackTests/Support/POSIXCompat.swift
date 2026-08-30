@@ -169,3 +169,20 @@ func sendBytes(_ descriptor: Int32, _ bytes: [UInt8]) -> Int {
 func acceptConnection(_ descriptor: Int32) -> Int32 {
     accept(descriptor, nil, nil)
 }
+
+/// `MSG_DONTWAIT`, which is `Int32` on Darwin and `Int` on Linux.
+///
+/// Every test here that drains a wire polls it non-blocking, so this is the
+/// most-used of the lot.
+let dontWait: Int32 = {
+    #if canImport(Darwin)
+        return MSG_DONTWAIT
+    #else
+        return Int32(MSG_DONTWAIT)
+    #endif
+}()
+
+/// `recv(2)` into a buffer, non-blocking.
+func receiveNonBlocking(_ descriptor: Int32, into buffer: inout [UInt8]) -> Int {
+    buffer.withUnsafeMutableBytes { recv(descriptor, $0.baseAddress, $0.count, dontWait) }
+}

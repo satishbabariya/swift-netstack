@@ -49,7 +49,7 @@ private func swgAwaitFrame(
     var pending = [UInt8]()
     for _ in 0..<400 {
         var chunk = [UInt8](repeating: 0, count: 65536)
-        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             pending.append(contentsOf: chunk[0..<read])
             let prefix = framing == .qemu ? 4 : 2
@@ -365,7 +365,7 @@ private func swgRequest(_ method: String, _ path: String, to socketPath: String)
     var read = 0
     for _ in 0..<400 where read < 2 {
         let got = acknowledgement.withUnsafeMutableBytes {
-            recv(tunnel, $0.baseAddress!.advanced(by: read), 2 - read, MSG_DONTWAIT)
+            recv(tunnel, $0.baseAddress!.advanced(by: read), 2 - read, dontWait)
         }
         if got > 0 { read += got } else { try? await Task.sleep(nanoseconds: 5_000_000) }
     }
@@ -445,7 +445,7 @@ private func swgAwaitFrameSync(
     let prefix = framing == .qemu ? 4 : 2
     for _ in 0..<400 {
         var chunk = [UInt8](repeating: 0, count: 65536)
-        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             pending.append(contentsOf: chunk[0..<read])
             while pending.count >= prefix {

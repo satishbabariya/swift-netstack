@@ -59,7 +59,7 @@ private func pfDrain(_ fd: Int32) -> [(header: TCPHeader, payload: ByteBuffer)] 
     var out: [(header: TCPHeader, payload: ByteBuffer)] = []
     for _ in 0..<64 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         guard read > 0 else { break }
         var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
         guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }
@@ -248,7 +248,7 @@ private func pfGuestSegment(
     var arrived: (source: UInt16, payload: [UInt8])?
     for _ in 0..<400 where arrived == nil {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(guestSide, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(guestSide, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
             guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,
@@ -272,7 +272,7 @@ private func pfGuestSegment(
     var answer = [UInt8](repeating: 0, count: 128)
     var received = -1
     for _ in 0..<400 where received <= 0 {
-        received = answer.withUnsafeMutableBytes { recv(sender, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        received = answer.withUnsafeMutableBytes { recv(sender, $0.baseAddress, $0.count, dontWait) }
         if received <= 0 { try? await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(received == 4, "the guest's reply never came back to the host sender")

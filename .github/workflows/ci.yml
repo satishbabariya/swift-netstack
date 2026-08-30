@@ -162,6 +162,14 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+
+      # The interop driver is Go. This came free in the old combined job, which
+      # set Go up for the harness; splitting the job took it away and the
+      # failure was `go: command not found` rather than anything about interop.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: differential/interop/go.mod
+          cache-dependency-path: differential/interop/go.sum
       - name: Check the formatting
         run: ./scripts/format.sh
 

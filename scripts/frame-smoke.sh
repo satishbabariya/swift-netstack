@@ -16,13 +16,14 @@ WIRE=""
 CONFIG=""
 CONTROL=""
 RESOLVER=""
+CAPTURE=""
 GATEWAY=""
 LISTENER=""
 ECHO_PID=""
 cleanup() {
     [[ -n "$GATEWAY" ]] && kill "$GATEWAY" 2>/dev/null
     [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null
-    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "$RESOLVER" "${LISTENER:-/nonexistent}.port"
+    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "$RESOLVER" "$CAPTURE" "${LISTENER:-/nonexistent}.port"
 }
 trap cleanup EXIT INT TERM
 
@@ -1005,6 +1006,142 @@ PY
     return $outcome
 }
 
+# The capture file.
+#
+# `--pcap` is what an operator reaches for when the network is doing something
+# they cannot explain, which means it is used exactly when nothing else is
+# working and its own correctness is the last thing anyone wants to be debugging.
+# A file format is also the easiest thing in this program to get subtly wrong and
+# never notice: nothing in the gateway reads it back.
+#
+# So it is read back here, by a parser that knows only what libpcap's format
+# says, and the frames the guest sent have to be in it.
+pcap_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    CAPTURE="${TMPDIR:-/tmp}/netstack-smoke-$$.pcap"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-pcap-$$.sock"
+    rm -f "$WIRE" "$CAPTURE"
+    "$binary" --listen-vfkit "$WIRE" --pcap "$CAPTURE" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: wire socket never appeared (pcap)"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
+import os, socket, sys
+
+expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+src = bytes.fromhex("5a94efe4bc00")
+wire = os.environ["WIRE"]
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+try:
+    s.connect(wire)
+    s.send(
+        b"\xff\xff\xff\xff\xff\xff" + src + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + src + guest + b"\x00" * 6 + expected
+    )
+    s.settimeout(10)
+    try:
+        s.recv(2048)
+    except socket.timeout:
+        print("FAIL: the gateway did not answer, so there is nothing to have captured")
+        sys.exit(1)
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    # Stopped before reading: the writer buffers, and a capture is only a capture
+    # once it has been flushed and closed. Reading it while the gateway still
+    # holds it would check something the operator never gets.
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE"
+    [[ $outcome -eq 0 ]] || { rm -f "$CAPTURE"; return 1; }
+
+    CAPTURE="$CAPTURE" EXPECTED="$expected" GUEST="$guest" ARGS="$*" python3 - <<'PY'
+import os, struct, sys
+
+described = os.environ.get("ARGS") or "(defaults)"
+expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+try:
+    with open(os.environ["CAPTURE"], "rb") as handle:
+        data = handle.read()
+except OSError as error:
+    print("FAIL: the capture file could not be read:", error, "for", described)
+    sys.exit(1)
+
+if len(data) < 24:
+    print("FAIL: the capture is", len(data), "bytes, which is not even a header, for",
+          described)
+    sys.exit(1)
+
+magic = struct.unpack("<I", data[:4])[0]
+if magic != 0xA1B2C3D4:
+    print("FAIL: the capture begins", hex(magic), "rather than a libpcap magic, for",
+          described)
+    sys.exit(1)
+major, minor, _, _, snaplen, link = struct.unpack("<HHiIII", data[4:24])
+if (major, minor) != (2, 4):
+    print("FAIL: the capture says version", f"{major}.{minor}", "for", described)
+    sys.exit(1)
+if link != 1:
+    print("FAIL: the capture says link type", link, "rather than 1 (ethernet), for",
+          described)
+    sys.exit(1)
+
+# Walked record by record. A length that runs off the end is the failure a reader
+# actually hits, and it is silent in a file that opens fine.
+frames = []
+at = 24
+while at + 16 <= len(data):
+    _, _, captured, original = struct.unpack("<IIII", data[at:at + 16])
+    if captured > original or captured > snaplen:
+        print("FAIL: a record claims", captured, "captured of", original,
+              "original bytes, for", described)
+        sys.exit(1)
+    if at + 16 + captured > len(data):
+        print("FAIL: the last record runs", at + 16 + captured - len(data),
+              "bytes past the end of the file, for", described)
+        sys.exit(1)
+    frames.append(data[at + 16:at + 16 + captured])
+    at += 16 + captured
+if at != len(data):
+    print("FAIL:", len(data) - at, "trailing bytes are not a record, for", described)
+    sys.exit(1)
+if not frames:
+    print("FAIL: the capture has a valid header and no frames, for", described)
+    sys.exit(1)
+
+# The exchange that just happened, both halves: a capture that only recorded one
+# direction would still parse.
+asked = any(f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x01" and f[38:42] == expected
+            for f in frames if len(f) >= 42)
+answered = any(f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x02" and f[28:32] == expected
+               for f in frames if len(f) >= 42)
+if not asked:
+    print("FAIL: the guest's ARP request is not in the capture, for", described)
+    sys.exit(1)
+if not answered:
+    print("FAIL: the gateway's ARP reply is not in the capture -- only one direction",
+          "was recorded, for", described)
+    sys.exit(1)
+print("ok: pcap ", len(frames), "frames, both directions of the exchange, for", described)
+PY
+    outcome=$?
+    rm -f "$CAPTURE"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -1046,5 +1183,8 @@ dns_forward_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the other transport.
 udp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
+
+# And the file an operator reads when nothing else is working.
+pcap_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

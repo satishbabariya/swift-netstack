@@ -388,11 +388,19 @@ the **`--listen-qemu` wire**, where a four-byte big-endian length says where
 each frame ends, because a whole entry point nobody drives is a whole entry
 point that can be wrong.
 
+And it reads back a **`--pcap` capture**, with a parser that knows only what
+libpcap's format says, requiring both directions of the exchange to be in it.
+Nothing in the gateway reads that file, which makes it the easiest thing here to
+get subtly wrong and never notice — and it was: the writer buffers, the program
+had no shutdown path at all, and Ctrl-C on a capture left the operator an empty
+file.
+
 Each of those fails when the thing it names is broken: removing the NAT entry
 turns the SYN into a reset, breaking the return direction of the splice leaves
 the handshake intact and loses the echo, switching the stream framing to
-hyperkit's two little-endian bytes leaves the wire silent, and a resolver that
-declines to forward answers REFUSED where an address belonged.
+hyperkit's two little-endian bytes leaves the wire silent, a resolver that
+declines to forward answers REFUSED where an address belonged, and a capture
+that never flushes is zero bytes where a header belonged.
 
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
 the two slow ones. It exists because the gates were seven scripts across five CI

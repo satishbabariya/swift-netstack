@@ -1,5 +1,7 @@
+import Dispatch
 import Foundation
 import Logging
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 import Netstack
@@ -147,7 +149,9 @@ let usage = """
                                  last usable address of the subnet)
       --subnet <cidr>            The subnet leased to guests (default 192.168.127.0/24)
       --mtu <bytes>              Link MTU (default 1500)
-      --pcap <path>              Write every frame to a pcap file (capped at 64 MiB)
+      --pcap <path>              Write every frame to a pcap file (capped at 64 MiB).
+                                 Buffered: end the gateway with Ctrl-C or SIGTERM
+                                 rather than SIGKILL, or the tail is lost
       --notification <path>      Socket told when the network is ready and guests join
       --ec2-metadata-access      Let guests reach 169.254.0.0/16. Off by default: that
                                  is where the cloud instance metadata service lives.
@@ -247,6 +251,38 @@ if options.listenPath != nil, options.listenStream != nil {
     exit(2)
 }
 
+/// Block until the operator interrupts, and say which signal did it.
+///
+/// A free function rather than inline top-level code, and that is the whole
+/// point of it. Every top-level binding in a `main.swift` is main-actor
+/// isolated, so a Dispatch handler written up there captures main-actor state
+/// and the runtime's isolation check trips the moment it runs -- and a signal
+/// source runs on a Dispatch queue, never on the main one. The failure is a
+/// `dispatch_assert_queue` trap with nothing on stderr, at the exact instant the
+/// operator presses Ctrl-C. Written inline first; found by pressing Ctrl-C.
+///
+/// `SIG_IGN` first is not decoration either: a Dispatch signal source is *in
+/// addition* to the disposition, so without it the default action kills the
+/// process before the handler is ever reached.
+func awaitTerminationSignal() -> Int32 {
+    let received = NIOLockedValueBox<Int32>(SIGTERM)
+    let arrived = DispatchSemaphore(value: 0)
+    var sources: [DispatchSourceSignal] = []
+    for number in [SIGINT, SIGTERM] {
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+        source.setEventHandler {
+            received.withLockedValue { $0 = number }
+            arrived.signal()
+        }
+        source.resume()
+        sources.append(source)
+    }
+    arrived.wait()
+    for source in sources { source.cancel() }
+    return received.withLockedValue { $0 }
+}
+
 var resolvers: [SocketAddress] = []
 if let resolver = options.upstreamResolver {
     guard let separator = resolver.lastIndex(of: ":"),
@@ -329,9 +365,24 @@ do {
     _ = control
 
     print("netstack-gateway: running")
-    // Nothing to do but let the loop run. The gateway is entirely event-driven,
-    // so the main thread's only job is to not exit.
-    try group.next().scheduleTask(in: .hours(24 * 365)) {}.futureResult.wait()
+
+    // Interrupted rather than killed.
+    //
+    // The gateway is entirely event-driven, so the main thread's only job is to
+    // wait for a reason to stop. It used to park for a year and there was no
+    // such reason: the process only ever ended by dying where it stood, which
+    // for `--pcap` meant the operator got an empty file. The capture buffers
+    // frames -- a write syscall per frame would cost more than the stack spends
+    // on the frame -- and nothing flushed it, not even its own header. Ctrl-C on
+    // a capture is not an unusual way to end one; it is the usual way.
+    //
+    // `close()` walks the same path as any other shutdown and flushes the
+    // capture on the way through, so this needs no knowledge of what is being
+    // closed.
+    let received = awaitTerminationSignal()
+    print("netstack-gateway: stopping on \(received == SIGINT ? "SIGINT" : "SIGTERM")")
+    try? gateway.close().wait()
+    try? group.syncShutdownGracefully()
 } catch {
     FileHandle.standardError.write(Data("error: \(error)\n".utf8))
     exit(1)

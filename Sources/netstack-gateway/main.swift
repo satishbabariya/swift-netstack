@@ -19,7 +19,10 @@ struct Options {
     var listenPath: String?
     var listenStream: String?
     var listenSwitch: String?
-    var controlPath: String?
+    var controlEndpoints: [String] = []
+    var servicesEndpoints: [String] = []
+    var pidFile: String?
+    var logFile: String?
     var upstreamResolver: String?
     var gateway: String?
     var subnet: String?
@@ -55,7 +58,10 @@ struct Options {
             // gvproxy would have pointed the control API at the VM's socket and
             // the VM at the control socket. Nothing would have said so.
             case "--config": options.configPath = try value(flag)
-            case "--listen": options.controlPath = try value(flag).replacingOccurrences(of: "unix://", with: "")
+            case "--listen": options.controlEndpoints.append(try value(flag))
+            case "--services": options.servicesEndpoints.append(try value(flag))
+            case "--pid-file": options.pidFile = try value(flag)
+            case "--log-file": options.logFile = try value(flag)
             case "--listen-vfkit": options.listenPath = try value(flag)
             case "--listen-qemu": options.listenStream = try value(flag)
             case "--listen-switch": options.listenSwitch = try value(flag)
@@ -143,7 +149,13 @@ let usage = """
     Flag names are gvproxy's, so a command line moves across unchanged.
 
       --config <path>            Configuration file, in gvproxy's shape as JSON
-      --listen <path>            Unix socket for the HTTP control API
+      --listen <endpoint>        HTTP control API: unix://<path>, tcp://<host>:<port>
+                                 or a bare path. Repeatable
+      --services <endpoint>      The same API without /connect, for an endpoint a
+                                 guest may reach. Repeatable
+      --pid-file <path>          Write this process's PID there, and remove it on
+                                 a clean stop
+      --log-file <path>          Append log messages there as well as to stderr
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
       --listen-qemu <path>       Stream socket with length-prefixed frames (qemu),
                                  carrying one guest
@@ -291,6 +303,32 @@ func awaitTerminationSignal() -> Int32 {
     return received.withLockedValue { $0 }
 }
 
+/// Where a control endpoint listens.
+///
+/// Upstream's `--listen` takes a URL, so a command line moved across carries
+/// `unix:///run/gvproxy.sock` or `tcp://127.0.0.1:7070`. A bare path is accepted
+/// too, because that is what this program took before it took a URL.
+enum ControlEndpoint {
+    case unix(String)
+    case tcp(String, Int)
+}
+
+func controlEndpoint(_ text: String) throws -> ControlEndpoint {
+    if text.hasPrefix("unix://") {
+        return .unix(String(text.dropFirst("unix://".count)))
+    }
+    if text.hasPrefix("tcp://") {
+        let rest = String(text.dropFirst("tcp://".count))
+        guard let separator = rest.lastIndex(of: ":"), let port = Int(rest[rest.index(after: separator)...]),
+            port > 0, port < 65536
+        else { throw OptionError.badValue("--listen", text) }
+        let host = String(rest[rest.startIndex..<separator])
+        return .tcp(host.isEmpty ? "127.0.0.1" : host, port)
+    }
+    guard !text.contains("://") else { throw OptionError.badValue("--listen", text) }
+    return .unix(text)
+}
+
 var resolvers: [SocketAddress] = []
 if let resolver = options.upstreamResolver {
     guard let separator = resolver.lastIndex(of: ":"),
@@ -311,7 +349,16 @@ guard let logLevel = Logger.Level(rawValue: options.logLevel) else {
 // global log handler decides for every other library in the process, and this
 // is the one place in the package that is entitled to, because it is the
 // process.
+let logFile = options.logFile
+if let logFile, FileLogHandler(label: "probe", path: logFile) == nil {
+    FileHandle.standardError.write(Data("error: --log-file cannot be written: \(logFile)\n".utf8))
+    exit(2)
+}
 LoggingSystem.bootstrap { label in
+    if let logFile, var handler = FileLogHandler(label: label, path: logFile) {
+        handler.logLevel = logLevel
+        return handler
+    }
     var handler = StreamLogHandler.standardError(label: label)
     handler.logLevel = logLevel
     return handler
@@ -369,15 +416,46 @@ do {
         print("netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on 127.0.0.1:\(forward.host)")
     }
 
-    var control: ControlPlane?
-    if let controlPath = options.controlPath {
+    // One plane per endpoint. `--listen` is repeatable upstream, and the planes
+    // are stateless over the gateway, so this is a listener each rather than
+    // anything shared.
+    var planes: [ControlPlane] = []
+    for (endpoint, attaches) in options.controlEndpoints.map({ ($0, true) }) + options.servicesEndpoints.map({ ($0, false) }) {
         let plane = ControlPlane(gateway: gateway)
-        try plane.listen(unixSocketPath: controlPath).wait()
-        control = plane
-        print("netstack-gateway: control API on \(controlPath)")
+        plane.allowsGuestAttach = attaches
+        switch try controlEndpoint(endpoint) {
+        case .unix(let path):
+            try plane.listen(unixSocketPath: path).wait()
+        case .tcp(let host, let port):
+            try plane.listen(host: host, port: port).wait()
+        }
+        planes.append(plane)
+        print("netstack-gateway: \(attaches ? "control API" : "services API") on \(endpoint)")
     }
-    _ = control
+    _ = planes
 
+    // Written after everything is listening, so a supervisor that reads it as
+    // "ready" is not told so before the sockets exist.
+    if let pidFile = options.pidFile {
+        do {
+            try Data("\(getpid())\n".utf8).write(to: URL(fileURLWithPath: pidFile))
+        } catch {
+            FileHandle.standardError.write(Data("error: --pid-file cannot be written: \(error)\n".utf8))
+            exit(2)
+        }
+    }
+
+    // Logged as well as printed, and this is the reason: a log file that stays
+    // empty until something goes wrong is indistinguishable from a log file that
+    // was never opened. One line at startup tells an operator which they have,
+    // at the only moment they can still do something about it.
+    Logger(label: "netstack").notice(
+        "running",
+        metadata: [
+            "wire": .string(path),
+            "gateway": .string(configuration.gatewayAddress.description),
+            "subnet": .string(configuration.subnet.description),
+        ])
     print("netstack-gateway: running")
 
     // Interrupted rather than killed.
@@ -397,6 +475,9 @@ do {
     print("netstack-gateway: stopping on \(received == SIGINT ? "SIGINT" : "SIGTERM")")
     try? gateway.close().wait()
     try? group.syncShutdownGracefully()
+    // Removed only on a clean stop. A PID file left behind by a crash is how a
+    // supervisor finds out there was one.
+    if let pidFile = options.pidFile { try? FileManager.default.removeItem(atPath: pidFile) }
 } catch {
     FileHandle.standardError.write(Data("error: \(error)\n".utf8))
     exit(1)

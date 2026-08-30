@@ -635,6 +635,94 @@ PY
     return $outcome
 }
 
+# The other wire.
+#
+# `--listen-vfkit` is a datagram socket where one datagram is one frame;
+# `--listen-qemu` is a stream where a four-byte big-endian length says where each
+# frame ends. They are different code paths from the socket up, and a whole
+# entry point that nobody drives is a whole entry point that can be wrong -- the
+# `--config` ordering bug was exactly that, and every check in the repository
+# stayed green through it.
+stream_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-stream-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-qemu "$WIRE" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: the stream wire never appeared"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
+import os, socket, struct, sys
+
+expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+src = bytes.fromhex("5a94efe4bc00")
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(os.environ["WIRE"])
+    frame = (
+        b"\xff\xff\xff\xff\xff\xff" + src + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + src + guest + b"\x00" * 6 + expected
+    )
+    # Four bytes, big-endian, then the frame. Getting the endianness or the width
+    # wrong gives a length that is not a length, and every byte after it is
+    # garbage -- which is the failure this exists to notice.
+    s.sendall(struct.pack(">I", len(frame)) + frame)
+
+    held = b""
+
+    def next_frame():
+        global held
+        while True:
+            if len(held) >= 4:
+                length = struct.unpack(">I", held[:4])[0]
+                if length > 65536:
+                    print("FAIL: the gateway framed a", length, "byte frame, which is not a",
+                          "length -- the prefix is being read the wrong way round for", described)
+                    sys.exit(1)
+                if len(held) >= 4 + length:
+                    body, held = held[4:4 + length], held[4 + length:]
+                    return body
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                return None
+            if not chunk:
+                return None
+            held += chunk
+
+    while True:
+        reply = next_frame()
+        if reply is None:
+            print("FAIL: no ARP reply over the stream wire within 10s for", described)
+            sys.exit(1)
+        if len(reply) < 42 or reply[12:14] != b"\x08\x06":
+            continue
+        if reply[20:22] != b"\x00\x02" or reply[28:32] != expected:
+            continue
+        print("ok: qemu  ARP", ".".join(map(str, expected)),
+              "answered over the length-prefixed wire for", described)
+        break
+finally:
+    s.close()
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -667,5 +755,8 @@ tcp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 # And the other direction: a host port held open for the guest.
 forward_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And the wire nobody drives.
+stream_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

@@ -30,20 +30,8 @@ private final class NotificationListener: @unchecked Sendable {
     private var running = true
 
     init(path: String) {
-        fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
-            path.withCString { source in
-                raw.withMemoryRebound(to: CChar.self, capacity: 104) { strncpy($0, source, 103) }
-            }
-        }
-        _ = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
+        fd = makeSocket(AF_UNIX, .stream)
+        _ = bindTo(fd, unixAddress(path: path))
         listen(fd, 32)
         queue.async { [weak self] in self?.accept() }
     }

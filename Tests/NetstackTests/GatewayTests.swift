@@ -429,7 +429,7 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
 /// the documented fallback, and means the assertions about real reachability
 /// have nothing to say rather than something wrong to say.
 private func unprivilegedICMPIsAvailable() -> Bool {
-    let fd = socket(AF_INET, SOCK_DGRAM, Int32(IPPROTO_ICMP))
+    let fd = makeICMPSocket()
     guard fd >= 0 else { return false }
     close(fd)
     return true

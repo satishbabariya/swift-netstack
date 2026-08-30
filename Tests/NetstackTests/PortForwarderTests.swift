@@ -239,22 +239,10 @@ private func pfGuestSegment(
     let hostPort = forwarder.listeningAddress!.port!
 
     // A host sender, bound so it can be replied to.
-    let sender = socket(AF_INET, SOCK_DGRAM, 0)
+    let sender = makeSocket(AF_INET, .datagram)
     #expect(sender >= 0)
     defer { close(sender) }
-    var target = sockaddr_in()
-    target.sin_family = sa_family_t(AF_INET)
-    target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    target.sin_port = UInt16(hostPort).bigEndian
-    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr)
-    let payload = Array("ping".utf8)
-    _ = withUnsafePointer(to: &target) { addr in
-        addr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
-            payload.withUnsafeBytes {
-                sendto(sender, $0.baseAddress, $0.count, 0, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-    }
+    _ = sendTo(sender, Array("ping".utf8), loopbackAddress(port: UInt16(hostPort)))
 
     // It should arrive at the guest, on the guest port that was published.
     var arrived: (source: UInt16, payload: [UInt8])?
@@ -347,21 +335,9 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     /// One datagram from a socket of its own, so each has its own source port
     /// and is therefore its own flow.
     func sendFromANewSocket() {
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        let fd = makeSocket(AF_INET, .datagram)
         defer { close(fd) }
-        var target = sockaddr_in()
-        target.sin_family = sa_family_t(AF_INET)
-        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        target.sin_port = UInt16(hostPort).bigEndian
-        inet_pton(AF_INET, "127.0.0.1", &target.sin_addr)
-        let payload = Array("x".utf8)
-        _ = withUnsafePointer(to: &target) { addr in
-            addr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
-                payload.withUnsafeBytes {
-                    sendto(fd, $0.baseAddress, $0.count, 0, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
+        _ = sendTo(fd, Array("x".utf8), loopbackAddress(port: UInt16(hostPort)))
     }
 
     for _ in 0..<12 { sendFromANewSocket() }

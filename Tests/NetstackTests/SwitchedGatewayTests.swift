@@ -23,23 +23,9 @@ private func swgTemporaryPath(_ tag: String) -> String {
 }
 
 func swgDial(_ path: String) -> Int32 {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let fd = makeSocket(AF_UNIX, .stream)
     #expect(fd >= 0)
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
-        path.withCString { source in
-            raw.withMemoryRebound(to: CChar.self, capacity: 104) { destination in
-                strncpy(destination, source, 103)
-            }
-        }
-    }
-    let connected = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-        }
-    }
+    let connected = connectTo(fd, unixAddress(path: path))
     #expect(connected == 0, "could not dial \(path): \(String(cString: strerror(errno)))")
     return fd
 }

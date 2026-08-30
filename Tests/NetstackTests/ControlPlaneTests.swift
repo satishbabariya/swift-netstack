@@ -41,19 +41,10 @@ private func controlPlaneFixture(group: EventLoopGroup, guestSide: inout Int32) 
 private func request(
     _ method: String, _ path: String, body: String?, to address: SocketAddress
 ) throws -> (status: Int, body: String) {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    let fd = makeSocket(AF_INET, .stream)
     #expect(fd >= 0)
     defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    addr.sin_port = UInt16(address.port!).bigEndian
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
-    let connected = withUnsafePointer(to: &addr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
+    let connected = connectTo(fd, loopbackAddress(port: UInt16(address.port!)))
     #expect(connected == 0, "could not reach the control plane")
 
     // A read deadline, because without one a route that answers nothing makes
@@ -494,19 +485,10 @@ private func boundPort(in body: String) -> Int? {
 /// A raw request, written verbatim, so a test can send something no well-behaved
 /// client would.
 private func rawRequest(_ text: String, to address: SocketAddress) throws -> String {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    let fd = makeSocket(AF_INET, .stream)
     #expect(fd >= 0)
     defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    addr.sin_port = UInt16(address.port!).bigEndian
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
-    _ = withUnsafePointer(to: &addr) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
+    _ = connectTo(fd, loopbackAddress(port: UInt16(address.port!)))
     var deadline = timeval(tv_sec: 3, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
     let out = Array(text.utf8)
@@ -573,21 +555,10 @@ private func rawRequest(_ text: String, to address: SocketAddress) throws -> Str
 private enum RawOutcome { case answered, closed, hung }
 
 private func rawProbe(_ bytes: [UInt8], to address: SocketAddress) -> RawOutcome {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    let fd = makeSocket(AF_INET, .stream)
     guard fd >= 0 else { return .closed }
     defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    addr.sin_port = UInt16(address.port!).bigEndian
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
-    guard
-        withUnsafePointer(to: &addr, {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }) == 0
-    else { return .closed }
+    guard connectTo(fd, loopbackAddress(port: UInt16(address.port!))) == 0 else { return .closed }
     var deadline = timeval(tv_sec: 3, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
     _ = bytes.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }

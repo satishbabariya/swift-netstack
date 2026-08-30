@@ -126,11 +126,10 @@ jobs:
       - name: Build the library and the program
         run: swift build
 
-      # Run them and find out. Most of this suite drives an `EmbeddedEventLoop`
-      # with no sockets at all, and a great deal of it is endianness and
-      # integer-width work -- which is exactly where a platform difference
-      # hides. `|| true` for this first run so the job reports what happens
-      # rather than stopping at the first failure; the summary below is the
-      # point.
-      - name: Test on Linux
-        run: swift test 2>&1 | tail -40 || true
+      # Compiled, not run. The test target's own portability is worth gating on
+      # -- it did not compile here at all, for the same three reasons the
+      # library did not -- while running the suite is a separate question: a
+      # container restricts unprivileged ICMP and the ping tests would fail for
+      # the sandbox rather than for the code.
+      - name: Build the tests on Linux
+        run: swift build --build-tests

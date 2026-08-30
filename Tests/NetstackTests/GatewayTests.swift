@@ -221,7 +221,13 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
 
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group,
-        configuration: .init(upstreamResolvers: [], logger: logger)
+        // An hour, rather than the ten-second default. The claim is "twenty
+        // refusals produce one line", and with the default that is also a claim
+        // about how fast the machine is: on a CI runner the twenty queries took
+        // longer than the window, the window turned over, and a second line
+        // appeared. A test that fails on a slow machine and passes here is
+        // measuring the machine.
+        configuration: .init(upstreamResolvers: [], logger: logger, logWindow: .hours(1))
     ).get()
 
     let discover = frame(
@@ -233,8 +239,8 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     let leased = try #require(DHCPCodec.parse(offer)).yourAddress
 
     // A name this gateway does not own, asked for twenty times. One line, not
-    // twenty -- and the twenty are all inside the default window, so this is
-    // also the rate limit doing its job on a real datapath rather than in a
+    // twenty -- and the twenty are all inside one window by construction, so
+    // this is the rate limit doing its job on a real datapath rather than in a
     // unit test holding a `ManualClock`.
     for transaction in 0..<20 {
         var query = ByteBuffer()

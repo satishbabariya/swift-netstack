@@ -130,6 +130,64 @@ try:
               "for", described)
         sys.exit(1)
     print("ok: lease ", ".".join(map(str, leased)), "offered for", described)
+
+    # And a name. `gateway.containers.internal` is the one the gateway publishes
+    # for itself, so the answer says both that the resolver is bound and that it
+    # knows which address it is on -- the thing that was wrong when this file was
+    # written.
+    def udp_frame(source, destination, sport, dport, payload):
+        udp = (
+            sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
+            + (8 + len(payload)).to_bytes(2, "big") + b"\x00\x00" + payload
+        )
+        total = 20 + len(udp)
+        header = bytearray(
+            b"\x45\x00" + total.to_bytes(2, "big") + b"\x00\x00\x00\x00\x40\x11\x00\x00"
+            + source + destination
+        )
+        checksum = 0
+        for i in range(0, 20, 2):
+            checksum += (header[i] << 8) | header[i + 1]
+        checksum = (checksum >> 16) + (checksum & 0xFFFF)
+        checksum = (~((checksum >> 16) + (checksum & 0xFFFF))) & 0xFFFF
+        header[10:12] = checksum.to_bytes(2, "big")
+        return b"\x5a\x94\xef\xe4\x0c\xee" + src + b"\x08\x00" + bytes(header) + udp
+
+    name = b"".join(bytes([len(part)]) + part for part in
+                    [b"gateway", b"containers", b"internal"]) + b"\x00"
+    query = (
+        b"\x4d\x4e" + b"\x01\x00" + b"\x00\x01" + b"\x00" * 6
+        + name + b"\x00\x01\x00\x01"
+    )
+    s.send(udp_frame(leased, expected, 40000, 53, query))
+
+    s.settimeout(5)
+    resolved = None
+    while resolved is None:
+        try:
+            reply = s.recv(2048)
+        except socket.timeout:
+            print("FAIL: no DNS answer within 5s for", described)
+            sys.exit(1)
+        if len(reply) < 54 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
+            continue
+        if int.from_bytes(reply[34:36], "big") != 53:
+            continue
+        body = reply[42:]
+        if len(body) < 12 or body[0:2] != b"\x4d\x4e":
+            continue
+        if int.from_bytes(body[6:8], "big") < 1:
+            print("FAIL: the resolver answered with no records for", described)
+            sys.exit(1)
+        resolved = body[-4:]
+
+    if resolved != expected:
+        print("FAIL: gateway.containers.internal resolved to",
+              ".".join(map(str, resolved)), "rather than",
+              ".".join(map(str, expected)), "for", described)
+        sys.exit(1)
+    print("ok: name  gateway.containers.internal ->",
+          ".".join(map(str, resolved)), "for", described)
 finally:
     s.close()
     os.unlink(client_path)

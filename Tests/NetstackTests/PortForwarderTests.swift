@@ -31,7 +31,7 @@ private func portForwardingGateway(
     group: EventLoopGroup, guestSide: inout Int32, guestPort: UInt16, maximumConnections: Int = 256
 ) async throws -> PFHolder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
@@ -217,7 +217,7 @@ private func pfGuestSegment(
     // to match it to.
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let guestSide = pair[1]
     defer { close(guestSide) }
     let link = try await WireBootstrap.adoptingDatagramSocket(
@@ -308,7 +308,7 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     // bound turns into a permanent refusal rather than a temporary one.
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     defer { close(pair[1]) }
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500

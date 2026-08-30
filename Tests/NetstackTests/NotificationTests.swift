@@ -38,7 +38,7 @@ private final class NotificationListener: @unchecked Sendable {
 
     private func accept() {
         while running {
-            let client = Darwin.accept(fd, nil, nil)
+            let client = acceptConnection(fd)
             guard client >= 0 else { break }
             var buffer = [UInt8](repeating: 0, count: 4096)
             let read = buffer.withUnsafeMutableBytes { recv(client, $0.baseAddress, $0.count, 0) }
@@ -78,7 +78,7 @@ private final class NotificationListener: @unchecked Sendable {
     defer { listener.stop() }
 
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group,

@@ -145,3 +145,27 @@ func sendTo(_ descriptor: Int32, _ payload: [UInt8], _ address: sockaddr_un) -> 
         }
     }
 }
+
+/// `socketpair(2)`, with the type spelled portably.
+///
+/// This is how nearly every test here builds a wire: the host keeps one end and
+/// the other stands in for the VM, exactly as Virtualization.framework hands one
+/// over.
+func makeSocketPair(_ domain: Int32, _ kind: SocketKind, _ pair: inout [Int32]) -> Int32 {
+    socketpair(domain, kind.rawType, 0, &pair)
+}
+
+// `Darwin.send` and `Darwin.accept` were written with the module qualifier to
+// disambiguate from a same-named symbol in scope -- `send` collides with NIO's,
+// and `accept` with a local. The qualifier is the module name, so it does not
+// exist on Linux. These two wrappers say the same thing portably.
+
+/// `send(2)` on a connected socket.
+func sendBytes(_ descriptor: Int32, _ bytes: [UInt8]) -> Int {
+    bytes.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, 0) }
+}
+
+/// `accept(2)`, discarding the peer address.
+func acceptConnection(_ descriptor: Int32) -> Int32 {
+    accept(descriptor, nil, nil)
+}

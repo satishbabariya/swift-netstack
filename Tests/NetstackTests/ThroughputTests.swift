@@ -110,7 +110,7 @@ private func benchFrame(
     guard ProcessInfo.processInfo.environment["NETSTACK_THROUGHPUT"] != nil else { return }
 
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     var size: Int32 = 8 * 1024 * 1024
     _ = setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
     _ = setsockopt(pair[1], SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))

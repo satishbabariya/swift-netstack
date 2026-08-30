@@ -173,7 +173,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // kernel: one datagram in, one whole frame out, boundaries preserved with no
     // framing of our own.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0, "the platform refused a datagram socketpair")
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0, "the platform refused a datagram socketpair")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let link = try await WireBootstrap.adoptingDatagramSocket(
@@ -238,7 +238,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // truncated, merged or misframed request produces no reply at all — and it
     // needs no handshake, no timers and no clock control to complete.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let link = try await WireBootstrap.adoptingDatagramSocket(

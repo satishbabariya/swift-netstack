@@ -223,7 +223,7 @@ private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
 
 @Test func anAssembledGatewaySurvivesAGuestTryingToBreakIt() async throws {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     // A send buffer large enough that the flood is not throttled by the socket
     // before it reaches the stack, which is the thing under test.
     var size: Int32 = 4 * 1024 * 1024

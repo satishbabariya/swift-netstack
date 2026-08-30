@@ -33,7 +33,7 @@ private func gateway(
     nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false
 ) async throws -> Holder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: outboundGatewayMAC, mtu: 1500
@@ -96,7 +96,7 @@ private func drainSegments(_ fd: Int32) -> [(header: TCPHeader, payload: ByteBuf
 }
 
 private func send(_ fd: Int32, _ bytes: [UInt8]) {
-    #expect(bytes.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) } == bytes.count)
+    #expect(sendBytes(fd, bytes) == bytes.count)
 }
 
 /// Poll for segments rather than sleeping a fixed time: the work is on another

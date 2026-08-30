@@ -24,7 +24,7 @@ private final class CPHolder: @unchecked Sendable {
 
 private func controlPlaneFixture(group: EventLoopGroup, guestSide: inout Int32) async throws -> CPHolder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group, configuration: .init()

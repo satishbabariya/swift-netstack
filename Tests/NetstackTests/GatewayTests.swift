@@ -78,7 +78,7 @@ private func awaitUDP(_ fd: Int32, fromPort: UInt16) async -> ByteBuffer? {
     // round, both services answer nothing and the failure looks like a bug in
     // whichever one is tested first.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let gateway = try await Gateway.start(
@@ -135,7 +135,7 @@ private func awaitUDP(_ fd: Int32, fromPort: UInt16) async -> ByteBuffer? {
     // package in one test: the guest's TCP reaches a real listener, and the
     // answer comes back.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group, configuration: .init()
@@ -215,7 +215,7 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     // in complete silence. The guest sees "DNS is broken", the host sees
     // nothing at all, and the cause is one missing line of configuration.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let (logger, lines) = makeLogger()
 
@@ -290,7 +290,7 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     // about a task scheduled on a dead loop *after* the group shut down, which
     // reads like a test-teardown race and was dismissed as one.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group, configuration: .init()
@@ -328,7 +328,7 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     // name resolves to must be an address `nat` rewrites. Change either one alone
     // and this fails.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let configuration = Gateway.Configuration()
     let gateway = try await Gateway.start(
@@ -392,7 +392,7 @@ private final class GatewayEcho: ChannelInboundHandler, @unchecked Sendable {
     let path = "/tmp/netstack-gateway-capture-\(UInt32.random(in: 0...UInt32.max)).pcap"
     defer { try? FileManager.default.removeItem(atPath: path) }
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group, configuration: .init(captureFile: path)
@@ -485,7 +485,7 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     // gateway's own address is the router answering a question about itself, and
     // the host address is translated and sent for real.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let configuration = Gateway.Configuration()
     let gateway = try await Gateway.start(
@@ -530,7 +530,7 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     // question ping asks.
     guard unprivilegedICMPIsAvailable() else { return }
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group,
@@ -574,7 +574,7 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     // what has to hold is that arrivals are accounted for, not that there were
     // exactly nine of them.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group, configuration: .init()

@@ -332,7 +332,7 @@ private func forwardingGateway(
     group: EventLoopGroup, guestSide: inout Int32, upstream: SocketAddress, maximumPending: Int = 256
 ) async throws -> DNSHolder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: dnsGatewayMAC, mtu: 1500
@@ -632,7 +632,7 @@ private func awaitReply(_ fd: Int32) async -> ByteBuffer? {
 /// look like a forwarded one.
 private func zoneGateway(group: EventLoopGroup, guestSide: inout Int32) async throws -> DNSHolder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: dnsGatewayMAC, mtu: 1500

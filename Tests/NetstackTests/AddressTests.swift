@@ -79,13 +79,13 @@ import Testing
     #expect(offset.lastUsable == IPv4Address("10.7.0.254")!)
 }
 
-@Test func aGatewayGivenOnlyASubnetPlacesItselfAndTheHostOnIt() throws {
-    let configuration = try Gateway.Configuration(subnet: IPv4Subnet(cidr: "10.9.0.0/25")!)
+@Test func aGatewayGivenOnlyASubnetPlacesItselfAndTheHostOnIt() {
+    let configuration = Gateway.Configuration(subnet: IPv4Subnet(cidr: "10.9.0.0/25")!)
     #expect(configuration.gatewayAddress == IPv4Address("10.9.0.1")!)
     #expect(configuration.hostAddress == IPv4Address("10.9.0.126")!)
 
     // An address that *is* given still wins over the derivation.
-    let told = try Gateway.Configuration(
+    let told = Gateway.Configuration(
         gatewayAddress: IPv4Address("10.9.0.9")!, subnet: IPv4Subnet(cidr: "10.9.0.0/25")!)
     #expect(told.gatewayAddress == IPv4Address("10.9.0.9")!)
 }

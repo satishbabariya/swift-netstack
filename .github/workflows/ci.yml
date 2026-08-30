@@ -71,6 +71,13 @@ jobs:
       - name: Check the conventions
         run: ./scripts/conventions.sh
 
+      # Drives this gateway with gvisor-tap-vsock's own client library. Every
+      # other comparison against upstream here depends on my having read
+      # upstream correctly, and reading is what got `--listen` backwards and
+      # missed `/services/dhcp/leases`.
+      - name: Interoperate with upstream's client
+        run: ./scripts/interop.sh
+
       - name: Falsify the guards
         run: ./scripts/falsify.sh --all
 

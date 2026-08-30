@@ -326,6 +326,7 @@ which is the part that explains it.
 
 ```
 swift test
+./scripts/interop.sh
 NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
 NETSTACK_FUZZ_ITERATIONS=500000 swift test --filter Fuzz
 NETSTACK_THROUGHPUT=1 swift test -c release --filter Throughput
@@ -345,6 +346,14 @@ real TCP stack from the same generated sequences and compares every frame. The
 generator withholds nothing: both stacks negotiate window scaling, timestamps and
 SACK, and 10,000 randomised sequences agree frame for frame apart from three
 documented differences, each with a reason recorded in `differential/README.md`.
+
+`scripts/interop.sh` starts a gateway and drives it with **gvisor-tap-vsock's own
+client library**, pinned at v0.8.9. Every other comparison with upstream here
+rests on having read upstream correctly — and reading is what put `--listen` on
+the wrong socket, missed `/services/dhcp/leases`, and did not notice that Go's
+JSON decoder matches field names case-insensitively where this one did not, so
+upstream's client could list zones from this gateway but not add one. This is the
+only check that does not depend on my reading being right.
 
 The fuzzer mutates real frames rather than generating random bytes — uniformly
 random input is rejected by the first length check and never reaches anything.

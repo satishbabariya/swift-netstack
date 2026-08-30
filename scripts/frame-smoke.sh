@@ -14,13 +14,14 @@ cd "$(dirname "$0")/.." || exit 1
 
 WIRE=""
 CONFIG=""
+CONTROL=""
 GATEWAY=""
 LISTENER=""
 ECHO_PID=""
 cleanup() {
     [[ -n "$GATEWAY" ]] && kill "$GATEWAY" 2>/dev/null
     [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null
-    rm -f "$WIRE" "$CONFIG" "$LISTENER" "${LISTENER:-/nonexistent}.port"
+    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "${LISTENER:-/nonexistent}.port"
 }
 trap cleanup EXIT INT TERM
 
@@ -408,6 +409,232 @@ PY
     return $outcome
 }
 
+# A host port forwarded into the guest.
+#
+# The other direction, and the other headline feature: something on the host
+# connects to a port the gateway is holding for the guest, and the gateway opens
+# the connection inside the network to deliver it. Nothing has ever pushed a
+# byte through one. The interop driver calls Expose and checks that the list
+# grew, which says the control API accepted the request and nothing at all about
+# whether a forward forwards.
+#
+# The guest side of this is a listener, so the script has to act like one: answer
+# the ARP the gateway sends looking for the guest, accept the SYN it dials, and
+# echo. The host side is an ordinary socket, on an ordinary thread.
+forward_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-control-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" && -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" && -S "$CONTROL" ]] || {
+        echo "FAIL: the wire or the control socket never appeared (forward)"
+        return 1
+    }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
+import json, os, socket, subprocess, sys, threading
+
+wire = os.environ["WIRE"]
+control = os.environ["CONTROL"]
+gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+guest_text = ".".join(map(str, guest))
+
+GUEST_MAC = bytes.fromhex("5a94efe4bc00")
+GATEWAY_MAC = bytes.fromhex("5a94efe40cee")
+GUEST_PORT = 8080
+SYN, ACK, PSH, FIN, RST = 0x02, 0x10, 0x08, 0x01, 0x04
+
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+
+
+def ones_complement(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total >> 16) + (total & 0xFFFF)
+    return (~total) & 0xFFFF
+
+
+def tcp_frame(source, destination, sport, dport, seq, ack, flags, payload=b""):
+    header = (
+        sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
+        + seq.to_bytes(4, "big") + ack.to_bytes(4, "big")
+        + bytes([5 << 4, flags]) + (65535).to_bytes(2, "big") + b"\x00\x00\x00\x00"
+    )
+    segment = header + payload
+    pseudo = source + destination + b"\x00\x06" + len(segment).to_bytes(2, "big")
+    segment = (segment[:16] + ones_complement(pseudo + segment).to_bytes(2, "big")
+               + segment[18:])
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(segment)).to_bytes(2, "big")
+        + b"\x00\x00\x40\x00\x40\x06\x00\x00" + source + destination
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    return GATEWAY_MAC + GUEST_MAC + b"\x08\x00" + bytes(ip) + segment
+
+
+def arp_reply(target_mac, target_ip):
+    return (
+        target_mac + GUEST_MAC + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x02"
+        + GUEST_MAC + guest + target_mac + target_ip
+    )
+
+
+def expose():
+    """Ask for a host port, bound to whatever is free, delivered to the guest."""
+    request = json.dumps({
+        "local": "127.0.0.1:0", "remote": f"{guest_text}:{GUEST_PORT}", "protocol": "tcp",
+    })
+    answer = subprocess.run(
+        ["curl", "--silent", "--fail-with-body", "--unix-socket", control,
+         "-X", "POST", "--data", request,
+         "http://gateway/services/forwarder/expose"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if answer.returncode != 0:
+        print("FAIL: expose was refused:", answer.stdout.strip() or answer.stderr.strip(),
+              "for", described)
+        sys.exit(1)
+    body = json.loads(answer.stdout)
+    return int(body["local"].rsplit(":", 1)[1])
+
+
+body = b"the host reached the guest"
+received = {}
+
+
+def host_side(port):
+    """An ordinary client, on the host, that knows nothing about any of this."""
+    try:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=15)
+        connection.settimeout(15)
+        # Sent at once, before the guest-side handshake can possibly have
+        # finished. That is what every HTTP client does, and it is what the
+        # forwarder used to lose.
+        connection.sendall(body)
+        echoed = b""
+        while len(echoed) < len(body):
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            echoed += chunk
+        received["echoed"] = echoed
+        connection.close()
+    except Exception as error:  # reported by the main thread, which owns the verdict
+        received["error"] = error
+
+
+try:
+    s.connect(wire)
+
+    # Announce the guest before asking for anything. The switch learns which port
+    # an address is on from frames it receives, so until the guest has spoken it
+    # is on no port at all and the gateway has nowhere to send the dial -- which
+    # looks exactly like a forwarder that does not forward.
+    s.send(
+        b"\xff\xff\xff\xff\xff\xff" + GUEST_MAC + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + GUEST_MAC + guest + b"\x00" * 6 + gateway
+    )
+
+    port = expose()
+    print("ok: fwd   host port", port, "->", f"{guest_text}:{GUEST_PORT}", "for", described)
+
+    client = threading.Thread(target=host_side, args=(port,), daemon=True)
+    client.start()
+
+    # Act like a guest with something listening: answer the ARP, accept the SYN,
+    # echo what arrives. The gateway chooses its own source address for the dial,
+    # so it is read off the SYN rather than assumed.
+    s.settimeout(20)
+    peer = None
+    their_port = None
+    seq = 5000
+    theirs = 0
+    echoed_back = 0
+    deadline_missed = "no SYN arrived from the gateway"
+    while echoed_back < len(body):
+        try:
+            frame = s.recv(4096)
+        except socket.timeout:
+            print("FAIL:", deadline_missed, "for", described)
+            sys.exit(1)
+        if len(frame) < 42:
+            continue
+
+        if frame[12:14] == b"\x08\x06" and frame[38:42] == guest:
+            # who-has <the guest> -- the gateway cannot dial until this is answered
+            s.send(arp_reply(frame[22:28], frame[28:32]))
+            continue
+
+        if frame[12:14] != b"\x08\x00":
+            continue
+        ip = frame[14:int.from_bytes(frame[16:18], "big") + 14]
+        if len(ip) < 20 or ip[9] != 6 or ip[16:20] != guest:
+            continue
+        segment = ip[(ip[0] & 0x0F) * 4:]
+        if int.from_bytes(segment[2:4], "big") != GUEST_PORT:
+            continue
+        flags = segment[13]
+        their_seq = int.from_bytes(segment[4:8], "big")
+        payload = segment[(segment[12] >> 4) * 4:]
+
+        if flags & SYN and not flags & ACK:
+            peer, their_port = ip[12:16], int.from_bytes(segment[0:2], "big")
+            theirs = their_seq + 1
+            s.send(tcp_frame(guest, peer, GUEST_PORT, their_port, seq, theirs, SYN | ACK))
+            seq += 1
+            deadline_missed = "the handshake was answered but no data arrived"
+            continue
+
+        if peer is None:
+            continue
+        if flags & RST:
+            print("FAIL: the gateway reset the forwarded connection for", described)
+            sys.exit(1)
+        if payload and their_seq == theirs:
+            theirs += len(payload)
+            s.send(tcp_frame(guest, peer, GUEST_PORT, their_port, seq, theirs,
+                             PSH | ACK, payload))
+            echoed_back += len(payload)
+            deadline_missed = "the echo was sent but the host never saw it"
+
+    client.join(20)
+    if "error" in received:
+        print("FAIL: the host side failed:", received["error"], "for", described)
+        sys.exit(1)
+    if received.get("echoed") != body:
+        print("FAIL: the host read", received.get("echoed"), "rather than", body,
+              "for", described)
+        sys.exit(1)
+    print("ok: fwd  ", len(body), "bytes round-tripped host -> guest -> host for", described)
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -437,5 +664,8 @@ smoke 10.8.0.1 10.8.0.2 10.8.0.254 --config "$CONFIG" || status=1
 # The whole path, once, on the defaults: guest -> host address -> NAT ->
 # 127.0.0.1 -> a real listener, and the bytes back.
 tcp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
+
+# And the other direction: a host port held open for the guest.
+forward_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

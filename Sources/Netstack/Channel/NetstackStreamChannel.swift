@@ -36,6 +36,12 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     private let ownsEndpoint: Bool
     private var state: State = .idle
     private var pendingWrites: [(buffer: ByteBuffer, promise: EventLoopPromise<Void>?)] = []
+
+    /// Set by a `flush` that arrived before the channel was active, and honoured
+    /// by `activate`. Without it the queued bytes would sit there until some
+    /// later write happened to flush them, which for a request/response protocol
+    /// is never.
+    private var flushPending = false
     private var autoRead = true
     private var readPending = false
     private var writable = true
@@ -166,17 +172,32 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     }
 
     public func write0(_ data: NIOAny, promise: EventLoopPromise<Void>?) {
-        guard state == .active else {
+        guard state != .closed else {
             promise?.fail(ChannelError.ioOnClosedChannel)
             return
         }
         // Queued, not sent. The promise means "these bytes were accepted by the
         // send buffer", which `flush0` is the first thing in a position to know.
+        //
+        // A write before the channel is active is queued rather than refused,
+        // which is what NIO's own channels do and what anything spliced onto
+        // this one assumes. Refusing it here failed the promise -- and the
+        // splice writes with no promise, so the bytes went nowhere and said
+        // nothing. That is a real connection losing real data: a host client
+        // that connects to a forwarded port and writes at once, which is every
+        // HTTP client there is, had its request dropped while the guest-side
+        // handshake was still in flight.
         pendingWrites.append((unwrapData(data, as: ByteBuffer.self), promise))
     }
 
     public func flush0() {
-        guard state == .active else { return }
+        guard state == .active else {
+            // Remembered rather than discarded: these bytes have been asked for,
+            // and `activate` owes them to the peer as soon as there is somewhere
+            // to send them.
+            flushPending = !pendingWrites.isEmpty
+            return
+        }
         drainPendingWrites()
     }
 
@@ -235,6 +256,10 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         connectPromise = nil
         promise?.succeed(())
         pipeline.fireChannelActive()
+        if flushPending {
+            flushPending = false
+            drainPendingWrites()
+        }
         if autoRead { read0() }
     }
 

@@ -104,6 +104,41 @@ else
     done
 fi
 
+# 6. The harness pins gVisor to this stack's constants, and still does.
+#
+# `differential/README.md` says the comparison is about algorithms rather than
+# about two choices of number, and that rests on three values being the same on
+# both sides. Nothing checked it, and the failure would be quiet in the worst
+# way: change `RTTEstimator.minimumTimeout` and the gate keeps passing while
+# comparing two stacks with different RTO floors -- so it reports fewer real
+# differences, not more.
+check_pinned() {
+    local name="$1" swift_value="$2" go_value="$3"
+    if [[ -z "$swift_value" || -z "$go_value" ]]; then
+        fail "could not read $name from both sides" "swift='$swift_value' go='$go_value'"
+    elif [[ "$swift_value" != "$go_value" ]]; then
+        fail "$name is $swift_value here and $go_value in the harness" \
+            "the differential would compare two stacks tuned differently"
+    fi
+}
+
+swift_min=$(grep -oE 'static let minimumTimeout = TimeAmount\.seconds\([0-9]+\)' \
+    Sources/Netstack/Transport/TCP/RTTEstimator.swift | grep -oE '[0-9]+')
+go_min=$(grep -oE 'TCPMinRTOOption\([0-9]+ \* time\.Second\)' differential/harness/main.go \
+    | grep -oE '[0-9]+' | head -1)
+check_pinned "the minimum RTO" "$swift_min" "$go_min"
+
+swift_max=$(grep -oE 'static let maximumTimeout = TimeAmount\.seconds\([0-9]+\)' \
+    Sources/Netstack/Transport/TCP/RTTEstimator.swift | grep -oE '[0-9]+')
+go_max=$(grep -oE 'TCPMaxRTOOption\([0-9]+ \* time\.Second\)' differential/harness/main.go \
+    | grep -oE '[0-9]+' | head -1)
+check_pinned "the maximum RTO" "$swift_max" "$go_max"
+
+swift_retries=$(grep -oE 'static let maximumFinTransmissions = [0-9]+' \
+    Sources/Netstack/Transport/TCP/TCPEndpoint.swift | grep -oE '[0-9]+')
+go_retries=$(grep -oE 'TCPMaxRetriesOption\([0-9]+\)' differential/harness/main.go | grep -oE '[0-9]+')
+check_pinned "the retry limit" "$swift_retries" "$go_retries"
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

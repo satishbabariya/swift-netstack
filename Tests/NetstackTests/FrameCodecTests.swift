@@ -118,7 +118,7 @@ private func framed(_ bytes: [UInt8]) -> ByteBuffer {
     // Refuses rather than truncates, for the reason `Sender.write` does: a
     // truncated frame is one the peer will misinterpret, and because the length
     // prefix would then be wrong it takes every frame after it down too.
-    var encoder = FrameEncoder(maximumFrame: 1514)
+    let encoder = FrameEncoder(maximumFrame: 1514)
     var out = ByteBuffer()
     #expect(throws: FrameCodecError.self) {
         try encoder.encode(data: ByteBuffer(bytes: [UInt8](repeating: 0, count: 1515)), out: &out)
@@ -130,7 +130,7 @@ private func framed(_ bytes: [UInt8]) -> ByteBuffer {
     // The round trip, which is the only thing that checks the two halves agree
     // about byte order. A decoder and encoder that both used little-endian would
     // pass every test above and fail against qemu.
-    var encoder = FrameEncoder(maximumFrame: 1514)
+    let encoder = FrameEncoder(maximumFrame: 1514)
     var wire = ByteBuffer()
     let payload = ByteBuffer(bytes: [0xde, 0xad, 0xbe, 0xef])
     try encoder.encode(data: payload, out: &wire)

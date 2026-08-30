@@ -13,7 +13,7 @@ import Testing
     let forwarder = TCPForwarder(stack: fixture.stack) { request in
         seen.append((request.sourcePort, request.destinationPort))
     }
-    try withExtendedLifetime(forwarder) {
+    withExtendedLifetime(forwarder) {
         fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: 9999))
 
         #expect(seen.count == 1)
@@ -169,7 +169,7 @@ import Testing
     let forwarder = TCPForwarder(stack: fixture.stack) { request in
         if let endpoint = try? request.complete() { accepted.append(endpoint) }
     }
-    try withExtendedLifetime(forwarder) {
+    withExtendedLifetime(forwarder) {
         for peerPort in UInt16(50001)...UInt16(50006) {
             fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: peerPort))
         }
@@ -208,7 +208,7 @@ import Testing
         original = nil
         _ = original
     }
-    try withExtendedLifetime(replacement) {
+    withExtendedLifetime(replacement) {
         fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: 9999))
         #expect(seen == 1, "the replacement's handler was uninstalled by the original's teardown")
     }

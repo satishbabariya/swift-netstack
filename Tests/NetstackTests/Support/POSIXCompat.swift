@@ -186,3 +186,14 @@ let dontWait: Int32 = {
 func receiveNonBlocking(_ descriptor: Int32, into buffer: inout [UInt8]) -> Int {
     buffer.withUnsafeMutableBytes { recv(descriptor, $0.baseAddress, $0.count, dontWait) }
 }
+
+/// A boolean an escaping callback sets and the assertion after it reads.
+///
+/// A captured `var` would be the obvious thing and the compiler is right to
+/// object: the closure is `@Sendable` and the variable is not. Everything here
+/// runs on one event loop, which the compiler cannot see, so this is the same
+/// `@unchecked` bargain the library makes for its own loop-confined types.
+final class Flag: @unchecked Sendable {
+    private(set) var isSet = false
+    func set() { isSet = true }
+}

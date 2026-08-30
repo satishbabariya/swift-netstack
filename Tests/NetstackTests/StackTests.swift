@@ -211,10 +211,10 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         weakRoutes = stack.routes
         weakIPv4 = stack.ipv4
         weakLink = link
-        var completed = false
-        stack.shutdown().whenSuccess { completed = true }
+        let completed = Flag()
+        stack.shutdown().whenSuccess { completed.set() }
         loop.run()
-        #expect(completed)
+        #expect(completed.isSet)
     }
     #expect(weakNIC == nil)
     #expect(weakRoutes == nil)
@@ -265,10 +265,10 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     // promise onto the loop, and an EmbeddedEventLoop only advances when
     // something drives it — so waiting deadlocks. Drive the loop instead.
     let (stack, _, loop) = makeStack()
-    var completed = false
-    stack.shutdown().whenSuccess { completed = true }
+    let completed = Flag()
+    stack.shutdown().whenSuccess { completed.set() }
     loop.run()
-    #expect(completed)
+    #expect(completed.isSet)
 
     // Advancing after shutdown must neither fire the cancelled task nor trap.
     loop.advanceTime(by: .seconds(60))
@@ -290,7 +290,7 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     // that it is itself on `eventLoop`, so construction and `start()` have
     // to happen there — off-loop is the scenario under test for `shutdown`
     // specifically, not for building the stack in the first place.
-    let stack = try await eventLoop.submit {
+    let carried = try await eventLoop.submit {
         let link = RecordingEndpoint(eventLoop: eventLoop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
         let stack = Stack(
             link: link,
@@ -300,8 +300,10 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
             ),
             clock: ManualClock())
         stack.start()
-        return stack
+        return StackBox(stack: stack)
     }.get()
+    let stack = carried.stack
+
 
     // Resumed on Swift concurrency's own executor after the `await` above,
     // not on `eventLoop`'s dedicated thread — a genuinely off-loop call.
@@ -332,10 +334,10 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     // must bypass `flatSubmit` entirely here and call straight through
     // instead, completing synchronously.
     let (stack, _, loop) = makeStack()
-    var firstCompleted = false
-    stack.shutdown().whenSuccess { firstCompleted = true }
+    let firstCompleted = Flag()
+    stack.shutdown().whenSuccess { firstCompleted.set() }
     loop.run()
-    #expect(firstCompleted)
+    #expect(firstCompleted.isSet)
 
     try stack.shutdown().wait()
 }
@@ -409,10 +411,10 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
         link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
         #expect(link.drainTransmitted().count == 1)
 
-        var completed = false
-        stack.shutdown().whenSuccess { completed = true }
+        let completed = Flag()
+        stack.shutdown().whenSuccess { completed.set() }
         loop.run()
-        #expect(completed)
+        #expect(completed.isSet)
 
         link.inject(arpRequestFrame(for: "192.168.127.1", from: "192.168.127.2", senderMAC: "0a:0b:0c:0d:0e:0f"))
         #expect(link.drainTransmitted().isEmpty)

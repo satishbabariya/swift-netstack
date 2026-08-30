@@ -89,7 +89,7 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     let fixture = TCPFixture()
     do {
         let (server, collector) = try servingFixture(fixture)
-        try withExtendedLifetime(server) {
+        withExtendedLifetime(server) {
             let iss = handshakeThroughForwarder(fixture)
             _ = fixture.drainSegments()
             fixture.inject(
@@ -211,7 +211,7 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     let fixture = TCPFixture()
     do {
         let (server, collector) = try servingFixture(fixture)
-        try withExtendedLifetime(server) {
+        withExtendedLifetime(server) {
             let iss = handshakeThroughForwarder(fixture)
             _ = fixture.drainSegments()
             // Bytes and the FIN together: the FIN says no more will arrive, not
@@ -249,7 +249,7 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     do {
         let (first, _) = try servingFixture(fixture)
         let second = NetstackServerChannel(stack: fixture.stack)
-        try withExtendedLifetime((first, second)) {
+        withExtendedLifetime((first, second)) {
             // There is one demuxer slot per protocol. A second forwarder would
             // take it, and the first would not error — it would simply stop
             // seeing connections, which is the worst way to find out.
@@ -270,7 +270,7 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     let fixture = TCPFixture()
     do {
         let (server, collector) = try servingFixture(fixture, autoRead: false, installRecorder: false)
-        try withExtendedLifetime(server) {
+        withExtendedLifetime(server) {
             fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: 50001))
             fixture.inject(guestSegment(sequence: guestISS, flags: [.syn], peerPort: 50002))
             #expect(collector.children.isEmpty)

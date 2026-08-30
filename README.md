@@ -366,6 +366,18 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
+`scripts/frame-smoke.sh` drives the **built executable** with real ethernet
+frames over its wire socket, because everything else that watches the program
+watches its control plane — and a gateway that has come up believing it is
+`0.0.0.0` answers its control socket perfectly well. That exact failure shipped
+once. It asks, across four configurations, who owns the gateway address, what
+address may I have, what do the two `.containers.internal` names resolve to, and
+then opens a **TCP connection to the host address and gets its bytes echoed
+back** by a real listener on the loopback — the forwarder, the NAT rewrite and
+the splice in one question, none of which the control API touches. Removing the
+NAT entry turns the SYN into a reset; breaking the return direction of the
+splice leaves the handshake intact and loses the echo.
+
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
 the two slow ones. It exists because the gates were seven scripts across five CI
 jobs and running "the ones I remembered" is not running them — CI builds with

@@ -177,3 +177,76 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// The test above holds the first guest open, which is the case a test author
+// writes and not the one a VM lives. A VM reboots: its connection dies, and the
+// next one is the same guest coming back.
+//
+// That connection used to be accepted and closed. The slot was taken once and
+// never released, so a rebooted guest could not reconnect and the gateway had to
+// be restarted alongside the VM. The datagram wire never had the problem — its
+// peer is whoever last sent — which is exactly why nothing noticed.
+@Test func aGuestThatGoesAwayReleasesTheWireForTheNextOne() async throws {
+    let path = temporaryPath("stream")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let pending = WireBootstrap.listeningStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500)
+    for _ in 0..<400 where !FileManager.default.fileExists(atPath: path) {
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+
+    let first = dial(path, type: .stream)
+    let link = try await pending.get()
+    let collector = Collector()
+    try await link.eventLoop.submit { link.attach(collector) }.get()
+
+    func sendFrame(_ descriptor: Int32) {
+        var wire = ByteBuffer()
+        let frame = ethernetFrame(payload: 40)
+        wire.writeInteger(UInt32(frame.count), endianness: .big)
+        wire.writeBytes(frame)
+        let bytes = Array(wire.readableBytesView)
+        _ = bytes.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
+    }
+
+    func awaitFrames(_ count: Int) async throws -> Int {
+        var seen = 0
+        for _ in 0..<400 where seen < count {
+            seen = try await link.eventLoop.submit { collector.frames.count }.get()
+            if seen < count { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        return seen
+    }
+
+    sendFrame(first)
+    #expect(try await awaitFrames(1) == 1)
+
+    // The guest goes away, the way a rebooting VM does. Waited for rather than
+    // assumed: the link learns of it on its own loop, and dialling before it has
+    // is a race that would make this test pass for the wrong reason.
+    close(first)
+    var released = false
+    for _ in 0..<400 where !released {
+        released = try await link.eventLoop.submit { !link.isActiveForTesting }.get()
+        if !released { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(released, "the link never noticed the guest had gone")
+
+    // And comes back. The same link has to carry it: that is what the stack
+    // above is attached to, so a second link would be one nobody is listening
+    // to -- which is why this asserts on frames reaching `collector` rather than
+    // merely on the connection staying open.
+    let second = dial(path, type: .stream)
+    sendFrame(second)
+    #expect(
+        try await awaitFrames(2) == 2,
+        "the returning guest's frames did not reach the link the stack is attached to")
+    #expect(
+        try await link.eventLoop.submit { link.guestsAdopted }.get() == 2,
+        "the link did not record a second guest taking it over")
+
+    _ = try? await link.close().get()
+    close(second)
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

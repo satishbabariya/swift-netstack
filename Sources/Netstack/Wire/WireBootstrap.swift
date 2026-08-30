@@ -160,9 +160,16 @@ public enum WireBootstrap {
     /// socket is bound -- there is no link until there is a guest, and a link
     /// with no wire behind it would be a thing callers could write to and lose.
     ///
-    /// One guest. A second connection is closed rather than served: this wire
-    /// carries one ethernet segment, and two guests on it would need a switch
-    /// that learns which addresses are behind which socket.
+    /// One guest **at a time**. A second connection while one is live is closed
+    /// rather than served: this wire carries one ethernet segment, and two
+    /// guests on it would need a switch that learns which addresses are behind
+    /// which socket -- which is what `switchedStreamSocket` is for.
+    ///
+    /// But a guest that goes away releases the wire, and the next connection
+    /// takes it over. VMs reboot, and a stream connection dies with the guest;
+    /// this used to hold the slot forever, so the gateway had to be restarted
+    /// along with the VM. The datagram wire never had the problem -- its peer is
+    /// whoever last sent -- which is why it went unnoticed.
     public static func listeningStreamSocket(
         atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
         framing: StreamFraming = .qemu
@@ -188,9 +195,24 @@ public enum WireBootstrap {
                 // On `loop`, because the child was pinned to it.
                 guard !accepted.taken else { return channel.close() }
                 accepted.taken = true
+                // Released when this guest's connection ends, so the next one is
+                // served rather than closed.
+                channel.closeFuture.whenComplete { _ in accepted.taken = false }
+
+                // The first guest builds the link; every later one takes over
+                // the same link, because that is what the stack above is
+                // attached to. Building a second would leave the gateway talking
+                // to a wire nobody is on.
+                if let existing = accepted.link {
+                    return configure(
+                        channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true,
+                        framing: framing, adopting: existing
+                    ).map { _ in }
+                }
                 return configure(
                     channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
                 ).map { link in
+                    accepted.link = link
                     arrived.succeed(link)
                 }
             }
@@ -263,11 +285,13 @@ public enum WireBootstrap {
     static func configure(
         channel: Channel, linkAddress: MACAddress, mtu: UInt32, framed: Bool, remote: SocketAddress? = nil,
         flushPerFrame: Bool = false, learnsPeer: Bool = false, framing: StreamFraming = .qemu,
-        rawDescriptor: NIOBSDSocket.Handle? = nil
+        rawDescriptor: NIOBSDSocket.Handle? = nil, adopting existing: WireLinkEndpoint? = nil
     ) -> EventLoopFuture<WireLinkEndpoint> {
-        let link = WireLinkEndpoint(
-            channel: channel, linkAddress: linkAddress, mtu: mtu, flushPerFrame: flushPerFrame,
-            rawDescriptor: rawDescriptor)
+        let link =
+            existing
+            ?? WireLinkEndpoint(
+                channel: channel, linkAddress: linkAddress, mtu: mtu, flushPerFrame: flushPerFrame,
+                rawDescriptor: rawDescriptor)
         return channel.eventLoop.submit {
             let sync = channel.pipeline.syncOperations
             if learnsPeer {
@@ -283,12 +307,15 @@ public enum WireBootstrap {
                     MessageToByteHandler(FrameEncoder(maximumFrame: maximumFrame, framing: framing)))
             }
             try sync.addHandler(WireInboundHandler(link: link))
+            // Last, so the link only starts writing here once the pipeline can
+            // carry what it writes.
+            if existing != nil { link.adopt(channel) }
             return link
         }
     }
 }
 
-/// Whether the one guest this wire carries has already arrived.
+/// Whether a guest is on this wire, and which link it is on.
 ///
 /// A class rather than a captured `var` because the compiler cannot see that the
 /// closure reading it is pinned to a single loop, and `@unchecked Sendable` on
@@ -298,4 +325,7 @@ public enum WireBootstrap {
 /// `scripts/conventions.sh` exists to prevent.
 private final class FirstGuest: @unchecked Sendable {
     var taken = false
+    /// Kept so a guest that reconnects takes over the link the stack is already
+    /// attached to, rather than getting a second one nothing is listening to.
+    var link: WireLinkEndpoint?
 }

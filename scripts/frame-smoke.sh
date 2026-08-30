@@ -702,18 +702,35 @@ try:
                 return None
             held += chunk
 
-    while True:
-        reply = next_frame()
-        if reply is None:
-            print("FAIL: no ARP reply over the stream wire within 10s for", described)
-            sys.exit(1)
-        if len(reply) < 42 or reply[12:14] != b"\x08\x06":
-            continue
-        if reply[20:22] != b"\x00\x02" or reply[28:32] != expected:
-            continue
-        print("ok: qemu  ARP", ".".join(map(str, expected)),
-              "answered over the length-prefixed wire for", described)
-        break
+    def await_reply(when):
+        while True:
+            reply = next_frame()
+            if reply is None:
+                print("FAIL: no ARP reply over the stream wire within 10s", when,
+                      "for", described)
+                sys.exit(1)
+            if len(reply) < 42 or reply[12:14] != b"\x08\x06":
+                continue
+            if reply[20:22] != b"\x00\x02" or reply[28:32] != expected:
+                continue
+            return
+
+    await_reply("on the first connection")
+    print("ok: qemu  ARP", ".".join(map(str, expected)),
+          "answered over the length-prefixed wire for", described)
+
+    # And again, on a new connection, the way a rebooted VM comes back. The wire
+    # used to be taken once and never released: the second connection was
+    # accepted and closed, so a guest could not reboot without the gateway being
+    # restarted alongside it.
+    s.close()
+    held = b""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect(os.environ["WIRE"])
+    s.sendall(struct.pack(">I", len(frame)) + frame)
+    await_reply("after the guest reconnected")
+    print("ok: qemu  the wire was taken over again by a returning guest for", described)
 finally:
     s.close()
 PY

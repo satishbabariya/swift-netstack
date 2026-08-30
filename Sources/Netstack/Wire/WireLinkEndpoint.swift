@@ -35,7 +35,7 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     public let capabilities: LinkCapabilities = []
     public let eventLoop: EventLoop
 
-    private let channel: Channel
+    private var channel: Channel?
 
     /// Whether every frame must be flushed on its own.
     ///
@@ -71,7 +71,7 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     /// rejected frame is not traffic that crossed.
     /// Whether the underlying channel is still open. For diagnosing a wire that
     /// has stopped rather than guessing at it.
-    public var isActiveForTesting: Bool { channel.isActive }
+    public var isActiveForTesting: Bool { channel?.isActive ?? false }
 
     public private(set) var bytesReceived = 0
     public private(set) var bytesSent = 0
@@ -164,6 +164,15 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
                 }
                 continue
             }
+            guard let channel else {
+                // No guest on the wire. Dropped and counted, which is what a
+                // real link does while the cable is out -- and the alternative,
+                // holding frames for a guest that may never return, is a queue
+                // with no bound and no reader.
+                outboundDropped += 1
+                log?.record(.outboundFrameDropped, ["reason": .string("no guest is on the wire")])
+                continue
+            }
             channel.write(frame, promise: nil)
             bytesSent += frame.readableBytes
             wrote = true
@@ -171,7 +180,7 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
             // and on a datagram wire the batch is exactly what must not happen.
             if flushPerFrame { channel.flush() }
         }
-        if wrote, !flushPerFrame { channel.flush() }
+        if wrote, !flushPerFrame { channel?.flush() }
     }
 
     /// Called by `WireInboundHandler` on the channel's own loop.
@@ -217,8 +226,41 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
 
     /// Close the wire. Idempotent, because the peer closing it is one of the
     /// ways this gets called.
+    /// Take over a new channel, for a guest that went away and came back.
+    ///
+    /// A VM reboots. On the datagram wire that needs nothing -- the peer is
+    /// whoever last sent -- but a stream wire's connection dies with the guest,
+    /// and the link is what the stack above is attached to, so a reconnection
+    /// has to reach the same link rather than build another one. Without this
+    /// the second connection was accepted and closed and the gateway had to be
+    /// restarted along with the VM.
+    ///
+    /// The caller must have configured the new channel's pipeline to deliver
+    /// here, and it must be on this link's own loop.
+    public func adopt(_ channel: Channel) {
+        eventLoop.preconditionInEventLoop()
+        precondition(channel.eventLoop === eventLoop, "a wire's channels all live on its own loop")
+        self.channel?.close(promise: nil)
+        self.channel = channel
+        guestsAdopted += 1
+    }
+
+    /// Called when the current guest's connection ends, so `write` stops
+    /// pretending there is somewhere to send.
+    fileprivate func guestLeft(_ channel: Channel) {
+        eventLoop.preconditionInEventLoop()
+        // Compared, because a closing channel that has already been replaced is
+        // the ordinary reconnection order and must not clear its successor.
+        guard self.channel === channel else { return }
+        self.channel = nil
+    }
+
+    /// How many guests have taken this wire over. One for the first.
+    public private(set) var guestsAdopted = 1
+
     public func close() -> EventLoopFuture<Void> {
-        channel.close().recover { _ in () }
+        guard let channel else { return eventLoop.makeSucceededVoidFuture() }
+        return channel.close().recover { _ in () }
     }
 }
 
@@ -238,6 +280,15 @@ final class WireInboundHandler: ChannelInboundHandler {
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         link?.deliver(unwrapInboundIn(data))
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        // The guest is gone. Told to the link so it stops writing into a dead
+        // channel, and told with the channel so a connection that has already
+        // been replaced -- the ordinary reconnection order -- does not clear its
+        // own successor on the way out.
+        link?.guestLeft(context.channel)
+        context.fireChannelInactive()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {

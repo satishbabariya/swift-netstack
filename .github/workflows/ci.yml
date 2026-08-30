@@ -103,3 +103,25 @@ jobs:
       - name: Vet
         run: go vet ./...
         working-directory: differential/harness
+
+  linux:
+    name: Build on Linux
+    # Not a claimed platform: `Package.swift` names macOS and the README says
+    # macOS 14+. This job exists to find out how far off Linux is, and to stop
+    # it drifting further -- upstream runs on Linux, so anyone who wants this
+    # port for podman on Linux starts from whatever state it happens to be in.
+    #
+    # `Sources/Netstack` imports Darwin in exactly two files and both guard it,
+    # so the answer may be "it already works". It builds the library and the
+    # executable; the tests are not run here because several of them open
+    # unprivileged ICMP sockets and bind unix sockets in ways a container
+    # restricts, and a red job for the sandbox rather than the code would teach
+    # nobody anything.
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build the library and the program
+        run: swift build

@@ -245,11 +245,24 @@ public final class ICMPForwarder: @unchecked Sendable {
     /// that was asked, so the filtering is done here instead -- see
     /// `EchoRequest.expecting`, which is checked before a reply is believed.
     private static func openEchoSocket() -> NIOBSDSocket.Handle? {
-        let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+        // The three spellings that differ between platforms, in the one place
+        // this package touches a raw socket. On Darwin `SOCK_DGRAM` and
+        // `IPPROTO_ICMP` are already `Int32` and `sockaddr_in` carries a length
+        // byte; on Linux they are `__socket_type` and `Int`, and there is no
+        // `sin_len`. Converting unconditionally does not work either -- an
+        // `Int32(Int32)` initialiser is fine but `sin_len` simply does not
+        // exist to assign to.
+        #if canImport(Darwin)
+            let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+        #else
+            let descriptor = socket(AF_INET, Int32(SOCK_DGRAM.rawValue), Int32(IPPROTO_ICMP))
+        #endif
         guard descriptor >= 0 else { return nil }
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #if canImport(Darwin)
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
         address.sin_port = 0
         address.sin_addr.s_addr = INADDR_ANY.bigEndian
         let bound = withUnsafePointer(to: &address) {

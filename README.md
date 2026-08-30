@@ -301,6 +301,15 @@ to any host and transmits from addresses it does not own. That is not a
 weakness, it is the point. A gateway terminating a guest's connection to an
 arbitrary internet host has to answer as that host.
 
+**A guest that stops reading does not take the gateway with it.** A full unix
+datagram queue reports `ENOBUFS` on BSD where Linux reports `EAGAIN`; NIO retries
+the second and treats the first as fatal, closing the channel — so a paused or
+slow VM used to leave this gateway permanently off the network, with nothing
+above it noticing. Frames adopted from a descriptor are written through it with a
+bounded retry and dropped if the peer still will not take them, which is what a
+link does when its queue is full. Upstream has the same failure and the same fix
+([gvisor-tap-vsock#367](https://github.com/containers/gvisor-tap-vsock/issues/367)).
+
 **The guest is assumed hostile.** Every guest-reachable resource is bounded, and
 each bound is written down where it is enforced: half-open connections,
 established connections, UDP flows, DHCP leases, outstanding DNS queries,
@@ -356,7 +365,7 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-765 tests, plus a differential harness in `differential/` that drives gVisor's
+766 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

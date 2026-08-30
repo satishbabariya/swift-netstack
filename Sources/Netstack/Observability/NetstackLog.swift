@@ -19,6 +19,10 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     /// A frame this stack tried to send and could not. Not guest-driven in the
     /// ordinary case, which is why it is worth a higher level than the rest.
     case outboundFrameRejected
+    /// A frame dropped because the wire was backed up -- the guest is not
+    /// reading. Ordinary on a busy link and fatal if ignored; see
+    /// `WireLinkEndpoint.write`.
+    case outboundFrameDropped
     /// A guest connection refused because `maximumTCPConnections` was reached.
     case tcpRefusedByLimit
     /// A guest connection refused because the destination did not accept.

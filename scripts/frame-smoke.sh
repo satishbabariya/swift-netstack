@@ -1293,6 +1293,128 @@ PY
     return $outcome
 }
 
+# A guest's ping, sent for real.
+#
+# Every reply here looks the same to the guest, which is the difficulty: the
+# gateway answers echo requests for its own address itself, and it falls back to
+# answering locally when it cannot open an unprivileged ICMP socket. So "a reply
+# came back" is true whether the ping left this machine or not, and a check that
+# asserted only that would pass with the forwarder removed entirely.
+#
+# The host address is the one that is genuinely forwarded -- NAT turns it into
+# 127.0.0.1 *after* the loopback check, deliberately, so that
+# `ping host.containers.internal` is a real ping. The gateway's own statistics
+# say which happened, so the check asks for both: the reply, and the count.
+icmp_smoke() {
+    local expected="$1" guest="$2" expected_host="$3"
+    shift 3
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-icmp-ctl-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-icmp-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" && -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" && -S "$CONTROL" ]] || { echo "FAIL: the icmp gateway never came up"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
+        WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
+import json, os, socket, struct, subprocess, sys
+
+wire = os.environ["WIRE"]
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+src = bytes.fromhex("5a94efe4bc00")
+
+
+def ones_complement(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total >> 16) + (total & 0xFFFF)
+    return (~total) & 0xFFFF
+
+
+def echo_frame(destination, identifier, payload):
+    icmp = bytearray(b"\x08\x00\x00\x00" + struct.pack(">HH", identifier, 1) + payload)
+    icmp[2:4] = ones_complement(bytes(icmp)).to_bytes(2, "big")
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(icmp)).to_bytes(2, "big")
+        + b"\x00\x00\x00\x00\x40\x01\x00\x00" + guest + destination
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    return bytes.fromhex("5a94efe40cee") + src + b"\x08\x00" + bytes(ip) + bytes(icmp)
+
+
+def statistics():
+    answer = subprocess.run(
+        ["curl", "--silent", "--fail-with-body", "--max-time", "10",
+         "--unix-socket", os.environ["CONTROL"], "http://gateway/stats"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if answer.returncode != 0:
+        print("FAIL: /stats was not answered for", described)
+        sys.exit(1)
+    return json.loads(answer.stdout)
+
+
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+identifier = 0x4321
+body = b"a guests ping"
+try:
+    s.connect(wire)
+    before = statistics().get("icmp_forwarded", 0)
+    s.send(echo_frame(host, identifier, body))
+
+    s.settimeout(10)
+    while True:
+        try:
+            reply = s.recv(2048)
+        except socket.timeout:
+            print("FAIL: the ping went unanswered within 10s for", described)
+            sys.exit(1)
+        if len(reply) < 42 or reply[12:14] != b"\x08\x00" or reply[23] != 1:
+            continue
+        if reply[34] != 0:
+            continue
+        if struct.unpack(">H", reply[38:40])[0] != identifier:
+            continue
+        if reply[42:] != body:
+            print("FAIL: the echo came back as", reply[42:], "rather than", body,
+                  "for", described)
+            sys.exit(1)
+        break
+    print("ok: icmp  the echo came back with its payload for", described)
+
+    # And it was a real ping rather than this process answering for an address it
+    # holds. Without this the check passes with the forwarder gone: declining
+    # falls back to a local answer, which looks identical on the wire.
+    after = statistics().get("icmp_forwarded", 0)
+    if after <= before:
+        print("FAIL: the gateway answered the ping itself --", "icmp_forwarded stayed at",
+              after, "for", described)
+        sys.exit(1)
+    print("ok: icmp  the gateway forwarded it rather than answering for", described)
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -1340,5 +1462,8 @@ pcap_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the wire that carries a network rather than a link.
 switch_smoke 192.168.127.1 || status=1
+
+# And a ping that actually leaves.
+icmp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 exit $status

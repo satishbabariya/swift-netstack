@@ -177,17 +177,6 @@ do {
     exit(2)
 }
 
-// A flag that was left at its default loses to the file; one that was given
-// wins. Comparing against the default is how that is decided without a second
-// optional per setting.
-let gatewayAddress = options.gateway == "192.168.127.1" ? (file.gatewayAddress ?? IPv4Address("192.168.127.1")!) : IPv4Address(options.gateway)
-let hostAddress = options.host == "192.168.127.254" ? (file.hostAddress ?? IPv4Address("192.168.127.254")!) : IPv4Address(options.host)
-let subnet = options.subnet == "192.168.127.0/24" ? (file.subnet ?? IPv4Subnet(cidr: "192.168.127.0/24")!) : IPv4Subnet(cidr: options.subnet)
-guard let gatewayAddress, let subnet, let hostAddress else {
-    FileHandle.standardError.write(Data("error: --gatewayIP, --hostIP or --subnet is not an address\n".utf8))
-    exit(2)
-}
-
 // The file first, then the flags over it. gvproxy documents the same order --
 // "configuration file with command line override" -- and it is the order that
 // makes a file useful: a shared file plus one flag for what differs.
@@ -201,6 +190,25 @@ if let path = options.configPath {
     }
 }
 if file.debug, options.logLevel == "notice" { options.logLevel = "debug" }
+
+// A flag that was left at its default loses to the file; one that was given
+// wins. Comparing against the default is how that is decided without a second
+// optional per setting.
+//
+// This has to come AFTER `file` is declared and loaded, and the order is
+// load-bearing in the worst way: in the main file, top-level variables are
+// initialized in execution order, and reading one above its declaration does
+// not trap -- it reads zeroed storage. `file.gatewayAddress` read early was a
+// non-nil 0.0.0.0, every `??` default was skipped, and the gateway came up
+// believing it was 0.0.0.0 on 0.0.0.0/0: bound, running, and answering ARP
+// for nobody. Nothing named the problem; the guest simply never got a reply.
+let gatewayAddress = options.gateway == "192.168.127.1" ? (file.gatewayAddress ?? IPv4Address("192.168.127.1")!) : IPv4Address(options.gateway)
+let hostAddress = options.host == "192.168.127.254" ? (file.hostAddress ?? IPv4Address("192.168.127.254")!) : IPv4Address(options.host)
+let subnet = options.subnet == "192.168.127.0/24" ? (file.subnet ?? IPv4Subnet(cidr: "192.168.127.0/24")!) : IPv4Subnet(cidr: options.subnet)
+guard let gatewayAddress, let subnet, let hostAddress else {
+    FileHandle.standardError.write(Data("error: --gatewayIP, --hostIP or --subnet is not an address\n".utf8))
+    exit(2)
+}
 
 // The wire is checked now: after the file has had its chance to be wrong about
 // something more specific.

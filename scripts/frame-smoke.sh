@@ -873,6 +873,138 @@ PY
     return $outcome
 }
 
+# A UDP datagram the guest sends to the host.
+#
+# The TCP case above is a connection; this is the other transport, through a
+# different forwarder, with no handshake to hide behind. The guest sends to the
+# host address, NAT rewrites it to the loopback, a real socket carries it, and
+# the reply has to find its way back to the flow it belongs to -- which is the
+# part with somewhere to go wrong, since nothing in a datagram says which
+# conversation it is part of.
+udp_smoke() {
+    local expected="$1" guest="$2" expected_host="$3"
+    shift 3
+    LISTENER="${TMPDIR:-/tmp}/netstack-smoke-udp-$$.py"
+    cat > "$LISTENER" <<'ECHO'
+import socket
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(("127.0.0.1", 0))
+print(server.getsockname()[1], flush=True)
+while True:
+    payload, sender = server.recvfrom(4096)
+    server.sendto(payload[::-1], sender)
+ECHO
+    python3 "$LISTENER" > "$LISTENER.port" &
+    ECHO_PID=$!
+    local port=""
+    for _ in $(seq 1 80); do
+        port="$(head -1 "$LISTENER.port" 2>/dev/null)"
+        [[ -n "$port" ]] && break
+        sleep 0.25
+    done
+    [[ -n "$port" ]] || { echo "FAIL: the udp echo listener never reported a port"; return 1; }
+
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-udp-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-vfkit "$WIRE" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: wire socket never appeared (udp)"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
+        WIRE="$WIRE" PORT="$port" ARGS="$*" python3 - <<'PY'
+import os, socket, sys
+
+wire = os.environ["WIRE"]
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
+port = int(os.environ["PORT"])
+described = os.environ.get("ARGS") or "(defaults)"
+src = bytes.fromhex("5a94efe4bc00")
+
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+
+
+def ones_complement(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total >> 16) + (total & 0xFFFF)
+    return (~total) & 0xFFFF
+
+
+def udp_frame(source, destination, sport, dport, payload):
+    udp = (
+        sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
+        + (8 + len(payload)).to_bytes(2, "big") + b"\x00\x00" + payload
+    )
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(udp)).to_bytes(2, "big")
+        + b"\x00\x00\x00\x00\x40\x11\x00\x00" + source + destination
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    return bytes.fromhex("5a94efe40cee") + src + b"\x08\x00" + bytes(ip) + udp
+
+
+body = b"a datagram the guest sent"
+sport = 40010
+try:
+    s.connect(wire)
+    s.send(udp_frame(guest, host, sport, port, body))
+
+    s.settimeout(10)
+    while True:
+        try:
+            reply = s.recv(4096)
+        except socket.timeout:
+            print("FAIL: the datagram was not answered within 10s for", described)
+            sys.exit(1)
+        if len(reply) < 42 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
+            continue
+        ip = reply[14:]
+        # Back from the address it was sent to, to the port it was sent from.
+        # Either being wrong means the flow was not carried, only the bytes.
+        if ip[12:16] != host or ip[16:20] != guest:
+            continue
+        body_start = (ip[0] & 0x0F) * 4
+        udp = ip[body_start:int.from_bytes(ip[2:4], "big")]
+        if int.from_bytes(udp[0:2], "big") != port:
+            continue
+        if int.from_bytes(udp[2:4], "big") != sport:
+            print("FAIL: the reply came back to port", int.from_bytes(udp[2:4], "big"),
+                  "rather than", sport, "for", described)
+            sys.exit(1)
+        echoed = udp[8:]
+        if echoed != body[::-1]:
+            print("FAIL: the host sent back", echoed, "rather than", body[::-1],
+                  "for", described)
+            sys.exit(1)
+        print("ok: udp  ", len(echoed), "bytes there and back through a real socket for",
+              described)
+        break
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    kill "$ECHO_PID" 2>/dev/null
+    wait "$ECHO_PID" 2>/dev/null
+    ECHO_PID=""
+    rm -f "$WIRE" "$LISTENER" "$LISTENER.port"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -911,5 +1043,8 @@ stream_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And a name the gateway has to ask somebody else about.
 dns_forward_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And the other transport.
+udp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 exit $status

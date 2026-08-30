@@ -366,6 +366,14 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
+`./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
+the two slow ones. It exists because the gates were seven scripts across five CI
+jobs and running "the ones I remembered" is not running them — CI builds with
+`-warnings-as-errors` and nothing local did, so code that compiled clean here
+failed there after the push. `scripts/conventions.sh` checks that every script
+`ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
+and quietly stay unrunnable locally.
+
 768 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by

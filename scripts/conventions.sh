@@ -139,6 +139,21 @@ swift_retries=$(grep -oE 'static let maximumFinTransmissions = [0-9]+' \
 go_retries=$(grep -oE 'TCPMaxRetriesOption\([0-9]+\)' differential/harness/main.go | grep -oE '[0-9]+')
 check_pinned "the retry limit" "$swift_retries" "$go_retries"
 
+
+# 7. Every gate CI runs can be run locally by one command.
+#
+# The gates live in seven scripts across five CI jobs, and "did I run them"
+# used to be a question of memory. scripts/check.sh answers it -- but only for
+# as long as it is still the same set. A gate added to ci.yml and not to
+# check.sh is one that fails after the push rather than before it, which is the
+# situation check.sh exists to end.
+for referenced in $(grep -oE './scripts/[a-z-]+\.sh' .github/workflows/ci.yml | sort -u); do
+    if ! grep -qF "$referenced" scripts/check.sh; then
+        fail "ci.yml runs $referenced and scripts/check.sh does not" \
+            "a gate that only exists in CI is one you find out about after pushing"
+    fi
+done
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

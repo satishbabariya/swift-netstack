@@ -31,7 +31,7 @@ private func portForwardingGateway(
     group: EventLoopGroup, guestSide: inout Int32, guestPort: UInt16, maximumConnections: Int = 256
 ) async throws -> PFHolder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
@@ -59,7 +59,7 @@ private func pfDrain(_ fd: Int32) -> [(header: TCPHeader, payload: ByteBuffer)] 
     var out: [(header: TCPHeader, payload: ByteBuffer)] = []
     for _ in 0..<64 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         guard read > 0 else { break }
         var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
         guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }
@@ -217,7 +217,7 @@ private func pfGuestSegment(
     // to match it to.
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let guestSide = pair[1]
     defer { close(guestSide) }
     let link = try await WireBootstrap.adoptingDatagramSocket(
@@ -239,28 +239,16 @@ private func pfGuestSegment(
     let hostPort = forwarder.listeningAddress!.port!
 
     // A host sender, bound so it can be replied to.
-    let sender = socket(AF_INET, SOCK_DGRAM, 0)
+    let sender = makeSocket(AF_INET, .datagram)
     #expect(sender >= 0)
     defer { close(sender) }
-    var target = sockaddr_in()
-    target.sin_family = sa_family_t(AF_INET)
-    target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    target.sin_port = UInt16(hostPort).bigEndian
-    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr)
-    let payload = Array("ping".utf8)
-    _ = withUnsafePointer(to: &target) { addr in
-        addr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
-            payload.withUnsafeBytes {
-                sendto(sender, $0.baseAddress, $0.count, 0, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-    }
+    _ = sendTo(sender, Array("ping".utf8), loopbackAddress(port: UInt16(hostPort)))
 
     // It should arrive at the guest, on the guest port that was published.
     var arrived: (source: UInt16, payload: [UInt8])?
     for _ in 0..<400 where arrived == nil {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(guestSide, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(guestSide, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
             guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,
@@ -284,7 +272,7 @@ private func pfGuestSegment(
     var answer = [UInt8](repeating: 0, count: 128)
     var received = -1
     for _ in 0..<400 where received <= 0 {
-        received = answer.withUnsafeMutableBytes { recv(sender, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        received = answer.withUnsafeMutableBytes { recv(sender, $0.baseAddress, $0.count, dontWait) }
         if received <= 0 { try? await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(received == 4, "the guest's reply never came back to the host sender")
@@ -320,7 +308,7 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     // bound turns into a permanent refusal rather than a temporary one.
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     defer { close(pair[1]) }
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
@@ -347,21 +335,9 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     /// One datagram from a socket of its own, so each has its own source port
     /// and is therefore its own flow.
     func sendFromANewSocket() {
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        let fd = makeSocket(AF_INET, .datagram)
         defer { close(fd) }
-        var target = sockaddr_in()
-        target.sin_family = sa_family_t(AF_INET)
-        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        target.sin_port = UInt16(hostPort).bigEndian
-        inet_pton(AF_INET, "127.0.0.1", &target.sin_addr)
-        let payload = Array("x".utf8)
-        _ = withUnsafePointer(to: &target) { addr in
-            addr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
-                payload.withUnsafeBytes {
-                    sendto(fd, $0.baseAddress, $0.count, 0, raw, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
+        _ = sendTo(fd, Array("x".utf8), loopbackAddress(port: UInt16(hostPort)))
     }
 
     for _ in 0..<12 { sendFromANewSocket() }

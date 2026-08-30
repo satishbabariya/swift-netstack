@@ -30,27 +30,15 @@ private final class NotificationListener: @unchecked Sendable {
     private var running = true
 
     init(path: String) {
-        fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
-            path.withCString { source in
-                raw.withMemoryRebound(to: CChar.self, capacity: 104) { strncpy($0, source, 103) }
-            }
-        }
-        _ = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
+        fd = makeSocket(AF_UNIX, .stream)
+        _ = bindTo(fd, unixAddress(path: path))
         listen(fd, 32)
         queue.async { [weak self] in self?.accept() }
     }
 
     private func accept() {
         while running {
-            let client = Darwin.accept(fd, nil, nil)
+            let client = acceptConnection(fd)
             guard client >= 0 else { break }
             var buffer = [UInt8](repeating: 0, count: 4096)
             let read = buffer.withUnsafeMutableBytes { recv(client, $0.baseAddress, $0.count, 0) }
@@ -90,7 +78,7 @@ private final class NotificationListener: @unchecked Sendable {
     defer { listener.stop() }
 
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(
         adoptingDatagramSocket: pair[0], group: group,

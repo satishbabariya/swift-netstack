@@ -125,3 +125,11 @@ jobs:
         run: swift --version
       - name: Build the library and the program
         run: swift build
+
+      # Compiled, not run. The test target's own portability is worth gating on
+      # -- it did not compile here at all, for the same three reasons the
+      # library did not -- while running the suite is a separate question: a
+      # container restricts unprivileged ICMP and the ping tests would fail for
+      # the sandbox rather than for the code.
+      - name: Build the tests on Linux
+        run: swift build --build-tests

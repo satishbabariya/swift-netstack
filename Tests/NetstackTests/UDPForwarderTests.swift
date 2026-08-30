@@ -33,7 +33,7 @@ private func udpGatewayFixture(
     group: EventLoopGroup, guestSide: inout Int32, maximumFlows: Int = 512
 ) async throws -> UDPHolder {
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let link = try await WireBootstrap.adoptingDatagramSocket(
         pair[0], group: group, linkAddress: udpGatewayMAC, mtu: 1500
@@ -75,7 +75,7 @@ private func drainDatagrams(_ fd: Int32) -> [(IPv4Address, UInt16, [UInt8])] {
     var out: [(IPv4Address, UInt16, [UInt8])] = []
     for _ in 0..<64 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         guard read > 0 else { break }
         var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
         guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }

@@ -23,23 +23,9 @@ private func swgTemporaryPath(_ tag: String) -> String {
 }
 
 func swgDial(_ path: String) -> Int32 {
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    let fd = makeSocket(AF_UNIX, .stream)
     #expect(fd >= 0)
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
-        path.withCString { source in
-            raw.withMemoryRebound(to: CChar.self, capacity: 104) { destination in
-                strncpy(destination, source, 103)
-            }
-        }
-    }
-    let connected = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-        }
-    }
+    let connected = connectTo(fd, unixAddress(path: path))
     #expect(connected == 0, "could not dial \(path): \(String(cString: strerror(errno)))")
     return fd
 }
@@ -63,7 +49,7 @@ private func swgAwaitFrame(
     var pending = [UInt8]()
     for _ in 0..<400 {
         var chunk = [UInt8](repeating: 0, count: 65536)
-        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             pending.append(contentsOf: chunk[0..<read])
             let prefix = framing == .qemu ? 4 : 2
@@ -379,7 +365,7 @@ private func swgRequest(_ method: String, _ path: String, to socketPath: String)
     var read = 0
     for _ in 0..<400 where read < 2 {
         let got = acknowledgement.withUnsafeMutableBytes {
-            recv(tunnel, $0.baseAddress!.advanced(by: read), 2 - read, MSG_DONTWAIT)
+            recv(tunnel, $0.baseAddress!.advanced(by: read), 2 - read, dontWait)
         }
         if got > 0 { read += got } else { try? await Task.sleep(nanoseconds: 5_000_000) }
     }
@@ -459,7 +445,7 @@ private func swgAwaitFrameSync(
     let prefix = framing == .qemu ? 4 : 2
     for _ in 0..<400 {
         var chunk = [UInt8](repeating: 0, count: 65536)
-        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = chunk.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             pending.append(contentsOf: chunk[0..<read])
             while pending.count >= prefix {

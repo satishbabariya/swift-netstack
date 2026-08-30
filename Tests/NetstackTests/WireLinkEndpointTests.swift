@@ -173,7 +173,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // kernel: one datagram in, one whole frame out, boundaries preserved with no
     // framing of our own.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0, "the platform refused a datagram socketpair")
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0, "the platform refused a datagram socketpair")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let link = try await WireBootstrap.adoptingDatagramSocket(
@@ -213,7 +213,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     var sizes: [Int] = []
     for _ in 0..<200 where sizes.count < 2 {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             sizes.append(read)
         } else {
@@ -238,7 +238,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // truncated, merged or misframed request produces no reply at all — and it
     // needs no handshake, no timers and no clock control to complete.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_DGRAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let link = try await WireBootstrap.adoptingDatagramSocket(
@@ -278,7 +278,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     var reply: [UInt8] = []
     for _ in 0..<400 where reply.isEmpty {
         var back = [UInt8](repeating: 0, count: 4096)
-        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let read = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, dontWait) }
         if read > 0 {
             reply = Array(back[0..<read])
         } else {
@@ -314,7 +314,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // stream link that inherited `flushPerFrame` would spend a syscall per
     // frame for nothing.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .stream, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let link = try await WireBootstrap.adoptingStreamSocket(
@@ -348,7 +348,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     var back = [UInt8](repeating: 0, count: 4096)
     var read = 0
     for _ in 0..<400 where read == 0 {
-        let n = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let n = back.withUnsafeMutableBytes { recv(pair[1], $0.baseAddress, $0.count, dontWait) }
         if n > 0 { read = n } else { try await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(read == 4 + 74, "the frame did not arrive with its four-byte length: \(read)")

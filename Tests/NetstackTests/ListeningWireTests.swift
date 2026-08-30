@@ -40,24 +40,10 @@ private func ethernetFrame(payload: Int) -> [UInt8] {
 }
 
 /// Connect a unix socket of the given type to `path`, as a guest would.
-private func dial(_ path: String, type: Int32) -> Int32 {
-    let fd = socket(AF_UNIX, type, 0)
+private func dial(_ path: String, type: SocketKind) -> Int32 {
+    let fd = makeSocket(AF_UNIX, type)
     #expect(fd >= 0)
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    _ = withUnsafeMutablePointer(to: &address.sun_path) { raw in
-        path.withCString { source in
-            raw.withMemoryRebound(to: CChar.self, capacity: 104) { destination in
-                strncpy(destination, source, 103)
-            }
-        }
-    }
-    let connected = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-        }
-    }
+    let connected = connectTo(fd, unixAddress(path: path))
     #expect(connected == 0, "could not dial \(path): \(String(cString: strerror(errno)))")
     return fd
 }
@@ -79,37 +65,11 @@ private func dial(_ path: String, type: Int32) -> Int32 {
     // socket has nowhere to go, and this is the case that would otherwise look
     // like a gateway that never answers.
     let guestPath = temporaryPath("guest")
-    let guest = socket(AF_UNIX, SOCK_DGRAM, 0)
-    var guestAddress = sockaddr_un()
-    guestAddress.sun_family = sa_family_t(AF_UNIX)
-    guestAddress.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    _ = withUnsafeMutablePointer(to: &guestAddress.sun_path) { raw in
-        guestPath.withCString { source in
-            raw.withMemoryRebound(to: CChar.self, capacity: 104) { strncpy($0, source, 103) }
-        }
-    }
-    #expect(withUnsafePointer(to: &guestAddress) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            bind(guest, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-        }
-    } == 0)
-    var target = sockaddr_un()
-    target.sun_family = sa_family_t(AF_UNIX)
-    target.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-    _ = withUnsafeMutablePointer(to: &target.sun_path) { raw in
-        path.withCString { source in
-            raw.withMemoryRebound(to: CChar.self, capacity: 104) { strncpy($0, source, 103) }
-        }
-    }
+    let guest = makeSocket(AF_UNIX, .datagram)
+    #expect(bindTo(guest, unixAddress(path: guestPath)) == 0)
 
     let outbound = ethernetFrame(payload: 40)
-    let sent = outbound.withUnsafeBytes { bytes in
-        withUnsafePointer(to: &target) { addr in
-            addr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                sendto(guest, bytes.baseAddress, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-    }
+    let sent = sendTo(guest, outbound, unixAddress(path: path))
     #expect(sent == outbound.count)
 
     var received: [[UInt8]] = []
@@ -126,7 +86,7 @@ private func dial(_ path: String, type: Int32) -> Int32 {
     var back = [UInt8](repeating: 0, count: 4096)
     var read = 0
     for _ in 0..<400 where read == 0 {
-        let n = back.withUnsafeMutableBytes { recv(guest, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let n = back.withUnsafeMutableBytes { recv(guest, $0.baseAddress, $0.count, dontWait) }
         if n > 0 { read = n } else { try await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(read == 74, "the gateway's answer did not reach the guest: \(read)")
@@ -181,7 +141,7 @@ private func dial(_ path: String, type: Int32) -> Int32 {
     for _ in 0..<400 where !FileManager.default.fileExists(atPath: path) {
         try await Task.sleep(nanoseconds: 5_000_000)
     }
-    let first = dial(path, type: SOCK_STREAM)
+    let first = dial(path, type: .stream)
     let link = try await pending.get()
     let collector = Collector()
     try await link.eventLoop.submit { link.attach(collector) }.get()
@@ -202,11 +162,11 @@ private func dial(_ path: String, type: Int32) -> Int32 {
     #expect(received.first?.count == frame.count)
 
     // A second guest is closed rather than served.
-    let second = dial(path, type: SOCK_STREAM)
+    let second = dial(path, type: .stream)
     var probe = [UInt8](repeating: 0, count: 16)
     var closed = false
     for _ in 0..<400 where !closed {
-        let n = probe.withUnsafeMutableBytes { recv(second, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+        let n = probe.withUnsafeMutableBytes { recv(second, $0.baseAddress, $0.count, dontWait) }
         if n == 0 { closed = true } else { try await Task.sleep(nanoseconds: 5_000_000) }
     }
     #expect(closed, "a second guest was left connected to a wire that carries one")

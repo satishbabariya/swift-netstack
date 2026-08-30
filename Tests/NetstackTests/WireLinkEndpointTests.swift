@@ -314,7 +314,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // stream link that inherited `flushPerFrame` would spend a syscall per
     // frame for nothing.
     var pair: [Int32] = [0, 0]
-    #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0)
+    #expect(makeSocketPair(AF_UNIX, .stream, &pair) == 0)
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
     let link = try await WireBootstrap.adoptingStreamSocket(

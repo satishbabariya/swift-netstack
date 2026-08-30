@@ -225,8 +225,24 @@ private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
 @Test func anAssembledGatewaySurvivesAGuestTryingToBreakIt() async throws {
     var pair: [Int32] = [0, 0]
     #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
-    // A send buffer large enough that the flood is not throttled by the socket
-    // before it reaches the stack, which is the thing under test.
+    // The flood is PACED, not buffered.
+    //
+    // This used to raise `SO_SNDBUF` to four megabytes and call the socket
+    // unthrottled. It is not, and it cannot be: a unix datagram socket's queue
+    // is bounded by `net.local.dgram.recvspace`, which is **4096 bytes** on
+    // macOS -- about forty frames -- and `setsockopt` is silently clamped to it.
+    //
+    // So every send past the first forty failed with ENOBUFS, and the result was
+    // discarded. This test floods seven thousand frames and passed in a quarter
+    // of a second having delivered perhaps eighty. The counters it asserts on
+    // went non-zero from those, so it looked like a soak and was not one -- and
+    // its occasional CI failure was the same fact from the other side: on a
+    // slower machine the handful that got through sometimes contained no DNS
+    // query at all.
+    //
+    // `floodSend` waits for the gateway to drain instead, and `unsent` is
+    // asserted to be zero, so a flood that stops arriving fails rather than
+    // quietly shrinking.
     var size: Int32 = 4 * 1024 * 1024
     _ = setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -257,13 +273,21 @@ private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
     var peakUDP = 0
     var peakRegistrations = 0
 
+    // Frames the socket would not take. The flood outruns the gateway on a
+    // small machine, the send buffer fills, and `send` fails -- and the first
+    // version of this discarded that result, so a kind of frame could go
+    // entirely unsent and the positive control below would report "no DNS query
+    // reached the server" when the truth was "no DNS query was ever sent". That
+    // is a flake on a loaded runner and a misleading message when it fires.
+    var unsent = 0
+
     var rng = Xoshiro(seed: 0x5EED)
     for round in 0..<20 {
         for kind in UInt64(0)..<9 {
             for _ in 0..<40 {
                 let frame = hostileFrame(&rng, kind: kind, reachablePort: reachablePort)
                 guard !frame.isEmpty else { continue }
-                _ = frame.withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+                if await !floodSend(pair[1], frame) { unsent += 1 }
             }
             drainReturnPath(pair[1])
         }
@@ -288,14 +312,18 @@ private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
     // gateway. Waiting on the counters is waiting for the thing actually being
     // measured -- and it finishes as soon as it is true, so the idle case does
     // not pay for the loaded one.
-    for _ in 0..<600 {
+    // Thirty seconds of budget rather than six, and it costs nothing when it is
+    // not needed: the loop stops as soon as the counters move. Six was enough
+    // on this machine and not on a CI runner with two cores, where the failure
+    // arrived as an assertion about DNS rather than as "still waiting".
+    var settled = false
+    for _ in 0..<3000 where !settled {
         drainReturnPath(pair[1], limit: 400)
-        let arrived = try await gateway.eventLoop.submit {
+        settled = try await gateway.eventLoop.submit {
             gateway.dhcp.leaseCount > 0 && gateway.dns.refusedForNoUpstream > 0
                 && (gateway.tcp.refusedForDial + gateway.tcp.refusedForLimit) > 0
         }.get()
-        if arrived { break }
-        try await Task.sleep(nanoseconds: 10_000_000)
+        if !settled { try await Task.sleep(nanoseconds: 10_000_000) }
     }
     drainReturnPath(pair[1], limit: 4000)
 
@@ -305,19 +333,57 @@ private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
     // The flood contains DHCP DISCOVERs under forged hardware addresses, so the
     // lease pool must have been drawn on; and SYNs to addresses nothing is
     // listening on, so the forwarder must have tried to dial.
-    // A POSITIVE CONTROL first, because without one this test passes against a
-    // gateway that dropped every frame on the floor -- which is exactly what a
-    // soak whose only assertions are upper bounds cannot tell from success.
     let reached = try await gateway.eventLoop.submit {
         (
             leases: gateway.dhcp.leaseCount,
             dialled: gateway.tcp.refusedForDial + gateway.tcp.refusedForLimit,
-            refusedNames: gateway.dns.refusedForNoUpstream
+            // Every way a query can be accounted for, not one of them.
+            //
+            // This asked for `refusedForNoUpstream` alone while its message said
+            // "no DNS query reached the server" -- a claim about arrival tested
+            // by a claim about outcome. Which outcome a query gets depends on
+            // the name the generator drew: one for a name this gateway owns is
+            // answered locally and never refused. So the assertion failed on
+            // draws that were entirely correct, which is what made it flaky.
+            names: gateway.dns.answeredLocally + gateway.dns.refusedForNoUpstream
+                + gateway.dns.refusedForLimit
         )
     }.get()
-    #expect(reached.leases > 0, "no DHCP request reached the server: the flood went nowhere")
-    #expect(reached.refusedNames > 0, "no DNS query reached the server")
-    #expect(reached.dialled > 0, "no connection attempt reached the forwarder")
+    // The unsent count is in every message, because "nothing reached the
+    // server" and "nothing was sent" are different failures and only one of
+    // them is about the gateway.
+    // The flood was actually delivered. This is the assertion whose absence let
+    // the test pass for weeks having sent eighty frames of seven thousand: every
+    // other check here is about what the gateway did with what it received, and
+    // none of them can tell "the gateway held up" from "almost nothing arrived".
+    // One of each kind, delivered rather than attempted, so the positive
+    // controls below are about the gateway and not about the socket's mood.
+    //
+    // The flood above is best-effort by nature: a unix datagram socket holds
+    // about forty frames (`net.local.dgram.recvspace` is 4096) and how much of a
+    // seven-thousand-frame burst lands depends on scheduling -- measured between
+    // 170 and 7000 here, the low end when the whole suite runs in parallel. That
+    // is fine for pressing the bounds, which is what a flood is for, and no
+    // basis at all for "did a DNS query reach the server".
+    //
+    // Which is exactly how this test failed on CI: the assertion was about the
+    // gateway and the variable was the socket.
+    var rng2 = Xoshiro(seed: 0xC0FFEE)
+    for kind in UInt64(0)..<9 {
+        let frame = hostileFrame(&rng2, kind: kind, reachablePort: reachablePort)
+        guard !frame.isEmpty else { continue }
+        for _ in 0..<20 where !(await floodSend(pair[1], frame)) {
+            drainReturnPath(pair[1], limit: 400)
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    // The flood really did reach the network layer, in the quantity sent. This
+    // is the number that was 173 when the socket was silently refusing.
+    let context = "after \(unsent) frame(s) the socket would not take, settled=\(settled)"
+    #expect(reached.leases > 0, "no DHCP request reached the server, \(context)")
+    #expect(reached.names > 0, "no DNS query reached the server, \(context)")
+    #expect(reached.dialled > 0, "no connection attempt reached the forwarder, \(context)")
 
     // Still there, and still answering: the strongest single statement this can
     // make, because it fails on a trap, a hang, and a wedged datapath alike.
@@ -347,4 +413,51 @@ private func drainReturnPath(_ fd: Int32, limit: Int = 200) {
     _ = try? await gateway.close().get()
     close(pair[1])
     try? await group.shutdownGracefully()
+}
+
+/// Push one frame at the gateway, waiting for it to drain.
+///
+/// A unix datagram socket holds about forty of these -- see
+/// `net.local.dgram.recvspace` -- so a flood of seven thousand cannot be handed
+/// over in a burst at any buffer size. It has to be paced against the gateway's
+/// own progress, and `send` refusing with ENOBUFS is exactly the signal to wait.
+///
+/// Discarding that signal, which is what this did, turns a soak into a trickle
+/// that still passes: the counters go non-zero on the first few frames and
+/// nothing else notices.
+///
+/// ## Draining while waiting is the whole point
+///
+/// The two ends deadlock otherwise, and this is what the original discarded
+/// result was hiding. The gateway answers the flood -- ARP replies, DHCP
+/// offers, resets -- and writes those back down the same socketpair. If nothing
+/// reads them its channel stops being writable and NIO stops reading, so the
+/// gateway stops consuming the flood; and the test, waiting for room to send,
+/// never gets to the drain it does between batches. Each side waits for the
+/// other.
+///
+/// Measured, not deduced: with the wait added and no drain, the gateway took
+/// about two hundred frames of seven thousand and then went quiet, having
+/// written fourteen kilobytes back that nobody collected.
+///
+/// `Task.yield` rather than `usleep`, so the runtime is free to run the
+/// gateway's work rather than the test's thread spinning.
+private func floodSend(_ descriptor: Int32, _ frame: [UInt8]) async -> Bool {
+    for attempt in 0..<2000 {
+        let sent = frame.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, 0) }
+        if sent == frame.count { return true }
+        let failure = errno
+        guard failure == EWOULDBLOCK || failure == EAGAIN || failure == ENOBUFS else {
+            // Anything else is the frame's own fault -- a datagram past
+            // `net.local.dgram.maxdgram`, say -- and retrying cannot help.
+            return false
+        }
+        drainReturnPath(descriptor, limit: 64)
+        if attempt % 16 == 15 {
+            try? await Task.sleep(nanoseconds: 200_000)
+        } else {
+            await Task.yield()
+        }
+    }
+    return false
 }

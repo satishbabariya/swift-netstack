@@ -69,8 +69,42 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
 
     /// Bytes carried, counted for frames that were actually accepted -- a
     /// rejected frame is not traffic that crossed.
+    /// Whether the underlying channel is still open. For diagnosing a wire that
+    /// has stopped rather than guessing at it.
+    public var isActiveForTesting: Bool { channel.isActive }
+
     public private(set) var bytesReceived = 0
     public private(set) var bytesSent = 0
+
+    /// The descriptor to write through directly, when this wire was adopted
+    /// from one.
+    ///
+    /// ## Why not just `channel.write`
+    ///
+    /// A full unix datagram queue is reported as **ENOBUFS** on BSD where Linux
+    /// reports EAGAIN. NIO retries the second and treats the first as an
+    /// unrecoverable write error: it closes the channel. So a guest that stops
+    /// reading for a moment -- a paused VM, a stalled vCPU, a slow reader --
+    /// leaves this gateway with a **closed wire and no network, permanently**,
+    /// and nothing above notices.
+    ///
+    /// Measured, not deduced: two hundred DHCP exchanges with the guest not
+    /// reading, and the wire is closed with `outboundDropped` still at zero.
+    ///
+    /// Upstream has the same failure and the same fix -- see
+    /// `pkg/tap/switch.go`, which retries on ENOBUFS and cites
+    /// gvisor-tap-vsock#367. This does that: writes go to the descriptor with a
+    /// bounded retry, and a frame that still cannot go is dropped and counted,
+    /// which is what a link does when its queue is full.
+    ///
+    /// Only for wires adopted from a descriptor the caller handed over, which is
+    /// the Virtualization.framework path and the one that matters most. The
+    /// bootstraps that let NIO create the socket keep NIO's write path and keep
+    /// its behaviour; `WireBootstrap` says which is which.
+    private let rawDescriptor: NIOBSDSocket.Handle?
+
+    /// Frames dropped because the wire would not take them after retrying.
+    public private(set) var outboundBackedUp = 0
 
     /// Where rejected frames are reported, if anywhere.
     ///
@@ -84,7 +118,11 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     /// The channel is the parameter rather than a socket path so that a test can
     /// pass an `EmbeddedChannel` and drive the wire without one, and so the two
     /// transports can share every line below the framing.
-    public init(channel: Channel, linkAddress: MACAddress, mtu: UInt32 = 1500, flushPerFrame: Bool = false) {
+    public init(
+        channel: Channel, linkAddress: MACAddress, mtu: UInt32 = 1500, flushPerFrame: Bool = false,
+        rawDescriptor: NIOBSDSocket.Handle? = nil
+    ) {
+        self.rawDescriptor = rawDescriptor
         self.channel = channel
         self.flushPerFrame = flushPerFrame
         self.eventLoop = channel.eventLoop
@@ -120,6 +158,12 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
                 log?.record(.outboundFrameRejected, ["bytes": .stringConvertible(frame.readableBytes), "limit": .stringConvertible(maximumFrame)])
                 continue
             }
+            if let descriptor = rawDescriptor {
+                if writeDirectly(frame, to: descriptor) {
+                    bytesSent += frame.readableBytes
+                }
+                continue
+            }
             channel.write(frame, promise: nil)
             bytesSent += frame.readableBytes
             wrote = true
@@ -141,6 +185,34 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
         bytesReceived += frame.readableBytes
         assert(dispatcher != nil || !hasAttached, "dispatcher was deallocated while still attached to this link")
         dispatcher?.deliverInbound(PacketBuffer(received: frame))
+    }
+
+    /// Put one frame on the wire, retrying while the peer's queue is full.
+    ///
+    /// See `rawDescriptor` for why this exists rather than `channel.write`. The
+    /// retry is bounded: a peer that has stopped reading altogether must not
+    /// block this event loop, which carries every other connection on the
+    /// gateway. Past the bound the frame is dropped and counted, which is what a
+    /// link does when its queue is full -- and unlike a closed channel, a
+    /// dropped frame is something TCP recovers from and UDP is allowed to lose.
+    private func writeDirectly(_ frame: ByteBuffer, to descriptor: NIOBSDSocket.Handle) -> Bool {
+        let bytes = frame.readableBytesView
+        for _ in 0..<16 {
+            let written = bytes.withUnsafeBytes { raw in
+                send(descriptor, raw.baseAddress, raw.count, 0)
+            }
+            if written == bytes.count { return true }
+            let failure = errno
+            guard failure == ENOBUFS || failure == EWOULDBLOCK || failure == EAGAIN || failure == EINTR
+            else {
+                outboundDropped += 1
+                log?.record(.outboundFrameRejected, ["errno": .stringConvertible(failure)])
+                return false
+            }
+        }
+        outboundBackedUp += 1
+        log?.record(.outboundFrameDropped, ["reason": .string("the peer is not reading")])
+        return false
     }
 
     /// Close the wire. Idempotent, because the peer closing it is one of the

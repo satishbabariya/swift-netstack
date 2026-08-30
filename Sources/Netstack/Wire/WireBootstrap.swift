@@ -57,8 +57,14 @@ public enum WireBootstrap {
             .channelOption(.recvAllocator, value: FixedSizeRecvByteBufferAllocator(capacity: frameSize))
             .withConnectedSocket(descriptor)
             .flatMap { channel in
+                // The descriptor is handed on so the link can write through it
+                // directly. See `WireLinkEndpoint.rawDescriptor`: NIO closes the
+                // channel when a write returns ENOBUFS, which a full unix
+                // datagram queue does on BSD, and a guest that pauses would
+                // otherwise take the gateway's network down with it for good.
                 configure(
-                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false, flushPerFrame: true)
+                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false,
+                    flushPerFrame: true, rawDescriptor: descriptor)
             }
     }
 
@@ -256,10 +262,12 @@ public enum WireBootstrap {
     /// bootstrap above with the socket already in hand.
     static func configure(
         channel: Channel, linkAddress: MACAddress, mtu: UInt32, framed: Bool, remote: SocketAddress? = nil,
-        flushPerFrame: Bool = false, learnsPeer: Bool = false, framing: StreamFraming = .qemu
+        flushPerFrame: Bool = false, learnsPeer: Bool = false, framing: StreamFraming = .qemu,
+        rawDescriptor: NIOBSDSocket.Handle? = nil
     ) -> EventLoopFuture<WireLinkEndpoint> {
         let link = WireLinkEndpoint(
-            channel: channel, linkAddress: linkAddress, mtu: mtu, flushPerFrame: flushPerFrame)
+            channel: channel, linkAddress: linkAddress, mtu: mtu, flushPerFrame: flushPerFrame,
+            rawDescriptor: rawDescriptor)
         return channel.eventLoop.submit {
             let sync = channel.pipeline.syncOperations
             if learnsPeer {

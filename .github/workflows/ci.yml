@@ -65,6 +65,20 @@ jobs:
       - name: Check the README's test count
         run: ./scripts/check-test-count.sh /tmp/swift-test.log
 
+      # The full gate, not the 300 sequences `swift test` runs by default.
+      #
+      # The README says 10,000 randomised sequences agree with gVisor frame for
+      # frame. Nothing verified that: the default is 300, and 10,000 was run
+      # only when somebody remembered to ask. A claim checked by hand is a claim
+      # that goes stale, and this one is the headline evidence for the whole
+      # port. It takes about twenty seconds.
+      #
+      # The seed is fixed on purpose -- see `differentialSeed` -- so this is the
+      # same ten thousand sequences every run and a regression cannot hide
+      # behind a lucky draw.
+      - name: The full differential gate
+        run: NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
+
       # Deletes each guard in `scripts/guards.tsv` and requires that the named
       # test notices. Guards drift out from under their tests as code around
       # them changes, and nothing else here would say so.
@@ -113,6 +127,18 @@ jobs:
       - name: Vet
         run: go vet ./...
         working-directory: differential/harness
+
+      # The interop module is Go too, and was getting neither of these.
+      - name: Vet the interop driver
+        run: go vet ./...
+        working-directory: differential/interop
+
+      - name: Check the Go formatting
+        run: |
+          unformatted="$(gofmt -l differential/harness differential/interop)"
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
 
   linux:
     name: Build on Linux

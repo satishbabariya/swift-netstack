@@ -4,13 +4,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // Notifications go to a supervisor -- the thing that started the VM and wants to
 // know when its network came up and when a guest arrived or left. The audience

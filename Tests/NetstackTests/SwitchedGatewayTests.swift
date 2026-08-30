@@ -3,13 +3,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // A whole network, not a link: several guests on one gateway, reaching the
 // host through it and each other across it. This is the shape upstream has and

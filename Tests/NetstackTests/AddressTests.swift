@@ -18,7 +18,7 @@ import Testing
     #expect(IPv4Address("::1") == nil)
     #expect(IPv4Address("192.168.001.001") == nil)  // leading zeros: octal hazard
     #expect(IPv4Address("192.168.1.01") == nil)
-    #expect(IPv4Address("0.0.0.0") != nil)          // a bare zero octet is fine
+    #expect(IPv4Address("0.0.0.0") != nil)  // a bare zero octet is fine
 }
 
 @Test func macRoundTripsThroughText() {

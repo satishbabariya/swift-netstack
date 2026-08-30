@@ -4,13 +4,13 @@ import NIOHTTP1
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // Upstream's API for managing port forwards while the gateway runs, so a tool
 // written against `gvproxy` works here unchanged. Anything that can reach it can
@@ -337,7 +337,6 @@ private func request(
     close(guestSide)
     try? await group.shutdownGracefully()
 }
-
 
 /// The port named by `{"local":":8080",...}`, parsed rather than string-stripped.
 ///

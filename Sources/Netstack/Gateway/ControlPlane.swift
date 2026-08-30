@@ -382,8 +382,10 @@ public final class ControlPlane: @unchecked Sendable {
             }
             guard stopped else {
                 return loop.makeSucceededFuture(
-                    (.notFound,
-                     "{\"error\":\"no \(request.transport.rawValue) forward on \(ControlPlane.escaped(request.local))\"}"))
+                    (
+                        .notFound,
+                        "{\"error\":\"no \(request.transport.rawValue) forward on \(ControlPlane.escaped(request.local))\"}"
+                    ))
             }
             return loop.makeSucceededFuture((.ok, "{}"))
 
@@ -902,8 +904,9 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
         // API is used a handful of times over a gateway's life, and a connection
         // held open is a resource whose bound would then need thinking about.
         headers.add(name: "Connection", value: "close")
-        channel.write(HTTPServerResponsePart.head(
-            HTTPResponseHead(version: .http1_1, status: status, headers: headers)), promise: nil)
+        channel.write(
+            HTTPServerResponsePart.head(
+                HTTPResponseHead(version: .http1_1, status: status, headers: headers)), promise: nil)
         channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
         let flushed = channel.eventLoop.makePromise(of: Void.self)
         flushed.futureResult.whenComplete { _ in channel.close(promise: nil) }

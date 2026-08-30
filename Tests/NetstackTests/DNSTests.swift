@@ -3,13 +3,13 @@ import NIOEmbedded
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // The gateway is the resolver because the DHCP offer says so, which means every
 // name a guest looks up passes through here. That makes it the one place a
@@ -625,7 +625,6 @@ private func awaitReply(_ fd: Int32) async -> ByteBuffer? {
     close(guestSide)
     try? await group.shutdownGracefully()
 }
-
 
 /// A zone fixture with no upstream at all: these tests are about what the
 /// gateway answers itself, and a resolver behind it would make a wrong answer

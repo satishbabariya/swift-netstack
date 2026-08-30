@@ -3,7 +3,6 @@ import Testing
 
 @testable import Netstack
 
-
 private func fragment(id: UInt16, offset: Int, more: Bool, bytes: [UInt8]) -> (IPv4Header, ByteBuffer) {
     var header = IPv4Header(
         source: IPv4Address("192.168.127.2")!,
@@ -166,7 +165,7 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     // end = 65520; 65520 + 20 > 65535, so this must be refused.
     let tail = fragment(id: 40, offset: 65512, more: false, bytes: Array(repeating: UInt8(0xbb), count: 8))
     #expect(reassembler.process(header: tail.0, payload: tail.1) == nil)
-    #expect(reassembler.pendingCount == 1)   // still incomplete, not assembled
+    #expect(reassembler.pendingCount == 1)  // still incomplete, not assembled
 }
 
 @Test func rejectsASingleFragmentWhosePayloadAloneExceedsTheMaximum() {
@@ -205,7 +204,7 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     let terminator = fragment(id: 60, offset: 15, more: false, bytes: Array(repeating: UInt8(0xbb), count: 65500))
     let result = reassembler.process(header: terminator.0, payload: terminator.1)
     #expect(result == nil)
-    #expect(reassembler.pendingCount == 1)   // only the head fragment's entry remains
+    #expect(reassembler.pendingCount == 1)  // only the head fragment's entry remains
 }
 
 @Test func rejectsAnOverlappingFragment() {
@@ -227,7 +226,7 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     #expect(result != nil)
     let bytes = Array(result!.1.readableBytesView)
     #expect(bytes.count == 10)
-    #expect(bytes.prefix(8).allSatisfy { $0 == 0xaa })   // 0xff never landed
+    #expect(bytes.prefix(8).allSatisfy { $0 == 0xaa })  // 0xff never landed
     #expect(Array(bytes.suffix(2)) == [0xbb, 0xbb])
 }
 
@@ -306,7 +305,7 @@ private func fragmentWithOptions(id: UInt16, offset: Int, more: Bool, payloadLen
     var frame = ByteBufferAllocator().buffer(capacity: 1500)
     frame.writeRepeatingByte(0xaa, count: 1500)
     let onebyte = frame.getSlice(at: frame.readerIndex, length: 1)!
-    #expect(onebyte.storageCapacity >= 1500)   // confirms the slice really is COW-backed by the whole frame
+    #expect(onebyte.storageCapacity >= 1500)  // confirms the slice really is COW-backed by the whole frame
 
     var header = IPv4Header(
         source: IPv4Address("192.168.127.2")!, destination: IPv4Address("192.168.127.1")!,

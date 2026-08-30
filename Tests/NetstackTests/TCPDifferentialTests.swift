@@ -1111,4 +1111,3 @@ private let differentialBaseSeed: UInt64 = {
         ],
         "an unexpected recognised difference appeared: \(recognisedCounts)")
 }
-

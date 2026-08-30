@@ -304,7 +304,6 @@ private func arpRequestFrame(for target: String, from sender: String, senderMAC:
     }.get()
     let stack = carried.stack
 
-
     // Resumed on Swift concurrency's own executor after the `await` above,
     // not on `eventLoop`'s dedicated thread — a genuinely off-loop call.
     // Completing at all (rather than hanging or racing the ingress path)

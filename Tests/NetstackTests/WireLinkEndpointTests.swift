@@ -408,7 +408,6 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     #expect(wide.maximumFrame == 200_000)
 }
 
-
 /// Collects what a link delivered upward. `ListeningWireTests` has its own,
 /// file-private; one per file is cheaper than making either shared.
 private final class FramingCollector: LinkDispatcher, @unchecked Sendable {

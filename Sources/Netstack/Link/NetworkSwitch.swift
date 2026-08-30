@@ -298,8 +298,10 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
                 addressesRefused += 1
                 log?.record(
                     .switchAddressRefused,
-                    ["port": .stringConvertible(port),
-                     "limit": .stringConvertible(maximumAddressesPerPort)])
+                    [
+                        "port": .stringConvertible(port),
+                        "limit": .stringConvertible(maximumAddressesPerPort),
+                    ])
                 return
             }
             cam[address] = port
@@ -308,8 +310,10 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
             addressesMoved += 1
             log?.record(
                 .switchAddressMoved,
-                ["mac": .string(address.description), "from": .stringConvertible(existing),
-                 "to": .stringConvertible(port)])
+                [
+                    "mac": .string(address.description), "from": .stringConvertible(existing),
+                    "to": .stringConvertible(port),
+                ])
             return
         }
         guard claimed[port, default: 0] < maximumAddressesPerPort else {

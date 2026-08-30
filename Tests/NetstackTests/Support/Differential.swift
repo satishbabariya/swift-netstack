@@ -1,7 +1,7 @@
-import Testing
 import Foundation
 import NIOCore
 import NIOEmbedded
+import Testing
 
 @testable import Netstack
 

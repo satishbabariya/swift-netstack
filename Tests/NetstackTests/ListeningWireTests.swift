@@ -3,13 +3,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // The other way round from `WireLinkEndpointTests`: there the host owns a
 // descriptor and hands one end to the VM, here the gateway LISTENS and the guest

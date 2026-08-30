@@ -82,7 +82,6 @@ public final class UDPForwarder: @unchecked Sendable {
     /// hand-assembled arrangement opts in by setting it too.
     public var log: RateLimitedLogger?
 
-
     public var flowCount: Int { flows.count }
 
     public init(
@@ -162,8 +161,9 @@ public final class UDPForwarder: @unchecked Sendable {
         // flow to the address it named, and replies have to come back from that
         // address or the guest will not match them to anything it sent.
         let translated = nat[key.destination] ?? key.destination
-        guard let remote = try? SocketAddress(
-            ipAddress: translated.description, port: Int(key.destinationPort))
+        guard
+            let remote = try? SocketAddress(
+                ipAddress: translated.description, port: Int(key.destinationPort))
         else { return }
         opening.insert(key)
 
@@ -206,9 +206,10 @@ public final class UDPForwarder: @unchecked Sendable {
         // else is one the kernel in the guest discards, and the application sees
         // a request that was never answered.
         let allocator = ByteBufferAllocator()
-        guard let response = UDPHeader.serialize(
-            payload: datagram, source: key.destination, destination: key.source,
-            sourcePort: key.destinationPort, destinationPort: key.sourcePort, allocator: allocator)
+        guard
+            let response = UDPHeader.serialize(
+                payload: datagram, source: key.destination, destination: key.source,
+                sourcePort: key.destinationPort, destinationPort: key.sourcePort, allocator: allocator)
         else { return }
         try? stack.ipv4.send(
             payload: response, to: key.source, from: key.destination, protocolNumber: .udp)

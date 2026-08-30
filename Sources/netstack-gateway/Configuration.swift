@@ -1,6 +1,6 @@
 import Foundation
-import Netstack
 import NIOCore
+import Netstack
 
 /// `--config`, in the shape of upstream's `types.Configuration`.
 ///

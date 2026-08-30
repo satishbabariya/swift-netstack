@@ -1837,9 +1837,11 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
                     sequence: guestISS, flags: [.syn],
                     options: [.maximumSegmentSize(1460), .timestamps(value: 7000, echo: 0)]))
             let synAck = try #require(fixture.drainSegments().first).header
-            guard case .timestamps(_, let synAckEcho)? = synAck.options.first(where: {
-                if case .timestamps = $0 { return true } else { return false }
-            }) else {
+            guard
+                case .timestamps(_, let synAckEcho)? = synAck.options.first(where: {
+                    if case .timestamps = $0 { return true } else { return false }
+                })
+            else {
                 Issue.record("the SYN-ACK did not answer the offer: \(synAck.options)")
                 return
             }
@@ -1857,9 +1859,11 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             // 2*MSS of data to force it — would change what this test is about.
             fixture.advance(by: TCPEndpoint.delayedAckTimeout)
             let ack = try #require(fixture.drainSegments().last).header
-            guard case .timestamps(_, let echo)? = ack.options.first(where: {
-                if case .timestamps = $0 { return true } else { return false }
-            }) else {
+            guard
+                case .timestamps(_, let echo)? = ack.options.first(where: {
+                    if case .timestamps = $0 { return true } else { return false }
+                })
+            else {
                 Issue.record("a bare acknowledgement dropped the option: \(ack.options)")
                 return
             }
@@ -2006,7 +2010,6 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     fixture.drain()
 }
 
-
 @Test func aGuestCannotDriveTheRoundTripEstimateWithAForgedTimestampEcho() throws {
     // The guest chooses TSecr. Nothing stops it echoing a value we never sent.
     //
@@ -2072,7 +2075,6 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     }
     fixture.drain()
 }
-
 
 @Test func anApplicationThatNeverReadsStopsThePeerInsteadOfLosingData() throws {
     // The property backpressure exists for, and the one the stack could not have

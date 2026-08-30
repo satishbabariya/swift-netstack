@@ -44,9 +44,10 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     // A listener bound to a local address and port, any peer.
     try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: listener)
 
-    #expect(demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "192.168.127.9", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 7000))
+    #expect(
+        demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "192.168.127.9", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 7000))
     #expect(listener.count == 1)
 }
 
@@ -70,17 +71,19 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     let listener = Recorder()
     try demuxer.register(id("0.0.0.0", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: listener)
 
-    #expect(demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "10.0.0.1", to: "93.184.216.34"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 9000))
+    #expect(
+        demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "10.0.0.1", to: "93.184.216.34"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 9000))
     #expect(listener.count == 1)
 }
 
 @Test func reportsNoMatch() {
     let demuxer = TransportDemuxer()
-    #expect(!demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "1.2.3.4", to: "5.6.7.8"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 99, remotePort: 100))
+    #expect(
+        !demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "1.2.3.4", to: "5.6.7.8"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 99, remotePort: 100))
 }
 
 @Test func keepsProtocolsApart() throws {
@@ -88,9 +91,10 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     let udp = Recorder()
     try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: udp)
     // Same tuple, different protocol: must not match.
-    #expect(!demuxer.deliver(
-        protocolNumber: .tcp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+    #expect(
+        !demuxer.deliver(
+            protocolNumber: .tcp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
     #expect(udp.count == 0)
 }
 
@@ -133,9 +137,10 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
         return true
     }
 
-    #expect(demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+    #expect(
+        demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
     #expect(intercepted == 1)
     #expect(endpoint.count == 0)
 }
@@ -146,9 +151,10 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     try demuxer.register(id("192.168.127.1", 53, "0.0.0.0", 0), protocolNumber: .udp, delegate: endpoint)
     demuxer.setProtocolHandler(.udp) { _, _, _, _ in false }
 
-    #expect(demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+    #expect(
+        demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
     #expect(endpoint.count == 1)
 }
 
@@ -160,16 +166,18 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     // While installed, the handler consumes everything and the endpoint
     // sees nothing.
     demuxer.setProtocolHandler(.udp) { _, _, _, _ in true }
-    #expect(demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+    #expect(
+        demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
     #expect(endpoint.count == 0)
 
     // Passing nil must remove it, so endpoint matching resumes.
     demuxer.setProtocolHandler(.udp, nil)
-    #expect(demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x02]), localPort: 53, remotePort: 4000))
+    #expect(
+        demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x02]), localPort: 53, remotePort: 4000))
     #expect(endpoint.count == 1)
     #expect(endpoint.lastPayload == [0x02])
 }
@@ -185,9 +193,10 @@ private func id(_ localAddress: String, _ localPort: UInt16, _ remoteAddress: St
     // registration is still in the table. `deliver` must report false, not
     // silently swallow the packet, so the caller can send ICMP
     // port-unreachable.
-    #expect(!demuxer.deliver(
-        protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
-        payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
+    #expect(
+        !demuxer.deliver(
+            protocolNumber: .udp, header: header(from: "192.168.127.2", to: "192.168.127.1"),
+            payload: ByteBuffer(bytes: [0x01]), localPort: 53, remotePort: 4000))
 }
 
 @Test func aSpecificAddressListenerBeatsAWildcardListener() throws {

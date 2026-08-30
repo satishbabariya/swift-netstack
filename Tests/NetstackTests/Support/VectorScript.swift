@@ -170,11 +170,13 @@ struct VectorScript {
     private static func parseARP(_ fields: [String], line: String) throws -> VectorPacket {
         // arp who-has <target> tell <sender>   |   arp reply <addr> is-at <mac>
         if fields.count == 5, fields[1] == "who-has", fields[3] == "tell",
-            let target = IPv4Address(fields[2]), let sender = IPv4Address(fields[4]) {
+            let target = IPv4Address(fields[2]), let sender = IPv4Address(fields[4])
+        {
             return .arpRequest(target: target, sender: sender)
         }
         if fields.count == 5, fields[1] == "reply", fields[3] == "is-at",
-            let address = IPv4Address(fields[2]), let mac = MACAddress(fields[4]) {
+            let address = IPv4Address(fields[2]), let mac = MACAddress(fields[4])
+        {
             return .arpReply(address: address, mac: mac)
         }
         throw VectorScriptError.unknownPacketForm(line)
@@ -183,7 +185,8 @@ struct VectorScript {
     private static func parseICMP(_ fields: [String], line: String) throws -> VectorPacket {
         // icmp echo_request id <n> seq <n>   |   icmp unreachable <code>
         if fields.count == 6, fields[2] == "id", fields[4] == "seq",
-            let identifier = UInt16(fields[3]), let sequence = UInt16(fields[5]) {
+            let identifier = UInt16(fields[3]), let sequence = UInt16(fields[5])
+        {
             switch fields[1] {
             case "echo_request": return .icmpEcho(request: true, identifier: identifier, sequence: sequence)
             case "echo_reply": return .icmpEcho(request: false, identifier: identifier, sequence: sequence)
@@ -255,11 +258,13 @@ struct VectorScript {
                 // throw rather than silently leave the field looking unset (or overwrite it).
                 guard ack == nil else { throw VectorScriptError.malformedField(line) }
                 guard let value = UInt32(fields[index + 1]) else { throw VectorScriptError.malformedField(line) }
-                ack = value; index += 2
+                ack = value
+                index += 2
             } else if field == "win", index + 1 < fields.count {
                 guard window == nil else { throw VectorScriptError.malformedField(line) }
                 guard let value = UInt16(fields[index + 1]) else { throw VectorScriptError.malformedField(line) }
-                window = value; index += 2
+                window = value
+                index += 2
             } else if field.hasPrefix("<") {
                 // Options may contain spaces ("mss 1460"), so rejoin to the ">".
                 // This loop is bounded by `fields.count` on every iteration, so it
@@ -292,7 +297,8 @@ struct VectorScript {
             }
         }
 
-        return TCPLine(flags: flags, seqStart: start, seqEnd: end, payloadLength: length,
-                       ack: ack, window: window, options: options)
+        return TCPLine(
+            flags: flags, seqStart: start, seqEnd: end, payloadLength: length,
+            ack: ack, window: window, options: options)
     }
 }

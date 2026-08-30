@@ -5,7 +5,7 @@ import Testing
 
 private func echoRequest(identifier: UInt16, sequence: UInt16, payload: [UInt8]) -> ByteBuffer {
     var buffer = ByteBuffer()
-    buffer.writeInteger(UInt8(8))   // echo request
+    buffer.writeInteger(UInt8(8))  // echo request
     buffer.writeInteger(UInt8(0))
     buffer.writeInteger(UInt16(0), endianness: .big)  // checksum placeholder
     buffer.writeInteger(identifier, endianness: .big)
@@ -140,12 +140,12 @@ private func echoRequest(identifier: UInt16, sequence: UInt16, payload: [UInt8])
         allocator: ByteBufferAllocator())
 
     let bytes = Array(message.readableBytesView)
-    #expect(bytes.count == 36)                          // 8 ICMP + 20 IP + 8 payload
+    #expect(bytes.count == 36)  // 8 ICMP + 20 IP + 8 payload
     let quoted = Array(bytes[8...])
-    #expect(quoted[0] == 0x45)                          // IHL 5, options dropped
-    #expect(UInt16(quoted[2]) << 8 | UInt16(quoted[3]) == 60)      // ORIGINAL total length
+    #expect(quoted[0] == 0x45)  // IHL 5, options dropped
+    #expect(UInt16(quoted[2]) << 8 | UInt16(quoted[3]) == 60)  // ORIGINAL total length
     #expect(UInt16(quoted[4]) << 8 | UInt16(quoted[5]) == 0x55aa)  // identification
-    #expect(Array(quoted[20...]) == [0, 1, 2, 3, 4, 5, 6, 7])      // first 8 payload bytes
+    #expect(Array(quoted[20...]) == [0, 1, 2, 3, 4, 5, 6, 7])  // first 8 payload bytes
     // The quoted header still carries a valid checksum of its own.
     #expect(quoted.prefix(20).withUnsafeBytes { Checksum.compute($0) } == 0)
 }

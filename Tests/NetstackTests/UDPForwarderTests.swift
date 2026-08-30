@@ -2,13 +2,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // UDP has no connection to accept and no close to observe, so what a forwarder
 // keeps is a NAT table -- and a table a guest can grow is the thing worth

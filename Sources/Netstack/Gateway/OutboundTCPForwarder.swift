@@ -65,7 +65,6 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     /// hand-assembled arrangement opts in by setting it too.
     public var log: RateLimitedLogger?
 
-
     /// `keepAlive` is on by default here, which is the opposite of
     /// `TCPEndpoint`'s default and deliberately so.
     ///
@@ -257,7 +256,6 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         guestChannel.registerAlreadyConfigured0(promise: nil)
     }
 }
-
 
 /// One established connection's place in `maximumConnections`, returned exactly
 /// once however many of its channels close.

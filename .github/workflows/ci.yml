@@ -72,6 +72,12 @@ jobs:
       # reads, no printing from a library, and the TCP state machine staying
       # behind its own surface. Cheap, and each was true when written and is
       # only true now because something checks.
+      # `.swift-format` sat here unenforced with 657 findings against it,
+      # because it was swift-format's defaults saved once and never reconciled
+      # with the code. It describes the code now, and this keeps it that way.
+      - name: Check the formatting
+        run: ./scripts/format.sh
+
       - name: Check the conventions
         run: ./scripts/conventions.sh
 

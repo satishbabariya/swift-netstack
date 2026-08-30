@@ -282,7 +282,9 @@ struct Sender {
     /// -- and inferring that from whether a segment was marked confuses "the
     /// window is open" with "this segment happened to be inside it".
     var rackEnabledForTesting: Bool { rackEnabled }
-    var rackStateForTesting: (send: NIODeadline?, rtt: TimeAmount, window: TimeAmount, minRTT: TimeAmount?) { (rack.mostRecentSend, rack.roundTrip, rack.reorderWindow, rack.minimumRoundTrip) }
+    var rackStateForTesting: (send: NIODeadline?, rtt: TimeAmount, window: TimeAmount, minRTT: TimeAmount?) {
+        (rack.mostRecentSend, rack.roundTrip, rack.reorderWindow, rack.minimumRoundTrip)
+    }
     var reorderWindowForTesting: TimeAmount { rack.reorderWindow }
     var sawReorderingForTesting: Bool { rack.sawReordering }
 

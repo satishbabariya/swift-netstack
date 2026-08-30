@@ -150,10 +150,11 @@ public final class Gateway: @unchecked Sendable {
             // 192.168.127.1 on the host -- where nothing is listening, because
             // the host's own services are on its loopback. Reaching the host is
             // the headline feature of this whole package and it did not work.
-            self.dnsRecords = dnsRecords ?? [
-                .init(name: "gateway.containers.internal", address: gatewayAddress),
-                .init(name: "host.containers.internal", address: hostAddress),
-            ]
+            self.dnsRecords =
+                dnsRecords ?? [
+                    .init(name: "gateway.containers.internal", address: gatewayAddress),
+                    .init(name: "host.containers.internal", address: hostAddress),
+                ]
             self.upstreamResolvers = upstreamResolvers
             self.leaseSeconds = leaseSeconds
             self.dhcpStaticLeases = dhcpStaticLeases

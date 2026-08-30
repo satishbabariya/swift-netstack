@@ -183,6 +183,12 @@ jobs:
       - name: Interoperate with upstream's client
         run: ./scripts/interop.sh
 
+      # The interop check talks to the control plane, and a gateway that has
+      # come up wrong can answer its control socket perfectly well. One frame
+      # through the wire is the check that watches what a guest actually gets.
+      - name: One frame through the built executable
+        run: ./scripts/frame-smoke.sh
+
   guards:
     name: Falsify the guards
     # Its own job because it is the long pole: seventeen mutations, each with a

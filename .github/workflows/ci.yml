@@ -89,21 +89,6 @@ jobs:
       # `.swift-format` sat here unenforced with 657 findings against it,
       # because it was swift-format's defaults saved once and never reconciled
       # with the code. It describes the code now, and this keeps it that way.
-      - name: Check the formatting
-        run: ./scripts/format.sh
-
-      - name: Check the conventions
-        run: ./scripts/conventions.sh
-
-      # Drives this gateway with gvisor-tap-vsock's own client library. Every
-      # other comparison against upstream here depends on my having read
-      # upstream correctly, and reading is what got `--listen` backwards and
-      # missed `/services/dhcp/leases`.
-      - name: Interoperate with upstream's client
-        run: ./scripts/interop.sh
-
-      - name: Falsify the guards
-        run: ./scripts/falsify.sh --all
 
   harness:
     name: Build the differential harness
@@ -169,3 +154,42 @@ jobs:
       # the sandbox rather than for the code.
       - name: Build the tests on Linux
         run: swift build --build-tests
+
+  lint:
+    name: Formatting, conventions and interop
+    # Split out of `test` so the cheap checks answer in a minute rather than
+    # waiting behind the suite and the differential gate.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      # The interop driver is Go. This came free in the old combined job, which
+      # set Go up for the harness; splitting the job took it away and the
+      # failure was `go: command not found` rather than anything about interop.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: differential/interop/go.mod
+          cache-dependency-path: differential/interop/go.sum
+      - name: Check the formatting
+        run: ./scripts/format.sh
+
+      - name: Check the conventions
+        run: ./scripts/conventions.sh
+
+      # Drives this gateway with gvisor-tap-vsock's own client library. Every
+      # other comparison against upstream here depends on my having read
+      # upstream correctly, and reading is what got `--listen` backwards and
+      # missed `/services/dhcp/leases`.
+      - name: Interoperate with upstream's client
+        run: ./scripts/interop.sh
+
+  guards:
+    name: Falsify the guards
+    # Its own job because it is the long pole: seventeen mutations, each with a
+    # build and a filtered test run. Nothing else needs to wait for it, and it
+    # needs nothing from anything else.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Falsify the guards
+        run: ./scripts/falsify.sh --all

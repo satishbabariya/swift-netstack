@@ -14,7 +14,7 @@ import Testing
         let a = try listeningEndpoint(left)
         let b = try listeningEndpoint(right)
         let splice = TCPSplice(a, b)
-        try withExtendedLifetime((a, b, splice)) {
+        withExtendedLifetime((a, b, splice)) {
             completeHandshake(left)
             completeHandshake(right)
             _ = left.drainSegments()
@@ -47,7 +47,7 @@ import Testing
         let a = try listeningEndpoint(left)
         let b = try listeningEndpoint(right)
         let splice = TCPSplice(a, b)
-        try withExtendedLifetime((a, b, splice)) {
+        withExtendedLifetime((a, b, splice)) {
             completeHandshake(left)
             completeHandshake(right)
             _ = left.drainSegments()
@@ -99,7 +99,7 @@ import Testing
         let a = try listeningEndpoint(left)
         let b = try listeningEndpoint(right)
         let splice = TCPSplice(a, b)
-        try withExtendedLifetime((a, b, splice)) {
+        withExtendedLifetime((a, b, splice)) {
             completeHandshake(left)
             completeHandshake(right)
             _ = left.drainSegments()
@@ -136,7 +136,7 @@ import Testing
         let a = try listeningEndpoint(left)
         let b = try listeningEndpoint(right)
         let splice = TCPSplice(a, b)
-        try withExtendedLifetime((a, b, splice)) {
+        withExtendedLifetime((a, b, splice)) {
             completeHandshake(left)
             completeHandshake(right)
             _ = left.drainSegments()
@@ -206,7 +206,7 @@ import Testing
         let a = try listeningEndpoint(left)
         let b = try listeningEndpoint(right)
         let splice = TCPSplice(a, b)
-        try withExtendedLifetime((a, b, splice)) {
+        withExtendedLifetime((a, b, splice)) {
             completeHandshake(left)
             completeHandshake(right)
             _ = left.drainSegments()

@@ -158,7 +158,9 @@ func tcpPayload(_ count: Int, fill: UInt8 = 0x5a) -> ByteBuffer {
 
 /// A count an escaping callback and the assertion after it can share, for the
 /// same reason `DataRecorder` is a class.
-final class Counter {
+/// `@unchecked Sendable` for the reason every loop-confined type in this package
+/// is: the callback and the assertion both run on the endpoint's event loop.
+final class Counter: @unchecked Sendable {
     private(set) var value = 0
     func increment() { value += 1 }
 }
@@ -1547,7 +1549,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -1625,7 +1627,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -2081,7 +2083,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             // No onData handler at all: nothing ever reads.
             completeHandshake(fixture)
             _ = fixture.drainSegments()
@@ -2150,7 +2152,7 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
     let signals = Counter()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             endpoint.onWritable = { signals.increment() }
             completeHandshake(fixture)
             _ = fixture.drainSegments()

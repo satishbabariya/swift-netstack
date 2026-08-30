@@ -20,7 +20,10 @@ private final class StackHolder: @unchecked Sendable {
     var stack: Stack?
 }
 
-private final class FrameCollector: LinkDispatcher {
+/// `@unchecked Sendable` on the same terms as the library types it stands in
+/// for: it is touched only on the link's event loop, and the safety comes from
+/// that confinement rather than from anything the compiler checked.
+private final class FrameCollector: LinkDispatcher, @unchecked Sendable {
     var frames: [[UInt8]] = []
     func deliverInbound(_ frame: PacketBuffer) {
         frames.append(Array(frame.frame.readableBytesView))
@@ -138,7 +141,7 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     // into an `errorCaught` rather than letting it out of `writeInbound`, so a
     // throwing assertion here would be asserting about NIO's plumbing. What
     // matters is what the link did about it.
-    try? channel.writeInbound(claim)
+    _ = try? channel.writeInbound(claim)
 
     #expect(!channel.isActive, "the wire stayed open after a framing error")
     _ = try? channel.finish()

@@ -22,17 +22,21 @@ jobs:
       - name: Swift version
         run: swift --version
 
-      # `Sources/Netstack` is warning-free and this keeps it that way. The gate
-      # is deliberately on the library alone: the test target still carries
-      # warnings from earlier work, and failing on those would mean the useful
-      # half of this check never gets enabled.
+      # The library AND the tests, warning-free.
       #
-      # It also has to be a fresh checkout to mean anything. An incremental
+      # This used to cover the library alone, because the test target carried
+      # fifty-five warnings from earlier work and failing on those would have
+      # meant the useful half never got enabled. They are cleared, so the caveat
+      # is gone -- and it mattered more than tidiness: twenty-seven NIO warnings
+      # about scheduling on a dead event loop were dismissed as noise in this
+      # repository, and one of them was a real leak.
+      #
+      # It has to be a fresh checkout to mean anything. An incremental
       # `swift build` reuses an already-compiled module and prints nothing at
       # all, which is how twelve warnings went unnoticed locally for several
       # weeks of work.
-      - name: Build the library with warnings as errors
-        run: swift build -Xswiftc -warnings-as-errors
+      - name: Build with warnings as errors
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
 
       # The differential tests now FAIL rather than skip when this binary is
       # missing, because a silent skip made them indistinguishable from a pass:

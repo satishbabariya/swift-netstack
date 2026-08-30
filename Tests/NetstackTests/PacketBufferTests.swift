@@ -34,7 +34,7 @@ import Testing
 }
 
 @Test func cloneIsIndependent() {
-    var original = PacketBuffer(allocator: ByteBufferAllocator(), payload: ByteBuffer(bytes: [0x01]))
+    let original = PacketBuffer(allocator: ByteBufferAllocator(), payload: ByteBuffer(bytes: [0x01]))
     var copy = original.clone()
     copy.prepend([0xff])
     #expect(Array(original.frame.readableBytesView) == [0x01])

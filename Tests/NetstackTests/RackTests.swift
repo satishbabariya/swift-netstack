@@ -414,7 +414,7 @@ private func block(_ index: Int, count: Int = 1) -> SACKBlock {
     do {
         let endpoint = try listeningEndpoint(fixture)
         endpoint.rack = true
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
             #expect(endpoint.usesRackForTesting, "the endpoint built a sender with RACK off")

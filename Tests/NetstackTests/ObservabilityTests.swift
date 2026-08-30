@@ -19,7 +19,12 @@ import Testing
 /// for the same reason: `LogHandler` must be `Sendable` and swift-log gives no
 /// promise about which thread calls it. Nothing in `Sources/Netstack` depends on
 /// this type.
-final class CapturingLogHandler: LogHandler {
+/// `@unchecked` because `LogHandler` refines `Sendable` and requires `metadata`
+/// and `logLevel` to be settable `var`s -- a protocol requirement that cannot be
+/// met by a checked `Sendable` class. The captured lines, which are the part a
+/// test reads from another thread, are behind the lock; these two are written
+/// once at construction and never again.
+final class CapturingLogHandler: LogHandler, @unchecked Sendable {
     struct Line: Sendable {
         var level: Logger.Level
         var message: String
@@ -39,12 +44,16 @@ final class CapturingLogHandler: LogHandler {
         set { metadata[key] = newValue }
     }
 
-    func log(
-        level: Logger.Level, message: Logger.Message, metadata: Logger.Metadata?,
-        source: String, file: String, function: String, line: UInt
-    ) {
+    // `log(event:)` rather than the older `log(level:message:...)`. swift-log
+    // deprecated satisfying the protocol through the default implementation, and
+    // the deprecation is the kind of thing that sits in a build log until
+    // somebody turns warnings into errors -- which is what this change did.
+    func log(event: LogEvent) {
         box.withLockedValue {
-            $0.append(Line(level: level, message: message.description, metadata: metadata ?? [:]))
+            $0.append(
+                Line(
+                    level: event.level, message: event.message.description,
+                    metadata: event.metadata ?? [:]))
         }
     }
 }

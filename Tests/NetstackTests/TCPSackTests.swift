@@ -58,7 +58,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             let answered = sackHandshake(fixture)
             #expect(answered.contains(.sackPermitted))
         }
@@ -73,7 +73,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             let synAck = completeHandshake(fixture).first?.header.options ?? []
             #expect(!synAck.contains(.sackPermitted))
         }
@@ -85,7 +85,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             sackHandshake(fixture)
             // A hole at [1, 501), then data at [501, 1001).
             fixture.inject(
@@ -107,7 +107,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
             fixture.inject(
@@ -126,7 +126,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             sackHandshake(fixture)
             for offset in [UInt32(501), UInt32(1001)] {
                 fixture.inject(
@@ -148,7 +148,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             sackHandshake(fixture)
             // LOW first, then HIGH, and the order matters to the test as much
             // as to the RFC. The first draft injected high then low, so the
@@ -181,7 +181,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
         let fixture = TCPFixture()
         do {
             let endpoint = try listeningEndpoint(fixture)
-            try withExtendedLifetime(endpoint) {
+            withExtendedLifetime(endpoint) {
                 sackHandshake(fixture, timestamps: timestamps)
                 // Five separate runs offered; only as many as fit are reported.
                 for run in 0..<5 {
@@ -326,7 +326,7 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             sackHandshake(fixture)
             // 3001, then 5001, then 1001 — chosen so recency order and sequence
             // order differ in the TAIL, not just at the head. The first draft

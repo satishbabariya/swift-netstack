@@ -25,7 +25,7 @@ import Testing
 /// From "Using it".
 private func readmeUsingIt() async throws {
     var pair: [Int32] = [0, 0]
-    makeSocketPair(AF_UNIX, .datagram, &pair)
+    _ = makeSocketPair(AF_UNIX, .datagram, &pair)
 
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let gateway = try await Gateway.start(

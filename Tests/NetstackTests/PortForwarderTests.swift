@@ -121,7 +121,7 @@ private func pfGuestSegment(
 
     // The guest accepts.
     let guestISS: UInt32 = 5000
-    var bytes = pfGuestSegment(
+    let bytes = pfGuestSegment(
         sourcePort: 8080, destinationPort: guestPortUsed, sequence: guestISS,
         acknowledgement: gatewayISS &+ 1, flags: [.syn, .ack])
     _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
@@ -192,7 +192,7 @@ private func pfGuestSegment(
     let opening = try #require(syn.first { $0.header.flags.contains(.syn) })
 
     // The guest resets it.
-    var bytes = pfGuestSegment(
+    let bytes = pfGuestSegment(
         sourcePort: 8080, destinationPort: opening.header.sourcePort, sequence: 0,
         acknowledgement: opening.header.sequence.value &+ 1, flags: [.rst, .ack])
     _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }

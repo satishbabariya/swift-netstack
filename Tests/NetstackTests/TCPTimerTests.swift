@@ -272,7 +272,7 @@ private final class FiringCounter {
     // never run at all.
     let fixture = TimerFixture()
     var timers: TCPTimers? = fixture.makeTimers()
-    weak var weakTimers = timers
+    weak let weakTimers = timers
     let fired = FiringCounter()
 
     timers!.scheduleRetransmit(after: .seconds(1)) { fired.record() }

@@ -251,7 +251,7 @@ private struct DiffGenerator {
         // compares sequence numbers as integers rather than serially gets
         // wrong (RFC 9293 §3.4).
         let crossesWrap = rng.next() % 4 == 0
-        var entersPersist = false
+        let entersPersist = false
         let guestISS: UInt32 = crossesWrap ? UInt32.max - UInt32(rng.next() % 3000) : UInt32(truncatingIfNeeded: rng.next())
 
         // A model of the receiver's reassembly, kept in OFFSETS from the byte

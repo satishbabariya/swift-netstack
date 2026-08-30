@@ -53,7 +53,7 @@ private func keepAliveEndpoint(
     let fixture = TCPFixture()
     do {
         let endpoint = try listeningEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -73,7 +73,7 @@ private func keepAliveEndpoint(
     let fixture = TCPFixture()
     do {
         let endpoint = try keepAliveEndpoint(fixture)
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 
@@ -166,7 +166,7 @@ private func keepAliveEndpoint(
     let fixture = TCPFixture()
     do {
         let endpoint = try keepAliveEndpoint(fixture, idle: .seconds(100))
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
 

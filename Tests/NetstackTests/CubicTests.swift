@@ -89,7 +89,7 @@ private func afterLoss(window segments: Int) -> Cubic {
     // β = 0.7, not Reno's 0.5. The gentler decrease is half of why CUBIC
     // recovers faster; a test that only checked "the window went down" would
     // pass against Reno.
-    var cubic = afterLoss(window: 100)
+    let cubic = afterLoss(window: 100)
     #expect(cubic.slowStartThreshold == 70 * cubicMSS)
     #expect(cubic.congestionWindow == 70 * cubicMSS, "a scoreboard loss must not inflate the window")
 
@@ -105,7 +105,7 @@ private func afterLoss(window segments: Int) -> Cubic {
     // then convex beyond it. Checked at three points rather than one, because a
     // window that merely increases passes a single-point test against any
     // algorithm at all.
-    var cubic = afterLoss(window: 100)
+    let cubic = afterLoss(window: 100)
     let reduced = cubic.congestionWindow / cubicMSS
 
     // K = cbrt(100 * 0.3 / 0.4) = cbrt(75) ≈ 4.217 seconds, so the curve reaches
@@ -340,7 +340,7 @@ private func afterLoss(window segments: Int) -> Cubic {
     do {
         let endpoint = try listeningEndpoint(fixture)
         endpoint.congestionControl = .cubic
-        try withExtendedLifetime(endpoint) {
+        withExtendedLifetime(endpoint) {
             completeHandshake(fixture)
             _ = fixture.drainSegments()
             #expect(endpoint.usesCubicForTesting, "the endpoint built a Reno sender after being told CUBIC")

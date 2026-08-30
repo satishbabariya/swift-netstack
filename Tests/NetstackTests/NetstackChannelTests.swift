@@ -51,7 +51,7 @@ private func makeStack(_ link: RecordingEndpoint) -> Stack {
 
     #expect(channel.isActive)
     #expect(channel.eventLoop === stack.eventLoop)
-    #expect(try channel.localAddress?.port == 53)
+    #expect(channel.localAddress?.port == 53)
 }
 
 @Test func inboundDatagramsArriveAsEnvelopes() throws {
@@ -194,7 +194,7 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
         sourcePort: sourcePort, destinationPort: destinationPort,
         allocator: ByteBufferAllocator())!
     var ipPacket = PacketBuffer(allocator: ByteBufferAllocator(), payload: datagram)
-    var header = IPv4Header(
+    let header = IPv4Header(
         source: IPv4Address(source)!, destination: IPv4Address(destination)!,
         protocolNumber: .udp, payloadLength: datagram.readableBytes)
     header.prepend(to: &ipPacket)
@@ -227,7 +227,7 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
     // `RecordingEndpoint.attach` (from `NIC.init`) preconditions that it is
     // on `eventLoop`, so building the stack has to happen there; off-loop is
     // the scenario under test for `bind` specifically, not for construction.
-    let stack = try await eventLoop.submit {
+    let carried = try await eventLoop.submit {
         let link = RecordingEndpoint(eventLoop: eventLoop, linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
         let stack = Stack(
             link: link,
@@ -237,8 +237,10 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
             ),
             clock: ManualClock())
         stack.start()
-        return stack
+        return StackBox(stack: stack)
     }.get()
+    let stack = carried.stack
+
 
     // Resumed on Swift concurrency's executor after the `await` above, not on
     // `eventLoop`'s own thread — a genuinely off-loop call.
@@ -249,6 +251,8 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
     #expect(channel.localAddress?.port == 5300)
 
     try await channel.close()
-    _ = try await eventLoop.submit { stack.shutdown() }.get().get()
+    // Carried in, for the same reason it was carried out.
+    let shutting = StackBox(stack: stack)
+    _ = try await eventLoop.submit { shutting.stack.shutdown() }.get().get()
     try await group.shutdownGracefully()
 }

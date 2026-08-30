@@ -377,7 +377,11 @@ connection to the host address** and gets its bytes echoed back by a real
 listener on the loopback — the forwarder, the NAT rewrite and the splice in one
 question. It **exposes a host port into the guest** and requires bytes sent the
 instant the host connects to come back — which is how the silent data loss in
-`write0` was found, after 768 library tests had passed over it. It sends **a UDP datagram to the host** and requires the reply to come back to
+`write0` was found, after 768 library tests had passed over it. It **pings the host** and requires two things: the echo back, and the gateway's
+own `icmp_forwarded` count to have moved. Only the second distinguishes a real
+ping from this process answering for an address it holds — the gateway falls
+back to a local answer when it cannot open an unprivileged ICMP socket, and that
+fallback is identical on the wire. It sends **a UDP datagram to the host** and requires the reply to come back to
 the port it was sent from — nothing in a datagram says which conversation it
 belongs to, so that is the part with somewhere to go wrong. It asks for **a name
 the gateway does not own**, which is every name a guest
@@ -402,8 +406,9 @@ file.
 Each of those fails when the thing it names is broken: removing the NAT entry
 turns the SYN into a reset, breaking the return direction of the splice leaves
 the handshake intact and loses the echo, switching the stream framing to
-hyperkit's two little-endian bytes leaves the wire silent, a resolver that
-declines to forward answers REFUSED where an address belonged, and a capture
+hyperkit's two little-endian bytes leaves the wire silent, a forwarder that cannot open its
+socket still answers the ping and leaves `icmp_forwarded` at zero, a resolver
+that declines to forward answers REFUSED where an address belonged, and a capture
 that never flushes is zero bytes where a header belonged.
 
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips

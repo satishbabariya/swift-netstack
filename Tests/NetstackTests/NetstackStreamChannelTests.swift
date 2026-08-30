@@ -286,3 +286,61 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     }
     fixture.drain()
 }
+
+// A write issued before the connection is established.
+//
+// Every test above writes to a channel that is already active, which is the
+// ordering a test author picks and not the one a client uses. A client connects
+// and writes at once -- an HTTP request is in flight long before any handshake
+// downstream of it has finished -- and on a forwarded host port those bytes
+// reach a guest-side channel that is still connecting.
+//
+// They were dropped there, in silence. The channel refused a write before
+// `.active` by failing its promise, and `GlueHandler` writes with no promise, so
+// a real connection lost real data and nothing anywhere said so: the handshake
+// completed, the connection stayed open, and the request simply never arrived.
+// Found by opening a forwarded port through the built executable and sending on
+// it the way a client does; every test in this file passed throughout.
+@Test func aWriteBeforeTheConnectionIsEstablishedIsQueuedRatherThanDropped() throws {
+    let fixture = TCPFixture()
+    do {
+        let endpoint = TCPEndpoint(stack: fixture.stack)
+        let channel = NetstackStreamChannel(
+            eventLoop: fixture.loop, endpoint: endpoint, owns: true, parent: nil)
+        channel.installCallbacks()
+        try channel.setOption(ChannelOptions.autoRead, value: false).wait()
+        channel.register0(promise: nil)
+        channel.connect0(
+            to: try SocketAddress(ipAddress: tcpGuest.description, port: 8080), promise: nil)
+
+        // The SYN is on the wire and nothing has answered it yet.
+        let syn = try #require(fixture.drainSegments().first { $0.header.flags.contains(.syn) })
+        #expect(!channel.isActive, "the channel cannot be active before the peer has answered")
+
+        // Written exactly as the splice writes: through the pipeline, with no
+        // promise, so a refusal here has nowhere to be reported.
+        var out = channel.allocator.buffer(capacity: 5)
+        out.writeString("hello")
+        channel.writeAndFlush(out, promise: nil)
+        #expect(
+            fixture.drainSegments().allSatisfy { $0.payload.readableBytes == 0 },
+            "bytes went out before the peer accepted the connection")
+
+        // Only now does the peer accept.
+        fixture.inject(
+            TCPHeader(
+                sourcePort: 8080, destinationPort: syn.header.sourcePort,
+                sequence: SequenceNumber(guestISS),
+                acknowledgement: syn.header.sequence + 1,
+                dataOffset: 5, flags: [.syn, .ack], window: 65535, checksum: 0,
+                urgentPointer: 0, options: []))
+
+        let carried = fixture.drainSegments().first { $0.payload.readableBytes > 0 }
+        #expect(
+            carried.map { String(decoding: $0.payload.readableBytesView, as: UTF8.self) } == "hello",
+            "the queued bytes were dropped rather than sent once the peer accepted")
+
+        channel.close0(error: ChannelError.alreadyClosed, mode: .all, promise: nil)
+    }
+    fixture.drain()
+}

@@ -249,16 +249,32 @@ public enum WireBootstrap {
             linkAddress: linkAddress, mtu: mtu, eventLoop: loop,
             maximumAddressesPerPort: maximumAddressesPerPort)
         let limit = max(1, maximumGuests)
+        let admitting = AdmittedGuests()
 
         return ServerBootstrap(group: group, childGroup: loop)
             .childChannelInitializer { channel in
                 // Counted on the switch's loop, where `portCount` is safe to
                 // read -- and the child is already on that loop, so this is a
                 // check rather than a hop.
-                guard netSwitch.portCount < limit else { return channel.close() }
+                //
+                // `admitting` is the part that took a falsification to find.
+                // `configure` finishes on a LATER tick of this loop, so the port
+                // does not exist yet when the next connection is checked: every
+                // guest in a burst read `portCount == 0` and every one was
+                // admitted. The limit was checkable and not enforced, under
+                // exactly the condition it exists for -- many guests at once --
+                // in a package whose threat model is that the guest is hostile.
+                //
+                // Counting the admission rather than the port closes the window,
+                // because that happens here, synchronously, before this returns.
+                guard netSwitch.portCount + admitting.pending < limit else {
+                    return channel.close()
+                }
+                admitting.pending += 1
                 return configure(
                     channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
                 ).map { link in
+                    admitting.pending -= 1
                     let id = netSwitch.addPort(link)
                     // A guest that goes away takes its port with it, and with it
                     // everything the switch learned on that port. Without this a
@@ -267,6 +283,12 @@ public enum WireBootstrap {
                     channel.closeFuture.whenComplete { _ in
                         _ = netSwitch.removePort(id)
                     }
+                }.flatMapErrorThrowing { error in
+                    // Released on the way out too. A reservation that is only
+                    // ever taken is a limit that shrinks to nothing over a long
+                    // enough run.
+                    admitting.pending -= 1
+                    throw error
                 }
             }
             .bind(unixDomainSocketPath: path)
@@ -323,6 +345,15 @@ public enum WireBootstrap {
 /// from loop confinement, not from anything the compiler checked. A lock here
 /// would be the second in `Sources/Netstack`, which is the thing
 /// `scripts/conventions.sh` exists to prevent.
+/// Guests admitted but not yet holding a port.
+///
+/// See `switchedStreamSocket`: the port appears a tick after the admission, and
+/// the gap is wide enough to fit every connection in a burst. Loop-confined on
+/// exactly the terms `FirstGuest` is.
+private final class AdmittedGuests: @unchecked Sendable {
+    var pending = 0
+}
+
 private final class FirstGuest: @unchecked Sendable {
     var taken = false
     /// Kept so a guest that reconnects takes over the link the stack is already

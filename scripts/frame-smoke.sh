@@ -1159,6 +1159,122 @@ PY
     return $outcome
 }
 
+# Several guests on one wire.
+#
+# `--listen-switch` is the shape gvisor-tap-vsock actually is: a network, not a
+# point-to-point link. Every guest that connects gets its own port, the gateway
+# leases each one its own address, and guests reach each other directly -- the
+# gateway never sees that traffic, which is the part a check has to be careful
+# about, because "the reply arrived" and "the first frame was the reply" are
+# different claims. They are different here: a broadcast is flooded to every
+# other port, so the first frame a guest reads is usually somebody else's.
+switch_smoke() {
+    local expected="$1"
+    shift 1
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-switch-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-switch "$WIRE" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: the switch wire never appeared"; return 1; }
+
+    EXPECTED="$expected" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
+import os, socket, struct, sys
+
+gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+wire = os.environ["WIRE"]
+
+GUESTS = [
+    (bytes.fromhex("5a94efe4bc01"), bytes([gateway[0], gateway[1], gateway[2], 2])),
+    (bytes.fromhex("5a94efe4bc02"), bytes([gateway[0], gateway[1], gateway[2], 3])),
+]
+
+
+class Guest:
+    def __init__(self, mac, address):
+        self.mac, self.address = mac, address
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(10)
+        self.socket.connect(wire)
+        self.held = b""
+
+    def send(self, frame):
+        self.socket.sendall(struct.pack(">I", len(frame)) + frame)
+
+    def frames(self, deadline=10):
+        """Every frame, not just the first: a broadcast is flooded to every other
+        port, so somebody else's traffic arrives interleaved with the answer."""
+        self.socket.settimeout(deadline)
+        while True:
+            if len(self.held) >= 4:
+                length = struct.unpack(">I", self.held[:4])[0]
+                if len(self.held) >= 4 + length:
+                    frame, self.held = self.held[4:4 + length], self.held[4 + length:]
+                    yield frame
+                    continue
+            try:
+                chunk = self.socket.recv(8192)
+            except socket.timeout:
+                return
+            if not chunk:
+                return
+            self.held += chunk
+
+    def request(self, target):
+        self.send(
+            b"\xff\xff\xff\xff\xff\xff" + self.mac + b"\x08\x06"
+            + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+            + self.mac + self.address + b"\x00" * 6 + target
+        )
+
+
+def find(guest, predicate, what):
+    for frame in guest.frames():
+        if len(frame) >= 42 and predicate(frame):
+            return frame
+    print("FAIL:", what, "for", described)
+    sys.exit(1)
+
+
+guests = [Guest(mac, address) for mac, address in GUESTS]
+try:
+    # Each guest asks who owns the gateway, and each has to be answered on its
+    # own port. Serving only the first is exactly what the single-guest wire
+    # does, and it is what this is here to tell apart.
+    for index, guest in enumerate(guests):
+        guest.request(gateway)
+    for index, guest in enumerate(guests):
+        find(
+            guest,
+            lambda f: f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x02" and f[28:32] == gateway,
+            f"guest {index + 1} was never told who owns {'.'.join(map(str, gateway))}")
+    print("ok: switch", len(guests), "guests each answered on their own port for", described)
+
+    # And one guest reaches another. The gateway is not involved: the switch
+    # carries it, which is the whole difference between a network and a wire.
+    guests[0].request(guests[1].address)
+    find(
+        guests[1],
+        lambda f: (f[12:14] == b"\x08\x06" and f[20:22] == b"\x00\x01"
+                   and f[28:32] == guests[0].address and f[38:42] == guests[1].address),
+        "one guest's request never reached the other")
+    print("ok: switch a guest reached another guest directly for", described)
+finally:
+    for guest in guests:
+        guest.socket.close()
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -1203,5 +1319,8 @@ udp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 # And the file an operator reads when nothing else is working.
 pcap_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And the wire that carries a network rather than a link.
+switch_smoke 192.168.127.1 || status=1
 
 exit $status

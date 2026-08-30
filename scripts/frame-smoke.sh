@@ -25,8 +25,9 @@ echo "building the gateway"
 swift build -c release --product netstack-gateway >/dev/null || exit 1
 binary="$(swift build -c release --show-bin-path)/netstack-gateway"
 
-# One run: start the gateway with the given arguments, ARP for `expected`, and
-# require the reply to claim it.
+# One run: start the gateway with the given arguments, then ask it the two
+# questions a guest asks first -- who owns the gateway address, and what address
+# may I use -- and require both answers to match what it was configured with.
 smoke() {
     local expected="$1" guest="$2"
     shift 2
@@ -76,7 +77,59 @@ try:
         print("FAIL: the reply claims", ".".join(map(str, reply[28:32])),
               "rather than", ".".join(map(str, expected)), "for", described)
         sys.exit(1)
-    print("ok:", ".".join(map(str, expected)), "answered for", described)
+    print("ok: ARP  ", ".".join(map(str, expected)), "answered for", described)
+
+    # And a lease. The bug this file exists for produced a gateway that answered
+    # its control socket while serving a subnet nobody asked for, so the address
+    # it hands a guest has to be checked against the one it was configured with
+    # -- not merely that it handed out something.
+    transaction = b"\x5a\x5a\x00\x01"
+    discover = (
+        b"\x01\x01\x06\x00" + transaction + b"\x00\x00\x80\x00"
+        + b"\x00" * 16 + src + b"\x00" * 10 + b"\x00" * 192
+        + b"\x63\x82\x53\x63" + b"\x35\x01\x01" + b"\xff"
+    )
+    udp = (
+        (68).to_bytes(2, "big") + (67).to_bytes(2, "big")
+        + (8 + len(discover)).to_bytes(2, "big") + b"\x00\x00" + discover
+    )
+    total = 20 + len(udp)
+    header = bytearray(
+        b"\x45\x00" + total.to_bytes(2, "big") + b"\x00\x00\x00\x00\x40\x11\x00\x00"
+        + b"\x00\x00\x00\x00" + b"\xff\xff\xff\xff"
+    )
+    checksum = 0
+    for i in range(0, 20, 2):
+        checksum += (header[i] << 8) | header[i + 1]
+    checksum = (checksum >> 16) + (checksum & 0xFFFF)
+    checksum = (~((checksum >> 16) + (checksum & 0xFFFF))) & 0xFFFF
+    header[10:12] = checksum.to_bytes(2, "big")
+    s.send(b"\xff" * 6 + src + b"\x08\x00" + bytes(header) + udp)
+
+    s.settimeout(5)
+    leased = None
+    while leased is None:
+        try:
+            reply = s.recv(2048)
+        except socket.timeout:
+            print("FAIL: no DHCP offer within 5s for", described)
+            sys.exit(1)
+        # ethernet + IPv4 + UDP, from the DHCP server port
+        if len(reply) < 42 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
+            continue
+        if int.from_bytes(reply[34:36], "big") != 67:
+            continue
+        payload = reply[42:]
+        if len(payload) < 240 or payload[4:8] != transaction:
+            continue
+        leased = payload[16:20]
+
+    if leased[:3] != expected[:3]:
+        print("FAIL: leased", ".".join(map(str, leased)),
+              "which is not on the subnet of", ".".join(map(str, expected)),
+              "for", described)
+        sys.exit(1)
+    print("ok: lease ", ".".join(map(str, leased)), "offered for", described)
 finally:
     s.close()
     os.unlink(client_path)

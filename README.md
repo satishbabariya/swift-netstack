@@ -10,6 +10,21 @@ with Swift so the gateway can be **linked into a Swift host process** —
 `apple/container`, or anything else driving Virtualization.framework — rather
 than spawned as a separate Go binary.
 
+## Adding it
+
+```swift
+.package(url: "https://github.com/satishbabariya/swift-netstack.git", from: "0.1.0")
+```
+
+```swift
+.product(name: "Netstack", package: "swift-netstack")
+```
+
+**0.x, and the API is not stable yet.** `Gateway.Configuration` gained eight
+parameters in a single day of work and will gain more; pin an exact version if
+that matters to you. What is stable is the wire behaviour — that is what the
+differential harness and the interop check are for.
+
 ## Using it
 
 One descriptor in, a working network out:

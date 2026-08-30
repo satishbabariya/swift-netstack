@@ -67,6 +67,16 @@ public final class ControlPlane: @unchecked Sendable {
     /// Whether `/connect` has anywhere to put a guest.
     fileprivate var gatewayHasSwitch: Bool { gateway.networkSwitch != nil }
 
+    /// Whether this endpoint will attach a guest at all.
+    ///
+    /// Upstream publishes two endpoints from one API: `--listen`, which can do
+    /// everything, and `--services`, which is the same API "without the
+    /// /connect endpoint". The difference is who is on the other end. A guest
+    /// may be given the services endpoint so it can publish its own ports; a
+    /// guest that could also reach `/connect` could put another guest on the
+    /// network, which is a different privilege entirely.
+    public var allowsGuestAttach = true
+
     public init(gateway: Gateway) {
         self.gateway = gateway
     }
@@ -825,6 +835,12 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
                 plane.tunnel(channel, carrying: framer, to: target.address, port: target.port)
                 return
             case "/connect":
+                guard plane.allowsGuestAttach else {
+                    respond(
+                        context: context, status: .notFound,
+                        json: "{\"error\":\"this endpoint does not attach guests\"}")
+                    return
+                }
                 guard plane.gatewayHasSwitch else {
                     respond(
                         context: context, status: .conflict,

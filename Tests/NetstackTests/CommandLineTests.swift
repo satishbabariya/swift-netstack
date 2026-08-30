@@ -190,3 +190,145 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     guard let missing = run(["--config", "/nonexistent/netstack.json"]) else { return }
     #expect(missing.output.contains("cannot read"), "unhelpful error: \(missing.output)")
 }
+
+// The operator's flags, run rather than read.
+//
+// gvproxy has --pid-file, --log-file and --services, and it takes --listen more
+// than once and as a URL. None of that existed here, so a real command line hit
+// "unknown option" on plumbing that has nothing to do with networking. These run
+// the gateway and take it apart again, because the interesting half of a PID
+// file is whether it is removed.
+@Test func theOperatorsFlagsDoWhatTheirNamesSay() async throws {
+    let binary = gatewayBinary()
+    guard !binary.isEmpty else { return }
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("netstack-ops-\(getpid())-\(UInt32.random(in: 0..<UInt32.max))")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    func path(_ name: String) -> String { directory.appendingPathComponent(name).path }
+    let wire = path("wire.sock")
+    let control = path("control.sock")
+    let pidFile = path("gateway.pid")
+    let logFile = path("gateway.log")
+    let port = Int.random(in: 20000..<30000)
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: binary)
+    process.arguments = [
+        "--listen-switch", wire,
+        "--listen", "unix://\(control)",
+        "--services", "tcp://127.0.0.1:\(port)",
+        "--pid-file", pidFile,
+        "--log-file", logFile,
+    ]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    defer {
+        if process.isRunning { process.terminate() }
+    }
+
+    // The PID file is written after everything is listening, so waiting for it
+    // is waiting for the gateway to be ready -- which is what a supervisor uses
+    // it for and therefore what this should depend on.
+    var written = ""
+    for _ in 0..<400 where written.isEmpty {
+        written = (try? String(contentsOfFile: pidFile, encoding: .utf8)) ?? ""
+        if written.isEmpty { try await Task.sleep(nanoseconds: 25_000_000) }
+    }
+    let claimed = written.trimmingCharacters(in: .whitespacesAndNewlines)
+    #expect(
+        Int32(claimed) == process.processIdentifier,
+        "the pid file says \(claimed) and the process is \(process.processIdentifier)")
+
+    // A log file that stays empty until something goes wrong cannot be told from
+    // one that was never opened, so there is a line at startup and this is it.
+    let logged = (try? String(contentsOfFile: logFile, encoding: .utf8)) ?? ""
+    #expect(logged.contains("running"), "the log file has no startup line: \(logged.debugDescription)")
+
+    // Both endpoints answer, one over a unix socket and one over TCP.
+    #expect(controlAnswers(unixSocket: control), "the unix control endpoint did not answer")
+    #expect(controlAnswers(tcpPort: port), "the tcp services endpoint did not answer")
+
+    // And they are not the same endpoint: --services is documented upstream as
+    // the same API "without the /connect endpoint", because a guest that could
+    // reach /connect could put another guest on the network.
+    #expect(
+        statusOf(tcpPort: port, path: "/connect") == 404,
+        "--services offered /connect, which is the one thing it is defined not to")
+
+    process.terminate()
+    process.waitUntilExit()
+
+    // Removed on a clean stop, and only then: one left behind by a crash is how
+    // a supervisor finds out there was one.
+    var lingering = true
+    for _ in 0..<200 where lingering {
+        lingering = FileManager.default.fileExists(atPath: pidFile)
+        if lingering { try await Task.sleep(nanoseconds: 25_000_000) }
+    }
+    #expect(!lingering, "the pid file outlived a clean stop")
+}
+
+/// A GET against an HTTP endpoint, by hand.
+///
+/// `URLSession` cannot dial a unix socket and curl is a dependency this suite
+/// does not otherwise have, so both transports go through the same few lines.
+private func httpStatus(_ descriptor: Int32, _ path: String) -> Int? {
+    // A read deadline, because one of the things being checked is an endpoint
+    // that must NOT hijack the connection -- and a hijacked connection answers
+    // nothing, ever. Without this the test that catches that hangs instead of
+    // failing, which is worse: it takes the whole run with it, and it took a
+    // swift-test process and the package's build lock with it here.
+    var timeout = timeval(tv_sec: 3, tv_usec: 0)
+    setsockopt(
+        descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+    let request = "GET \(path) HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n"
+    guard sendBytes(descriptor, Array(request.utf8)) > 0 else { return nil }
+
+    var deadline = 400
+    var answer = [UInt8]()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while deadline > 0, !answer.contains(0x0A) {
+        let read = recv(descriptor, &buffer, buffer.count, 0)
+        if read > 0 {
+            answer.append(contentsOf: buffer[0..<read])
+        } else if read == 0 {
+            break
+        } else if errno == EAGAIN || errno == EWOULDBLOCK {
+            // The deadline expired with nothing said. For `/connect` on an
+            // endpoint that hijacks, that is the answer.
+            return nil
+        } else if errno != EINTR {
+            return nil
+        }
+        deadline -= 1
+    }
+    // "HTTP/1.1 200 OK" -- the status is the second word of the first line.
+    let line = String(decoding: answer.prefix(while: { $0 != 0x0D && $0 != 0x0A }), as: UTF8.self)
+    let words = line.split(separator: " ")
+    guard words.count >= 2 else { return nil }
+    return Int(words[1])
+}
+
+private func controlAnswers(unixSocket path: String) -> Bool {
+    let descriptor = makeSocket(AF_UNIX, .stream)
+    guard descriptor >= 0 else { return false }
+    defer { close(descriptor) }
+    guard connectTo(descriptor, unixAddress(path: path)) == 0 else { return false }
+    return httpStatus(descriptor, "/services/forwarder/all") == 200
+}
+
+private func controlAnswers(tcpPort port: Int) -> Bool {
+    statusOf(tcpPort: port, path: "/services/forwarder/all") == 200
+}
+
+private func statusOf(tcpPort port: Int, path: String) -> Int? {
+    let descriptor = makeSocket(AF_INET, .stream)
+    guard descriptor >= 0 else { return nil }
+    defer { close(descriptor) }
+    guard connectTo(descriptor, loopbackAddress(port: UInt16(port))) == 0 else { return nil }
+    return httpStatus(descriptor, path)
+}

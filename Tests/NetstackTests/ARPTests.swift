@@ -6,10 +6,10 @@ import Testing
 
 private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, targetMAC: String, targetIP: String) -> ByteBuffer {
     var buffer = ByteBuffer()
-    buffer.writeInteger(UInt16(1), endianness: .big)        // hardware: ethernet
-    buffer.writeInteger(UInt16(0x0800), endianness: .big)   // protocol: IPv4
-    buffer.writeInteger(UInt8(6))                           // hardware length
-    buffer.writeInteger(UInt8(4))                           // protocol length
+    buffer.writeInteger(UInt16(1), endianness: .big)  // hardware: ethernet
+    buffer.writeInteger(UInt16(0x0800), endianness: .big)  // protocol: IPv4
+    buffer.writeInteger(UInt8(6))  // hardware length
+    buffer.writeInteger(UInt8(4))  // protocol length
     buffer.writeInteger(operation, endianness: .big)
     buffer.writeBytes(MACAddress(senderMAC)!.bytes)
     buffer.writeBytes(IPv4Address(senderIP)!.bytes)
@@ -19,9 +19,10 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
 }
 
 @Test func parsesAnARPRequest() {
-    var packet = PacketBuffer(received: arpFrame(
-        operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
-        targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.1"))
+    var packet = PacketBuffer(
+        received: arpFrame(
+            operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
+            targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.1"))
     let arp = ARPPacket.parse(&packet)
 
     #expect(arp?.operation == .request)
@@ -31,12 +32,14 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
 }
 
 @Test func rejectsNonEthernetOrNonIPv4ARP() {
-    var wrongHardware = PacketBuffer(received: {
-        var b = arpFrame(operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "1.2.3.4",
-                         targetMAC: "00:00:00:00:00:00", targetIP: "1.2.3.5")
-        b.setInteger(UInt16(6), at: 0, endianness: .big)  // not ethernet
-        return b
-    }())
+    var wrongHardware = PacketBuffer(
+        received: {
+            var b = arpFrame(
+                operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "1.2.3.4",
+                targetMAC: "00:00:00:00:00:00", targetIP: "1.2.3.5")
+            b.setInteger(UInt16(6), at: 0, endianness: .big)  // not ethernet
+            return b
+        }())
     let parsedWrongHardware = ARPPacket.parse(&wrongHardware)
     #expect(parsedWrongHardware == nil)
 
@@ -305,8 +308,8 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     cache.record(ip(5), mac(5))
 
     #expect(cache.count == 4)
-    #expect(cache.lookup(ip(1)) == mac(1))   // recently touched: survives
-    #expect(cache.lookup(ip(2)) == nil)      // least-recently-used: evicted
+    #expect(cache.lookup(ip(1)) == mac(1))  // recently touched: survives
+    #expect(cache.lookup(ip(2)) == nil)  // least-recently-used: evicted
     #expect(cache.lookup(ip(3)) == mac(3))
     #expect(cache.lookup(ip(4)) == mac(4))
     #expect(cache.lookup(ip(5)) == mac(5))
@@ -337,8 +340,9 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     request.writeBytes(MACAddress.broadcast.bytes)
     request.writeBytes(MACAddress("0a:0b:0c:0d:0e:0f")!.bytes)
     request.writeInteger(UInt16(0x0806), endianness: .big)
-    var payload = arpFrame(operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
-                           targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.1")
+    var payload = arpFrame(
+        operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
+        targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.1")
     request.writeBuffer(&payload)
     link.inject(request)
 
@@ -363,9 +367,10 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     let cache = ARPCache(clock: ManualClock(), ttl: .seconds(60))
     let responder = ARPResponder(nic: nic, cache: cache, allocator: ByteBufferAllocator())
 
-    let packet = PacketBuffer(received: arpFrame(
-        operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
-        targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.99"))
+    let packet = PacketBuffer(
+        received: arpFrame(
+            operation: 1, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
+            targetMAC: "00:00:00:00:00:00", targetIP: "192.168.127.99"))
     let ethernet = EthernetHeader(destination: .broadcast, source: MACAddress("0a:0b:0c:0d:0e:0f")!, etherType: .arp)
     responder.handle(packet, ethernet)
     #expect(link.drainTransmitted().isEmpty)
@@ -378,9 +383,10 @@ private func arpFrame(operation: UInt16, senderMAC: String, senderIP: String, ta
     let cache = ARPCache(clock: ManualClock(), ttl: .seconds(60))
     let responder = ARPResponder(nic: nic, cache: cache, allocator: ByteBufferAllocator())
 
-    let packet = PacketBuffer(received: arpFrame(
-        operation: 2, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
-        targetMAC: "5a:94:ef:e4:0c:ee", targetIP: "192.168.127.1"))
+    let packet = PacketBuffer(
+        received: arpFrame(
+            operation: 2, senderMAC: "0a:0b:0c:0d:0e:0f", senderIP: "192.168.127.2",
+            targetMAC: "5a:94:ef:e4:0c:ee", targetIP: "192.168.127.1"))
     responder.handle(packet, EthernetHeader(destination: link.linkAddress, source: MACAddress("0a:0b:0c:0d:0e:0f")!, etherType: .arp))
 
     #expect(cache.lookup(IPv4Address("192.168.127.2")!) == MACAddress("0a:0b:0c:0d:0e:0f"))

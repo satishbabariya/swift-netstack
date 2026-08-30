@@ -39,7 +39,6 @@ public protocol LinkEndpoint: AnyObject {
     func write(_ packets: [PacketBuffer])
 }
 
-
 /// What `Gateway` needs from whatever is under it.
 ///
 /// Two things satisfy this: a `WireLinkEndpoint`, which is one guest on one

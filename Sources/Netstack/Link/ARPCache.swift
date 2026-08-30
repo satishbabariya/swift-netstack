@@ -27,7 +27,7 @@ public struct ARPPacket: Sendable, Equatable {
     public static func parse(_ packet: inout PacketBuffer) -> ARPPacket? {
         guard var body = packet.consumeHeader(length) else { return nil }
         guard
-            body.readInteger(endianness: .big, as: UInt16.self) == 1,       // ethernet
+            body.readInteger(endianness: .big, as: UInt16.self) == 1,  // ethernet
             body.readInteger(endianness: .big, as: UInt16.self) == 0x0800,  // IPv4
             body.readInteger(as: UInt8.self) == 6,
             body.readInteger(as: UInt8.self) == 4,

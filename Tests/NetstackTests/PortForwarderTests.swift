@@ -2,13 +2,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // The mirror image of the outbound path: something on the host dials, and this
 // process opens a connection INTO the guest for it. Without this, a service in

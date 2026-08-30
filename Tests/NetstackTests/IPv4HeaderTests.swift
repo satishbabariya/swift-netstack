@@ -148,8 +148,8 @@ private let sampleHeader: [UInt8] = [
     parsed?.prepend(to: &outgoing)
 
     let emitted = Array(outgoing.frame.readableBytesView)
-    #expect(emitted.count == 24)                 // 20-byte header + 4-byte payload
-    #expect(emitted[0] == 0x45)                  // IHL back down to 5
+    #expect(emitted.count == 24)  // 20-byte header + 4-byte payload
+    #expect(emitted[0] == 0x45)  // IHL back down to 5
     #expect(emitted.prefix(20).withUnsafeBytes { Checksum.compute($0) } == 0)
 }
 

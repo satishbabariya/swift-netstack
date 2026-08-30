@@ -116,7 +116,6 @@ import Testing
     right.drain()
 }
 
-
 @Test func aSpliceUnderBackpressureLosesNothing() throws {
     // The property the buffering bound does NOT imply, and the one a splice is
     // actually for.

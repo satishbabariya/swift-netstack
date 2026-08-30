@@ -2,13 +2,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // The threat model, tested as a whole rather than a bound at a time.
 //
@@ -198,9 +198,10 @@ private func udpFrame(
     payload: ByteBuffer, source: IPv4Address = IPv4Address("192.168.127.2")!
 ) -> [UInt8] {
     let allocator = ByteBufferAllocator()
-    guard let datagram = UDPHeader.serialize(
-        payload: payload, source: source, destination: destination,
-        sourcePort: sourcePort, destinationPort: destinationPort, allocator: allocator)
+    guard
+        let datagram = UDPHeader.serialize(
+            payload: payload, source: source, destination: destination,
+            sourcePort: sourcePort, destinationPort: destinationPort, allocator: allocator)
     else { return [] }
     var packet = PacketBuffer(allocator: allocator, payload: datagram)
     IPv4Header(

@@ -196,7 +196,10 @@ private func timeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: In
 }
 
 private func containsSendSynAck(_ actions: [TCPAction]) -> Bool {
-    actions.contains { if case .sendSynAck = $0 { return true }; return false }
+    actions.contains {
+        if case .sendSynAck = $0 { return true }
+        return false
+    }
 }
 
 /// Whether the state machine asked for an acknowledgement, promptly or not.
@@ -217,19 +220,31 @@ private func containsSendAck(_ actions: [TCPAction]) -> Bool {
 }
 
 private func containsDeliver(_ actions: [TCPAction]) -> Bool {
-    actions.contains { if case .deliver = $0 { return true }; return false }
+    actions.contains {
+        if case .deliver = $0 { return true }
+        return false
+    }
 }
 
 private func containsDeleteTCB(_ actions: [TCPAction]) -> Bool {
-    actions.contains { if case .deleteTCB = $0 { return true }; return false }
+    actions.contains {
+        if case .deleteTCB = $0 { return true }
+        return false
+    }
 }
 
 private func containsStartTimeWait(_ actions: [TCPAction]) -> Bool {
-    actions.contains { if case .startTimeWait = $0 { return true }; return false }
+    actions.contains {
+        if case .startTimeWait = $0 { return true }
+        return false
+    }
 }
 
 private func containsSendFin(_ actions: [TCPAction]) -> Bool {
-    actions.contains { if case .sendFin = $0 { return true }; return false }
+    actions.contains {
+        if case .sendFin = $0 { return true }
+        return false
+    }
 }
 
 private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: Int = 100) -> TCB {
@@ -389,8 +404,16 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     // a peer inject data anywhere in the stream.
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
     let actions = stateMachineReceive(segment: segment(sequence: 5000, payload: 4), on: &tcb)
-    #expect(actions.contains { if case .sendAck = $0 { return true }; return false })
-    #expect(!actions.contains { if case .deliver = $0 { return true }; return false })
+    #expect(
+        actions.contains {
+            if case .sendAck = $0 { return true }
+            return false
+        })
+    #expect(
+        !actions.contains {
+            if case .deliver = $0 { return true }
+            return false
+        })
     #expect(tcb.rcvNxt == SequenceNumber(1000), "rcvNxt must not move for a rejected segment")
 }
 
@@ -421,7 +444,11 @@ private func closeWaitTCB(sndUna: UInt32 = 100, rcvNxt: UInt32 = 1000, rcvWnd: I
     var tcb = establishedTCB(rcvNxt: 1000, rcvWnd: 100)
     let actions = stateMachineReceive(segment: segment(sequence: 1000, flags: [.syn]), on: &tcb)
     #expect(tcb.state == .established)
-    #expect(actions.contains { if case .sendAck = $0 { return true }; return false })
+    #expect(
+        actions.contains {
+            if case .sendAck = $0 { return true }
+            return false
+        })
 }
 
 @Test func anAckForDataNeverSentIsRejected() {

@@ -3,7 +3,6 @@ import Testing
 
 @testable import Netstack
 
-
 private func codec() -> VectorFrames {
     VectorFrames(
         gateway: IPv4Address("192.168.127.1")!, gatewayMAC: MACAddress("5a:94:ef:e4:0c:ee")!,
@@ -11,8 +10,9 @@ private func codec() -> VectorFrames {
 }
 
 @Test func encodesATCPSynAgainstLiteralWireBytes() throws {
-    let line = TCPLine(flags: "S", seqStart: 0, seqEnd: 0, payloadLength: 0,
-                       ack: nil, window: 65535, options: [])
+    let line = TCPLine(
+        flags: "S", seqStart: 0, seqEnd: 0, payloadLength: 0,
+        ack: nil, window: 65535, options: [])
     let frame = try codec().encode(.tcp(line), direction: .inbound)
     let bytes = Array(frame.readableBytesView)
 
@@ -34,8 +34,9 @@ private func codec() -> VectorFrames {
 }
 
 @Test func encodesTCPOptionsInTheDeclaredOrder() throws {
-    let line = TCPLine(flags: "S", seqStart: 0, seqEnd: 0, payloadLength: 0,
-                       ack: nil, window: 65535, options: ["mss 1460", "wscale 7", "sackOK"])
+    let line = TCPLine(
+        flags: "S", seqStart: 0, seqEnd: 0, payloadLength: 0,
+        ack: nil, window: 65535, options: ["mss 1460", "wscale 7", "sackOK"])
     let frame = try codec().encode(.tcp(line), direction: .inbound)
     let bytes = Array(frame.readableBytesView)
 
@@ -120,30 +121,30 @@ private func codec() -> VectorFrames {
     #expect(bytes.count == 70)
 
     // --- Ethernet, offsets 0..13 ---
-    #expect(Array(bytes[0..<6]) == MACAddress("5a:94:ef:e4:0c:ee")!.bytes)   // to the gateway
+    #expect(Array(bytes[0..<6]) == MACAddress("5a:94:ef:e4:0c:ee")!.bytes)  // to the gateway
     #expect(Array(bytes[6..<12]) == MACAddress("0a:0b:0c:0d:0e:0f")!.bytes)  // from the guest
-    #expect(bytes[12] == 0x08 && bytes[13] == 0x00)                          // ethertype IPv4
+    #expect(bytes[12] == 0x08 && bytes[13] == 0x00)  // ethertype IPv4
 
     // --- IPv4, offsets 14..33 (RFC 791 §3.1) ---
-    #expect(bytes[14] == 0x45)                                                // version 4, IHL 5
-    #expect(UInt16(bytes[16]) << 8 | UInt16(bytes[17]) == 56)                 // total length: 20 + 36
-    #expect(bytes[23] == 6)                                                   // protocol TCP
-    #expect(Array(bytes[26..<30]) == IPv4Address("192.168.127.2")!.bytes)     // source: the guest
-    #expect(Array(bytes[30..<34]) == IPv4Address("192.168.127.1")!.bytes)     // destination: the gateway
+    #expect(bytes[14] == 0x45)  // version 4, IHL 5
+    #expect(UInt16(bytes[16]) << 8 | UInt16(bytes[17]) == 56)  // total length: 20 + 36
+    #expect(bytes[23] == 6)  // protocol TCP
+    #expect(Array(bytes[26..<30]) == IPv4Address("192.168.127.2")!.bytes)  // source: the guest
+    #expect(Array(bytes[30..<34]) == IPv4Address("192.168.127.1")!.bytes)  // destination: the gateway
 
     // --- TCP, offsets 34.. (RFC 9293 §3.1) ---
     let tcp = 34
-    #expect(UInt16(bytes[tcp + 0]) << 8 | UInt16(bytes[tcp + 1]) == 50_000)   // source port
-    #expect(UInt16(bytes[tcp + 2]) << 8 | UInt16(bytes[tcp + 3]) == 8_080)    // destination port
+    #expect(UInt16(bytes[tcp + 0]) << 8 | UInt16(bytes[tcp + 1]) == 50_000)  // source port
+    #expect(UInt16(bytes[tcp + 2]) << 8 | UInt16(bytes[tcp + 3]) == 8_080)  // destination port
     #expect(Array(bytes[(tcp + 4)..<(tcp + 8)]) == [0x11, 0x22, 0x33, 0x44])  // sequence number, big endian
     #expect(Array(bytes[(tcp + 8)..<(tcp + 12)]) == [0x55, 0x66, 0x77, 0x88])  // acknowledgement number
     // Byte 12 is data offset in the high nibble and four reserved bits in
     // the low nibble, which RFC 9293 requires to be zero. 8 words = 20 bytes
     // of fixed header plus 12 of options.
     #expect(bytes[tcp + 12] == 0x80)
-    #expect(bytes[tcp + 13] == 0x12)                                          // SYN|ACK: 0x02|0x10
+    #expect(bytes[tcp + 13] == 0x12)  // SYN|ACK: 0x02|0x10
     #expect(UInt16(bytes[tcp + 14]) << 8 | UInt16(bytes[tcp + 15]) == 0x9abc)  // window
-    #expect(UInt16(bytes[tcp + 18]) << 8 | UInt16(bytes[tcp + 19]) == 0)      // urgent pointer, URG not set
+    #expect(UInt16(bytes[tcp + 18]) << 8 | UInt16(bytes[tcp + 19]) == 0)  // urgent pointer, URG not set
 
     // Options at offset 20, each pinned to its RFC kind/length pair rather
     // than to whatever `encodeTCPOptions` emitted: MSS is kind 2 length 4
@@ -277,8 +278,10 @@ private func codec() -> VectorFrames {
     // remainder would turn a malformed segment into a plausible one.
     #expect(throws: VectorFrameError.self) {
         _ = try codec().encode(
-            .tcp(TCPLine(flags: ".", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 0,
-                         options: ["sack 1000"])),
+            .tcp(
+                TCPLine(
+                    flags: ".", seqStart: 0, seqEnd: 0, payloadLength: 0, ack: 1, window: 0,
+                    options: ["sack 1000"])),
             direction: .expectedOutbound)
     }
 }

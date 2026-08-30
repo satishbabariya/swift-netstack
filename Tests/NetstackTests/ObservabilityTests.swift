@@ -166,10 +166,12 @@ func suppressedEventsDoNotPayForTheMetadataTheyWouldHaveCarried() {
     let built = NIOLockedValueBox(0)
 
     for _ in 0..<100 {
-        limiter.record(.tcpDialFailed, {
-            built.withLockedValue { $0 += 1 }
-            return ["destination": .string("10.0.0.1:80")]
-        }())
+        limiter.record(
+            .tcpDialFailed,
+            {
+                built.withLockedValue { $0 += 1 }
+                return ["destination": .string("10.0.0.1:80")]
+            }())
     }
 
     // Once, not a hundred times. Drop the `@autoclosure` and this is 100: the

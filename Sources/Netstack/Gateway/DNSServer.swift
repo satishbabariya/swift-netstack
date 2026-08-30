@@ -180,7 +180,6 @@ public final class DNSServer: @unchecked Sendable {
     /// hand-assembled arrangement opts in by setting it too.
     public var log: RateLimitedLogger?
 
-
     public static let port: UInt16 = 53
 
     public init(
@@ -366,8 +365,9 @@ public final class DNSServer: @unchecked Sendable {
     }
 
     private func refuse(_ query: DNSQuery, payload: ByteBuffer, to source: IPv4Address, port: UInt16) {
-        guard let reply = DNSCodec.failure(
-            to: query, in: payload, code: DNSCodec.responseCodeRefused, allocator: allocator)
+        guard
+            let reply = DNSCodec.failure(
+                to: query, in: payload, code: DNSCodec.responseCodeRefused, allocator: allocator)
         else { return }
         try? endpoint.send(reply, to: source, port: port)
     }

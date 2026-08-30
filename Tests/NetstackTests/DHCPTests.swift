@@ -388,8 +388,9 @@ extension DHCPFixture {
     let options = try #require(harness.discoverOptions(from: MACAddress("0a:00:00:00:aa:bb")!))
     let list = try #require(options[119], "no search list was offered")
 
-    #expect(list == [3, 115, 118, 99, 4, 116, 101, 115, 116, 0]
-        + [7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0])
+    #expect(
+        list == [3, 115, 118, 99, 4, 116, 101, 115, 116, 0]
+            + [7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0])
 }
 
 @Test func noSearchDomainsMeansNoOptionRatherThanAnEmptyOne() throws {
@@ -418,7 +419,6 @@ extension DHCPFixture {
     // The rest of the list still arrives.
     #expect(encoded.suffix(9) == [2, 111, 107, 4, 116, 101, 115, 116, 0])
 }
-
 
 /// Every option in a reply, by code, with its bytes. `optionCodes` above answers
 /// "was it there"; several tests need to know what it said.

@@ -241,7 +241,6 @@ private func injectUDP(into link: RecordingEndpoint, from source: String, to des
     }.get()
     let stack = carried.stack
 
-
     // Resumed on Swift concurrency's executor after the `await` above, not on
     // `eventLoop`'s own thread — a genuinely off-loop call.
     let channel = try await StackBootstrap(stack: stack).bind(host: IPv4Address("192.168.127.1")!, port: 5300).get()

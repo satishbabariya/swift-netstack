@@ -4,7 +4,8 @@ import Testing
 @testable import Netstack
 
 @Test func parsesAPacketdrillStyleHandshake() throws {
-    let script = try VectorScript.parse("""
+    let script = try VectorScript.parse(
+        """
         0.000 < S  0:0(0)   win 65535 <mss 1460,wscale 7,sackOK>
         0.000 > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 7,sackOK>
         0.100 < .  1:1(0) ack 1 win 512
@@ -15,7 +16,10 @@ import Testing
     let syn = script.events[0]
     #expect(syn.time == .milliseconds(0))
     #expect(syn.direction == .inbound)
-    guard case .tcp(let line) = syn.packet else { Issue.record("expected tcp"); return }
+    guard case .tcp(let line) = syn.packet else {
+        Issue.record("expected tcp")
+        return
+    }
     #expect(line.flags == "S")
     #expect(line.seqStart == 0)
     #expect(line.payloadLength == 0)
@@ -25,7 +29,10 @@ import Testing
 
     let synack = script.events[1]
     #expect(synack.direction == .expectedOutbound)
-    guard case .tcp(let reply) = synack.packet else { Issue.record("expected tcp"); return }
+    guard case .tcp(let reply) = synack.packet else {
+        Issue.record("expected tcp")
+        return
+    }
     #expect(reply.flags == "S.")
     #expect(reply.ack == 1)
 
@@ -34,7 +41,10 @@ import Testing
 
 @Test func parsesAPayloadBearingSegment() throws {
     let script = try VectorScript.parse("0.250 < P. 1:1461(1460) ack 1 win 512")
-    guard case .tcp(let line) = script.events[0].packet else { Issue.record("expected tcp"); return }
+    guard case .tcp(let line) = script.events[0].packet else {
+        Issue.record("expected tcp")
+        return
+    }
     #expect(line.flags == "P.")
     #expect(line.seqStart == 1)
     #expect(line.seqEnd == 1461)
@@ -43,7 +53,8 @@ import Testing
 }
 
 @Test func parsesTheNonTCPProtocolForms() throws {
-    let script = try VectorScript.parse("""
+    let script = try VectorScript.parse(
+        """
         0.000 < arp who-has 192.168.127.1 tell 192.168.127.2
         0.000 > arp reply 192.168.127.1 is-at 5a:94:ef:e4:0c:ee
         0.010 < icmp echo_request id 4660 seq 42
@@ -53,23 +64,33 @@ import Testing
         """)
     #expect(script.events.count == 6)
 
-    guard case .arpRequest(let target, let sender) = script.events[0].packet else { Issue.record("arp"); return }
+    guard case .arpRequest(let target, let sender) = script.events[0].packet else {
+        Issue.record("arp")
+        return
+    }
     #expect(target == IPv4Address("192.168.127.1"))
     #expect(sender == IPv4Address("192.168.127.2"))
 
-    guard case .icmpEcho(let request, let identifier, let sequence) = script.events[2].packet else { Issue.record("icmp"); return }
+    guard case .icmpEcho(let request, let identifier, let sequence) = script.events[2].packet else {
+        Issue.record("icmp")
+        return
+    }
     #expect(request)
     #expect(identifier == 4660)
     #expect(sequence == 42)
 
-    guard case .udp(let source, let destination, let length) = script.events[4].packet else { Issue.record("udp"); return }
+    guard case .udp(let source, let destination, let length) = script.events[4].packet else {
+        Issue.record("udp")
+        return
+    }
     #expect(source == 4000)
     #expect(destination == 53)
     #expect(length == 12)
 }
 
 @Test func ignoresBlankLinesAndComments() throws {
-    let script = try VectorScript.parse("""
+    let script = try VectorScript.parse(
+        """
         # the guest opens a connection
         0.000 < S 0:0(0) win 65535
 
@@ -171,7 +192,8 @@ import Testing
     // A packet-only DSL cannot state a send-side vector at all — "the
     // application wrote 300 bytes here" is not something any sequence of
     // packets says. See `VectorPacket`.
-    let script = try VectorScript.parse("""
+    let script = try VectorScript.parse(
+        """
         0.010 < write 300
         0.020 < close
         """)

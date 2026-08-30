@@ -205,12 +205,13 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
                 // for is not a test.
                 let frames = parsedFrames(fixture)
                 #expect(frames.unparsed == 0, "a segment went out that cannot be parsed back")
-                let widest = frames.headers.map { header in
-                    header.options.compactMap { option -> Int? in
-                        if case .selectiveAcknowledgement(let blocks) = option { return blocks.count }
-                        return nil
-                    }.first ?? 0
-                }.max() ?? 0
+                let widest =
+                    frames.headers.map { header in
+                        header.options.compactMap { option -> Int? in
+                            if case .selectiveAcknowledgement(let blocks) = option { return blocks.count }
+                            return nil
+                        }.first ?? 0
+                    }.max() ?? 0
                 #expect(widest == expected, "timestamps: \(timestamps)")
                 for header in frames.headers {
                     #expect(
@@ -253,9 +254,11 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
             try endpoint.send(tcpPayload(8000))
             let frames = parsedFrames(fixture)
             #expect(frames.unparsed == 0, "a data segment went out that cannot be parsed back")
-            let data = frames.headers.filter { $0.options.contains { option in
-                if case .selectiveAcknowledgement = option { return true } else { return false }
-            } }
+            let data = frames.headers.filter {
+                $0.options.contains { option in
+                    if case .selectiveAcknowledgement = option { return true } else { return false }
+                }
+            }
             #expect(!data.isEmpty, "no segment carried blocks: the budget was never tested")
             for header in data {
                 #expect(TCPOptionCodec.encode(header.options).count <= TCPOptionCodec.maximumOptionsBytes)
@@ -340,15 +343,15 @@ private func lastSackBlocks(_ fixture: TCPFixture) -> [SACKBlock] {
             }
             let blocks = lastSackBlocks(fixture)
             #expect(blocks.count == 3)
-            #expect(blocks.map(\.left) == [
-                SequenceNumber(guestISS + 1001), SequenceNumber(guestISS + 5001),
-                SequenceNumber(guestISS + 3001),
-            ], "the report is not in the order the runs were touched")
+            #expect(
+                blocks.map(\.left) == [
+                    SequenceNumber(guestISS + 1001), SequenceNumber(guestISS + 5001),
+                    SequenceNumber(guestISS + 3001),
+                ], "the report is not in the order the runs were touched")
         }
     }
     fixture.drain()
 }
-
 
 @Test func theSackOptionsSequenceNumbersLandOnAFourByteBoundary() throws {
     // Why the alignment is there. The option carries 32-bit sequence numbers

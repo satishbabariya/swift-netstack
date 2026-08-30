@@ -3,13 +3,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // The whole thing, assembled the way a user would assemble it: one descriptor
 // in, a working network out. Everything below this has its own tests; what

@@ -55,6 +55,12 @@ public final class PacketCapture {
     ///     smaller.
     ///   - maximumBytes: the file stops growing here. 64 MiB by default, which
     ///     is minutes of ordinary traffic and seconds of a flood.
+    ///   - bufferLimit: how much is held before a write. See the note above on
+    ///     what buffering costs.
+    ///   - now: the wall clock. Injectable because `NetstackClock` is monotonic,
+    ///     which is right for timers and useless in a file somebody correlates
+    ///     with something outside this process.
+    /// - Throws: if the file cannot be created or opened for writing.
     public init(
         path: String, snapshotLength: Int = 1514, maximumBytes: Int = 64 * 1024 * 1024,
         bufferLimit: Int = 64 * 1024, now: @escaping WallClock = PacketCapture.systemTime

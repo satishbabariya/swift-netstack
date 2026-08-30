@@ -2,13 +2,13 @@ import NIOCore
 import NIOPosix
 import Testing
 
+@testable import Netstack
+
 #if canImport(Darwin)
     import Darwin
 #else
     import Glibc
 #endif
-
-@testable import Netstack
 
 // The point of the whole package: a guest opens a TCP connection and it comes
 // out of a real socket on the host.
@@ -128,20 +128,26 @@ private func awaitSegments(
     let port = UInt16(listener.localAddress!.port!)
 
     // The guest dials it.
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
     let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
     let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
     #expect(answer.header.flags.contains(.ack), "the SYN was not answered")
     let gatewayISS = answer.header.sequence.value
 
     // Third leg, then data.
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
-        acknowledgement: gatewayISS &+ 1, flags: [.ack]))
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
-        acknowledgement: gatewayISS &+ 1, flags: [.ack, .psh], payload: Array("hello".utf8)))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: gatewayISS &+ 1, flags: [.ack]))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: gatewayISS &+ 1, flags: [.ack, .psh], payload: Array("hello".utf8)))
 
     let echoed = await awaitSegments(guestSide) { segments in
         segments.contains { $0.payload.readableBytes > 0 }
@@ -176,8 +182,10 @@ private func awaitSegments(
     let deadPort = UInt16(scout.localAddress!.port!)
     try await scout.close()
 
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: deadPort, sequence: 7000, flags: [.syn]))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: deadPort, sequence: 7000, flags: [.syn]))
 
     let answer = await awaitSegments(guestSide) { !$0.isEmpty }
     let reset = try #require(answer.first)
@@ -209,17 +217,21 @@ private func awaitSegments(
     let port = UInt16(listener.localAddress!.port!)
 
     // The first connection takes the only slot.
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn],
-        sourcePort: 50001))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn],
+            sourcePort: 50001))
     let first = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
     #expect(first.contains { $0.header.flags.contains(.syn) }, "the first connection was refused")
 
     // The second is refused, and refused with a reset rather than in silence:
     // the forwarder consumed the segment, so silence would be a hang.
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 9000, flags: [.syn],
-        sourcePort: 50002))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 9000, flags: [.syn],
+            sourcePort: 50002))
     let second = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.rst) } }
     let reset = try #require(second.first { $0.header.flags.contains(.rst) })
     #expect(reset.header.acknowledgement == SequenceNumber(9001))
@@ -273,13 +285,17 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
         .bind(host: "127.0.0.1", port: 0).get()
     let port = UInt16(listener.localAddress!.port!)
 
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
     let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
     let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
-    send(guestSide, guestFrame(
-        to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
-        acknowledgement: answer.header.sequence.value &+ 1, flags: [.ack]))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: answer.header.sequence.value &+ 1, flags: [.ack]))
     _ = await awaitSegments(guestSide) { _ in true }
 
     // The guest now vanishes: it answers nothing, including the probes.
@@ -332,8 +348,10 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     let port = UInt16(listener.localAddress!.port!)
 
     // The guest dials the HOST address, which exists on no host interface.
-    send(guestSide, guestFrame(
-        to: hostAddress, destinationPort: port, sequence: 7000, flags: [.syn], sourcePort: 50010))
+    send(
+        guestSide,
+        guestFrame(
+            to: hostAddress, destinationPort: port, sequence: 7000, flags: [.syn], sourcePort: 50010))
     let answer = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
 
     #expect(
@@ -363,9 +381,11 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     var guestSide: Int32 = -1
     let holder = try await gateway(group: group, guestSide: &guestSide)
 
-    send(guestSide, guestFrame(
-        to: IPv4Address("169.254.169.254")!, destinationPort: 80, sequence: 8000, flags: [.syn],
-        sourcePort: 50011))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("169.254.169.254")!, destinationPort: 80, sequence: 8000, flags: [.syn],
+            sourcePort: 50011))
     let answer = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.rst) } }
 
     let reset = try #require(answer.first { $0.header.flags.contains(.rst) })
@@ -407,8 +427,10 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
         .bind(host: "127.0.0.1", port: 0).get()
     let port = UInt16(listener.localAddress!.port!)
 
-    send(guestSide, guestFrame(
-        to: metadata, destinationPort: port, sequence: 8100, flags: [.syn], sourcePort: 50012))
+    send(
+        guestSide,
+        guestFrame(
+            to: metadata, destinationPort: port, sequence: 8100, flags: [.syn], sourcePort: 50012))
     let answer = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
 
     #expect(
@@ -424,7 +446,6 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
-
 
 @Test func slotsAreReturnedExactlyOnceAcrossManyConnections() async throws {
     // The counter that decides `maximumConnections` is maintained by hand: taken
@@ -460,20 +481,24 @@ private final class UppercasingEcho: ChannelInboundHandler, @unchecked Sendable 
     for round in 0..<120 {
         let reachable = round % 2 == 0
         sourcePort &+= 1
-        send(guestSide, guestFrame(
-            to: IPv4Address("127.0.0.1")!, destinationPort: reachable ? port : deadPort,
-            sequence: UInt32(round) &* 1000 &+ 7000, flags: [.syn], sourcePort: sourcePort))
+        send(
+            guestSide,
+            guestFrame(
+                to: IPv4Address("127.0.0.1")!, destinationPort: reachable ? port : deadPort,
+                sequence: UInt32(round) &* 1000 &+ 7000, flags: [.syn], sourcePort: sourcePort))
         let answer = await awaitSegments(guestSide) { !$0.isEmpty }
 
         // Close whatever was opened, from the guest's side.
         if let opened = answer.first(where: {
             $0.header.flags.contains(.syn) && $0.header.flags.contains(.ack)
         }) {
-            send(guestSide, guestFrame(
-                to: IPv4Address("127.0.0.1")!, destinationPort: port,
-                sequence: UInt32(round) &* 1000 &+ 7001,
-                acknowledgement: opened.header.sequence.value &+ 1, flags: [.rst],
-                sourcePort: sourcePort))
+            send(
+                guestSide,
+                guestFrame(
+                    to: IPv4Address("127.0.0.1")!, destinationPort: port,
+                    sequence: UInt32(round) &* 1000 &+ 7001,
+                    acknowledgement: opened.header.sequence.value &+ 1, flags: [.rst],
+                    sourcePort: sourcePort))
         }
         _ = await awaitSegments(guestSide) { _ in true }
 

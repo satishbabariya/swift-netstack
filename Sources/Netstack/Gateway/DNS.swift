@@ -122,8 +122,9 @@ enum DNSCodec {
         to query: DNSQuery, in original: ByteBuffer, address: IPv4Address, ttl: UInt32,
         allocator: ByteBufferAllocator
     ) -> ByteBuffer? {
-        guard let question = original.getSlice(
-            at: original.readerIndex + query.questionRange.lowerBound, length: query.questionRange.count)
+        guard
+            let question = original.getSlice(
+                at: original.readerIndex + query.questionRange.lowerBound, length: query.questionRange.count)
         else { return nil }
         var out = allocator.buffer(capacity: 64)
         out.writeInteger(query.id, endianness: .big)
@@ -153,8 +154,9 @@ enum DNSCodec {
     static func failure(
         to query: DNSQuery, in original: ByteBuffer, code: UInt16, allocator: ByteBufferAllocator
     ) -> ByteBuffer? {
-        guard let question = original.getSlice(
-            at: original.readerIndex + query.questionRange.lowerBound, length: query.questionRange.count)
+        guard
+            let question = original.getSlice(
+                at: original.readerIndex + query.questionRange.lowerBound, length: query.questionRange.count)
         else { return nil }
         var out = allocator.buffer(capacity: 32)
         out.writeInteger(query.id, endianness: .big)

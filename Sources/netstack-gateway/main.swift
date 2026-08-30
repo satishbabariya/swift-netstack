@@ -1,8 +1,8 @@
 import Foundation
 import Logging
-import Netstack
 import NIOCore
 import NIOPosix
+import Netstack
 
 // A gateway as a program, for the hosts that cannot link a Swift library:
 // vfkit, qemu, and anything else that hands a network device a socket. Upstream
@@ -133,36 +133,36 @@ enum OptionError: Error, CustomStringConvertible {
 }
 
 let usage = """
-netstack-gateway — a userspace network for a VM, over a socket.
+    netstack-gateway — a userspace network for a VM, over a socket.
 
-Flag names are gvproxy's, so a command line moves across unchanged.
+    Flag names are gvproxy's, so a command line moves across unchanged.
 
-  --config <path>            Configuration file, in gvproxy's shape as JSON
-  --listen <path>            Unix socket for the HTTP control API
-  --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
-  --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
-  --gatewayIP <address>      The gateway's own address (default 192.168.127.1)
-  --hostIP <address>         The address that means the host (default .254)
-  --subnet <cidr>            The subnet leased to guests (default 192.168.127.0/24)
-  --mtu <bytes>              Link MTU (default 1500)
-  --pcap <path>              Write every frame to a pcap file (capped at 64 MiB)
-  --notification <path>      Socket told when the network is ready and guests join
-  --ec2-metadata-access      Let guests reach 169.254.0.0/16. Off by default: that
-                             is where the cloud instance metadata service lives.
-  --debug                    Shorthand for --log-level debug
-  --log-level <level>        trace|debug|info|notice|warning|error (default notice)
+      --config <path>            Configuration file, in gvproxy's shape as JSON
+      --listen <path>            Unix socket for the HTTP control API
+      --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
+      --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
+      --gatewayIP <address>      The gateway's own address (default 192.168.127.1)
+      --hostIP <address>         The address that means the host (default .254)
+      --subnet <cidr>            The subnet leased to guests (default 192.168.127.0/24)
+      --mtu <bytes>              Link MTU (default 1500)
+      --pcap <path>              Write every frame to a pcap file (capped at 64 MiB)
+      --notification <path>      Socket told when the network is ready and guests join
+      --ec2-metadata-access      Let guests reach 169.254.0.0/16. Off by default: that
+                                 is where the cloud instance metadata service lives.
+      --debug                    Shorthand for --log-level debug
+      --log-level <level>        trace|debug|info|notice|warning|error (default notice)
 
-Also settable in the configuration file, which is the only way to reach zones,
-static leases, NAT and virtual addresses. Flags win over the file.
+    Also settable in the configuration file, which is the only way to reach zones,
+    static leases, NAT and virtual addresses. Flags win over the file.
 
-Not gvproxy's, because it takes them from the configuration file:
+    Not gvproxy's, because it takes them from the configuration file:
 
-  --dns <address:port>       Resolver for names this gateway does not own
-  --forward <h:addr:g>       Publish guest addr:g on host port h, repeatable
+      --dns <address:port>       Resolver for names this gateway does not own
+      --forward <h:addr:g>       Publish guest addr:g on host port h, repeatable
 
-Exactly one of --listen-vfkit or --listen-qemu is required: they are two
-different wires, and a socket is one or the other.
-"""
+    Exactly one of --listen-vfkit or --listen-qemu is required: they are two
+    different wires, and a socket is one or the other.
+    """
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 var options: Options
@@ -263,7 +263,8 @@ do {
     let stream = options.listenStream != nil
 
     print("netstack-gateway: waiting for a guest on \(path)")
-    let gateway = try (stream
+    let gateway = try
+        (stream
         ? Gateway.start(listeningOnStreamSocketAt: path, group: group, configuration: configuration)
         : Gateway.start(listeningOnDatagramSocketAt: path, group: group, configuration: configuration)).wait()
 

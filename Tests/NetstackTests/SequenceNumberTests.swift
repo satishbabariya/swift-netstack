@@ -88,7 +88,7 @@ import Testing
 }
 
 @Test func theRangePredicatesWorkAcrossTheWrap() {
-    let low = SequenceNumber(0xFFFF_FFC0)   // 64 below the wrap
+    let low = SequenceNumber(0xFFFF_FFC0)  // 64 below the wrap
     let high = SequenceNumber(0x0000_0040)  // 64 above it
     #expect(SequenceNumber(0xFFFF_FFFF).isInRange(after: low, throughAndIncluding: high))
     #expect(SequenceNumber(0x0000_0000).isInRange(after: low, throughAndIncluding: high))
@@ -130,7 +130,7 @@ import Testing
 }
 
 @Test func windowMembershipAcrossTheWrap() {
-    let start = SequenceNumber(0xFFFF_FFC0)   // 64 below the wrap
+    let start = SequenceNumber(0xFFFF_FFC0)  // 64 below the wrap
     #expect(SequenceNumber(0xFFFF_FFC0).inWindow(start: start, size: 128))
     #expect(SequenceNumber(0x0000_003F).inWindow(start: start, size: 128), "63 past the wrap is inside")
     #expect(!SequenceNumber(0x0000_0040).inWindow(start: start, size: 128), "64 past is outside")

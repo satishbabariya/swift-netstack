@@ -110,7 +110,12 @@ struct Cubic: CongestionControl, Sendable {
             return
         }
 
-        let epoch = epoch ?? { startEpoch(at: now, from: window); return now }()
+        let epoch =
+            epoch
+            ?? {
+                startEpoch(at: now, from: window)
+                return now
+            }()
         let elapsed = seconds(from: epoch, to: now)
         let roundTrip = max(seconds(smoothedRoundTrip), 0.001)
 

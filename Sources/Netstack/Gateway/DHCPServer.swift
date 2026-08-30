@@ -54,7 +54,6 @@ public final class DHCPServer {
     /// hand-assembled arrangement opts in by setting it too.
     public var log: RateLimitedLogger?
 
-
     /// How many hardware addresses hold a lease. The figure the pool bounds,
     /// and the one a test asking "did any of this reach the server" reads --
     /// `leasedAddress(for:)` cannot answer that when the addresses were forged.

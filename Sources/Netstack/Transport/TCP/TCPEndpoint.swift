@@ -241,7 +241,6 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     // which is how one justified change turns into churn that obscures both. See
     // `differential/README.md`.
 
-
     /// RFC 9293 §3.7.1's default when a peer sends no MSS option. Deliberately
     /// the conservative 536 rather than an Ethernet-shaped guess: a peer that
     /// says nothing has told us nothing about the path.

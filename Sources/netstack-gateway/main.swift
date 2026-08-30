@@ -18,13 +18,13 @@ struct Options {
     var listenStream: String?
     var controlPath: String?
     var upstreamResolver: String?
-    var gateway = "192.168.127.1"
-    var subnet = "192.168.127.0/24"
+    var gateway: String?
+    var subnet: String?
     var mtu: UInt32 = 1500
     var logLevel = "notice"
     var captureFile: String?
     var notifySocket: String?
-    var host = "192.168.127.254"
+    var host: String?
     var allowsLinkLocal = false
     var forwards: [(host: Int, guest: String, guestPort: UInt16)] = []
 
@@ -141,8 +141,10 @@ let usage = """
       --listen <path>            Unix socket for the HTTP control API
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
       --listen-qemu <path>       Stream socket with length-prefixed frames (qemu)
-      --gatewayIP <address>      The gateway's own address (default 192.168.127.1)
-      --hostIP <address>         The address that means the host (default .254)
+      --gatewayIP <address>      The gateway's own address (default: the first
+                                 usable address of the subnet)
+      --hostIP <address>         The address that means the host (default: the
+                                 last usable address of the subnet)
       --subnet <cidr>            The subnet leased to guests (default 192.168.127.0/24)
       --mtu <bytes>              Link MTU (default 1500)
       --pcap <path>              Write every frame to a pcap file (capped at 64 MiB)
@@ -202,12 +204,36 @@ if file.debug, options.logLevel == "notice" { options.logLevel = "debug" }
 // non-nil 0.0.0.0, every `??` default was skipped, and the gateway came up
 // believing it was 0.0.0.0 on 0.0.0.0/0: bound, running, and answering ARP
 // for nobody. Nothing named the problem; the guest simply never got a reply.
-let gatewayAddress = options.gateway == "192.168.127.1" ? (file.gatewayAddress ?? IPv4Address("192.168.127.1")!) : IPv4Address(options.gateway)
-let hostAddress = options.host == "192.168.127.254" ? (file.hostAddress ?? IPv4Address("192.168.127.254")!) : IPv4Address(options.host)
-let subnet = options.subnet == "192.168.127.0/24" ? (file.subnet ?? IPv4Subnet(cidr: "192.168.127.0/24")!) : IPv4Subnet(cidr: options.subnet)
-guard let gatewayAddress, let subnet, let hostAddress else {
-    FileHandle.standardError.write(Data("error: --gatewayIP, --hostIP or --subnet is not an address\n".utf8))
-    exit(2)
+// Not given anywhere means "derive it from the subnet", which is what
+// `Gateway.Configuration` does with nil and what upstream documents its
+// --gatewayIP and --hostIP defaults as.
+//
+// This used to compare against the default string, which cannot tell "the user
+// asked for 192.168.127.1" from "the user asked for nothing" -- and got the
+// second wrong for every subnet but the default one. `--subnet 10.7.0.0/24`
+// produced a gateway whose host.containers.internal answered 192.168.127.254,
+// an address the guest cannot route to, while the control API answered
+// perfectly and nothing said a word.
+func parsedAddress(_ text: String?, _ flag: String) -> IPv4Address? {
+    guard let text else { return nil }
+    guard let parsed = IPv4Address(text) else {
+        FileHandle.standardError.write(Data("error: \(flag) is not an address: \(text)\n".utf8))
+        exit(2)
+    }
+    return parsed
+}
+
+let gatewayAddress = parsedAddress(options.gateway, "--gatewayIP") ?? file.gatewayAddress
+let hostAddress = parsedAddress(options.host, "--hostIP") ?? file.hostAddress
+let subnet: IPv4Subnet
+if let text = options.subnet {
+    guard let parsed = IPv4Subnet(cidr: text) else {
+        FileHandle.standardError.write(Data("error: --subnet is not a CIDR block: \(text)\n".utf8))
+        exit(2)
+    }
+    subnet = parsed
+} else {
+    subnet = file.subnet ?? IPv4Subnet(cidr: "192.168.127.0/24")!
 }
 
 // The wire is checked now: after the file has had its chance to be wrong about

@@ -50,7 +50,8 @@ let gateway = try await Gateway.start(
 The guest then boots, asks for an address by DHCP, is told the gateway is its
 router and its resolver, and can open TCP connections and send UDP datagrams to
 anywhere the host can reach. `host.containers.internal` resolves to a **host
-address** inside the subnet (`192.168.127.254`) which the gateway answers ARP
+address** inside the subnet — the last usable one, `192.168.127.254` on the
+default subnet — which the gateway answers ARP
 for and rewrites to `127.0.0.1` when it dials — that translation is what makes
 the host's own services reachable, since they are on its loopback rather than on
 any address the guest could route to.
@@ -365,7 +366,15 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
-766 tests, plus a differential harness in `differential/` that drives gVisor's
+`./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
+the two slow ones. It exists because the gates were seven scripts across five CI
+jobs and running "the ones I remembered" is not running them — CI builds with
+`-warnings-as-errors` and nothing local did, so code that compiled clean here
+failed there after the push. `scripts/conventions.sh` checks that every script
+`ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
+and quietly stay unrunnable locally.
+
+768 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The
@@ -396,7 +405,7 @@ gateway and host addresses, the NAT entry, link-local being off, the two
 to happen: `Gateway.Configuration` gained eight parameters in a day, each one in
 the middle of an initialiser these samples call.
 
-`scripts/falsify.sh --all` deletes each of the seventeen guards in
+`scripts/falsify.sh --all` deletes each of the nineteen guards in
 `scripts/guards.tsv` in turn and requires that the named test notices — the
 bounds on half-open connections, established connections, UDP flows in both
 directions, reassembly entries and fragments, outstanding DNS queries, log

@@ -29,8 +29,8 @@ binary="$(swift build -c release --show-bin-path)/netstack-gateway"
 # questions a guest asks first -- who owns the gateway address, and what address
 # may I use -- and require both answers to match what it was configured with.
 smoke() {
-    local expected="$1" guest="$2"
-    shift 2
+    local expected="$1" guest="$2" expected_host="$3"
+    shift 3
     WIRE="${TMPDIR:-/tmp}/netstack-smoke-$$.sock"
     rm -f "$WIRE"
     "$binary" --listen-vfkit "$WIRE" "$@" >/dev/null 2>&1 &
@@ -42,11 +42,13 @@ smoke() {
     done
     [[ -S "$WIRE" ]] || { echo "FAIL: wire socket never appeared ($*)"; return 1; }
 
-    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
+    EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
+        WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, sys
 
 wire = os.environ["WIRE"]
 expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+expected_host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
 guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
 described = os.environ.get("ARGS") or "(defaults)"
 client_path = wire + ".client"
@@ -131,10 +133,13 @@ try:
         sys.exit(1)
     print("ok: lease ", ".".join(map(str, leased)), "offered for", described)
 
-    # And a name. `gateway.containers.internal` is the one the gateway publishes
-    # for itself, so the answer says both that the resolver is bound and that it
+    # And the names. `gateway.containers.internal` says the resolver is bound and
     # knows which address it is on -- the thing that was wrong when this file was
-    # written.
+    # written. `host.containers.internal` is the headline feature, "reach the
+    # machine you are running on", and it is derived from the subnet rather than
+    # configured, so it is the one that silently pointed off-subnet: a gateway on
+    # 10.7.0.0/24 answered 192.168.127.254, an address the guest cannot route to,
+    # while every other check here stayed green.
     def udp_frame(source, destination, sport, dport, payload):
         udp = (
             sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
@@ -153,41 +158,48 @@ try:
         header[10:12] = checksum.to_bytes(2, "big")
         return b"\x5a\x94\xef\xe4\x0c\xee" + src + b"\x08\x00" + bytes(header) + udp
 
-    name = b"".join(bytes([len(part)]) + part for part in
-                    [b"gateway", b"containers", b"internal"]) + b"\x00"
-    query = (
-        b"\x4d\x4e" + b"\x01\x00" + b"\x00\x01" + b"\x00" * 6
-        + name + b"\x00\x01\x00\x01"
-    )
-    s.send(udp_frame(leased, expected, 40000, 53, query))
+    def resolve(labels, transaction, sport):
+        name = b"".join(bytes([len(part)]) + part for part in labels) + b"\x00"
+        query = (
+            transaction + b"\x01\x00" + b"\x00\x01" + b"\x00" * 6
+            + name + b"\x00\x01\x00\x01"
+        )
+        s.send(udp_frame(leased, expected, sport, 53, query))
+        s.settimeout(5)
+        printable = ".".join(part.decode() for part in labels)
+        while True:
+            try:
+                reply = s.recv(2048)
+            except socket.timeout:
+                print("FAIL: no DNS answer for", printable, "within 5s for", described)
+                sys.exit(1)
+            if len(reply) < 54 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
+                continue
+            if int.from_bytes(reply[34:36], "big") != 53:
+                continue
+            if int.from_bytes(reply[36:38], "big") != sport:
+                continue
+            body = reply[42:]
+            if len(body) < 12 or body[0:2] != transaction:
+                continue
+            if int.from_bytes(body[6:8], "big") < 1:
+                print("FAIL: the resolver answered with no records for", printable,
+                      "for", described)
+                sys.exit(1)
+            return body[-4:]
 
-    s.settimeout(5)
-    resolved = None
-    while resolved is None:
-        try:
-            reply = s.recv(2048)
-        except socket.timeout:
-            print("FAIL: no DNS answer within 5s for", described)
+    for labels, wanted, sport in (
+        ([b"gateway", b"containers", b"internal"], expected, 40000),
+        ([b"host", b"containers", b"internal"], expected_host, 40001),
+    ):
+        printable = ".".join(part.decode() for part in labels)
+        resolved = resolve(labels, sport.to_bytes(2, "big"), sport)
+        if resolved != wanted:
+            print("FAIL:", printable, "resolved to", ".".join(map(str, resolved)),
+                  "rather than", ".".join(map(str, wanted)), "for", described)
             sys.exit(1)
-        if len(reply) < 54 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
-            continue
-        if int.from_bytes(reply[34:36], "big") != 53:
-            continue
-        body = reply[42:]
-        if len(body) < 12 or body[0:2] != b"\x4d\x4e":
-            continue
-        if int.from_bytes(body[6:8], "big") < 1:
-            print("FAIL: the resolver answered with no records for", described)
-            sys.exit(1)
-        resolved = body[-4:]
-
-    if resolved != expected:
-        print("FAIL: gateway.containers.internal resolved to",
-              ".".join(map(str, resolved)), "rather than",
-              ".".join(map(str, expected)), "for", described)
-        sys.exit(1)
-    print("ok: name  gateway.containers.internal ->",
-          ".".join(map(str, resolved)), "for", described)
+        print("ok: name ", printable, "->", ".".join(map(str, resolved)),
+              "for", described)
 finally:
     s.close()
     os.unlink(client_path)
@@ -203,11 +215,19 @@ PY
 status=0
 
 # The defaults.
-smoke 192.168.127.1 192.168.127.2 || status=1
+smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 # An address given as a flag. The gateway must answer for what it was told, not
 # for what it would have defaulted to.
-smoke 10.7.0.1 10.7.0.2 --gatewayIP 10.7.0.1 --subnet 10.7.0.0/24 || status=1
+smoke 10.7.0.1 10.7.0.2 10.7.0.254 --gatewayIP 10.7.0.1 --subnet 10.7.0.0/24 \
+    --hostIP 10.7.0.254 || status=1
+
+# A subnet and nothing else. Upstream documents --gatewayIP as "first usable
+# address of subnet" and --hostIP as "last usable"; both are derived here, so
+# this is the case where a hardcoded default shows up as an address the guest
+# cannot reach. A /25 is deliberate: its broadcast is not .255, so a derivation
+# that only knows how to subtract from 255 gets the host address wrong.
+smoke 10.9.0.1 10.9.0.2 10.9.0.126 --subnet 10.9.0.0/25 || status=1
 
 # The same, from a configuration file. This is the path that broke: the address
 # resolution read the file's contents before the file was loaded, so every
@@ -216,6 +236,6 @@ CONFIG="${TMPDIR:-/tmp}/netstack-smoke-$$.json"
 cat > "$CONFIG" <<JSON
 {"gatewayIP":"10.8.0.1","subnet":"10.8.0.0/24","hostIP":"10.8.0.254"}
 JSON
-smoke 10.8.0.1 10.8.0.2 --config "$CONFIG" || status=1
+smoke 10.8.0.1 10.8.0.2 10.8.0.254 --config "$CONFIG" || status=1
 
 exit $status

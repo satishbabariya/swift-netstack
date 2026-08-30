@@ -377,15 +377,19 @@ connection to the host address** and gets its bytes echoed back by a real
 listener on the loopback — the forwarder, the NAT rewrite and the splice in one
 question. It **exposes a host port into the guest** and requires bytes sent the
 instant the host connects to come back — which is how the silent data loss in
-`write0` was found, after 768 library tests had passed over it. And it drives
+`write0` was found, after 768 library tests had passed over it. It asks for **a name the gateway does not own**, which is every name a guest
+actually asks for, and requires the answer a fake upstream on the loopback gave
+— the forwarding path is the resolver's whole job, and a check that needs the
+real internet is a check that fails for reasons of its own. And it drives
 the **`--listen-qemu` wire**, where a four-byte big-endian length says where
 each frame ends, because a whole entry point nobody drives is a whole entry
 point that can be wrong.
 
 Each of those fails when the thing it names is broken: removing the NAT entry
 turns the SYN into a reset, breaking the return direction of the splice leaves
-the handshake intact and loses the echo, and switching the stream framing to
-hyperkit's two little-endian bytes leaves the wire silent.
+the handshake intact and loses the echo, switching the stream framing to
+hyperkit's two little-endian bytes leaves the wire silent, and a resolver that
+declines to forward answers REFUSED where an address belonged.
 
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
 the two slow ones. It exists because the gates were seven scripts across five CI

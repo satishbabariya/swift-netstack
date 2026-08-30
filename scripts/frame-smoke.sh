@@ -15,13 +15,14 @@ cd "$(dirname "$0")/.." || exit 1
 WIRE=""
 CONFIG=""
 CONTROL=""
+RESOLVER=""
 GATEWAY=""
 LISTENER=""
 ECHO_PID=""
 cleanup() {
     [[ -n "$GATEWAY" ]] && kill "$GATEWAY" 2>/dev/null
     [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null
-    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "${LISTENER:-/nonexistent}.port"
+    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "$RESOLVER" "${LISTENER:-/nonexistent}.port"
 }
 trap cleanup EXIT INT TERM
 
@@ -723,6 +724,155 @@ PY
     return $outcome
 }
 
+# A name the gateway does not own.
+#
+# The DNS checks above ask for the two `.containers.internal` names, which the
+# gateway answers from its own table without ever opening a socket. Every other
+# name a guest asks for -- which is every name a guest actually asks for -- is
+# forwarded to an upstream resolver over a real UDP socket and the answer
+# carried back. That path is the resolver's whole job and nothing outside the
+# library had driven it.
+#
+# The upstream here is a fake on the loopback rather than whatever the machine's
+# resolver is: a check that needs the internet is a check that fails for reasons
+# of its own.
+dns_forward_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    RESOLVER="${TMPDIR:-/tmp}/netstack-smoke-resolver-$$.py"
+    cat > "$RESOLVER" <<'FAKE'
+import socket, sys
+# Answers every A query with the same address, so the check is about carriage
+# rather than about what any real resolver happens to say today.
+ANSWER = bytes([203, 0, 113, 7])
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(("127.0.0.1", 0))
+print(server.getsockname()[1], flush=True)
+while True:
+    query, sender = server.recvfrom(2048)
+    if len(query) < 12:
+        continue
+    end = 12
+    while end < len(query) and query[end]:
+        end += query[end] + 1
+    name = query[12:end + 1]
+    reply = (
+        query[0:2] + b"\x81\x80" + b"\x00\x01\x00\x01" + b"\x00\x00\x00\x00"
+        + name + b"\x00\x01\x00\x01"
+        + b"\xc0\x0c" + b"\x00\x01\x00\x01" + b"\x00\x00\x00\x3c"
+        + b"\x00\x04" + ANSWER
+    )
+    server.sendto(reply, sender)
+FAKE
+    python3 "$RESOLVER" > "$RESOLVER.port" &
+    ECHO_PID=$!
+    local port=""
+    for _ in $(seq 1 80); do
+        port="$(head -1 "$RESOLVER.port" 2>/dev/null)"
+        [[ -n "$port" ]] && break
+        sleep 0.25
+    done
+    [[ -n "$port" ]] || { echo "FAIL: the fake resolver never reported a port"; return 1; }
+
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-dns-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-vfkit "$WIRE" --dns "127.0.0.1:$port" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: wire socket never appeared (dns)"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
+import os, socket, sys
+
+wire = os.environ["WIRE"]
+gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+src = bytes.fromhex("5a94efe4bc00")
+
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+
+
+def ones_complement(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) | data[i + 1]
+    while total >> 16:
+        total = (total >> 16) + (total & 0xFFFF)
+    return (~total) & 0xFFFF
+
+
+def udp_frame(source, destination, sport, dport, payload):
+    udp = (
+        sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
+        + (8 + len(payload)).to_bytes(2, "big") + b"\x00\x00" + payload
+    )
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(udp)).to_bytes(2, "big")
+        + b"\x00\x00\x00\x00\x40\x11\x00\x00" + source + destination
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    return bytes.fromhex("5a94efe40cee") + src + b"\x08\x00" + bytes(ip) + udp
+
+
+try:
+    s.connect(wire)
+    labels = [b"a-name-the-gateway-does-not-own", b"example"]
+    name = b"".join(bytes([len(part)]) + part for part in labels) + b"\x00"
+    query = b"\x7a\x1c" + b"\x01\x00" + b"\x00\x01" + b"\x00" * 6 + name + b"\x00\x01\x00\x01"
+    s.send(udp_frame(guest, gateway, 40002, 53, query))
+
+    s.settimeout(10)
+    while True:
+        try:
+            reply = s.recv(2048)
+        except socket.timeout:
+            print("FAIL: the forwarded query went unanswered within 10s for", described)
+            sys.exit(1)
+        if len(reply) < 54 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
+            continue
+        if int.from_bytes(reply[34:36], "big") != 53:
+            continue
+        body = reply[42:]
+        if len(body) < 12 or body[0:2] != b"\x7a\x1c":
+            continue
+        if body[3] & 0x0F:
+            print("FAIL: the gateway answered rcode", body[3] & 0x0F,
+                  "rather than forwarding, for", described)
+            sys.exit(1)
+        if int.from_bytes(body[6:8], "big") < 1:
+            print("FAIL: the forwarded answer carried no records for", described)
+            sys.exit(1)
+        resolved = body[-4:]
+        if resolved != bytes([203, 0, 113, 7]):
+            print("FAIL: the guest was told", ".".join(map(str, resolved)),
+                  "rather than what the upstream said, for", described)
+            sys.exit(1)
+        print("ok: dns   a forwarded name resolved to",
+              ".".join(map(str, resolved)), "for", described)
+        break
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    kill "$ECHO_PID" 2>/dev/null
+    wait "$ECHO_PID" 2>/dev/null
+    ECHO_PID=""
+    rm -f "$WIRE" "$RESOLVER" "$RESOLVER.port"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -758,5 +908,8 @@ forward_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the wire nobody drives.
 stream_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And a name the gateway has to ask somebody else about.
+dns_forward_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

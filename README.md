@@ -434,8 +434,16 @@ NETSTACK_THROUGHPUT=1 swift test -c release --filter Throughput
 ```
 
 The third is a **benchmark, not a gate**: it pushes 32 MiB through the whole
-gateway to a real loopback listener and prints a rate. It measured **618 Mbit/s
-in a release build** (85 in debug) on an Apple-silicon laptop. Profiling that run
+gateway to a real loopback listener and prints a rate. It measured **around 560 Mbit/s
+in a release build** (96 in debug) on an Apple-silicon laptop, over four runs
+varying by less than one percent.
+
+That number was 618 here for a while and did not reproduce. The write path had
+grown a branch per frame since, so the branch was the obvious suspect and was
+ruled out by removing it — 559, 558, 560, against 557 to 562 with it. Whatever
+moved is not in this package, which is the useful thing a re-measurement can
+tell you and the reason a figure like this is written down with the day and the
+machine attached rather than as a property of the code. Profiling that run
 says the socket calls dominate it: `write`, `sendto`, `recvfrom` and `read`
 together take around forty times the samples that `TCPHeader.serialize` and
 `TCPHeader.parse` do, so the benchmark measures its own harness at least as much

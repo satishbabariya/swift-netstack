@@ -553,6 +553,19 @@ doing its job. And it bounds absolute growth rather than a multiple: allowing
 "no more than double" let a removed flow bound through at 7,081 → 13,908
 descriptors, which is a rule loose enough to admit the failure it exists for.
 
+Its second half churns guests instead: half a million connect, speak and leave
+over twenty seconds on the switch wire, which is where a port is added per guest
+and has to be given back. Descriptors and memory stay flat, and the address table
+is empty at the end.
+
+That half also carries a floor — at least half the guests must have been
+*answered* — and the floor is what catches the failure it exists for. With port
+removal deleted the switch fills to its guest limit and refuses everyone after:
+descriptors stay flat, memory stays flat, and it settles beautifully while
+serving nobody. An earlier version had no floor, swallowed every connection
+error, and reported five hundred thousand guests a second having exercised
+nothing at all.
+
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
 the two slow ones. It exists because the gates were seven scripts across five CI
 jobs and running "the ones I remembered" is not running them — CI builds with

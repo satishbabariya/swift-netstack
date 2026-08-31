@@ -380,7 +380,11 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     func readExactly(_ count: Int) async throws -> [UInt8] {
         var collected = [UInt8]()
         var buffer = [UInt8](repeating: 0, count: count)
-        for _ in 0..<400 where collected.count < count {
+        // Ten seconds, not two. A loaded CI runner took nineteen seconds over
+        // tests that finish here in milliseconds, and a budget that runs out
+        // does not report a slow machine -- it reports whatever the assertions
+        // below make of an empty array.
+        for _ in 0..<2000 where collected.count < count {
             let read = buffer.withUnsafeMutableBytes {
                 recv(guest, $0.baseAddress, count - collected.count, dontWait)
             }
@@ -401,7 +405,11 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     _ = command.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
 
     let reply = try await readExactly(258)
-    #expect(reply.count == 258, "the reply was \(reply.count) bytes where hyperkit reads 258")
+    // Required before anything indexes into it. A short read here used to reach
+    // the assertions below, index an empty array, and kill the process with
+    // "Index out of range" -- which takes down every other test in the run and
+    // reports a crash where a failure belonged.
+    try #require(reply.count == 258, "the reply was \(reply.count) bytes where hyperkit reads 258")
     #expect(reply.first == 0x01)
     #expect(UInt16(reply[1]) | UInt16(reply[2]) << 8 == 1500, "the MTU was not what the switch was built with")
     // The frame size, which is the MTU plus an ethernet header. A reply that

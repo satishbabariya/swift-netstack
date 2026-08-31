@@ -103,6 +103,15 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     /// its behaviour; `WireBootstrap` says which is which.
     private let rawDescriptor: NIOBSDSocket.Handle?
 
+    /// Where a direct write should go, on a wire whose peer is learned rather
+    /// than connected.
+    ///
+    /// The bound datagram wire -- `--listen-vfkit`, the default -- has a socket
+    /// with no peer until a guest sends to it, so `send` has nowhere to go and
+    /// the write has to be a `sendto`. Set by `LearnedPeerHandler` on the loop,
+    /// from the same envelope it learns the peer from.
+    fileprivate var learnedPeer: SocketAddress?
+
     /// Frames dropped because the wire would not take them after retrying.
     public private(set) var outboundBackedUp = 0
 
@@ -227,11 +236,27 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     private func writeDirectly(_ frame: ByteBuffer, to descriptor: NIOBSDSocket.Handle) -> Bool {
         let bytes = frame.readableBytesView
         for _ in 0..<16 {
-            let written = bytes.withUnsafeBytes { raw in
-                send(descriptor, raw.baseAddress, raw.count, 0)
+            let written = bytes.withUnsafeBytes { raw -> Int in
+                // `sendto` when the peer was learned rather than connected, and
+                // `send` when the socket has one. Both are the same syscall with
+                // a destination or without.
+                if let peer = learnedPeer {
+                    return peer.withSockAddr { address, size in
+                        sendto(
+                            descriptor, raw.baseAddress, raw.count, 0, address, socklen_t(size))
+                    }
+                }
+                return send(descriptor, raw.baseAddress, raw.count, 0)
             }
             if written == bytes.count { return true }
             let failure = errno
+            // No peer yet, on a wire that learns one. Not a link failure and not
+            // counted as one: the guest has simply not spoken, and a gateway
+            // never speaks first -- it answers DHCP, ARP and SYN.
+            // `aWriteBeforeAnyFrameHasArrivedIsRefusedRatherThanQueued` pins
+            // that this stays silent, and it was written before this path
+            // existed.
+            if failure == EDESTADDRREQ || failure == ENOTCONN { return false }
             guard failure == ENOBUFS || failure == EWOULDBLOCK || failure == EAGAIN || failure == EINTR
             else {
                 outboundDropped += 1
@@ -370,9 +395,17 @@ final class LearnedPeerHandler: ChannelDuplexHandler {
 
     private var peer: SocketAddress?
 
+    /// The link, so a direct write knows where to send.
+    ///
+    /// Weak on the same terms as `WireInboundHandler`: the link owns the
+    /// channel, the channel's pipeline owns this, and a strong reference back
+    /// would close the cycle.
+    weak var link: WireLinkEndpoint?
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let envelope = unwrapInboundIn(data)
         peer = envelope.remoteAddress
+        link?.learnedPeer = envelope.remoteAddress
         context.fireChannelRead(wrapInboundOut(envelope.data))
     }
 

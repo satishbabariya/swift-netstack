@@ -166,13 +166,41 @@ public enum WireBootstrap {
             // path that exists and cannot be removed -- surfaces from the bind
             // below, where the message names the path.
         }
+        // Bound by hand, so the descriptor can be kept.
+        //
+        // Not fussiness: NIO closes a datagram channel when a write returns
+        // ENOBUFS, and a full unix datagram queue returns exactly that on BSD.
+        // `adoptingDatagramSocket` was given a direct-write path for this and
+        // the LISTENING wire -- which is `--listen-vfkit`, the default, and the
+        // one vfkit uses -- was not. A guest that paused took the gateway's
+        // network down for good, silently, and it stayed down: a later guest
+        // could not even connect, because the socket was gone.
         do {
             let local = try SocketAddress(unixDomainSocketPath: path)
+            #if canImport(Darwin)
+                let descriptor = socket(AF_UNIX, SOCK_DGRAM, 0)
+            #else
+                let descriptor = socket(AF_UNIX, Int32(SOCK_DGRAM.rawValue), 0)
+            #endif
+            guard descriptor >= 0 else {
+                return group.any().makeFailedFuture(
+                    IOError(errnoCode: errno, reason: "socket for \(path)"))
+            }
+            let bound = local.withSockAddr { address, size in
+                bind(descriptor, address, socklen_t(size))
+            }
+            guard bound == 0 else {
+                let failure = errno
+                close(descriptor)
+                return group.any().makeFailedFuture(IOError(errnoCode: failure, reason: "bind \(path)"))
+            }
             return DatagramBootstrap(group: group)
                 .channelOption(.recvAllocator, value: FixedSizeRecvByteBufferAllocator(capacity: frameSize))
-                .bind(to: local)
+                .withBoundSocket(descriptor)
                 .flatMap { channel in
-                    configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false, learnsPeer: true)
+                    configure(
+                        channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false,
+                        flushPerFrame: true, learnsPeer: true, rawDescriptor: descriptor)
                 }
         } catch {
             return group.any().makeFailedFuture(error)
@@ -555,7 +583,9 @@ public enum WireBootstrap {
         return channel.eventLoop.submit {
             let sync = channel.pipeline.syncOperations
             if learnsPeer {
-                try sync.addHandler(LearnedPeerHandler())
+                let learner = LearnedPeerHandler()
+                learner.link = link
+                try sync.addHandler(learner)
             } else if let remote {
                 try sync.addHandler(DatagramEnvelopeHandler(remote: remote))
             }

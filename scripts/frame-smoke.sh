@@ -2069,6 +2069,97 @@ PY
     return $outcome
 }
 
+# What the gateway says when a guest stops reading.
+#
+# Two questions an operator asks in that order: is anything being lost, and
+# whose end is it. The wire counts them apart -- a frame the queue had no room
+# for is backed up, a frame the kernel refused for another reason is rejected --
+# and until recently only the second reached `GET /stats`, which is the one that
+# almost never happens.
+#
+# What this pins is that the number is reported at all. The split itself -- full
+# queue against hard failure -- is real and is checked by the errno list in
+# `WireLinkEndpoint`, which an experiment settled: on an unconnected unix
+# datagram socket macOS reports ENOBUFS for a full queue and ECONNREFUSED for a
+# peer that has gone. Reading a flood's ECONNREFUSED as "full" is a mistake I
+# made and measured my way out of.
+backpressure_smoke() {
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-bp-ctl-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-bp-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" && -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" && -S "$CONTROL" ]] || { echo "FAIL: the backpressure gateway never came up"; return 1; }
+
+    WIRE="$WIRE" CONTROL="$CONTROL" python3 - <<'PY'
+import json, os, socket, subprocess, sys
+
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address
+
+wire = os.environ["WIRE"]
+gateway = address("192.168.127.1")
+guest = address("192.168.127.2")
+mac = bytes.fromhex("5a94efe4bc00")
+
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+try:
+    s.connect(wire)
+    frame = (
+        b"\xff\xff\xff\xff\xff\xff" + mac + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + mac + guest + b"\x00" * 6 + gateway
+    )
+    # Twenty thousand questions, and not one answer read.
+    for _ in range(20000):
+        try:
+            s.send(frame)
+        except OSError:
+            pass
+
+    answer = subprocess.run(
+        ["curl", "--silent", "--fail-with-body", "--max-time", "10",
+         "--unix-socket", os.environ["CONTROL"], "http://gateway/stats"],
+        capture_output=True, text=True, timeout=20)
+    if answer.returncode != 0:
+        print("FAIL: /stats was not answered after the flood")
+        sys.exit(1)
+    stats = json.loads(answer.stdout)
+    backed_up = stats.get("outbound_frames_backed_up")
+    rejected = stats.get("outbound_frames_rejected")
+    if backed_up is None:
+        print("FAIL: /stats does not report outbound_frames_backed_up at all,",
+              "so an operator cannot tell loss at the guest's end from loss at this one")
+        sys.exit(1)
+    if backed_up < 1:
+        print("FAIL: twenty thousand answers into a queue of about forty and",
+              "outbound_frames_backed_up is", backed_up)
+        sys.exit(1)
+    # No assertion on the ratio to `rejected`. It would express something true --
+    # ordinary loss is a full queue and not a hard failure -- and it cannot fail
+    # here, because a full queue reports ENOBUFS and ENOBUFS has always been
+    # handled. An assertion that holds either way reads as coverage of a rule it
+    # cannot see.
+    print("ok: stats", backed_up, "frames backed up and", rejected, "rejected:",
+          "the loss is reported at the guest's end, where it is")
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -2138,5 +2229,8 @@ tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
 # And the address a guest must not reach by accident.
 metadata_smoke 192.168.127.1 192.168.127.2 "" no || status=1
 metadata_smoke 192.168.127.1 192.168.127.2 "--ec2-metadata-access" yes || status=1
+
+# And what it says about a guest that has stopped reading.
+backpressure_smoke || status=1
 
 exit $status

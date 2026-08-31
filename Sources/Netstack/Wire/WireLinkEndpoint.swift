@@ -258,7 +258,22 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
             // that this stays silent, and it was written before this path
             // existed.
             if failure == EDESTADDRREQ || failure == ENOTCONN { return false }
-            guard failure == ENOBUFS || failure == EWOULDBLOCK || failure == EAGAIN || failure == EINTR
+            // ECONNREFUSED is deliberately NOT in this list, and it took an
+            // experiment to be sure. On an unconnected unix datagram socket --
+            // which is what the listening wire has, since it learns its peer and
+            // sends with `sendto` -- macOS reports:
+            //
+            //     full queue  -> ENOBUFS
+            //     peer gone   -> ECONNREFUSED
+            //
+            // I read a flood's ECONNREFUSED as "queue full" and added it here,
+            // which would have retried sixteen times for a guest that has
+            // definitively left and then reported it as merely slow. The errno
+            // was the guest's process exiting. A departed peer is a rejection
+            // and should be counted as one.
+            guard
+                failure == ENOBUFS || failure == EWOULDBLOCK || failure == EAGAIN
+                    || failure == EINTR
             else {
                 outboundDropped += 1
                 log?.record(.outboundFrameRejected, ["errno": .stringConvertible(failure)])

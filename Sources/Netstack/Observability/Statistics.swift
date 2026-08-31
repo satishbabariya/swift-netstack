@@ -42,6 +42,13 @@ extension Gateway {
         public var inboundFramesRejected: Int
         /// Frames this stack could not put on the wire.
         public var outboundFramesRejected: Int
+        /// Frames the wire had nowhere to put because the guest is not reading.
+        ///
+        /// The one an operator chasing "the network is lossy" actually wants: it
+        /// says the loss is at the guest's end of the wire and not this stack's.
+        /// It was counted from the day backpressure was added and reported
+        /// nowhere until long after.
+        public var outboundFramesBackedUp: Int
 
         /// Guest TCP connections currently spliced to a host socket. A **gauge**.
         public var tcpEstablished: Int
@@ -126,6 +133,7 @@ extension Gateway {
             icmpTimedOut: icmp.timedOut,
             inboundFramesRejected: link.inboundDropped,
             outboundFramesRejected: link.outboundDropped,
+            outboundFramesBackedUp: link.outboundBackedUp,
             tcpEstablished: tcp.establishedCount,
             tcpRefusedByLimit: tcp.refusedForLimit,
             tcpDialFailed: tcp.refusedForDial,
@@ -173,6 +181,7 @@ extension Gateway.Statistics {
             ("icmp_timed_out", icmpTimedOut),
             ("inbound_frames_rejected", inboundFramesRejected),
             ("outbound_frames_rejected", outboundFramesRejected),
+            ("outbound_frames_backed_up", outboundFramesBackedUp),
             ("tcp_established", tcpEstablished),
             ("tcp_refused_by_limit", tcpRefusedByLimit),
             ("tcp_dial_failed", tcpDialFailed),

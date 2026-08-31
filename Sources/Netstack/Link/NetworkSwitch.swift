@@ -104,8 +104,12 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
     /// restart.
     public var inboundDropped: Int { retiredInbound + ports.values.reduce(0) { $0 + $1.inboundDropped } }
     public var outboundDropped: Int { retiredOutbound + ports.values.reduce(0) { $0 + $1.outboundDropped } }
+    public var outboundBackedUp: Int {
+        retiredBackedUp + ports.values.reduce(0) { $0 + $1.outboundBackedUp }
+    }
     private var retiredInbound = 0
     private var retiredOutbound = 0
+    private var retiredBackedUp = 0
 
     /// Bytes across the whole fabric, including what crossed between guests and
     /// never reached the gateway at all -- which on a busy network is most of it,
@@ -386,6 +390,7 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         for link in ports.values {
             retiredInbound += link.inboundDropped
             retiredOutbound += link.outboundDropped
+            retiredBackedUp += link.outboundBackedUp
             retiredReceived += link.bytesReceived
             retiredSent += link.bytesSent
         }

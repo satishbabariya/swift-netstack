@@ -60,6 +60,16 @@ public protocol GatewayLink: LinkEndpoint, Sendable {
     /// Frames the link would not carry, in each direction.
     var inboundDropped: Int { get }
     var outboundDropped: Int { get }
+    /// Frames the link had nowhere to put: the guest is not reading and the
+    /// queue is full.
+    ///
+    /// Kept apart from `outboundDropped` because the two call for opposite
+    /// actions. A rejected frame is this stack's own fault -- an oversized frame
+    /// reached the wire, or the kernel refused it for a reason worth reading.
+    /// A backed-up frame is the guest's: it is not draining, and the link is
+    /// doing the only thing a link can. On a busy wire the second is the common
+    /// one, and until it was added here it was counted and shown to nobody.
+    var outboundBackedUp: Int { get }
     /// Bytes that crossed, in each direction. Upstream reports the same two on
     /// `GET /stats` and they are the first thing anyone asks of a network that
     /// is not working: whether anything is moving at all.

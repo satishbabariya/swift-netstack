@@ -206,9 +206,58 @@ private let backpressureMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
     let backedUp = try await link.eventLoop.submit { link.outboundBackedUp }.get()
     #expect(backedUp > 0, "five thousand frames into a queue of about forty and none backed up")
 
+    // No assertion here on backed-up versus rejected, though that distinction
+    // is a real one and was wrong until recently. In this setup a full queue
+    // reports ENOBUFS, which was always in the retry list, so an assertion here
+    // holds whether or not the fix is present -- removing ECONNREFUSED from the
+    // list leaves it passing three times out of three. It is checked where it
+    // can be seen, over `GET /stats` in `scripts/frame-smoke.sh`.
+
     close(guest)
     _ = try? await link.close().get()
     try? FileManager.default.removeItem(atPath: guestPath)
     try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
+// What an operator can see when a guest stops reading.
+//
+// The link has counted backed-up frames since the day backpressure was added,
+// and reported them to nobody: `outboundBackedUp` was on the concrete wire, not
+// on the protocol the gateway holds, so it reached neither `NetworkSwitch` nor
+// `Gateway.statistics()` nor `GET /stats`.
+//
+// It is the one that matters. "The network is lossy" has two answers -- this
+// stack refused the frame, or the guest is not draining -- and they call for
+// opposite actions. Only the second is common, and only the first was visible.
+@Test func aWireThatIsBackingUpSaysSoInTheStatistics() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [-1, -1]
+    #expect(makeSocketPair(AF_UNIX, .stream, &pair) == 0)
+
+    let link = try await WireBootstrap.adoptingStreamSocket(
+        pair[0], group: group, linkAddress: backpressureMAC, mtu: 1500
+    ).get()
+
+    let frame: ByteBuffer = {
+        var buffer = ByteBuffer()
+        buffer.writeBytes([UInt8](repeating: 0xEF, count: 1400))
+        return buffer
+    }()
+    try await link.eventLoop.submit {
+        for _ in 0..<20_000 {
+            link.write([PacketBuffer(allocator: ByteBufferAllocator(), payload: frame)])
+        }
+    }.get()
+
+    // Read through the protocol the gateway holds, which is where it was
+    // missing: the concrete type had the number all along.
+    let asGatewaySees: GatewayLink = link
+    #expect(
+        asGatewaySees.outboundBackedUp > 0,
+        "the wire backed up and the count is not visible through GatewayLink")
+
+    _ = try? await link.close().get()
+    close(pair[1])
     try? await group.shutdownGracefully()
 }

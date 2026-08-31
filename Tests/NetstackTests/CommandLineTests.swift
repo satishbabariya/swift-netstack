@@ -128,13 +128,25 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
         #expect(both.output.contains("different wires"), "unhelpful error: \(both.output)")
     }
 
-    // A wire upstream has and this does not says which, rather than "unknown
-    // option" -- the difference between "you typed it wrong" and "this does not
-    // do that yet".
-    guard let bess = run(["--listen-bess", "/tmp/c.sock"]) else { return }
-    #expect(bess.status != 0)
-    #expect(bess.output.contains("not supported"), "unhelpful error: \(bess.output)")
-    #expect(bess.output.contains("--listen-vfkit"), "the error does not say what to use instead")
+    // Every wire gvproxy has is a wire this has. `--listen-bess` was the last
+    // one that was not, and this used to assert that its rejection said so; the
+    // assertion is now that it is accepted, since accepting it is the change.
+    //
+    // Accepted, not "works here": Darwin has no SOCK_SEQPACKET for AF_UNIX, so
+    // on this platform the flag parses and the bind fails with the reason. That
+    // is a different thing from an option the program does not know, and this
+    // checks the difference by requiring the failure to name the socket type
+    // rather than the flag.
+    if let bess = run(["--listen-bess", "/tmp/netstack-bess-check.sock"]) {
+        #expect(
+            !bess.output.contains("unknown option"),
+            "--listen-bess is a wire this program has: \(bess.output)")
+        #if canImport(Darwin)
+            #expect(
+                bess.output.contains("SOCK_SEQPACKET"),
+                "on a platform without seqpacket the failure should name it: \(bess.output)")
+        #endif
+    }
 
     // The floor: a genuinely unknown flag is still rejected as unknown, so the
     // messages above are recognition rather than a catch-all.

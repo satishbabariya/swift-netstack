@@ -57,6 +57,9 @@ step "formatting" ./scripts/format.sh
 step "conventions" ./scripts/conventions.sh
 step "interop with upstream's client" ./scripts/interop.sh
 step "frames through the built executable" ./scripts/frame-smoke.sh
+# Says "skipped" and passes where the platform has no seqpacket, which is every
+# Mac. CI's Linux job is where this one actually runs.
+step "a frame through the seqpacket wire" ./scripts/bess-smoke.sh
 
 if [[ $quick -eq 1 ]]; then
     echo

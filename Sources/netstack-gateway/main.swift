@@ -21,6 +21,7 @@ struct Options {
     var listenSwitch: String?
     var listenStdio = false
     var listenVpnKit: String?
+    var listenBess: String?
     var controlEndpoints: [String] = []
     var servicesEndpoints: [String] = []
     var pidFile: String?
@@ -73,8 +74,7 @@ struct Options {
                 _ = try value(flag)
                 options.listenStdio = true
             case "--listen-vpnkit": options.listenVpnKit = try value(flag)
-            case "--listen-bess":
-                throw OptionError.unsupportedWire(flag)
+            case "--listen-bess": options.listenBess = try value(flag)
             case "--dns": options.upstreamResolver = try value(flag)
             case "--gatewayIP": options.gateway = try value(flag)
             case "--hostIP": options.host = try value(flag)
@@ -120,7 +120,6 @@ enum OptionError: Error, CustomStringConvertible {
     case unknown(String)
     /// A wire upstream has and this does not, named so the failure says which
     /// rather than "unknown option".
-    case unsupportedWire(String)
     case conflictingWires
     /// No guest wire at all. Its own case rather than a missing value, because
     /// `--listen` is present and valid and still leaves nothing for a guest to
@@ -134,15 +133,9 @@ enum OptionError: Error, CustomStringConvertible {
         case .missingValue(let flag): return "\(flag) needs a value"
         case .badValue(let flag, let text): return "\(flag) does not accept \(text)"
         case .unknown(let flag): return "unknown option \(flag)"
-        case .unsupportedWire(let flag):
-            return
-                "\(flag) is not supported: bess carries bare frames over SOCK_SEQPACKET, which the "
-                + "networking library underneath this does not offer. Every other wire gvproxy has "
-                + "is here: --listen-vfkit, --listen-qemu, --listen-vpnkit, --listen-stdio, and "
-                + "--listen-switch for several guests on one socket."
         case .conflictingWires:
-            return "--listen-vfkit, --listen-qemu, --listen-switch, --listen-vpnkit and "
-                + "--listen-stdio are different wires; pick one"
+            return "--listen-vfkit, --listen-qemu, --listen-switch, --listen-vpnkit, "
+                + "--listen-bess and --listen-stdio are different wires; pick one"
         case .noWire:
             return
                 "no guest wire: pass --listen-vfkit <path> for a datagram socket, --listen-qemu "
@@ -170,6 +163,9 @@ let usage = """
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
       --listen-qemu <path>       Stream socket with length-prefixed frames (qemu),
                                  carrying one guest
+      --listen-bess <path>       SOCK_SEQPACKET socket carrying bare frames, one
+                                 per message. Carries several guests. Not on
+                                 macOS, which has no SOCK_SEQPACKET for AF_UNIX
       --listen-vpnkit <path>     Stream socket speaking hyperkit's vpnkit
                                  protocol: a handshake, then two little-endian
                                  length bytes per frame. Carries several guests
@@ -280,8 +276,10 @@ if let text = options.subnet {
 // The wire is checked now: after the file has had its chance to be wrong about
 // something more specific.
 let wires =
-    [options.listenPath, options.listenStream, options.listenSwitch, options.listenVpnKit]
-    .compactMap { $0 } + (options.listenStdio ? ["(stdin and stdout)"] : [])
+    [
+        options.listenPath, options.listenStream, options.listenSwitch, options.listenVpnKit,
+        options.listenBess,
+    ].compactMap { $0 } + (options.listenStdio ? ["(stdin and stdout)"] : [])
 if wires.isEmpty {
     FileHandle.standardError.write(Data("error: \(OptionError.noWire)\n\n\(usage)\n".utf8))
     exit(2)
@@ -430,6 +428,9 @@ do {
         starting = Gateway.start(
             overPipes: STDIN_FILENO, output: STDOUT_FILENO, group: group,
             configuration: configuration)
+    } else if options.listenBess != nil {
+        starting = Gateway.start(
+            bessListeningOnSeqPacketSocketAt: path, group: group, configuration: configuration)
     } else if options.listenVpnKit != nil {
         starting = Gateway.start(
             vpnKitListeningOnStreamSocketAt: path, group: group, configuration: configuration)

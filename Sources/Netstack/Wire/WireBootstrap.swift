@@ -282,6 +282,124 @@ public enum WireBootstrap {
         return release
     }
 
+    /// Bind a `SOCK_SEQPACKET` unix socket carrying bare ethernet frames, one
+    /// per message, and give every guest that connects a port on a switch.
+    ///
+    /// `--listen-bess`. There is no length prefix and none is needed: the socket
+    /// type preserves message boundaries, so one `read` is one frame and one
+    /// `write` is one frame -- which is why `flushPerFrame` is on, since a
+    /// gathering write would put two frames in one message and the peer would
+    /// see one frame twice the size.
+    ///
+    /// ## Why this is hand-rolled where the others are not
+    ///
+    /// NIO binds stream and datagram sockets; it has nothing for
+    /// `SOCK_SEQPACKET`. But `NIOPipeBootstrap` will take ownership of an
+    /// already-open descriptor and do plain `read`/`write` on it, and on a
+    /// seqpacket socket that is exactly the right behaviour. So the listening
+    /// and the accepting are POSIX, and everything after the accept is ordinary
+    /// NIO.
+    ///
+    /// The accept loop is a thread, because a blocking `accept` is the only way
+    /// to wait on a descriptor NIO cannot watch. It is not the datapath -- it
+    /// runs once per guest -- and it touches nothing but the loop it hands each
+    /// descriptor to.
+    ///
+    /// ## Not every platform has it
+    ///
+    /// Darwin does not support `SOCK_SEQPACKET` on `AF_UNIX` at all: the
+    /// `socket` call fails with `EPROTOTYPE`. The returned future fails with
+    /// that error rather than pretending, so the message names the reason.
+    public static func seqPacketSocket(
+        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16
+    ) -> EventLoopFuture<NetworkSwitch> {
+        let loop = group.next()
+        #if canImport(Darwin)
+            let listener = socket(AF_UNIX, SOCK_SEQPACKET, 0)
+        #else
+            let listener = socket(AF_UNIX, Int32(SOCK_SEQPACKET.rawValue), 0)
+        #endif
+        guard listener >= 0 else {
+            return loop.makeFailedFuture(
+                IOError(errnoCode: errno, reason: "SOCK_SEQPACKET on AF_UNIX"))
+        }
+
+        try? FileManager.default.removeItem(atPath: path)
+        var local = sockaddr_un()
+        local.sun_family = sa_family_t(AF_UNIX)
+        let room = MemoryLayout.size(ofValue: local.sun_path)
+        guard path.utf8.count < room else {
+            close(listener)
+            return loop.makeFailedFuture(
+                IOError(errnoCode: ENAMETOOLONG, reason: "socket path is longer than \(room - 1)"))
+        }
+        withUnsafeMutableBytes(of: &local.sun_path) { raw in
+            raw.copyBytes(from: path.utf8)
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let bound = withUnsafePointer(to: &local) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listener, $0, size) }
+        }
+        guard bound == 0, listen(listener, 32) == 0 else {
+            let failure = errno
+            close(listener)
+            return loop.makeFailedFuture(IOError(errnoCode: failure, reason: "bind \(path)"))
+        }
+
+        let netSwitch = NetworkSwitch(
+            linkAddress: linkAddress, mtu: mtu, eventLoop: loop,
+            maximumAddressesPerPort: maximumAddressesPerPort)
+        let limit = max(1, maximumGuests)
+        let admitting = AdmittedGuests()
+
+        let accepting = Thread {
+            while true {
+                let guest = accept(listener, nil, nil)
+                if guest < 0 {
+                    // The listener was closed, or the process is going away.
+                    // Either way there is nothing left to accept.
+                    if errno == EINTR { continue }
+                    return
+                }
+                loop.execute {
+                    // Adopted on the switch's loop, where the accounting lives.
+                    NIOPipeBootstrap(group: loop)
+                        .channelOption(
+                            .recvAllocator,
+                            value: FixedSizeRecvByteBufferAllocator(
+                                capacity: Int(mtu) + EthernetHeader.length)
+                        )
+                        .takingOwnershipOfDescriptor(inputOutput: guest)
+                        .whenSuccess { channel in
+                            guard
+                                let release = admit(
+                                    channel, to: netSwitch, limit: limit, admitting: admitting)
+                            else {
+                                channel.close(promise: nil)
+                                return
+                            }
+                            // `framed: false`: the socket type is the framing.
+                            // `flushPerFrame`: a gathering write would put two
+                            // frames in one message.
+                            _ = configure(
+                                channel: channel, linkAddress: linkAddress, mtu: mtu,
+                                framed: false, flushPerFrame: true
+                            ).map { link in
+                                release()
+                                let id = netSwitch.addPort(link)
+                                channel.closeFuture.whenComplete { _ in _ = netSwitch.removePort(id) }
+                            }
+                        }
+                }
+            }
+        }
+        accepting.name = "netstack-bess-accept"
+        accepting.start()
+
+        return loop.makeSucceededFuture(netSwitch)
+    }
+
     /// Bind a unix stream socket that speaks hyperkit's vpnkit protocol, and
     /// give every guest that connects a port on a switch.
     ///

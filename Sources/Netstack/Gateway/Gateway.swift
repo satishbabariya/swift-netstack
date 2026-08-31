@@ -320,6 +320,28 @@ public final class Gateway: @unchecked Sendable {
         }
     }
 
+    /// Bind a `SOCK_SEQPACKET` unix socket carrying bare frames, one per
+    /// message.
+    ///
+    /// Upstream's `--listen-bess`. Every guest that connects gets a port on a
+    /// switch, as with the other multi-guest wires; the difference is that the
+    /// socket type carries the frame boundaries, so there is no length prefix at
+    /// all.
+    ///
+    /// Darwin has no `SOCK_SEQPACKET` for `AF_UNIX`, so this fails there with
+    /// the error the `socket` call gave rather than pretending otherwise.
+    public static func start(
+        bessListeningOnSeqPacketSocketAt path: String, group: EventLoopGroup,
+        configuration: Configuration = Configuration()
+    ) -> EventLoopFuture<Gateway> {
+        WireBootstrap.seqPacketSocket(
+            atPath: path, group: group, linkAddress: configuration.linkAddress,
+            mtu: configuration.mtu, maximumGuests: configuration.maximumGuests
+        ).flatMap { netSwitch in
+            assemble(on: netSwitch, group: group, configuration: configuration)
+        }
+    }
+
     /// Bind a unix stream socket that speaks hyperkit's vpnkit protocol.
     ///
     /// Upstream's `--listen-vpnkit`. Every guest gets a port on a switch, as

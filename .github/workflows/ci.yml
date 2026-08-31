@@ -154,6 +154,17 @@ jobs:
       # the sandbox rather than for the code.
       - name: Build the tests on Linux
         run: swift build --build-tests
+      # The one check that cannot run on the machine this is developed on:
+      # Darwin has no SOCK_SEQPACKET for AF_UNIX, so --listen-bess was written
+      # against a manual page and this is the only place it is ever opened.
+      #
+      # The image has no python3, and the check needs one to be a guest. Without
+      # this the script found no interpreter and reported the same "skipped" it
+      # reports on a Mac -- green, in the only place the wire can be opened.
+      - name: Install python3, which the check needs to be a guest
+        run: apt-get update -qq && apt-get install -y -qq python3
+      - name: One frame through the seqpacket wire
+        run: ./scripts/bess-smoke.sh
 
   lint:
     name: Formatting, conventions and interop

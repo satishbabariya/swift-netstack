@@ -200,6 +200,12 @@ jobs:
       - name: One frame through the built executable
         run: ./scripts/frame-smoke.sh
 
+      # Twenty seconds of mixed traffic, asking what the gateway is holding
+      # rather than what it answers: single-shot checks cannot see a descriptor
+      # leaked per connection or memory that climbs.
+      - name: A gateway under sustained traffic
+        run: ./scripts/soak.sh
+
   guards:
     name: Falsify the guards
     # Its own job because it is the long pole: seventeen mutations, each with a

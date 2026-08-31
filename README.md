@@ -255,7 +255,7 @@ because a missing row breaks nothing.
 | `--subnet <cidr>` | The subnet leased to guests. Default `192.168.127.0/24` |
 | `--mtu <bytes>` | Link MTU. Default 1500 |
 | `--forward <host:guest:port>` | Publish a guest port on the host at startup. Prefix `udp:` for a datagram forward, as in the config file |
-| `--pcap <path>` | Write every frame to a pcap file, capped at 64 MiB. Buffered: stop with Ctrl-C, not SIGKILL |
+| `--pcap <path>` | Write every frame to a pcap file, capped at 64 MiB. **Replaces** an existing file, unlike `--log-file`, which appends. Buffered: stop with Ctrl-C, not SIGKILL |
 | `--notification <path>` | Socket told when the network is ready and when guests come and go |
 | `--pid-file <path>` | Write this process's PID there, and remove it on a clean stop |
 | `--log-file <path>` | Append log messages there as well as to stderr |
@@ -522,6 +522,19 @@ against a manual page and CI's Linux job is the only place it is ever opened. It
 says "skipped" and passes on a Mac rather than passing silently — a check that
 quietly succeeds where it cannot run reports "fine" about a wire nobody has
 tried.
+
+`scripts/soak.sh` runs one gateway for twenty seconds under mixed traffic — ARP,
+DHCP, DNS, TCP dials, UDP flows — and then asks what it is *holding* rather than
+what it answers. Every other executable-level check asks one question and stops,
+which is right for "does this work" and blind to a descriptor leaked per
+connection or memory that climbs.
+
+It measures between the halfway mark and the end, not against the start. The
+gateway's pools are bounded, so a run that opens flows climbs to that ceiling and
+stops — the first version called 523 descriptors a leak when it was the limit
+doing its job. And it bounds absolute growth rather than a multiple: allowing
+"no more than double" let a removed flow bound through at 7,081 → 13,908
+descriptors, which is a rule loose enough to admit the failure it exists for.
 
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
 the two slow ones. It exists because the gates were seven scripts across five CI

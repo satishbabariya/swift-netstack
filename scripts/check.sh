@@ -65,8 +65,11 @@ step "a frame through the seqpacket wire" ./scripts/bess-smoke.sh
 
 if [[ $quick -eq 1 ]]; then
     echo
-    echo "skipped (--quick): falsify the guards, the full differential gate"
+    echo "skipped (--quick): the soak, falsify the guards, the full differential gate"
 else
+    # Twenty seconds of mixed traffic, watching what the gateway holds rather
+    # than what it answers. Slow by design and skipped by --quick.
+    step "a gateway under sustained traffic" ./scripts/soak.sh
     step "the full differential gate" \
         env NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
     step "falsify the guards" ./scripts/falsify.sh --all

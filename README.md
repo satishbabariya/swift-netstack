@@ -552,6 +552,13 @@ says "skipped" and passes on a Mac rather than passing silently — a check that
 quietly succeeds where it cannot run reports "fine" about a wire nobody has
 tried.
 
+The Swift examples on this page are **compiled**. They sit in a function nothing
+calls in `Tests/NetstackTests/READMEExample.swift`, so the test build type-checks
+them, and `scripts/conventions.sh` regenerates that copy from the code blocks
+above and refuses if the two disagree — so the page cannot drift from what
+compiles, in either direction. Renaming `Gateway.start`'s first label breaks the
+build rather than leaving the page quietly wrong.
+
 `scripts/soak.sh` runs one gateway for twenty seconds under mixed traffic — ARP,
 DHCP, DNS, TCP dials, UDP flows — and then asks what it is *holding* rather than
 what it answers. Every other executable-level check asks one question and stops,

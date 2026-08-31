@@ -276,6 +276,21 @@ for flag in $flags; do
     fi
 done
 
+
+# 12. The README's examples compile, and the copy that compiles is the README's.
+#
+# They are the first thing anybody runs. Every symbol in them has been renamed or
+# re-typed at some point in this project's life, and a `Gateway.start` that
+# changed shape would have left the page wrong with nothing failing.
+#
+# `Tests/NetstackTests/READMEExample.swift` holds them inside a function nothing
+# calls, so the test build type-checks them. That leaves the copy free to drift
+# from the page it stands in for, which this closes.
+if ! python3 scripts/smoke/readme_example.py; then
+    fail "the compiled copy of the README's examples is not what the README says" \
+        "regenerate it from the code blocks, or the page and the check disagree"
+fi
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

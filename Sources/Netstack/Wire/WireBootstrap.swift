@@ -103,6 +103,31 @@ public enum WireBootstrap {
         }
     }
 
+    /// Take over a pair of pipes -- ordinarily this process's own stdin and
+    /// stdout -- as the wire.
+    ///
+    /// This is upstream's `--listen-stdio`, whose framing it documents as
+    /// "HyperKitProtocol without the handshake": two little-endian length bytes
+    /// and then the frame, which is `.hyperkit` here. The caller passes the two
+    /// descriptors rather than this reaching for 0 and 1 itself, because a
+    /// library that took over the process's standard streams on its own would be
+    /// making a decision that belongs to the program.
+    ///
+    /// **Ownership passes to NIO**, which closes both when the channel closes.
+    /// Whatever the process was going to say on stdout has to go somewhere else
+    /// before this is called: a frame and a log line on the same descriptor
+    /// makes the log line part of a frame.
+    public static func adoptingPipes(
+        input: CInt, output: CInt, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        framing: StreamFraming = .hyperkit
+    ) -> EventLoopFuture<WireLinkEndpoint> {
+        NIOPipeBootstrap(group: group)
+            .takingOwnershipOfDescriptors(input: input, output: output)
+            .flatMap { channel in
+                configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing)
+            }
+    }
+
     /// Connect a unix stream socket to `path`, carrying length-prefixed frames.
     public static func connectingStreamSocket(
         toPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,

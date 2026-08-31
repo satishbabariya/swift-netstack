@@ -391,7 +391,14 @@ real internet is a check that fails for reasons of its own. And it drives
 the **`--listen-qemu` wire**, where a four-byte big-endian length says where
 each frame ends, because a whole entry point nobody drives is a whole entry
 point that can be wrong — then disconnects and comes back, the way a rebooting
-VM does. It joins a guest through **`POST /connect`**, which hands the connection to the
+VM does. It runs a whole gateway over **`--listen-stdio`**, where the wire is the
+process's own pipes — and requires stdout to carry nothing but frames while the
+program's messages appear on stderr, because on that wire a printed line lands
+in the middle of a frame. That second half is asserted on stderr rather than on
+stdout's cleanliness: `print` to a pipe is block-buffered, so a gateway printing
+into the wire writes nothing for the first four kilobytes, and a check watching
+only stdout passed with the redirection removed. It joins a guest through
+**`POST /connect`**, which hands the connection to the
 switch and stops being HTTP — with no status line, no body, nothing, because
 that silence is upstream's contract and a gateway that answered "200 OK" would
 put three bytes at the front of every client's first frame. And it opens

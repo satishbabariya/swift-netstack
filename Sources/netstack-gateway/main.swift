@@ -19,6 +19,7 @@ struct Options {
     var listenPath: String?
     var listenStream: String?
     var listenSwitch: String?
+    var listenStdio = false
     var controlEndpoints: [String] = []
     var servicesEndpoints: [String] = []
     var pidFile: String?
@@ -65,7 +66,12 @@ struct Options {
             case "--listen-vfkit": options.listenPath = try value(flag)
             case "--listen-qemu": options.listenStream = try value(flag)
             case "--listen-switch": options.listenSwitch = try value(flag)
-            case "--listen-stdio", "--listen-bess", "--listen-vpnkit":
+            case "--listen-stdio":
+                // Upstream takes a value here and only checks that it is not
+                // empty, so the value is consumed and ignored the same way.
+                _ = try value(flag)
+                options.listenStdio = true
+            case "--listen-bess", "--listen-vpnkit":
                 throw OptionError.unsupportedWire(flag)
             case "--dns": options.upstreamResolver = try value(flag)
             case "--gatewayIP": options.gateway = try value(flag)
@@ -132,12 +138,14 @@ enum OptionError: Error, CustomStringConvertible {
                 + "hyperkit's handshake. Use --listen-vfkit for a datagram socket or --listen-qemu for a "
                 + "stream one."
         case .conflictingWires:
-            return "--listen-vfkit, --listen-qemu and --listen-switch are different wires; pick one"
+            return "--listen-vfkit, --listen-qemu, --listen-switch and --listen-stdio are "
+                + "different wires; pick one"
         case .noWire:
             return
                 "no guest wire: pass --listen-vfkit <path> for a datagram socket, --listen-qemu "
-                + "<path> for a stream one, or --listen-switch <path> for a stream socket that "
-                + "carries several guests. (--listen is the control API, as in gvproxy.)"
+                + "<path> for a stream one, --listen-switch <path> for a stream socket that "
+                + "carries several guests, or --listen-stdio for this process's own pipes. "
+                + "(--listen is the control API, as in gvproxy.)"
         case .help: return usage
         }
     }
@@ -159,6 +167,10 @@ let usage = """
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
       --listen-qemu <path>       Stream socket with length-prefixed frames (qemu),
                                  carrying one guest
+      --listen-stdio <ignored>   The wire is this process's own stdin and stdout,
+                                 framed with two little-endian length bytes. Every
+                                 message this program prints goes to stderr then,
+                                 because stdout is the wire
       --listen-switch <path>     The same framing, carrying every guest that
                                  connects, each on its own port of a switch.
                                  Guests reach each other directly
@@ -261,7 +273,9 @@ if let text = options.subnet {
 
 // The wire is checked now: after the file has had its chance to be wrong about
 // something more specific.
-let wires = [options.listenPath, options.listenStream, options.listenSwitch].compactMap { $0 }
+let wires =
+    [options.listenPath, options.listenStream, options.listenSwitch].compactMap { $0 }
+    + (options.listenStdio ? ["(stdin and stdout)"] : [])
 if wires.isEmpty {
     FileHandle.standardError.write(Data("error: \(OptionError.noWire)\n\n\(usage)\n".utf8))
     exit(2)
@@ -311,6 +325,20 @@ func awaitTerminationSignal() -> Int32 {
 enum ControlEndpoint {
     case unix(String)
     case tcp(String, Int)
+}
+
+/// Say something, on the right descriptor.
+///
+/// `--listen-stdio` makes stdout the wire, and a line printed there lands in the
+/// middle of a frame -- the guest's decoder reads its first two bytes as a
+/// length and everything after that is noise. So every message this program
+/// prints goes through here, and goes to stderr when stdout is spoken for.
+func announce(_ text: String, toStandardError: Bool) {
+    if toStandardError {
+        FileHandle.standardError.write(Data((text + "\n").utf8))
+    } else {
+        print(text)
+    }
 }
 
 func controlEndpoint(_ text: String) throws -> ControlEndpoint {
@@ -386,9 +414,16 @@ do {
     // descriptor the way an embedding host does.
     let path = wires[0]
 
-    print("netstack-gateway: waiting for a guest on \(path)")
+    announce("netstack-gateway: waiting for a guest on \(path)", toStandardError: options.listenStdio)
     let starting: EventLoopFuture<Gateway>
-    if options.listenSwitch != nil {
+    if options.listenStdio {
+        // Ownership of both descriptors passes to NIO, which closes them with
+        // the channel. Nothing may print to stdout from here on -- see
+        // `announce`.
+        starting = Gateway.start(
+            overPipes: STDIN_FILENO, output: STDOUT_FILENO, group: group,
+            configuration: configuration)
+    } else if options.listenSwitch != nil {
         starting = Gateway.start(
             switchListeningOnStreamSocketAt: path, group: group, configuration: configuration)
     } else if options.listenStream != nil {
@@ -413,7 +448,7 @@ do {
     for forward in options.forwards + file.forwards {
         guard let address = IPv4Address(forward.guest) else { continue }
         _ = try gateway.forward(hostPort: forward.host, toGuest: address, port: forward.guestPort).wait()
-        print("netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on 127.0.0.1:\(forward.host)")
+        announce("netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on 127.0.0.1:\(forward.host)", toStandardError: options.listenStdio)
     }
 
     // One plane per endpoint. `--listen` is repeatable upstream, and the planes
@@ -430,7 +465,7 @@ do {
             try plane.listen(host: host, port: port).wait()
         }
         planes.append(plane)
-        print("netstack-gateway: \(attaches ? "control API" : "services API") on \(endpoint)")
+        announce("netstack-gateway: \(attaches ? "control API" : "services API") on \(endpoint)", toStandardError: options.listenStdio)
     }
     _ = planes
 
@@ -456,7 +491,7 @@ do {
             "gateway": .string(configuration.gatewayAddress.description),
             "subnet": .string(configuration.subnet.description),
         ])
-    print("netstack-gateway: running")
+    announce("netstack-gateway: running", toStandardError: options.listenStdio)
 
     // Interrupted rather than killed.
     //
@@ -472,7 +507,7 @@ do {
     // capture on the way through, so this needs no knowledge of what is being
     // closed.
     let received = awaitTerminationSignal()
-    print("netstack-gateway: stopping on \(received == SIGINT ? "SIGINT" : "SIGTERM")")
+    announce("netstack-gateway: stopping on \(received == SIGINT ? "SIGINT" : "SIGTERM")", toStandardError: options.listenStdio)
     try? gateway.close().wait()
     try? group.syncShutdownGracefully()
     // Removed only on a clean stop. A PID file left behind by a crash is how a

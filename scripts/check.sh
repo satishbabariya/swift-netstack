@@ -22,6 +22,7 @@ quick=0
 [[ "${1:-}" == "--quick" ]] && quick=1
 
 status=0
+failed=()
 
 # Output is held and printed only when the step fails. A gate runner whose
 # passing output is four thousand lines of green is one whose summary nobody
@@ -36,6 +37,7 @@ step() {
     else
         echo "✘ $name"
         sed 's/^/    /' "$held"
+        failed+=("$name")
         status=1
     fi
     rm -f "$held"
@@ -74,6 +76,13 @@ echo
 if [[ $status -eq 0 ]]; then
     echo "✔ every gate holds"
 else
-    echo "✘ something above did not hold"
+    # Named again, at the end, because the detail is printed where it happened
+    # and a long run is read from the bottom. "something above did not hold" is
+    # true and useless: it sent me back to search a few thousand lines three
+    # times in one day, and twice I did not search far enough and pushed anyway.
+    echo "✘ these did not hold:"
+    for name in "${failed[@]}"; do
+        echo "    - $name"
+    done
 fi
 exit $status

@@ -169,6 +169,30 @@ for helper in ones_complement; do
     fi
 done
 
+
+# 9. Guest-caused logging goes through the rate limiter.
+#
+# The README says a hostile guest cannot flood the host's disk through the log,
+# and unlike the capture file -- which is capped at 64 MiB for the same reason --
+# nothing bounds the log's size. What bounds it is that every guest-causable
+# event goes through `RateLimitedLogger`, which is keyed on a closed enum and
+# emits one line per kind per window.
+#
+# So a direct `logger.warning(...)` in the library is not a style question. It is
+# a line a guest can cause as fast as it can send frames, on a disk nothing else
+# is watching. The one allowed exception is the startup path in `Gateway`, which
+# runs once before any guest exists.
+# Matched on the method rather than on a variable called `logger`, which is the
+# narrower rule this started as -- and which a `Logger` stored under any other
+# name walked straight past. Checked against the whole library: the broad pattern
+# finds exactly one line, and it is the exception below.
+direct=$(grep -rnE "\.(debug|info|notice|warning|error|critical)\(" Sources/Netstack \
+    | grep -v "Sources/Netstack/Observability/NetstackLog.swift" \
+    | grep -v "could not open the capture file")
+if [[ -n "$direct" ]]; then
+    fail "library logging that does not go through the rate limiter" "$direct"
+fi
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

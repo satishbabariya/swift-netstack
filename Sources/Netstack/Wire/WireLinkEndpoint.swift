@@ -173,6 +173,26 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
                 log?.record(.outboundFrameDropped, ["reason": .string("no guest is on the wire")])
                 continue
             }
+            // A link drops when its queue is full, and this is that queue.
+            //
+            // Without this the stream wires had no bound at all: NIO holds
+            // whatever cannot be written yet, so a guest that asks questions and
+            // never reads the answers grows that queue as fast as it can ask.
+            // Measured at four hundred thousand ARP requests, read nothing:
+            //
+            //     rss before:   8432 KiB
+            //     rss after:  153568 KiB
+            //
+            // The datagram wire was hardened against exactly this and the stream
+            // wires -- every multi-guest one -- were not. `isWritable` is false
+            // once NIO holds more than the high watermark, so the bound is that
+            // watermark plus the frame in hand.
+            guard channel.isWritable else {
+                outboundDropped += 1
+                outboundBackedUp += 1
+                log?.record(.outboundFrameDropped, ["reason": .string("the peer is not reading")])
+                continue
+            }
             channel.write(frame, promise: nil)
             bytesSent += frame.readableBytes
             wrote = true

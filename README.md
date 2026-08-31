@@ -532,6 +532,10 @@ generator withholds nothing: both stacks negotiate window scaling, timestamps an
 SACK, and 10,000 randomised sequences agree frame for frame apart from three
 documented differences, each with a reason recorded in `differential/README.md`.
 
+It exposes and unexposes over **UDP** as well as TCP, which nothing exercised at
+all until that was written — a forward is two halves and only the TCP half of
+each had ever been driven.
+
 `scripts/interop.sh` starts a gateway and drives it with **gvisor-tap-vsock's own
 client library**, pinned at v0.8.9. Every other comparison with upstream here
 rests on having read upstream correctly — and reading is what put `--listen` on

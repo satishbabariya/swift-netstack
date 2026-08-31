@@ -100,5 +100,52 @@ func main() {
 	}
 	fmt.Println("OK   Unexpose")
 
+	// UDP, which nothing exercised until this was written -- not a test, not a
+	// script, not this driver. A forward is two halves and only the TCP half of
+	// each was ever driven; the UDP expose and unexpose reached the gateway
+	// through no path at all.
+	//
+	// Through upstream's client rather than by hand, because the protocol field
+	// has to survive its types as well as this gateway's parsing: "udp" is what
+	// upstream sends, and a gateway that only recognised "tcp" would answer this
+	// with a 400 nobody had ever seen.
+	if err := c.Expose(&types.ExposeRequest{
+		Local: ":0", Remote: "192.168.127.2:9999", Protocol: types.UDP,
+	}); err != nil {
+		fail("Expose udp", err)
+	}
+	fmt.Println("OK   Expose udp")
+
+	withUDP, err := c.List()
+	if err != nil {
+		fail("List after exposing udp", err)
+	}
+	var udpLocal string
+	for _, forward := range withUDP {
+		if forward.Protocol == types.UDP {
+			udpLocal = forward.Local
+		}
+	}
+	if udpLocal == "" {
+		fail("List after exposing udp", fmt.Errorf("no udp forward in %v", withUDP))
+	}
+	fmt.Printf("OK   the udp forward is listed as %s\n", udpLocal)
+
+	if err := c.Unexpose(&types.UnexposeRequest{Local: udpLocal, Protocol: types.UDP}); err != nil {
+		fail("Unexpose udp", err)
+	}
+	fmt.Println("OK   Unexpose udp")
+
+	afterUDP, err := c.List()
+	if err != nil {
+		fail("List after unexposing udp", err)
+	}
+	for _, forward := range afterUDP {
+		if forward.Protocol == types.UDP {
+			fail("Unexpose udp", fmt.Errorf("the forward is still listed: %v", forward))
+		}
+	}
+	fmt.Println("OK   and it is gone from the list")
+
 	fmt.Println("\nupstream's client library drove this gateway end to end")
 }

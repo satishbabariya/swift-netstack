@@ -282,6 +282,27 @@ broadcast are never forwarded, matching upstream. If the host will not open an
 unprivileged ICMP socket, the gateway answers locally as it did before, because
 a ping that works badly beats a network that fails to start.
 
+### What is not here
+
+**SSH forwarding.** gvproxy's `--forward-sock`, `--forward-dest`,
+`--forward-user`, `--forward-identity` and `--ssh-port` publish a unix socket on
+the host and carry it to the guest over SSH — how podman machine reaches the
+guest's podman socket. It is deliberately absent rather than overlooked.
+
+Upstream keeps it in a package that merely *uses* the virtual network as a
+dialer, which is the right shape: it sits on top of the stack rather than being
+part of it. Porting it is not 425 lines of Swift the way it is 425 lines of Go,
+because Go's standard library supplies the parts this would have to add — an SSH
+client, a parser for OpenSSH's private key format including its own KDF for
+encrypted keys, and the `direct-streamlocal@openssh.com` channel extension. That
+is a crypto dependency and a protocol implementation, and neither can be checked
+the way everything else here is checked without an SSH server to check against.
+
+Everything else gvproxy has is here. Every wire — `--listen-vfkit`,
+`--listen-qemu`, `--listen-vpnkit`, `--listen-stdio`, `--listen-bess`, and
+`--listen-switch` for several guests on one socket — and every other flag, and
+the control API route for route.
+
 ## Design
 
 Every packet, timer, and endpoint state transition runs on a single

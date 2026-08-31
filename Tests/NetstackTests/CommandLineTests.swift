@@ -362,3 +362,33 @@ private func statusOf(tcpPort port: Int, path: String) -> Int? {
     guard connectTo(descriptor, loopbackAddress(port: UInt16(port))) == 0 else { return nil }
     return httpStatus(descriptor, path)
 }
+
+// What the program says when it cannot do what it was asked.
+//
+// Both of these were wrong in the same direction: an operator was told
+// something true about the wrong thing, or nothing at all.
+@Test func aGatewayThatCannotDoWhatItWasAskedSaysWhichPart() async throws {
+    let binary = gatewayBinary()
+    guard !binary.isEmpty else { return }
+
+    // A capture file that cannot be opened used to be logged and stepped over,
+    // so the gateway ran and the operator debugged for a while before noticing
+    // they had no capture. Upstream refuses to start, and upstream is right --
+    // the whole failure that made --pcap produce an empty file was believing you
+    // have a record when you do not.
+    //
+    // It refused with "endpoint is not connected" at first, because
+    // PacketCapture threw StackError.notConnected: an unrelated error reused
+    // because it was to hand, invisible while the only caller swallowed it.
+    if let refused = run([
+        "--listen-vfkit", "/tmp/netstack-err-check.sock", "--pcap", "/no/such/dir/x.pcap",
+    ]) {
+        #expect(refused.status != 0, "a gateway started with a capture it could not write")
+        #expect(
+            refused.output.contains("/no/such/dir/x.pcap"),
+            "the error does not name the file: \(refused.output)")
+        #expect(
+            refused.output.contains("capture"),
+            "the error does not say what it is about: \(refused.output)")
+    }
+}

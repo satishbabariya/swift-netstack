@@ -241,7 +241,7 @@ because a missing row breaks nothing.
 
 | Flag | What it does |
 |---|---|
-| `--config <path>` | Configuration file, in gvproxy's shape as JSON |
+| `--config <path>` | Configuration file, in gvproxy's shape as JSON. A forwards entry prefixed `udp:` on the host side is a datagram forward, as upstream spells it |
 | `--listen <endpoint>` | HTTP control API: `unix://<path>`, `tcp://<host>:<port>`, or a bare path. Repeatable |
 | `--services <endpoint>` | The same API without `/connect`, for an endpoint a guest may reach. Repeatable |
 | `--listen-vfkit <path>` | Datagram socket the guest dials. One datagram is one frame |

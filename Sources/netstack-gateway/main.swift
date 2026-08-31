@@ -35,7 +35,8 @@ struct Options {
     var notifySocket: String?
     var host: String?
     var allowsLinkLocal = false
-    var forwards: [(host: Int, guest: String, guestPort: UInt16)] = []
+    typealias Forward = (host: Int, guest: String, guestPort: UInt16, transport: FileConfiguration.Transport)
+    var forwards: [Forward] = []
 
     /// Hand-rolled rather than a dependency: an argument parser would be a
     /// package in the dependency graph of everything that links this library.
@@ -97,7 +98,7 @@ struct Options {
                 guard parts.count == 3, let host = Int(parts[0]), let guestPort = UInt16(parts[2]),
                     IPv4Address(String(parts[1])) != nil
                 else { throw OptionError.badValue(flag, text) }
-                options.forwards.append((host, String(parts[1]), guestPort))
+                options.forwards.append((host, String(parts[1]), guestPort, .tcp))
             case "--help", "-h":
                 throw OptionError.help
             default:
@@ -469,8 +470,19 @@ do {
 
     for forward in options.forwards + file.forwards {
         guard let address = IPv4Address(forward.guest) else { continue }
-        _ = try gateway.forward(hostPort: forward.host, toGuest: address, port: forward.guestPort).wait()
-        announce("netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on 127.0.0.1:\(forward.host)", toStandardError: options.listenStdio)
+        switch forward.transport {
+        case .tcp:
+            _ = try gateway.forward(hostPort: forward.host, toGuest: address, port: forward.guestPort)
+                .wait()
+        case .udp:
+            _ = try gateway.forwardUDP(
+                hostPort: forward.host, toGuest: address, port: forward.guestPort
+            ).wait()
+        }
+        announce(
+            "netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on "
+                + "127.0.0.1:\(forward.host) over \(forward.transport == .udp ? "udp" : "tcp")",
+            toStandardError: options.listenStdio)
     }
 
     // One plane per endpoint. `--listen` is repeatable upstream, and the planes

@@ -35,7 +35,16 @@ struct FileConfiguration {
     var dialTimeout: Int?
     var zones: [DNSServer.Zone] = []
     /// Upstream's `forwards` is host address to guest address, both `host:port`.
-    var forwards: [(host: Int, guest: String, guestPort: UInt16)] = []
+    /// A forward's transport, which upstream spells as a prefix on the host side
+    /// of the entry: `"udp:127.0.0.1:5353": "192.168.127.2:53"`.
+    ///
+    /// Without this the prefix was skipped and every entry became a TCP forward,
+    /// because the parser took the last colon-separated component as the port
+    /// and `udp:127.0.0.1:5353` ends in one. A DNS forward -- the reason the
+    /// prefix exists -- listened on TCP and never saw a datagram.
+    enum Transport { case tcp, udp }
+
+    var forwards: [(host: Int, guest: String, guestPort: UInt16, transport: Transport)] = []
     var debug = false
     var captureFile: String?
 
@@ -139,12 +148,17 @@ struct FileConfiguration {
         // `forwards` maps a host endpoint to a guest one, both `host:port`, and
         // upstream's own default omits the host on the left.
         for (local, remote) in (jsonField(fields, "forwards") as? [String: String]) ?? [:] {
-            guard let hostPort = Int(local.split(separator: ":").last ?? ""),
+            // `udp:` in front of the host side means a datagram forward, which is
+            // upstream's spelling. Anything else is TCP.
+            let transport: Transport = local.hasPrefix("udp:") ? .udp : .tcp
+            let hostSide = transport == .udp ? String(local.dropFirst("udp:".count)) : local
+            guard let hostPort = Int(hostSide.split(separator: ":").last ?? ""),
                 let separator = remote.lastIndex(of: ":"),
                 let guestPort = UInt16(remote[remote.index(after: separator)...]),
                 IPv4Address(String(remote[remote.startIndex..<separator])) != nil
             else { throw Failure.badValue("forwards", "\(local): \(remote)") }
-            forwards.append((hostPort, String(remote[remote.startIndex..<separator]), guestPort))
+            forwards.append(
+                (hostPort, String(remote[remote.startIndex..<separator]), guestPort, transport))
         }
 
         for entry in (jsonField(fields, "dns") as? [[String: Any]]) ?? [] {

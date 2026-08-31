@@ -17,13 +17,14 @@ CONFIG=""
 CONTROL=""
 RESOLVER=""
 CAPTURE=""
+NOTIFY=""
 GATEWAY=""
 LISTENER=""
 ECHO_PID=""
 cleanup() {
     [[ -n "$GATEWAY" ]] && kill "$GATEWAY" 2>/dev/null
     [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null
-    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "$RESOLVER" "$CAPTURE" "${LISTENER:-/nonexistent}.port"
+    rm -f "$WIRE" "$CONFIG" "$CONTROL" "$LISTENER" "$RESOLVER" "$CAPTURE" "$NOTIFY" "${LISTENER:-/nonexistent}.port"
 }
 trap cleanup EXIT INT TERM
 
@@ -1689,6 +1690,255 @@ PY
     return $outcome
 }
 
+# The socket a supervisor waits on.
+#
+# `--notification` is how whatever started this gateway learns it is up. Upstream
+# dials the socket per message and closes it, and encodes with Go's
+# `json.Encoder`, which appends a newline -- so the reader on the other end is
+# reading newline-delimited JSON and a message without the newline would leave it
+# blocking on a line that never ends.
+#
+# The listener is opened BEFORE the gateway starts, because that is the order a
+# supervisor uses: nothing to connect to means the notification is lost, and a
+# check that started them the other way round would be testing its own timing.
+notification_smoke() {
+    NOTIFY="${TMPDIR:-/tmp}/netstack-smoke-notify-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-notify-wire-$$.sock"
+    rm -f "$NOTIFY" "$WIRE"
+
+    BINARY="$binary" NOTIFY="$NOTIFY" WIRE="$WIRE" python3 - <<'PY'
+import json, os, socket, subprocess, sys
+
+notify, wire = os.environ["NOTIFY"], os.environ["WIRE"]
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(notify)
+server.listen(8)
+server.settimeout(20)
+
+process = subprocess.Popen(
+    [os.environ["BINARY"], "--listen-vfkit", wire, "--notification", notify],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    try:
+        connection, _ = server.accept()
+    except socket.timeout:
+        print("FAIL: nothing was said on the notification socket within 20s")
+        sys.exit(1)
+    connection.settimeout(10)
+    said = b""
+    while b"\n" not in said:
+        try:
+            chunk = connection.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        said += chunk
+    connection.close()
+
+    if not said.endswith(b"\n"):
+        print("FAIL: the notification is not newline-terminated:", repr(said),
+              "-- the reader on the other end is reading lines")
+        sys.exit(1)
+    try:
+        message = json.loads(said)
+    except ValueError:
+        print("FAIL: the notification is not JSON:", repr(said))
+        sys.exit(1)
+    if message.get("notification_type") != "ready":
+        print("FAIL: the gateway announced", message, "rather than ready")
+        sys.exit(1)
+    print("ok: notify the gateway announced itself ready, as newline-delimited JSON")
+finally:
+    process.terminate()
+    process.wait()
+    server.close()
+    os.unlink(notify)
+PY
+    local outcome=$?
+    rm -f "$WIRE" "$NOTIFY"
+    return $outcome
+}
+
+# A host-side client dialled into the guest.
+#
+# `GET /tunnel?ip=&port=` is the other way for something on the host to reach a
+# guest: rather than publishing a port, the caller asks the control API to make
+# *this* connection into one. The connection stops being HTTP and the raw bytes
+# on it are the guest's.
+#
+# It is not silent, unlike `/connect`: upstream writes a literal `OK` -- not an
+# HTTP response, because the connection stopped being HTTP a moment earlier --
+# and a client waits for it before sending. So the two-byte answer is part of the
+# contract, and a gateway that spliced without it would leave every caller
+# waiting.
+tunnel_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-tunnel-ctl-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-tunnel-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" && -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" && -S "$CONTROL" ]] || { echo "FAIL: the tunnel gateway never came up"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
+import os, socket, struct, sys, threading
+
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
+
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
+described = os.environ.get("ARGS") or "(defaults)"
+GUEST_MAC = bytes.fromhex("5a94efe4bc00")
+GATEWAY_MAC = bytes.fromhex("5a94efe40cee")
+GUEST_PORT = 9090
+SYN, ACK, PSH, RST = 0x02, 0x10, 0x08, 0x04
+
+wire = os.environ["WIRE"]
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+
+body = b"through the tunnel"
+seen = {}
+
+
+def tcp_frame(source, destination, sport, dport, sequence, ack, flags, payload=b""):
+    header = (
+        sport.to_bytes(2, "big") + dport.to_bytes(2, "big")
+        + sequence.to_bytes(4, "big") + ack.to_bytes(4, "big")
+        + bytes([5 << 4, flags]) + (65535).to_bytes(2, "big") + b"\x00\x00\x00\x00"
+    )
+    segment = header + payload
+    pseudo = source + destination + b"\x00\x06" + len(segment).to_bytes(2, "big")
+    segment = (segment[:16] + ones_complement(pseudo + segment).to_bytes(2, "big")
+               + segment[18:])
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(segment)).to_bytes(2, "big")
+        + b"\x00\x00\x40\x00\x40\x06\x00\x00" + source + destination
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    return GATEWAY_MAC + GUEST_MAC + b"\x08\x00" + bytes(ip) + segment
+
+
+def caller():
+    """The thing on the host that wants to reach the guest."""
+    try:
+        control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        control.settimeout(20)
+        control.connect(os.environ["CONTROL"])
+        control.sendall(
+            ("GET /tunnel?ip=%s&port=%d HTTP/1.1\r\nHost: gateway\r\n\r\n"
+             % (printable(guest), GUEST_PORT)).encode())
+        # `OK`, then the connection is the guest's.
+        hello = b""
+        while len(hello) < 2:
+            chunk = control.recv(2 - len(hello))
+            if not chunk:
+                seen["error"] = "the control plane closed before saying OK"
+                return
+            hello += chunk
+        seen["hello"] = hello
+        control.sendall(body)
+        echoed = b""
+        while len(echoed) < len(body):
+            chunk = control.recv(4096)
+            if not chunk:
+                break
+            echoed += chunk
+        seen["echoed"] = echoed
+        control.close()
+    except Exception as error:
+        seen["error"] = error
+
+
+try:
+    s.connect(wire)
+    # The guest announces itself, so the gateway knows where to send the dial.
+    s.send(
+        b"\xff\xff\xff\xff\xff\xff" + GUEST_MAC + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + GUEST_MAC + guest + b"\x00" * 6 + gateway)
+
+    thread = threading.Thread(target=caller, daemon=True)
+    thread.start()
+
+    s.settimeout(20)
+    peer = None
+    their_port = None
+    sequence = 7000
+    theirs = 0
+    echoed_back = 0
+    missing = "no SYN arrived from the gateway"
+    while echoed_back < len(body):
+        try:
+            frame = s.recv(4096)
+        except socket.timeout:
+            print("FAIL:", missing, "for", described)
+            sys.exit(1)
+        if len(frame) < 42 or frame[12:14] != b"\x08\x00":
+            continue
+        packet = frame[14:int.from_bytes(frame[16:18], "big") + 14]
+        if len(packet) < 20 or packet[9] != 6 or packet[16:20] != guest:
+            continue
+        segment = packet[(packet[0] & 0x0F) * 4:]
+        if int.from_bytes(segment[2:4], "big") != GUEST_PORT:
+            continue
+        flags = segment[13]
+        their_sequence = int.from_bytes(segment[4:8], "big")
+        payload = segment[(segment[12] >> 4) * 4:]
+
+        if flags & SYN and not flags & ACK:
+            peer, their_port = packet[12:16], int.from_bytes(segment[0:2], "big")
+            theirs = their_sequence + 1
+            s.send(tcp_frame(guest, peer, GUEST_PORT, their_port, sequence, theirs, SYN | ACK))
+            sequence += 1
+            missing = "the handshake was answered but no data came through the tunnel"
+            continue
+        if peer is None:
+            continue
+        if flags & RST:
+            print("FAIL: the gateway reset the tunnelled connection for", described)
+            sys.exit(1)
+        if payload and their_sequence == theirs:
+            theirs += len(payload)
+            s.send(tcp_frame(guest, peer, GUEST_PORT, their_port, sequence, theirs,
+                             PSH | ACK, payload))
+            echoed_back += len(payload)
+            missing = "the guest echoed but the caller never saw it"
+
+    thread.join(20)
+    if "error" in seen:
+        print("FAIL: the caller failed:", seen["error"], "for", described)
+        sys.exit(1)
+    if seen.get("hello") != b"OK":
+        print("FAIL: /tunnel said", seen.get("hello"), "rather than OK --",
+              "a client waits for that before it sends, for", described)
+        sys.exit(1)
+    if seen.get("echoed") != body:
+        print("FAIL: the caller read", seen.get("echoed"), "rather than", body,
+              "for", described)
+        sys.exit(1)
+    print("ok: tunnel", len(body), "bytes host -> guest -> host through /tunnel for",
+          described)
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -1748,5 +1998,11 @@ stdio_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the wire that opens with a handshake.
 vpnkit_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And the socket a supervisor waits on.
+notification_smoke || status=1
+
+# And a host-side client dialled into the guest.
+tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

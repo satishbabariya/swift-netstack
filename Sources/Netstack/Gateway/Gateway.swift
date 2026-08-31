@@ -291,6 +291,28 @@ public final class Gateway: @unchecked Sendable {
         }
     }
 
+    /// Run the wire over a pair of pipes -- ordinarily this process's own stdin
+    /// and stdout.
+    ///
+    /// Upstream's `--listen-stdio`. The hypervisor spawns this process and talks
+    /// to it through the pipes it already has, so there is no socket to find and
+    /// nothing to clean up afterwards.
+    ///
+    /// The program must have moved its own output off `output` first. A log line
+    /// written to the same descriptor lands in the middle of a frame, and the
+    /// guest's decoder reads it as a length.
+    public static func start(
+        overPipes input: CInt, output: CInt, group: EventLoopGroup,
+        configuration: Configuration = Configuration()
+    ) -> EventLoopFuture<Gateway> {
+        WireBootstrap.adoptingPipes(
+            input: input, output: output, group: group, linkAddress: configuration.linkAddress,
+            mtu: configuration.mtu
+        ).flatMap { link in
+            assemble(on: link, group: group, configuration: configuration)
+        }
+    }
+
     /// Bind a unix stream socket and serve **every** guest that connects, each
     /// on its own port of a `NetworkSwitch`.
     ///

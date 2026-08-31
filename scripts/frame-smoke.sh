@@ -1506,6 +1506,101 @@ PY
     return $outcome
 }
 
+# The wire that is this process's own pipes.
+#
+# `--listen-stdio` has no socket: the hypervisor spawns the gateway and speaks to
+# it through the pipes it already has. Upstream documents the framing as
+# "HyperKitProtocol without the handshake" -- two little-endian length bytes and
+# then the frame.
+#
+# It has a hazard the socket wires do not, and the hazard is the reason this
+# check reads stdout strictly rather than looking for a frame somewhere in it:
+# stdout IS the wire, so every line the program would print lands in the middle
+# of one. The guest's decoder reads the first two bytes of "netstack-gateway: "
+# as a length of 25966 and everything after it is noise.
+stdio_smoke() {
+    local expected="$1" guest="$2"
+    EXPECTED="$expected" GUEST="$guest" BINARY="$binary" python3 - <<'PY'
+import os, select, struct, subprocess, sys
+
+gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+mac = bytes.fromhex("5a94efe4bc00")
+
+process = subprocess.Popen(
+    [os.environ["BINARY"], "--listen-stdio", "on"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    frame = (
+        b"\xff\xff\xff\xff\xff\xff" + mac + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + mac + guest + b"\x00" * 6 + gateway
+    )
+    process.stdin.write(struct.pack("<H", len(frame)) + frame)
+    process.stdin.flush()
+
+    held = b""
+    answered = False
+    for _ in range(80):
+        ready, _, _ = select.select([process.stdout], [], [], 0.25)
+        if not ready:
+            continue
+        chunk = os.read(process.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        held += chunk
+        while len(held) >= 2:
+            length = struct.unpack("<H", held[:2])[0]
+            # Strict, and deliberately so: anything on stdout that is not a frame
+            # is the bug this wire invites. A message printed there reads as a
+            # length of tens of thousands.
+            if length > 1600:
+                print("FAIL: stdout carried something that is not a frame --",
+                      repr(held[:48]), "-- stdout is the wire on --listen-stdio")
+                sys.exit(1)
+            if len(held) < 2 + length:
+                break
+            body, held = held[2:2 + length], held[2 + length:]
+            if len(body) >= 42 and body[12:14] == b"\x08\x06" and body[20:22] == b"\x00\x02":
+                if body[28:32] != gateway:
+                    continue
+                answered = True
+                break
+        if answered:
+            break
+
+    if not answered:
+        print("FAIL: no ARP reply over stdio within 20s")
+        sys.exit(1)
+    print("ok: stdio ARP", ".".join(map(str, gateway)),
+          "answered over this process's own pipes")
+
+    # And the program's own messages went somewhere else.
+    #
+    # Asserted on stderr rather than only on stdout's cleanliness, because
+    # `print` to a pipe is block-buffered: a gateway printing into the wire
+    # writes nothing until four kilobytes have piled up, so a check that only
+    # watched stdout passed with the redirection removed. It would have
+    # corrupted the wire later, on a longer run, which is worse than failing.
+    process.terminate()
+    _, complaints = process.communicate(timeout=15)
+    said = complaints.decode(errors="replace")
+    # The line printed BEFORE the wire is adopted, so it has certainly been
+    # written by the time a frame has been answered. "running" comes later --
+    # after the forwards and the control endpoints -- and terminating on the
+    # first reply beats it there.
+    if "netstack-gateway: waiting for a guest" not in said:
+        print("FAIL: the gateway said nothing on stderr, so its output is going",
+              "into the wire:", repr(said[:120]))
+        sys.exit(1)
+    print("ok: stdio every message went to stderr, leaving stdout to the frames")
+    sys.exit(0)
+finally:
+    process.kill()
+    process.wait()
+PY
+}
+
 status=0
 
 # The defaults.
@@ -1559,5 +1654,8 @@ icmp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 # And a guest that arrives through the control API rather than over a socket.
 connect_smoke 192.168.127.1 192.168.127.9 || status=1
+
+# And the wire that has no socket at all.
+stdio_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

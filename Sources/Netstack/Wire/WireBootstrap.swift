@@ -441,6 +441,15 @@ public enum WireBootstrap {
                                 capacity: Int(mtu) + EthernetHeader.length)
                         )
                         .takingOwnershipOfDescriptor(inputOutput: guest)
+                        // On failure NIO hands the descriptor back and says so:
+                        // "you still own the file descriptor and are responsible
+                        // for closing them". Without this branch a failed adopt
+                        // leaks one per accepted connection, silently, on a path
+                        // nothing else watches.
+                        .flatMapErrorThrowing { error in
+                            close(guest)
+                            throw error
+                        }
                         .whenSuccess { channel in
                             guard
                                 let release = admit(

@@ -88,7 +88,7 @@ public final class ControlPlane: @unchecked Sendable {
     /// hazard worth naming: the path is deleted before it is bound, so pointing
     /// this at a path holding something other than a stale socket deletes it.
     public func listen(unixSocketPath path: String) -> EventLoopFuture<Void> {
-        try? FileManager.default.removeItem(atPath: path)
+        removeStaleSocket(at: path)
         return bootstrap().bind(unixDomainSocketPath: path).map { [weak self] channel in
             self?.channel = channel
         }

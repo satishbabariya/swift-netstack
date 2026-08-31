@@ -41,3 +41,4 @@ Sources/Netstack/Gateway/Gateway.swift	aConfigurationThatCannotServeAnyoneSaysSo
 Sources/Netstack/Gateway/DHCPServer.swift	theLeasePoolNeverContainsAnAddressTheGatewayAnswersFor	            if !taken.contains(address) { out.append(address) }	            out.append(address)
 Sources/Netstack/Gateway/DHCPServer.swift	aGuestThatKeepsRenewingIsNeverReclaimed	            for (owner, when) in leasedAt where now - when >= term {	            for (owner, when) in leasedAt where now >= when {
 Sources/Netstack/Gateway/DHCPServer.swift	anAddressComesBackAfterTheGuestHoldingItHasBeenGoneItsWholeTerm	        if pool.first(where: { !taken.contains($0) }) == nil {	        if false {
+Sources/Netstack/Wire/StaleSocket.swift	bindingOverAFileThatIsNotASocketLeavesItAlone	    guard info.st_mode & S_IFMT == S_IFSOCK else { return }	    if false { return }

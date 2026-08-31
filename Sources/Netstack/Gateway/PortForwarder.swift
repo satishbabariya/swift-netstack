@@ -76,7 +76,7 @@ public final class PortForwarder: @unchecked Sendable {
     /// and worth naming as a hazard: the path is deleted before it is bound, so
     /// pointing this at a file that is not a stale socket deletes that file.
     public func listen(unixSocketPath path: String) -> EventLoopFuture<Void> {
-        try? FileManager.default.removeItem(atPath: path)
+        removeStaleSocket(at: path)
         return bootstrap()
             .bind(unixDomainSocketPath: path)
             .map { [weak self] channel in

@@ -62,6 +62,45 @@ public final class Gateway: @unchecked Sendable {
         /// invented address.
         public var vpnKitAddresses: [String: MACAddress] = [:]
 
+        /// Ways this configuration cannot work, in words an operator can act on.
+        ///
+        /// Empty for a configuration that will serve guests. Not a precondition,
+        /// because a library that traps on a bad argument turns an operator's
+        /// typo into a crash -- the program checks this and refuses to start,
+        /// and an embedder can ask.
+        ///
+        /// The failure this exists for looks like success. A gateway whose own
+        /// address is outside the subnet it leases starts, binds its wire and
+        /// answers ARP for that address; the guest is then told its router is on
+        /// a network it is not on, and cannot install the route. Everything is
+        /// running and nothing works, which is the same shape as the
+        /// initialisation bug that made a gateway believe it was 0.0.0.0.
+        public var inconsistencies: [String] {
+            var found: [String] = []
+            if !subnet.contains(gatewayAddress) {
+                found.append(
+                    "the gateway's address \(gatewayAddress) is not inside the subnet \(subnet), "
+                        + "so a guest cannot route to its own router")
+            }
+            if !subnet.contains(hostAddress) {
+                found.append(
+                    "the host's address \(hostAddress) is not inside the subnet \(subnet), "
+                        + "so host.containers.internal names somewhere the guest cannot reach")
+            }
+            if gatewayAddress == hostAddress {
+                found.append(
+                    "the gateway and the host are both \(gatewayAddress); one of them has to be "
+                        + "somewhere else, since the gateway answers for itself and the host is "
+                        + "translated to the loopback")
+            }
+            for (hardware, leased) in dhcpStaticLeases where !subnet.contains(leased) {
+                found.append(
+                    "the static lease for \(hardware) is \(leased), which is not inside the "
+                        + "subnet \(subnet)")
+            }
+            return found
+        }
+
         public var captureFile: String?
         /// The cap on that file. Reaching it stops the capture.
         public var captureMaximumBytes: Int

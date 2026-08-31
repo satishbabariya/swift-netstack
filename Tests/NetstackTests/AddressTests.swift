@@ -89,3 +89,37 @@ import Testing
         gatewayAddress: IPv4Address("10.9.0.9")!, subnet: IPv4Subnet(cidr: "10.9.0.0/25")!)
     #expect(told.gatewayAddress == IPv4Address("10.9.0.9")!)
 }
+
+// A configuration that runs and serves nobody.
+//
+// A gateway whose own address is outside the subnet it leases starts, binds its
+// wire and answers ARP for that address. The guest is then told its router is on
+// a network it is not on, and cannot install the route. Everything is running
+// and nothing works — the same shape as the initialisation bug that made a
+// gateway believe it was 0.0.0.0, and the same shape as the hardcoded host
+// address that pointed off-subnet.
+//
+// Reported rather than trapped: a library that preconditions on a bad argument
+// turns an operator's typo into a crash. The program asks and refuses to start.
+@Test func aConfigurationThatCannotServeAnyoneSaysSoRatherThanRunning() {
+    let subnet = IPv4Subnet(cidr: "192.168.127.0/24")!
+
+    let offSubnet = Gateway.Configuration(
+        gatewayAddress: IPv4Address("10.0.0.1")!, subnet: subnet)
+    #expect(offSubnet.inconsistencies.count == 1, "\(offSubnet.inconsistencies)")
+    #expect(offSubnet.inconsistencies.first?.contains("cannot route to its own router") == true)
+
+    let sameAddress = Gateway.Configuration(
+        gatewayAddress: IPv4Address("192.168.127.5")!, subnet: subnet,
+        hostAddress: IPv4Address("192.168.127.5")!)
+    #expect(sameAddress.inconsistencies.contains { $0.contains("both 192.168.127.5") })
+
+    let strayLease = Gateway.Configuration(
+        subnet: subnet,
+        dhcpStaticLeases: [MACAddress("aa:bb:cc:dd:ee:ff")!: IPv4Address("10.0.0.9")!])
+    #expect(strayLease.inconsistencies.contains { $0.contains("static lease") })
+
+    // The ordinary case, and the derived one, are silent.
+    #expect(Gateway.Configuration(subnet: subnet).inconsistencies.isEmpty)
+    #expect(Gateway.Configuration(subnet: IPv4Subnet(cidr: "10.9.0.0/25")!).inconsistencies.isEmpty)
+}

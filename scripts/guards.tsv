@@ -37,3 +37,4 @@ Sources/Netstack/Wire/WireLinkEndpoint.swift	aStreamWireDropsRatherThanQueueingF
 Sources/Netstack/Wire/WireBootstrap.swift	theListeningDatagramWireSurvivesAGuestThatStopsReading	                        flushPerFrame: true, learnsPeer: true, rawDescriptor: descriptor)	                        flushPerFrame: true, learnsPeer: true)
 Sources/Netstack/Wire/WireBootstrap.swift	aDialledDatagramWireCarriesFramesBothWays	                bind(descriptor, address, socklen_t(size))	                0
 Sources/Netstack/Wire/WireLinkEndpoint.swift	aWireThatIsBackingUpSaysSoInTheStatistics	                outboundBackedUp += 1	                _ = 0
+Sources/Netstack/Gateway/Gateway.swift	aConfigurationThatCannotServeAnyoneSaysSoRatherThanRunning	            if !subnet.contains(gatewayAddress) {	            if false {

@@ -49,6 +49,12 @@ extension Gateway {
         /// It was counted from the day backpressure was added and reported
         /// nowhere until long after.
         public var outboundFramesBackedUp: Int
+        /// Bytes that should be in the `--pcap` file and are not, because a
+        /// write to it failed -- a full disk, most often.
+        ///
+        /// Zero when no capture is running, which is the same as "nothing has
+        /// been lost" and is what an operator not capturing should see.
+        public var captureBytesLost: Int
 
         /// Guest TCP connections currently spliced to a host socket. A **gauge**.
         public var tcpEstablished: Int
@@ -134,6 +140,7 @@ extension Gateway {
             inboundFramesRejected: link.inboundDropped,
             outboundFramesRejected: link.outboundDropped,
             outboundFramesBackedUp: link.outboundBackedUp,
+            captureBytesLost: (link as? CapturingLink)?.capture.bytesLost ?? 0,
             tcpEstablished: tcp.establishedCount,
             tcpRefusedByLimit: tcp.refusedForLimit,
             tcpDialFailed: tcp.refusedForDial,
@@ -182,6 +189,7 @@ extension Gateway.Statistics {
             ("inbound_frames_rejected", inboundFramesRejected),
             ("outbound_frames_rejected", outboundFramesRejected),
             ("outbound_frames_backed_up", outboundFramesBackedUp),
+            ("capture_bytes_lost", captureBytesLost),
             ("tcp_established", tcpEstablished),
             ("tcp_refused_by_limit", tcpRefusedByLimit),
             ("tcp_dial_failed", tcpDialFailed),

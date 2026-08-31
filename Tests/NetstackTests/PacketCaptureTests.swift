@@ -171,3 +171,33 @@ private final class CaptureCollector: LinkDispatcher, @unchecked Sendable {
     var frames: [ByteBuffer] = []
     func deliverInbound(_ frame: PacketBuffer) { frames.append(frame.frame) }
 }
+
+// A capture whose writes fail says how much it lost.
+//
+// `flush` swallowed the failure and cleared the buffer regardless, so the file
+// ended wherever the last successful write did and said nothing. That is the
+// same failure as the capture that came out empty: believing you have a record
+// when you do not, which is worse than having none.
+//
+// The bytes are still discarded — the buffer is bounded on purpose, and holding
+// them would grow it without limit while the disk stays full. What changed is
+// that somebody can find out.
+@Test func aCaptureThatCannotWriteSaysHowMuchItLost() throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("netstack-lost-\(UInt32.random(in: 0..<UInt32.max)).pcap").path
+    let capture = try PacketCapture(path: path, bufferLimit: 1024)
+    #expect(capture.bytesLost == 0, "a capture that has written nothing has lost nothing")
+
+    // The handle goes out from under it, which is what a full disk looks like to
+    // the one call that matters: the write fails and the frames are gone.
+    capture.close()
+
+    for _ in 0..<64 {
+        capture.record(ByteBuffer(bytes: [UInt8](repeating: 0xAA, count: 200)))
+    }
+    capture.flush()
+
+    #expect(capture.bytesLost > 0, "frames were lost and the capture does not say so")
+
+    try? FileManager.default.removeItem(atPath: path)
+}

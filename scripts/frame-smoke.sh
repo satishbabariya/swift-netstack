@@ -2160,6 +2160,102 @@ PY
     return $outcome
 }
 
+# The pool must not contain an address the gateway answers for.
+#
+# It contained the host address -- the one `host.containers.internal` resolves
+# to, and the one NAT translates to the host's loopback. A guest handed it
+# believes it IS the host: the name resolves to itself, and its ARP for that
+# address collides with the gateway's own.
+#
+# On the default /24 that takes two hundred and fifty guests, which is why
+# nothing saw it. This asks on a /29, where it is the fifth guest, and it asks
+# through the executable because the claim is about what the gateway TELLS its
+# DHCP server -- a library test can only check that the pool builder knows the
+# rule, which it did all along.
+pool_smoke() {
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-pool-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-vfkit "$WIRE" --subnet 192.168.127.0/29 >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: the small-subnet gateway never came up"; return 1; }
+
+    WIRE="$WIRE" python3 - <<'PY'
+import os, socket, sys
+
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
+
+wire = os.environ["WIRE"]
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+s.connect(wire)
+s.settimeout(3)
+
+# On a /29 the gateway is .1 and the host is .6, so a guest may have .2 to .5.
+gateway = address("192.168.127.1")
+host = address("192.168.127.6")
+
+
+def discover(index):
+    mac = bytes.fromhex("5a94efe4bc%02x" % index)
+    payload = (
+        b"\x01\x01\x06\x00" + bytes([0, 0, 0, index]) + b"\x00" * 2 + b"\x80\x00"
+        + b"\x00" * 16 + mac + b"\x00" * 10 + b"\x00" * 64 + b"\x00" * 128
+        + b"\x63\x82\x53\x63" + b"\x35\x01\x01" + b"\xff"
+    )
+    udp = b"\x00\x44\x00\x43" + (8 + len(payload)).to_bytes(2, "big") + b"\x00\x00" + payload
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(udp)).to_bytes(2, "big")
+        + b"\x00\x00\x00\x00\x40\x11\x00\x00" + bytes(4) + b"\xff\xff\xff\xff"
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    s.send(b"\xff" * 6 + mac + b"\x08\x00" + bytes(ip) + udp)
+    try:
+        return s.recv(2048)[42 + 16:42 + 20]
+    except socket.timeout:
+        return None
+
+
+try:
+    leased = []
+    for index in range(1, 8):
+        offered = discover(index)
+        if offered is None:
+            break
+        leased.append(offered)
+        if offered == host:
+            print("FAIL: a guest was leased", printable(host), "-- the host's own address,",
+                  "which host.containers.internal resolves to")
+            sys.exit(1)
+        if offered == gateway:
+            print("FAIL: a guest was leased the gateway's own address", printable(gateway))
+            sys.exit(1)
+
+    # Exhausted rather than merely quiet: if the pool ran out at the first guest
+    # this check would pass having proved nothing.
+    if len(leased) != 4:
+        print("FAIL: a /29 offered", len(leased), "leases where four addresses are free:",
+              [printable(one) for one in leased])
+        sys.exit(1)
+    print("ok: pool ", len(leased), "guests leased .2 to .5, and the pool ran out before",
+          printable(host))
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -2232,5 +2328,8 @@ metadata_smoke 192.168.127.1 192.168.127.2 "--ec2-metadata-access" yes || status
 
 # And what it says about a guest that has stopped reading.
 backpressure_smoke || status=1
+
+# And that the pool keeps back what the gateway answers for.
+pool_smoke || status=1
 
 exit $status

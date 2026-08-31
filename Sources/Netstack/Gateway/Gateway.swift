@@ -466,7 +466,11 @@ public final class Gateway: @unchecked Sendable {
                 stack: stack, leaseSeconds: configuration.leaseSeconds,
                 mtu: UInt16(truncatingIfNeeded: configuration.mtu),
                 staticLeases: configuration.dhcpStaticLeases,
-                searchDomains: configuration.dnsSearchDomains)
+                searchDomains: configuration.dnsSearchDomains,
+                // Every address this gateway answers for itself. A guest given
+                // one of them would be told it is the host, or would collide
+                // with an address the gateway is already ARPing for.
+                reserved: [configuration.hostAddress] + configuration.gatewayVirtualAddresses)
             let dns = try DNSServer(
                 stack: stack, records: configuration.dnsRecords,
                 upstream: configuration.upstreamResolvers)

@@ -38,3 +38,4 @@ Sources/Netstack/Wire/WireBootstrap.swift	theListeningDatagramWireSurvivesAGuest
 Sources/Netstack/Wire/WireBootstrap.swift	aDialledDatagramWireCarriesFramesBothWays	                bind(descriptor, address, socklen_t(size))	                0
 Sources/Netstack/Wire/WireLinkEndpoint.swift	aWireThatIsBackingUpSaysSoInTheStatistics	                outboundBackedUp += 1	                _ = 0
 Sources/Netstack/Gateway/Gateway.swift	aConfigurationThatCannotServeAnyoneSaysSoRatherThanRunning	            if !subnet.contains(gatewayAddress) {	            if false {
+Sources/Netstack/Gateway/DHCPServer.swift	theLeasePoolNeverContainsAnAddressTheGatewayAnswersFor	            if !taken.contains(address) { out.append(address) }	            out.append(address)

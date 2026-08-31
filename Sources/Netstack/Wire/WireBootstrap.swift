@@ -203,13 +203,11 @@ public enum WireBootstrap {
         atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
     ) -> EventLoopFuture<WireLinkEndpoint> {
         let frameSize = Int(mtu) + EthernetHeader.length
-        do {
-            try FileManager.default.removeItem(atPath: path)
-        } catch {
-            // Absent is the ordinary case and not an error. Anything else -- a
-            // path that exists and cannot be removed -- surfaces from the bind
-            // below, where the message names the path.
-        }
+        // Absent is the ordinary case and not an error, and a path holding
+        // something that is not a socket is left alone -- see
+        // `removeStaleSocket`. Either way the bind below is what reports it, and
+        // its message names the path.
+        removeStaleSocket(at: path)
         // Bound by hand, so the descriptor can be kept.
         //
         // Not fussiness: NIO closes a datagram channel when a write returns
@@ -271,7 +269,7 @@ public enum WireBootstrap {
         atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
         framing: StreamFraming = .qemu
     ) -> EventLoopFuture<WireLinkEndpoint> {
-        try? FileManager.default.removeItem(atPath: path)
+        removeStaleSocket(at: path)
         // Children pinned to one loop, the way `switchedStreamSocket` pins
         // them, and for a reason beyond consistency: `ServerBootstrap` spreads
         // children across the group it is given, so the "have we already taken
@@ -397,7 +395,7 @@ public enum WireBootstrap {
                 IOError(errnoCode: errno, reason: "SOCK_SEQPACKET on AF_UNIX"))
         }
 
-        try? FileManager.default.removeItem(atPath: path)
+        removeStaleSocket(at: path)
         var local = sockaddr_un()
         local.sun_family = sa_family_t(AF_UNIX)
         let room = MemoryLayout.size(ofValue: local.sun_path)
@@ -501,7 +499,7 @@ public enum WireBootstrap {
         handshakeAllowance: TimeAmount = .seconds(10),
         macForUUID: @escaping @Sendable (String) -> MACAddress = { _ in MACAddress.randomLocallyAdministered() }
     ) -> EventLoopFuture<NetworkSwitch> {
-        try? FileManager.default.removeItem(atPath: path)
+        removeStaleSocket(at: path)
         let loop = group.next()
         let netSwitch = NetworkSwitch(
             linkAddress: linkAddress, mtu: mtu, eventLoop: loop,
@@ -574,7 +572,7 @@ public enum WireBootstrap {
         atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
         maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16, framing: StreamFraming = .qemu
     ) -> EventLoopFuture<NetworkSwitch> {
-        try? FileManager.default.removeItem(atPath: path)
+        removeStaleSocket(at: path)
         let loop = group.next()
         let netSwitch = NetworkSwitch(
             linkAddress: linkAddress, mtu: mtu, eventLoop: loop,

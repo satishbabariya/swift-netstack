@@ -612,3 +612,60 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// A path that is not a socket is left where it is.
+//
+// Every listener here clears the path before it binds, because a socket left by
+// a process that is gone makes the bind fail with EADDRINUSE forever. It cleared
+// whatever was there. `--listen-vfkit /etc/hosts` deleted /etc/hosts and bound a
+// socket in its place, and the only sign was a gateway that started normally.
+//
+// A mistyped path is the ordinary way that happens, and the file is gone before
+// anything can say so.
+@Test func bindingOverAFileThatIsNotASocketLeavesItAlone() async throws {
+    let path = temporaryPath("not-a-socket")
+    let contents = "something an operator would rather keep"
+    try contents.write(toFile: path, atomically: true, encoding: .utf8)
+
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var failed = false
+    do {
+        let link = try await WireBootstrap.listeningDatagramSocket(
+            atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+        ).get()
+        _ = try? await link.close().get()
+    } catch {
+        failed = true
+    }
+
+    #expect(failed, "a wire bound over a regular file rather than refusing")
+    #expect(
+        (try? String(contentsOfFile: path, encoding: .utf8)) == contents,
+        "the file was deleted to make room for a socket")
+
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
+// And a socket left by a process that is gone is still cleared, which is what
+// the unlink was there for.
+@Test func bindingOverAStaleSocketStillWorks() async throws {
+    let path = temporaryPath("stale")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+    // Bound, then abandoned without closing: the file outlives the endpoint the
+    // way it outlives a process that was killed.
+    let first = try await WireBootstrap.listeningDatagramSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
+    _ = try await first.close().get()
+    #expect(FileManager.default.fileExists(atPath: path), "the socket file was cleaned up already")
+
+    let second = try await WireBootstrap.listeningDatagramSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
+    _ = try? await second.close().get()
+
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

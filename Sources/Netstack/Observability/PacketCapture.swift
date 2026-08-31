@@ -178,6 +178,7 @@ public final class CapturingLink: GatewayLink, @unchecked Sendable {
     public var eventLoop: EventLoop { wrapped.eventLoop }
     public var inboundDropped: Int { wrapped.inboundDropped }
     public var outboundDropped: Int { wrapped.outboundDropped }
+    public var outboundBackedUp: Int { wrapped.outboundBackedUp }
     public var bytesReceived: Int { wrapped.bytesReceived }
     public var bytesSent: Int { wrapped.bytesSent }
 

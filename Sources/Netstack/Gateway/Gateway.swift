@@ -606,6 +606,18 @@ public final class Gateway: @unchecked Sendable {
     /// Stop a UDP forward. Returns whether there was one to stop.
     @discardableResult
     public func stopForwardingUDP(hostPort: Int) -> Bool {
+        // Confined to the loop, and now checked rather than assumed.
+        //
+        // This mutates the same dictionary `closeOnLoop` walks, with no lock,
+        // because the only caller is the control plane -- which runs on this
+        // gateway's own loop, so there is no race. Nothing said so. `close()`
+        // had exactly this shape and WAS racing, and what found it was a
+        // precondition added elsewhere turning a quiet race into a crash.
+        //
+        // A precondition rather than a hop: these answer `Bool`, so there is
+        // nowhere to hop to. An embedder calling them off-loop gets a trap,
+        // which is better than the data race it would otherwise have.
+        eventLoop.preconditionInEventLoop()
         guard let forwarder = udpForwards.removeValue(forKey: hostPort) else { return false }
         forwarder.close()
         return true
@@ -614,15 +626,33 @@ public final class Gateway: @unchecked Sendable {
     /// Stop a unix-socket forward. Returns whether there was one to stop.
     @discardableResult
     public func stopForwarding(unixSocketPath path: String) -> Bool {
+        // Confined to the loop, and now checked rather than assumed.
+        //
+        // This mutates the same dictionary `closeOnLoop` walks, with no lock,
+        // because the only caller is the control plane -- which runs on this
+        // gateway's own loop, so there is no race. Nothing said so. `close()`
+        // had exactly this shape and WAS racing, and what found it was a
+        // precondition added elsewhere turning a quiet race into a crash.
+        //
+        // A precondition rather than a hop: these answer `Bool`, so there is
+        // nowhere to hop to. An embedder calling them off-loop gets a trap,
+        // which is better than the data race it would otherwise have.
+        eventLoop.preconditionInEventLoop()
         guard let forwarder = unixForwards.removeValue(forKey: path) else { return false }
         forwarder.close()
         return true
     }
 
     /// The host UDP ports currently published, ascending.
-    public var forwardedUDPPorts: [Int] { udpForwards.keys.sorted() }
+    public var forwardedUDPPorts: [Int] {
+        eventLoop.preconditionInEventLoop()
+        return udpForwards.keys.sorted()
+    }
     /// The unix socket paths currently published, sorted.
-    public var forwardedUnixPaths: [String] { unixForwards.keys.sorted() }
+    public var forwardedUnixPaths: [String] {
+        eventLoop.preconditionInEventLoop()
+        return unixForwards.keys.sorted()
+    }
 
     /// The address leased to a guest, once it has asked for one. This is how a
     /// caller learns where to forward a port to without being told.
@@ -639,13 +669,28 @@ public final class Gateway: @unchecked Sendable {
     /// progress.
     @discardableResult
     public func stopForwarding(hostPort: Int) -> Bool {
+        // Confined to the loop, and now checked rather than assumed.
+        //
+        // This mutates the same dictionary `closeOnLoop` walks, with no lock,
+        // because the only caller is the control plane -- which runs on this
+        // gateway's own loop, so there is no race. Nothing said so. `close()`
+        // had exactly this shape and WAS racing, and what found it was a
+        // precondition added elsewhere turning a quiet race into a crash.
+        //
+        // A precondition rather than a hop: these answer `Bool`, so there is
+        // nowhere to hop to. An embedder calling them off-loop gets a trap,
+        // which is better than the data race it would otherwise have.
+        eventLoop.preconditionInEventLoop()
         guard let forwarder = forwards.removeValue(forKey: hostPort) else { return false }
         forwarder.close()
         return true
     }
 
     /// The host ports currently published, ascending.
-    public var forwardedPorts: [Int] { forwards.keys.sorted() }
+    public var forwardedPorts: [Int] {
+        eventLoop.preconditionInEventLoop()
+        return forwards.keys.sorted()
+    }
 
     /// The forwarder on a given host port. For tests, and for a caller that
     /// wants to read where a forward actually landed.

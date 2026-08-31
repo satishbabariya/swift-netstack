@@ -633,3 +633,41 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+// Closing a service from a thread that is not its loop.
+//
+// A gateway hands out its DNS server, its forwarders and its link, and every one
+// of them holds loop-confined state without a lock. A caller has no reason to be
+// on that loop -- `defer { gateway.dns.close() }` is written wherever the
+// gateway was made.
+//
+// `NetworkSwitch.close` had this shape and a bare `preconditionInEventLoop` made
+// its ordinary use a trap. The answer there and here is to hop when the caller
+// is elsewhere and run inline when it is not, since deferring would reorder the
+// close against the caller's own closing work.
+//
+// It works today because the only in-tree caller is the control plane, which
+// runs on the gateway's loop. "It works" and "it is checked" are different
+// claims, and this is the second.
+@Test func aServiceClosesSafelyFromAThreadThatIsNotItsLoop() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+    var pair: [Int32] = [-1, -1]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group,
+        configuration: .init(upstreamResolvers: [])
+    ).get()
+
+    // A loop that is not the gateway's. With two threads one of them is not.
+    var elsewhere = group.next()
+    if elsewhere === gateway.eventLoop { elsewhere = group.next() }
+    #expect(elsewhere !== gateway.eventLoop, "the group did not give a second loop")
+
+    // Without the hop this traps rather than fails, and a trap takes the whole
+    // suite down -- which is how it would be noticed.
+    _ = try await elsewhere.flatSubmit { gateway.dns.close() }.get()
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

@@ -364,6 +364,18 @@ Every packet, timer, and endpoint state transition runs on a single
 `EventLoop`. There are no locks anywhere in `Sources/Netstack` except one, in the
 test-only `ManualClock`.
 
+What replaces them is that everything is confined to one loop — which is a
+claim about callers as much as about code. The services a gateway hands out
+(`dns`, the forwarders, the link) are closed by whoever made the gateway, from
+wherever that was, so `close()` hops when the caller is elsewhere and runs
+inline when it is not; deferring unconditionally would reorder it against the
+caller's own closing work. The synchronous ones — `stopForwarding` and the
+`forwarded*` accessors answer a value, so there is nowhere to hop — assert the
+loop instead. An embedder who calls those from the wrong thread gets a trap,
+which is better than the data race it replaces. `Gateway.close()` had exactly
+that race, quietly, and a precondition added elsewhere is what turned it into a
+crash and found it.
+
 That used to be a convention checked by reading, and this file used to say so.
 Reading missed a second lock that had appeared in `WireBootstrap` — in a package
 whose entire concurrency design is that there are none. `scripts/conventions.sh`
@@ -574,7 +586,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-788 tests, plus a differential harness in `differential/` that drives gVisor's
+789 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The
@@ -609,7 +621,7 @@ gateway and host addresses, the NAT entry, link-local being off, the two
 to happen: `Gateway.Configuration` gained eight parameters in a day, each one in
 the middle of an initialiser these samples call.
 
-`scripts/falsify.sh --all` deletes each of the thirty-six guards in
+`scripts/falsify.sh --all` deletes each of the thirty-seven guards in
 `scripts/guards.tsv` in turn and requires that the named test notices — the
 bounds on half-open connections, established connections, UDP flows in both
 directions, reassembly entries and fragments, outstanding DNS queries, log

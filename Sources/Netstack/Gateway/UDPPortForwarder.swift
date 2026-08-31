@@ -138,7 +138,22 @@ public final class UDPPortForwarder: @unchecked Sendable {
     }
 
     @discardableResult
+    /// Callable from anywhere.
+    ///
+    /// Everything below is loop-confined state, and this is handed to callers
+    /// who have no reason to be on that loop. `NetworkSwitch.close` had the same
+    /// shape and a bare `preconditionInEventLoop` made its ordinary use a trap;
+    /// on the loop this still runs inline, because deferring would reorder it
+    /// against the caller's own closing work.
     public func close() -> EventLoopFuture<Void> {
+        guard eventLoop.inEventLoop else {
+            return eventLoop.flatSubmit { self.closeOnLoop() }
+        }
+        return closeOnLoop()
+    }
+
+    private func closeOnLoop() -> EventLoopFuture<Void> {
+        eventLoop.preconditionInEventLoop()
         for flow in flows.values { flow.endpoint.close() }
         flows.removeAll()
         guard let listener else { return eventLoop.makeSucceededVoidFuture() }

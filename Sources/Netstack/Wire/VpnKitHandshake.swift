@@ -67,13 +67,13 @@ final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandl
     ///   - allocator: where the buffer holding a partial handshake comes from.
     ///   - mtu: what the guest is told it may send. hyperkit is also told the
     ///     frame size, which is this plus an ethernet header.
+    ///   - allowance: how long the peer has to complete the exchange before the
+    ///     connection is closed and its place given back.
     ///   - macForUUID: the address to give the guest, chosen from the UUID it
     ///     sends. Upstream looks it up in a configured map and invents one when
     ///     the UUID is not in it.
     ///   - finished: called with the address handed out, once, when the exchange
     ///     completes. The caller installs the rest of the pipeline here.
-    ///   - allowance: how long the peer has to complete the exchange before the
-    ///     connection is closed and its place given back.
     init(
         allocator: ByteBufferAllocator, mtu: UInt16, allowance: TimeAmount = .seconds(10),
         macForUUID: @escaping @Sendable (String) -> MACAddress,
@@ -97,12 +97,20 @@ final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandl
 
     private func arm(_ context: ChannelHandlerContext) {
         guard deadline == nil, step != .done, context.channel.isActive else { return }
-        deadline = context.eventLoop.scheduleTask(in: allowance) { [weak self] in
-            guard let self, self.step != .done else { return }
+        // The channel and nothing else. A scheduled task's closure is
+        // `@Sendable`, and neither this handler -- which holds a buffer of half
+        // a handshake -- nor a `ChannelHandlerContext` can honestly be sent
+        // anywhere. `Channel` can, and closing it is the whole job.
+        //
+        // There is no "has it finished?" check inside, because a task that has
+        // been cancelled does not run: completing the exchange, leaving the
+        // pipeline and the connection going away each cancel it.
+        let channel = context.channel
+        deadline = context.eventLoop.scheduleTask(in: allowance) {
             // Closed, not merely abandoned: closing is what returns the place on
             // the switch, and a handler that only stopped listening would leave
             // the connection and the reservation exactly where they were.
-            context.close(promise: nil)
+            channel.close(promise: nil)
         }
     }
 

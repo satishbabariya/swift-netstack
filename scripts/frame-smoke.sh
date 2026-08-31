@@ -1415,6 +1415,97 @@ PY
     return $outcome
 }
 
+# A guest that arrives over the control API.
+#
+# `POST /connect` hands the connection to the switch and the connection stops
+# being HTTP -- with no status line, no body, nothing: upstream hijacks and
+# writes not a byte, so a client that waited for a response would wait forever.
+# That silence is the contract, which makes it the kind of thing a check should
+# pin: an implementation that helpfully answered "200 OK" would break every
+# client by putting three bytes at the front of the first frame.
+#
+# The framing on this wire is hyperkit's two little-endian bytes, not qemu's
+# four big-endian ones, because that is what upstream's clients speak here.
+connect_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-connect-ctl-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-connect-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    "$binary" --listen-switch "$WIRE" --listen "unix://$CONTROL" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" && -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" && -S "$CONTROL" ]] || { echo "FAIL: the connect gateway never came up"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
+import os, socket, struct, sys
+
+gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+mac = bytes.fromhex("5a94efe4bc09")
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(os.environ["CONTROL"])
+    s.sendall(b"POST /connect HTTP/1.1\r\nHost: gateway\r\nContent-Length: 0\r\n\r\n")
+
+    frame = (
+        b"\xff\xff\xff\xff\xff\xff" + mac + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + mac + guest + b"\x00" * 6 + gateway
+    )
+    s.sendall(struct.pack("<H", len(frame)) + frame)
+
+    held = b""
+    while True:
+        while len(held) >= 2:
+            length = struct.unpack("<H", held[:2])[0]
+            # Checked BEFORE waiting for the bytes, which is the whole point: an
+            # HTTP status line arrives here as a "frame" whose first two bytes
+            # ("HT") read as a length of 21576, and a reader that waits for that
+            # many bytes before noticing waits forever -- which is exactly what a
+            # real client would do. Written the other way round first, and it
+            # hung instead of failing.
+            if length > 1600:
+                print("FAIL: /connect wrote something before the wire started --",
+                      "the first two bytes say a frame of", length, "bytes, and the",
+                      "connection is meant to go silent, for", described)
+                sys.exit(1)
+            if len(held) < 2 + length:
+                break
+            body, held = held[2:2 + length], held[2 + length:]
+            if len(body) >= 42 and body[12:14] == b"\x08\x06" and body[20:22] == b"\x00\x02":
+                if body[28:32] != gateway:
+                    continue
+                print("ok: conn  a guest joined over POST /connect and was answered for",
+                      described)
+                sys.exit(0)
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            print("FAIL: no answer over /connect within 10s for", described)
+            sys.exit(1)
+        if not chunk:
+            print("FAIL: /connect closed the connection rather than carrying frames for",
+                  described)
+            sys.exit(1)
+        held += chunk
+finally:
+    s.close()
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -1465,5 +1556,8 @@ switch_smoke 192.168.127.1 || status=1
 
 # And a ping that actually leaves.
 icmp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
+
+# And a guest that arrives through the control API rather than over a socket.
+connect_smoke 192.168.127.1 192.168.127.9 || status=1
 
 exit $status

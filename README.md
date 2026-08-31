@@ -391,7 +391,11 @@ real internet is a check that fails for reasons of its own. And it drives
 the **`--listen-qemu` wire**, where a four-byte big-endian length says where
 each frame ends, because a whole entry point nobody drives is a whole entry
 point that can be wrong — then disconnects and comes back, the way a rebooting
-VM does. And it opens **`--listen-switch`** with two guests, requiring each to be
+VM does. It joins a guest through **`POST /connect`**, which hands the connection to the
+switch and stops being HTTP — with no status line, no body, nothing, because
+that silence is upstream's contract and a gateway that answered "200 OK" would
+put three bytes at the front of every client's first frame. And it opens
+**`--listen-switch`** with two guests, requiring each to be
 answered on its own port and one to reach the other directly — the shape
 gvisor-tap-vsock actually is, a network rather than a point-to-point link, which
 until now the library could do and the program could not.

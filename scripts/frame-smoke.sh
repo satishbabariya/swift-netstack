@@ -1601,6 +1601,120 @@ finally:
 PY
 }
 
+# hyperkit's wire.
+#
+# The one wire whose connection does not begin with a frame: hyperkit sends a
+# fixed-size init and a fixed-size command, and is told its MTU and its hardware
+# address before anything else happens. The sizes are hyperkit's -- 49, 41, 258
+# -- and there is nothing in them to negotiate, so getting one wrong is a wire
+# that never carries a frame and never says why.
+vpnkit_smoke() {
+    local expected="$1" guest="$2"
+    shift 2
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-vpnkit-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-vpnkit "$WIRE" "$@" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: the vpnkit wire never appeared"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
+import os, socket, struct, sys
+
+gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+described = os.environ.get("ARGS") or "(defaults)"
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+
+
+def exactly(count):
+    collected = b""
+    while len(collected) < count:
+        chunk = s.recv(count - len(collected))
+        if not chunk:
+            print("FAIL: the wire closed during the handshake for", described)
+            sys.exit(1)
+        collected += chunk
+    return collected
+
+
+try:
+    s.connect(os.environ["WIRE"])
+    initial = b"VMN3T" + bytes(44)
+    s.sendall(initial)
+    if exactly(49) != initial:
+        print("FAIL: the init message was not echoed back verbatim for", described)
+        sys.exit(1)
+
+    uuid = b"1e0a4f1a-0000-4000-8000-0123456789ab"
+    s.sendall(bytes([1]) + uuid + bytes(4))
+    reply = exactly(258)
+    mtu = struct.unpack("<H", reply[1:3])[0]
+    frame_size = struct.unpack("<H", reply[3:5])[0]
+    mac = reply[5:11]
+    if reply[0] != 0x01:
+        print("FAIL: the reply is tagged", reply[0], "rather than 1, for", described)
+        sys.exit(1)
+    if frame_size != mtu + 14:
+        print("FAIL: the reply says an MTU of", mtu, "and a frame size of", frame_size,
+              "-- the frame size is the MTU plus an ethernet header, for", described)
+        sys.exit(1)
+    if mac[0] & 0x03 != 0x02:
+        print("FAIL: the guest was given", mac.hex(":"), "which is not a locally",
+              "administered unicast address, for", described)
+        sys.exit(1)
+    print("ok: vpnkit the handshake gave an MTU of", mtu, "and the address", mac.hex(":"),
+          "for", described)
+
+    # And now it is an ordinary hyperkit wire, using the address it was handed.
+    frame = (
+        b"\xff\xff\xff\xff\xff\xff" + mac + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + mac + guest + b"\x00" * 6 + gateway
+    )
+    s.sendall(struct.pack("<H", len(frame)) + frame)
+    held = b""
+    while True:
+        while len(held) >= 2:
+            length = struct.unpack("<H", held[:2])[0]
+            if length > 1600:
+                print("FAIL: the wire carried something that is not a frame:",
+                      repr(held[:32]), "for", described)
+                sys.exit(1)
+            if len(held) < 2 + length:
+                break
+            body, held = held[2:2 + length], held[2 + length:]
+            if len(body) >= 42 and body[12:14] == b"\x08\x06" and body[20:22] == b"\x00\x02":
+                if body[28:32] != gateway:
+                    continue
+                print("ok: vpnkit ARP", ".".join(map(str, gateway)),
+                      "answered after the handshake for", described)
+                sys.exit(0)
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            print("FAIL: no ARP reply after the vpnkit handshake for", described)
+            sys.exit(1)
+        if not chunk:
+            print("FAIL: the wire closed after the handshake for", described)
+            sys.exit(1)
+        held += chunk
+finally:
+    s.close()
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -1657,5 +1771,8 @@ connect_smoke 192.168.127.1 192.168.127.9 || status=1
 
 # And the wire that has no socket at all.
 stdio_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And the wire that opens with a handshake.
+vpnkit_smoke 192.168.127.1 192.168.127.2 || status=1
 
 exit $status

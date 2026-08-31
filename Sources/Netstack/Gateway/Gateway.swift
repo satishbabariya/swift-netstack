@@ -57,6 +57,11 @@ public final class Gateway: @unchecked Sendable {
         public var allowsLinkLocal: Bool
         /// Write every frame in and out to a pcap file at this path. Upstream's
         /// `CaptureFile`. Bounded -- see `PacketCapture`.
+        /// The address to hand a vpnkit guest, by the UUID hyperkit sends.
+        /// Upstream's `vpnKitUUIDMacAddresses`. A UUID not here gets an
+        /// invented address.
+        public var vpnKitAddresses: [String: MACAddress] = [:]
+
         public var captureFile: String?
         /// The cap on that file. Reaching it stops the capture.
         public var captureMaximumBytes: Int
@@ -120,6 +125,7 @@ public final class Gateway: @unchecked Sendable {
             linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:ee")!,
             hostAddress: IPv4Address? = nil,
             nat: [IPv4Address: IPv4Address]? = nil,
+            vpnKitAddresses: [String: MACAddress] = [:],
             gatewayVirtualAddresses: [IPv4Address]? = nil,
             allowsLinkLocal: Bool = false,
             captureFile: String? = nil,
@@ -145,6 +151,7 @@ public final class Gateway: @unchecked Sendable {
             self.subnet = subnet
             self.linkAddress = linkAddress
             self.hostAddress = hostAddress
+            self.vpnKitAddresses = vpnKitAddresses
             self.nat = nat ?? [hostAddress: IPv4Address("127.0.0.1")!]
             self.gatewayVirtualAddresses = gatewayVirtualAddresses ?? [hostAddress]
             self.allowsLinkLocal = allowsLinkLocal
@@ -310,6 +317,30 @@ public final class Gateway: @unchecked Sendable {
             mtu: configuration.mtu
         ).flatMap { link in
             assemble(on: link, group: group, configuration: configuration)
+        }
+    }
+
+    /// Bind a unix stream socket that speaks hyperkit's vpnkit protocol.
+    ///
+    /// Upstream's `--listen-vpnkit`. Every guest gets a port on a switch, as
+    /// with `switchListeningOnStreamSocketAt`, but the connection opens with
+    /// hyperkit's handshake -- see `VpnKitHandshakeHandler` -- in which the
+    /// gateway tells the guest its MTU and its hardware address.
+    ///
+    /// `vpnKitAddresses` maps the UUID hyperkit sends to the address to hand it,
+    /// which is upstream's `vpnKitUUIDMacAddresses`. A UUID not in the map gets
+    /// an invented address.
+    public static func start(
+        vpnKitListeningOnStreamSocketAt path: String, group: EventLoopGroup,
+        configuration: Configuration = Configuration()
+    ) -> EventLoopFuture<Gateway> {
+        let addresses = configuration.vpnKitAddresses
+        return WireBootstrap.vpnKitStreamSocket(
+            atPath: path, group: group, linkAddress: configuration.linkAddress,
+            mtu: configuration.mtu, maximumGuests: configuration.maximumGuests,
+            macForUUID: { uuid in addresses[uuid] ?? MACAddress.randomLocallyAdministered() }
+        ).flatMap { netSwitch in
+            assemble(on: netSwitch, group: group, configuration: configuration)
         }
     }
 

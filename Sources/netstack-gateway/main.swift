@@ -20,6 +20,7 @@ struct Options {
     var listenStream: String?
     var listenSwitch: String?
     var listenStdio = false
+    var listenVpnKit: String?
     var controlEndpoints: [String] = []
     var servicesEndpoints: [String] = []
     var pidFile: String?
@@ -71,7 +72,8 @@ struct Options {
                 // empty, so the value is consumed and ignored the same way.
                 _ = try value(flag)
                 options.listenStdio = true
-            case "--listen-bess", "--listen-vpnkit":
+            case "--listen-vpnkit": options.listenVpnKit = try value(flag)
+            case "--listen-bess":
                 throw OptionError.unsupportedWire(flag)
             case "--dns": options.upstreamResolver = try value(flag)
             case "--gatewayIP": options.gateway = try value(flag)
@@ -134,12 +136,13 @@ enum OptionError: Error, CustomStringConvertible {
         case .unknown(let flag): return "unknown option \(flag)"
         case .unsupportedWire(let flag):
             return
-                "\(flag) is not supported: bess is SOCK_SEQPACKET, stdio is a pipe, and vpnkit needs "
-                + "hyperkit's handshake. Use --listen-vfkit for a datagram socket or --listen-qemu for a "
-                + "stream one."
+                "\(flag) is not supported: bess carries bare frames over SOCK_SEQPACKET, which the "
+                + "networking library underneath this does not offer. Every other wire gvproxy has "
+                + "is here: --listen-vfkit, --listen-qemu, --listen-vpnkit, --listen-stdio, and "
+                + "--listen-switch for several guests on one socket."
         case .conflictingWires:
-            return "--listen-vfkit, --listen-qemu, --listen-switch and --listen-stdio are "
-                + "different wires; pick one"
+            return "--listen-vfkit, --listen-qemu, --listen-switch, --listen-vpnkit and "
+                + "--listen-stdio are different wires; pick one"
         case .noWire:
             return
                 "no guest wire: pass --listen-vfkit <path> for a datagram socket, --listen-qemu "
@@ -167,6 +170,9 @@ let usage = """
       --listen-vfkit <path>      Datagram socket the guest dials (vfkit, unixgram)
       --listen-qemu <path>       Stream socket with length-prefixed frames (qemu),
                                  carrying one guest
+      --listen-vpnkit <path>     Stream socket speaking hyperkit's vpnkit
+                                 protocol: a handshake, then two little-endian
+                                 length bytes per frame. Carries several guests
       --listen-stdio <ignored>   The wire is this process's own stdin and stdout,
                                  framed with two little-endian length bytes. Every
                                  message this program prints goes to stderr then,
@@ -274,8 +280,8 @@ if let text = options.subnet {
 // The wire is checked now: after the file has had its chance to be wrong about
 // something more specific.
 let wires =
-    [options.listenPath, options.listenStream, options.listenSwitch].compactMap { $0 }
-    + (options.listenStdio ? ["(stdin and stdout)"] : [])
+    [options.listenPath, options.listenStream, options.listenSwitch, options.listenVpnKit]
+    .compactMap { $0 } + (options.listenStdio ? ["(stdin and stdout)"] : [])
 if wires.isEmpty {
     FileHandle.standardError.write(Data("error: \(OptionError.noWire)\n\n\(usage)\n".utf8))
     exit(2)
@@ -397,6 +403,7 @@ let configuration = Gateway.Configuration(
     gatewayAddress: gatewayAddress, subnet: subnet,
     linkAddress: file.linkAddress ?? MACAddress("5a:94:ef:e4:0c:ee")!,
     hostAddress: hostAddress, nat: file.nat,
+    vpnKitAddresses: file.vpnKitAddresses,
     gatewayVirtualAddresses: file.virtualAddresses,
     allowsLinkLocal: options.allowsLinkLocal || (file.allowsLinkLocal ?? false),
     captureFile: options.captureFile ?? file.captureFile,
@@ -423,6 +430,9 @@ do {
         starting = Gateway.start(
             overPipes: STDIN_FILENO, output: STDOUT_FILENO, group: group,
             configuration: configuration)
+    } else if options.listenVpnKit != nil {
+        starting = Gateway.start(
+            vpnKitListeningOnStreamSocketAt: path, group: group, configuration: configuration)
     } else if options.listenSwitch != nil {
         starting = Gateway.start(
             switchListeningOnStreamSocketAt: path, group: group, configuration: configuration)

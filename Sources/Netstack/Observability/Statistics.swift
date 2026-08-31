@@ -49,6 +49,16 @@ extension Gateway {
         public var tcpRefusedByLimit: Int
         /// Guest connections refused because the destination did not accept.
         public var tcpDialFailed: Int
+        /// Guest connections refused for being to a link-local address --
+        /// 169.254.169.254 above all, the cloud instance metadata service.
+        ///
+        /// Counted separately from every other refusal because it is the one an
+        /// operator has to be able to tell apart. "My guest cannot reach the
+        /// metadata service" has two answers -- policy, or the service is not
+        /// there -- and they call for opposite actions. Without this the two
+        /// look identical from outside: a refusal and a failed dial both end as
+        /// a reset on the guest's connection.
+        public var tcpRefusedLinkLocal: Int
 
         /// Guest UDP flows currently holding a host socket. A **gauge**.
         public var udpFlows: Int
@@ -119,6 +129,7 @@ extension Gateway {
             tcpEstablished: tcp.establishedCount,
             tcpRefusedByLimit: tcp.refusedForLimit,
             tcpDialFailed: tcp.refusedForDial,
+            tcpRefusedLinkLocal: tcp.refusedForLinkLocal,
             udpFlows: udp.flowCount,
             udpSocketsOpened: udp.openedSockets,
             udpRefusedByLimit: udp.refusedForLimit,
@@ -165,6 +176,7 @@ extension Gateway.Statistics {
             ("tcp_established", tcpEstablished),
             ("tcp_refused_by_limit", tcpRefusedByLimit),
             ("tcp_dial_failed", tcpDialFailed),
+            ("tcp_refused_link_local", tcpRefusedLinkLocal),
             ("udp_flows", udpFlows),
             ("udp_sockets_opened", udpSocketsOpened),
             ("udp_refused_by_limit", udpRefusedByLimit),

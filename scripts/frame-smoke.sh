@@ -1939,6 +1939,136 @@ PY
     return $outcome
 }
 
+# The instance metadata service, and the flag that opens it.
+#
+# A guest that reaches 169.254.169.254 on a cloud host is asking the host's
+# metadata service for the host's credentials. It is refused by default, and
+# `--ec2-metadata-access` is the deliberate opt-out.
+#
+# The library has a guard for the policy. What it cannot have is a check that the
+# FLAG reaches the policy -- and a flag that does not reach its setting is the
+# bug that shipped here once already, when --config was read before it was
+# loaded and every configured value was silently the default.
+metadata_smoke() {
+    local expected="$1" guest="$2"
+    METADATA_ARGS="$3"
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-imds-ctl-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-imds-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    # shellcheck disable=SC2086
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" $METADATA_ARGS >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" && -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" && -S "$CONTROL" ]] || { echo "FAIL: the metadata gateway never came up"; return 1; }
+
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" CONTROL="$CONTROL" \
+        EXPECT_REACHABLE="${4}" ARGS="${METADATA_ARGS:-(defaults)}" python3 - <<'PY'
+import json, os, socket, subprocess, sys
+
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
+
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
+metadata = address("169.254.169.254")
+
+
+def statistics():
+    answer = subprocess.run(
+        ["curl", "--silent", "--fail-with-body", "--max-time", "10",
+         "--unix-socket", os.environ["CONTROL"], "http://gateway/stats"],
+        capture_output=True, text=True, timeout=20)
+    if answer.returncode != 0:
+        print("FAIL: /stats was not answered")
+        sys.exit(1)
+    return json.loads(answer.stdout)
+reachable = os.environ["EXPECT_REACHABLE"] == "yes"
+described = os.environ.get("ARGS") or "(defaults)"
+mac = bytes.fromhex("5a94efe4bc00")
+
+wire = os.environ["WIRE"]
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+
+SYN, ACK, RST = 0x02, 0x10, 0x04
+
+
+def syn_frame(sport):
+    header = (
+        sport.to_bytes(2, "big") + (80).to_bytes(2, "big")
+        + (1000).to_bytes(4, "big") + (0).to_bytes(4, "big")
+        + bytes([5 << 4, SYN]) + (65535).to_bytes(2, "big") + b"\x00\x00\x00\x00"
+    )
+    pseudo = guest + metadata + b"\x00\x06" + len(header).to_bytes(2, "big")
+    header = header[:16] + ones_complement(pseudo + header).to_bytes(2, "big") + header[18:]
+    ip = bytearray(
+        b"\x45\x00" + (20 + len(header)).to_bytes(2, "big")
+        + b"\x00\x00\x40\x00\x40\x06\x00\x00" + guest + metadata
+    )
+    ip[10:12] = ones_complement(bytes(ip)).to_bytes(2, "big")
+    return bytes.fromhex("5a94efe40cee") + mac + b"\x08\x00" + bytes(ip) + header
+
+
+try:
+    s.connect(wire)
+    s.send(syn_frame(40200))
+    s.settimeout(6)
+    answer = None
+    while answer is None:
+        try:
+            frame = s.recv(2048)
+        except socket.timeout:
+            break
+        if len(frame) < 54 or frame[12:14] != b"\x08\x00" or frame[23] != 6:
+            continue
+        if frame[26:30] != metadata:
+            continue
+        answer = frame[14 + (frame[14] & 0x0F) * 4:][13]
+
+    # The guest sees the same thing either way, and that is the difficulty. A
+    # refusal by policy is a reset; a dial to an address nothing answers on ends
+    # as a reset too. Written first as "did a reset come back", this check
+    # reported a bug that was not there -- it could not tell the two apart,
+    # because from the wire they are not different.
+    #
+    # The gateway's own counter is what separates them, and it exists for the
+    # same reason: an operator asking why a guest cannot reach the metadata
+    # service has two possible answers that call for opposite actions.
+    refused = statistics().get("tcp_refused_link_local", 0)
+    if reachable:
+        if refused != 0:
+            print("FAIL: --ec2-metadata-access was given and the gateway refused",
+                  "169.254.169.254 by policy anyway, for", described)
+            sys.exit(1)
+        print("ok: imds  --ec2-metadata-access let the request through the policy for",
+              described)
+    else:
+        if refused < 1:
+            print("FAIL: 169.254.169.254 was not refused by policy --",
+                  "tcp_refused_link_local is", refused, "for", described)
+            sys.exit(1)
+        if answer is None or not answer & RST:
+            print("FAIL: the guest was not told --", "flags",
+                  hex(answer) if answer is not None else "no answer", "for", described)
+            sys.exit(1)
+        print("ok: imds  169.254.169.254 refused by policy, and the guest told, for",
+              described)
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -2004,5 +2134,9 @@ notification_smoke || status=1
 
 # And a host-side client dialled into the guest.
 tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# And the address a guest must not reach by accident.
+metadata_smoke 192.168.127.1 192.168.127.2 "" no || status=1
+metadata_smoke 192.168.127.1 192.168.127.2 "--ec2-metadata-access" yes || status=1
 
 exit $status

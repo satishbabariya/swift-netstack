@@ -526,7 +526,8 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     let path = temporaryPath("switch")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let netSwitch = try await WireBootstrap.switchedStreamSocket(
-        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500).get()
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
 
     // Open first, so the test is about closing rather than about binding.
     let before = dial(path, type: .stream)

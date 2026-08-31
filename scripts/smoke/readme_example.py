@@ -21,12 +21,15 @@ def expected_body(readme: str) -> str:
     # The first two are Package.swift fragments, not code that can compile here.
     body = "\n".join(block.rstrip("\n") for block in blocks[2:5])
     lines = [line for line in body.splitlines() if not line.strip().startswith("import ")]
-    return "\n".join(("    " + line) if line.strip() else line for line in lines)
+    # Eight spaces: the function sits inside a `#if canImport(Darwin)`, because
+    # the example is Darwin-specific and says so itself -- `pair[1]` goes to
+    # Virtualization.framework.
+    return "\n".join(("        " + line) if line.strip() else line for line in lines)
 
 
 def body_in(source: str) -> str:
     """What the file between the markers actually holds."""
-    match = re.search(r"// EXAMPLE BEGINS\n.*?\{\n(.*?)\n\}\n// EXAMPLE ENDS", source, re.S)
+    match = re.search(r"// EXAMPLE BEGINS\n.*?\{\n(.*?)\n    \}\n// EXAMPLE ENDS", source, re.S)
     return match.group(1) if match else ""
 
 

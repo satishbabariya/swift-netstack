@@ -44,6 +44,16 @@ private func ethernetFrame(payload: Int) -> [UInt8] {
 private func dial(_ path: String, type: SocketKind) -> Int32 {
     let fd = makeSocket(AF_UNIX, type)
     #expect(fd >= 0)
+    // A write to a socket the far end has closed raises SIGPIPE, whose default
+    // disposition kills the process -- so one test writing to a connection the
+    // gateway has (correctly) closed takes the whole suite down, reported as
+    // "exited with unexpected signal code 13" and pointing at no test in
+    // particular. Asking for EPIPE instead makes it a return value the caller
+    // can see.
+    #if canImport(Darwin)
+        var on: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+    #endif
     let connected = connectTo(fd, unixAddress(path: path))
     #expect(connected == 0, "could not dial \(path): \(String(cString: strerror(errno)))")
     return fd
@@ -370,7 +380,11 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     func readExactly(_ count: Int) async throws -> [UInt8] {
         var collected = [UInt8]()
         var buffer = [UInt8](repeating: 0, count: count)
-        for _ in 0..<400 where collected.count < count {
+        // Ten seconds, not two. A loaded CI runner took nineteen seconds over
+        // tests that finish here in milliseconds, and a budget that runs out
+        // does not report a slow machine -- it reports whatever the assertions
+        // below make of an empty array.
+        for _ in 0..<2000 where collected.count < count {
             let read = buffer.withUnsafeMutableBytes {
                 recv(guest, $0.baseAddress, count - collected.count, dontWait)
             }
@@ -391,7 +405,11 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     _ = command.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
 
     let reply = try await readExactly(258)
-    #expect(reply.count == 258, "the reply was \(reply.count) bytes where hyperkit reads 258")
+    // Required before anything indexes into it. A short read here used to reach
+    // the assertions below, index an empty array, and kill the process with
+    // "Index out of range" -- which takes down every other test in the run and
+    // reports a crash where a failure belonged.
+    try #require(reply.count == 258, "the reply was \(reply.count) bytes where hyperkit reads 258")
     #expect(reply.first == 0x01)
     #expect(UInt16(reply[1]) | UInt16(reply[2]) << 8 == 1500, "the MTU was not what the switch was built with")
     // The frame size, which is the MTU plus an ethernet header. A reply that
@@ -400,6 +418,92 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     #expect(Array(reply[5..<11]) == told.bytes, "the guest was given the wrong address for its UUID")
     #expect(Array(reply[11...]).allSatisfy { $0 == 0 }, "the tail of the reply is meant to be zero")
 
+    close(guest)
+    _ = try? await netSwitch.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
+// A peer that connects to the vpnkit wire and says nothing.
+//
+// It holds a place on the switch it has not earned. Thirty-two of those -- the
+// default guest limit -- and no real guest can join, for as long as the attacker
+// leaves the sockets open, which is forever:
+//
+//     silent connections held open: 32
+//     a real guest was CLOSED OUT by peers that never spoke
+//
+// Everything else guest-reachable in this package is bounded on the premise that
+// a connection held open is a resource. This was written without a bound, in a
+// package whose threat model is that the guest is hostile, and measured before
+// it was fixed rather than reasoned about after.
+@Test func aPeerThatNeverFinishesTheVpnKitHandshakeGivesItsPlaceBack() async throws {
+    let path = temporaryPath("vpnkit")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    // Short, so the test measures the rule and not the clock.
+    let netSwitch = try await WireBootstrap.vpnKitStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500, maximumGuests: 2,
+        handshakeAllowance: .milliseconds(200)
+    ).get()
+
+    func portsSettleAt(_ wanted: Int) async throws -> Int {
+        var ports = 0
+        for _ in 0..<200 {
+            ports = try await netSwitch.eventLoop.submit { netSwitch.portCount }.get()
+            if ports == wanted { return ports }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return ports
+    }
+
+    // Two peers that connect and never speak: the whole wire, by the limit.
+    let silent = (0..<2).map { _ in dial(path, type: .stream) }
+
+    // Waited out, because a guest arriving before the allowance has expired is
+    // refused and should be -- the wire really is full until then. The claim is
+    // that the places come back, not that they were never taken.
+    // No assertion on the port count here, and that is deliberate: a port is
+    // only granted at the END of the handshake, so a silent peer never has one
+    // and the count is zero whether the allowance works or not. An assertion
+    // there cannot fail, which makes it worse than none -- it would read as
+    // coverage of exactly the rule it cannot see.
+    //
+    // What the silent peers hold is an admission, and the thing that can be
+    // observed from outside is its consequence: whether a real guest gets in.
+    try await Task.sleep(nanoseconds: 500_000_000)
+
+    // A real guest, arriving to a wire the silent peers have been let go of.
+    //
+    // Both messages in one write. This test is about the allowance, and sending
+    // them separately makes it about the allowance AND how fast the test can
+    // poll: the guest's own clock starts when it connects, and on a slow machine
+    // the gap between the two writes ate the two hundred milliseconds and the
+    // gateway closed a guest that was doing everything right. Partial reads are
+    // the subject of `theVpnKitHandshakeIsExactlyTheSizesHyperkitExpects`, which
+    // splits the init deliberately.
+    //
+    // Retried, because the allowance expires on the gateway's own loop and a
+    // guest that arrives a moment early is refused -- correctly. Bounded, and
+    // far short of "never": with the allowance gone the places are never given
+    // back and no number of attempts helps.
+    let uuid = "1e0a4f1a-0000-4000-8000-0123456789ab"
+    let opening =
+        [UInt8]("VMN3T".utf8) + [UInt8](repeating: 0, count: 44)
+        + [UInt8(1)] + [UInt8](uuid.utf8) + [UInt8](repeating: 0, count: 4)
+    var guest: Int32 = -1
+    var ports = 0
+    for _ in 0..<20 where ports != 1 {
+        if guest >= 0 { close(guest) }
+        guest = dial(path, type: .stream)
+        _ = opening.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+        ports = try await portsSettleAt(1)
+        if ports != 1 { try await Task.sleep(nanoseconds: 25_000_000) }
+    }
+    #expect(
+        ports == 1,
+        "a guest that completed the handshake got no port: the silent peers never let go")
+
+    for descriptor in silent { close(descriptor) }
     close(guest)
     _ = try? await netSwitch.close().get()
     try? FileManager.default.removeItem(atPath: path)

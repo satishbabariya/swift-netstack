@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 import NIOPosix
 
@@ -303,7 +304,18 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     /// How many guests have taken this wire over. One for the first.
     public private(set) var guestsAdopted = 1
 
+    /// A socket file this link bound for itself, to be removed when it closes.
+    ///
+    /// Only the dialling wires have one: they need an address of their own so
+    /// the far end has somewhere to reply, and a socket file left behind after
+    /// the link is gone is litter in whatever directory it was put in.
+    public var localSocketPath: String?
+
     public func close() -> EventLoopFuture<Void> {
+        if let localSocketPath {
+            try? FileManager.default.removeItem(atPath: localSocketPath)
+            self.localSocketPath = nil
+        }
         guard let channel else { return eventLoop.makeSucceededVoidFuture() }
         return channel.close().recover { _ in () }
     }

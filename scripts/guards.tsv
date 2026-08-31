@@ -35,3 +35,4 @@ Sources/Netstack/Wire/VpnKitHandshake.swift	aPeerThatNeverFinishesTheVpnKitHands
 Sources/Netstack/Link/NetworkSwitch.swift	closingASwitchStopsItsListener	        let listener = stopListening?() ?? eventLoop.makeSucceededVoidFuture()	        let listener = eventLoop.makeSucceededVoidFuture()
 Sources/Netstack/Wire/WireLinkEndpoint.swift	aStreamWireDropsRatherThanQueueingForAGuestThatIsNotReading	            guard channel.isWritable else {	            guard true else {
 Sources/Netstack/Wire/WireBootstrap.swift	theListeningDatagramWireSurvivesAGuestThatStopsReading	                        flushPerFrame: true, learnsPeer: true, rawDescriptor: descriptor)	                        flushPerFrame: true, learnsPeer: true)
+Sources/Netstack/Wire/WireBootstrap.swift	aDialledDatagramWireCarriesFramesBothWays	                bind(descriptor, address, socklen_t(size))	                0

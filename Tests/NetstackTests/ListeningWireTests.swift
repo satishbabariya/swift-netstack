@@ -549,3 +549,59 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// The two entry points for a host that already knows where the guest is.
+//
+// `connectingDatagramSocket` and `connectingStreamSocket` are the other way
+// round from everything else here: the gateway dials rather than listens. They
+// had no caller and no test -- public API nobody had ever run -- which in a
+// package where an unexercised path turned out to have killed the default wire
+// is not a comfortable thing to leave alone.
+@Test func aDialledDatagramWireCarriesFramesBothWays() async throws {
+    let path = temporaryPath("dialled")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+    // One end listens, the other dials it. Both are this package's own wires.
+    let listening = try await WireBootstrap.listeningDatagramSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
+    let listener = Collector()
+    try await listening.eventLoop.submit { listening.attach(listener) }.get()
+
+    let dialling = try await WireBootstrap.connectingDatagramSocket(
+        toPath: path, group: group, linkAddress: MACAddress("0a:00:00:00:00:02")!, mtu: 1500
+    ).get()
+    let dialler = Collector()
+    try await dialling.eventLoop.submit { dialling.attach(dialler) }.get()
+
+    let outward = ethernetFrame(payload: 100)
+    try await dialling.eventLoop.submit {
+        dialling.write([PacketBuffer(received: ByteBuffer(bytes: outward))])
+    }.get()
+
+    var arrived: [[UInt8]] = []
+    for _ in 0..<400 where arrived.isEmpty {
+        arrived = try await listening.eventLoop.submit { listener.frames }.get()
+        if arrived.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(arrived.first?.count == outward.count, "the dialled wire did not carry a frame")
+
+    // And back, which is the half that needs the dialling socket to have an
+    // address of its own: a reply has nowhere to go otherwise.
+    let inward = ethernetFrame(payload: 200)
+    try await listening.eventLoop.submit {
+        listening.write([PacketBuffer(received: ByteBuffer(bytes: inward))])
+    }.get()
+
+    var returned: [[UInt8]] = []
+    for _ in 0..<400 where returned.isEmpty {
+        returned = try await dialling.eventLoop.submit { dialler.frames }.get()
+        if returned.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(returned.first?.count == inward.count, "the answer never reached the dialling wire")
+
+    _ = try? await dialling.close().get()
+    _ = try? await listening.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

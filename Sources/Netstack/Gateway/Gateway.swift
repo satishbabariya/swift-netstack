@@ -93,10 +93,23 @@ public final class Gateway: @unchecked Sendable {
                         + "somewhere else, since the gateway answers for itself and the host is "
                         + "translated to the loopback")
             }
-            for (hardware, leased) in dhcpStaticLeases where !subnet.contains(leased) {
-                found.append(
-                    "the static lease for \(hardware) is \(leased), which is not inside the "
-                        + "subnet \(subnet)")
+            // Every address this gateway answers for. A guest given one of them
+            // is told it is something the gateway already is.
+            let spokenFor = [gatewayAddress, hostAddress] + gatewayVirtualAddresses
+            for (hardware, leased) in dhcpStaticLeases {
+                if !subnet.contains(leased) {
+                    found.append(
+                        "the static lease for \(hardware) is \(leased), which is not inside the "
+                            + "subnet \(subnet)")
+                } else if spokenFor.contains(leased) {
+                    // The dynamic pool keeps these back; a static lease names an
+                    // address directly and walked straight past that. Handing a
+                    // guest the host's address makes host.containers.internal
+                    // resolve to the guest itself.
+                    found.append(
+                        "the static lease for \(hardware) is \(leased), which is an address the "
+                            + "gateway answers for itself")
+                }
             }
             return found
         }

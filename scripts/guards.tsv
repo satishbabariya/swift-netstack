@@ -31,4 +31,4 @@ Sources/Netstack/Channel/NetstackStreamChannel.swift	aWriteBeforeTheConnectionIs
 Sources/Netstack/Wire/WireBootstrap.swift	aGuestThatGoesAwayReleasesTheWireForTheNextOne	                channel.closeFuture.whenComplete { _ in accepted.taken = false }	                _ = channel
 Sources/Netstack/Wire/WireBootstrap.swift	guestsArrivingAtOnceAreBoundedByTheLimitRatherThanAllAdmitted	        guard netSwitch.portCount + admitting.pending < limit else { return nil }	        guard netSwitch.portCount < limit else { return nil }
 Sources/Netstack/Wire/VpnKitHandshake.swift	theVpnKitHandshakeIsExactlyTheSizesHyperkitExpects	                reply.writeBytes([UInt8](repeating: 0, count: Self.replyLength - reply.readableBytes))	                // padding removed
-Sources/Netstack/Wire/VpnKitHandshake.swift	aPeerThatNeverFinishesTheVpnKitHandshakeGivesItsPlaceBack	            context.close(promise: nil)	            _ = self
+Sources/Netstack/Wire/VpnKitHandshake.swift	aPeerThatNeverFinishesTheVpnKitHandshakeGivesItsPlaceBack	            channel.close(promise: nil)	            _ = channel

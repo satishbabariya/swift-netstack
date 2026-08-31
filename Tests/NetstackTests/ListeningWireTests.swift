@@ -44,6 +44,16 @@ private func ethernetFrame(payload: Int) -> [UInt8] {
 private func dial(_ path: String, type: SocketKind) -> Int32 {
     let fd = makeSocket(AF_UNIX, type)
     #expect(fd >= 0)
+    // A write to a socket the far end has closed raises SIGPIPE, whose default
+    // disposition kills the process -- so one test writing to a connection the
+    // gateway has (correctly) closed takes the whole suite down, reported as
+    // "exited with unexpected signal code 13" and pointing at no test in
+    // particular. Asking for EPIPE instead makes it a return value the caller
+    // can see.
+    #if canImport(Darwin)
+        var on: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+    #endif
     let connected = connectTo(fd, unixAddress(path: path))
     #expect(connected == 0, "could not dial \(path): \(String(cString: strerror(errno)))")
     return fd
@@ -455,21 +465,33 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try await Task.sleep(nanoseconds: 500_000_000)
 
     // A real guest, arriving to a wire the silent peers have been let go of.
-    let guest = dial(path, type: .stream)
+    //
+    // Retried, because the allowance expires on the gateway's own loop and a
+    // guest that arrives a moment early is refused -- correctly. Bounded, and
+    // far shorter than "never": with the allowance gone the places are never
+    // given back and no number of attempts helps.
     let initial = [UInt8]("VMN3T".utf8) + [UInt8](repeating: 0, count: 44)
-    _ = initial.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
-
+    var guest: Int32 = -1
     var echoed = [UInt8]()
     var buffer = [UInt8](repeating: 0, count: 49)
-    for _ in 0..<400 where echoed.count < 49 {
-        let read = buffer.withUnsafeMutableBytes {
-            recv(guest, $0.baseAddress, 49 - echoed.count, dontWait)
+    for _ in 0..<20 where echoed.count < 49 {
+        if guest >= 0 { close(guest) }
+        guest = dial(path, type: .stream)
+        _ = initial.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+        echoed.removeAll()
+        for _ in 0..<60 where echoed.count < 49 {
+            let read = buffer.withUnsafeMutableBytes {
+                recv(guest, $0.baseAddress, 49 - echoed.count, dontWait)
+            }
+            if read > 0 {
+                echoed.append(contentsOf: buffer[0..<read])
+            } else if read == 0 {
+                break  // refused: the places have not come back yet
+            } else {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
         }
-        if read > 0 {
-            echoed.append(contentsOf: buffer[0..<read])
-        } else {
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
+        if echoed.count < 49 { try await Task.sleep(nanoseconds: 25_000_000) }
     }
     #expect(
         echoed == initial,

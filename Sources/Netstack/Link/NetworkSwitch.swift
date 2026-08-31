@@ -366,15 +366,31 @@ public final class NetworkSwitch: GatewayLink, @unchecked Sendable {
         return closeOnLoop()
     }
 
+    /// Stops whatever is putting guests on this switch, set by the bootstrap
+    /// that started it.
+    ///
+    /// Closing a switch used to close its ports and leave the listener behind:
+    /// the socket path stayed bound, and a guest connecting afterwards was still
+    /// accepted -- onto a switch whose ports had all been closed. The `bess`
+    /// wire was worse, since its listener is a thread blocked in `accept`, so
+    /// every gateway a long-running embedder created and closed left one behind.
+    ///
+    /// Called once, on this loop, before the ports go.
+    var stopListening: (@Sendable () -> EventLoopFuture<Void>)?
+
     private func closeOnLoop() -> EventLoopFuture<Void> {
         eventLoop.preconditionInEventLoop()
+        // First, so that nothing new arrives while the ports are being closed.
+        let listener = stopListening?() ?? eventLoop.makeSucceededVoidFuture()
+        stopListening = nil
         for link in ports.values {
             retiredInbound += link.inboundDropped
             retiredOutbound += link.outboundDropped
             retiredReceived += link.bytesReceived
             retiredSent += link.bytesSent
         }
-        let closing = ports.values.map { $0.close() }
+        var closing = ports.values.map { $0.close() }
+        closing.append(listener)
         ports.removeAll()
         shims.removeAll()
         claimed.removeAll()

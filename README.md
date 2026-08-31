@@ -461,7 +461,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-775 tests, plus a differential harness in `differential/` that drives gVisor's
+776 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The
@@ -492,7 +492,7 @@ gateway and host addresses, the NAT entry, link-local being off, the two
 to happen: `Gateway.Configuration` gained eight parameters in a day, each one in
 the middle of an initialiser these samples call.
 
-`scripts/falsify.sh --all` deletes each of the twenty-four guards in
+`scripts/falsify.sh --all` deletes each of the twenty-five guards in
 `scripts/guards.tsv` in turn and requires that the named test notices — the
 bounds on half-open connections, established connections, UDP flows in both
 directions, reassembly entries and fragments, outstanding DNS queries, log

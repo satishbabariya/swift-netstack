@@ -2256,6 +2256,60 @@ PY
     return $outcome
 }
 
+# A forward's transport, which upstream spells as a prefix.
+#
+# `{"udp:127.0.0.1:5353": "192.168.127.2:53"}` is upstream's way of asking for a
+# datagram forward. The parser here took the last colon-separated component of
+# the host side as the port, and `udp:127.0.0.1:5353` ends in one -- so the
+# prefix was skipped and every entry became a TCP forward. A DNS forward, which
+# is the reason the prefix exists, listened on TCP and never saw a datagram.
+#
+# Read back through the control API rather than by connecting, because what went
+# wrong is the transport and not the port: the wrong forward was listening on
+# exactly the right number.
+forward_transport_smoke() {
+    CONFIG="${TMPDIR:-/tmp}/netstack-smoke-fwd-$$.json"
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-fwd-ctl-$$.sock"
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-fwd-$$.sock"
+    rm -f "$WIRE" "$CONTROL"
+    cat > "$CONFIG" <<'JSON'
+{"subnet":"192.168.127.0/24",
+ "forwards":{"udp:127.0.0.1:0":"192.168.127.2:53","127.0.0.1:0":"192.168.127.2:80"}}
+JSON
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" --config "$CONFIG" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$CONTROL" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$CONTROL" ]] || { echo "FAIL: the forwarding gateway never came up"; return 1; }
+
+    CONTROL="$CONTROL" python3 - <<'PY'
+import json, os, subprocess, sys
+
+answer = subprocess.run(
+    ["curl", "--silent", "--fail-with-body", "--max-time", "10",
+     "--unix-socket", os.environ["CONTROL"], "http://gateway/services/forwarder/all"],
+    capture_output=True, text=True, timeout=20)
+if answer.returncode != 0:
+    print("FAIL: the forwarder list was not answered")
+    sys.exit(1)
+forwards = json.loads(answer.stdout)
+protocols = sorted(entry.get("protocol", "?") for entry in forwards)
+if protocols != ["tcp", "udp"]:
+    print("FAIL: a config asking for one udp forward and one tcp forward produced",
+          protocols, "-- the udp: prefix on the host side is what says which")
+    sys.exit(1)
+print("ok: fwd   a udp: entry made a udp forward and a plain one made tcp")
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE" "$CONTROL" "$CONFIG"
+    return $outcome
+}
+
 status=0
 
 # The defaults.
@@ -2331,5 +2385,8 @@ backpressure_smoke || status=1
 
 # And that the pool keeps back what the gateway answers for.
 pool_smoke || status=1
+
+# And that a forward's transport survives the config file.
+forward_transport_smoke || status=1
 
 exit $status

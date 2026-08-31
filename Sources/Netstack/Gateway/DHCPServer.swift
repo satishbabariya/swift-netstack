@@ -67,9 +67,13 @@ public final class DHCPServer {
     public static let serverPort: UInt16 = 67
     public static let clientPort: UInt16 = 68
 
+    /// Addresses in `reserved` are ones the gateway already answers for and must
+    /// never be leased to a guest. The gateway's own address is always one; the
+    /// host address is the one that was missing.
     public init(
         stack: Stack, leaseSeconds: UInt32 = 3600, mtu: UInt16 = 1500,
-        staticLeases: [MACAddress: IPv4Address] = [:], searchDomains: [String] = []
+        staticLeases: [MACAddress: IPv4Address] = [:], searchDomains: [String] = [],
+        reserved: [IPv4Address] = []
     ) throws {
         self.staticLeases = staticLeases
         self.searchDomains = searchDomains
@@ -82,7 +86,7 @@ public final class DHCPServer {
         // The pool excludes every statically-assigned address as well as the
         // gateway's own, so a guest with no static lease is never handed one
         // that belongs to a guest that has one.
-        self.pool = Self.addresses(in: subnet, excluding: gateway)
+        self.pool = Self.addresses(in: subnet, excluding: [gateway] + reserved)
             .filter { !Set(staticLeases.values).contains($0) }
         // Bound to `.any`, not to the gateway's address. A client that does not
         // have an address yet broadcasts to 255.255.255.255, so a binding on the
@@ -101,15 +105,32 @@ public final class DHCPServer {
     /// allocation. The cap is on the POOL, not on the subnet: a larger subnet
     /// still works, it simply does not lease past the first few thousand
     /// addresses in it.
-    static func addresses(in subnet: IPv4Subnet, excluding gateway: IPv4Address, limit: Int = 4096) -> [IPv4Address] {
+    /// Every address a guest may be given: the subnet without its network and
+    /// broadcast addresses, and without anything the gateway answers for.
+    ///
+    /// The exclusions used to be the gateway alone, so the pool contained the
+    /// HOST address -- the one `host.containers.internal` resolves to and NAT
+    /// translates to the host's loopback. A guest handed it believes it is the
+    /// host: `host.containers.internal` names itself, and its ARP for that
+    /// address collides with the gateway's.
+    ///
+    /// On the default /24 that needs two hundred and fifty guests, so it was
+    /// invisible. On a /29 it is the fifth:
+    ///
+    ///     guest 4: leased 192.168.127.5
+    ///     guest 5: leased 192.168.127.6   <- the host's address
+    static func addresses(in subnet: IPv4Subnet, excluding reserved: [IPv4Address], limit: Int = 4096)
+        -> [IPv4Address]
+    {
         var out: [IPv4Address] = []
         let network = subnet.address.raw
         let broadcast = subnet.broadcast.raw
         guard broadcast > network else { return [] }
+        let taken = Set(reserved)
         var candidate = network &+ 1
         while candidate < broadcast, out.count < limit {
             let address = IPv4Address(candidate)
-            if address != gateway { out.append(address) }
+            if !taken.contains(address) { out.append(address) }
             candidate &+= 1
         }
         return out

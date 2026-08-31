@@ -435,3 +435,36 @@ private func optionValues(in buffer: ByteBuffer) -> [UInt8: [UInt8]] {
     }
     return out
 }
+
+// The pool must not contain an address the gateway answers for.
+//
+// It contained the HOST address -- the one `host.containers.internal` resolves
+// to, and the one NAT translates to the host's loopback. A guest handed it
+// believes it is the host: the name resolves to itself, and its ARP for that
+// address collides with the gateway's.
+//
+// On the default /24 that takes two hundred and fifty guests, so nothing ever
+// saw it. On a /29 it is the fifth, and the fifth is where this looks:
+//
+//     guest 4: leased 192.168.127.5
+//     guest 5: leased 192.168.127.6   <- the host's address
+@Test func theLeasePoolNeverContainsAnAddressTheGatewayAnswersFor() {
+    let subnet = IPv4Subnet(cidr: "192.168.127.0/29")!
+    let gateway = subnet.firstUsable
+    let host = subnet.lastUsable
+    let virtual = IPv4Address("192.168.127.4")!
+
+    let pool = DHCPServer.addresses(in: subnet, excluding: [gateway, host, virtual])
+
+    #expect(!pool.contains(gateway), "the pool contains the gateway's own address")
+    #expect(!pool.contains(host), "the pool contains the host address")
+    #expect(!pool.contains(virtual), "the pool contains one of the gateway's virtual addresses")
+    #expect(!pool.contains(subnet.address), "the pool contains the network address")
+    #expect(!pool.contains(subnet.broadcast), "the pool contains the broadcast address")
+
+    // What is left is what a guest may have: .2, .3 and .5 on a /29 whose .4 is
+    // spoken for. Asserted exactly, because "fewer than before" would hold for a
+    // pool that had lost the wrong ones.
+    let expected = ["192.168.127.2", "192.168.127.3", "192.168.127.5"].map { IPv4Address($0)! }
+    #expect(pool == expected, "the pool is \(pool.map(\.description))")
+}

@@ -26,6 +26,9 @@ struct FileConfiguration {
     var searchDomains: [String] = []
     var staticLeases: [MACAddress: IPv4Address] = [:]
     var nat: [IPv4Address: IPv4Address]?
+    /// Upstream's `vpnKitUUIDMacAddresses`: the address to hand a vpnkit guest,
+    /// by the UUID hyperkit sends during the handshake.
+    var vpnKitAddresses: [String: MACAddress] = [:]
     var virtualAddresses: [IPv4Address]?
     var allowsLinkLocal: Bool?
     var maximumHalfOpen: Int?
@@ -116,6 +119,16 @@ struct FileConfiguration {
                 translations[source] = target
             }
             nat = translations
+        }
+        if let table = jsonField(fields, "vpnKitUUIDMacAddresses") as? [String: String] {
+            var addresses: [String: MACAddress] = [:]
+            for (uuid, text) in table {
+                guard let address = MACAddress(text) else {
+                    throw Failure.badValue("vpnKitUUIDMacAddresses", "\(uuid): \(text)")
+                }
+                addresses[uuid] = address
+            }
+            vpnKitAddresses = addresses
         }
         if let list = jsonField(fields, "gatewayVirtualIPs") as? [String] {
             virtualAddresses = try list.map {

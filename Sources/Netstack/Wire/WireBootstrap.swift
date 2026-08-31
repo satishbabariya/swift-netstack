@@ -246,6 +246,82 @@ public enum WireBootstrap {
         return arrived.futureResult
     }
 
+    /// Bind a unix stream socket that speaks hyperkit's vpnkit protocol, and
+    /// give every guest that connects a port on a switch.
+    ///
+    /// `--listen-vpnkit`. The difference from `switchedStreamSocket` is the
+    /// opening exchange -- see `VpnKitHandshakeHandler` -- after which the wire
+    /// is ordinary hyperkit framing. The guest is *told* its hardware address
+    /// here rather than choosing one, which is why `macForUUID` exists: upstream
+    /// maps the UUID hyperkit sends to a configured address and invents one when
+    /// it is not in the map.
+    public static func vpnKitStreamSocket(
+        atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16,
+        macForUUID: @escaping @Sendable (String) -> MACAddress = { _ in MACAddress.randomLocallyAdministered() }
+    ) -> EventLoopFuture<NetworkSwitch> {
+        try? FileManager.default.removeItem(atPath: path)
+        let loop = group.next()
+        let netSwitch = NetworkSwitch(
+            linkAddress: linkAddress, mtu: mtu, eventLoop: loop,
+            maximumAddressesPerPort: maximumAddressesPerPort)
+        let limit = max(1, maximumGuests)
+        let admitting = AdmittedGuests()
+
+        return ServerBootstrap(group: group, childGroup: loop)
+            .childChannelInitializer { channel in
+                guard netSwitch.portCount + admitting.pending < limit else {
+                    return channel.close()
+                }
+                admitting.pending += 1
+                // Given back exactly once, whichever happens first: the
+                // handshake completing, or the guest going away in the middle of
+                // it. A reservation taken and never returned is a limit that
+                // shrinks to nothing over a long enough run.
+                let reservation = AdmittedGuests()
+                reservation.pending = 1
+                @Sendable func release() {
+                    guard reservation.pending == 1 else { return }
+                    reservation.pending = 0
+                    admitting.pending -= 1
+                }
+
+                // The handshake first, alone in the pipeline. The frame codec is
+                // installed by its completion, so the decoder never sees the
+                // handshake bytes -- which are not frames and whose first two
+                // bytes would be read as a length.
+                let handshake = VpnKitHandshakeHandler(
+                    allocator: channel.allocator, mtu: UInt16(truncatingIfNeeded: mtu),
+                    macForUUID: macForUUID
+                ) { _ in
+                    release()
+                    _ = configure(
+                        channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true,
+                        framing: .hyperkit
+                    ).map { link in
+                        let id = netSwitch.addPort(link)
+                        channel.closeFuture.whenComplete { _ in _ = netSwitch.removePort(id) }
+                    }
+                }
+                channel.closeFuture.whenComplete { _ in release() }
+                // `syncOperations` directly, with no hop and no closure: the
+                // child is pinned to this loop and `childChannelInitializer`
+                // runs on it. `addHandler` would want the handler to be
+                // `Sendable`, and one holding a buffer of half a handshake
+                // cannot honestly be -- so the answer is not to send it
+                // anywhere.
+                do {
+                    try channel.pipeline.syncOperations.addHandler(handshake)
+                    return channel.eventLoop.makeSucceededVoidFuture()
+                } catch {
+                    release()
+                    return channel.eventLoop.makeFailedFuture(error)
+                }
+            }
+            .bind(unixDomainSocketPath: path)
+            .map { _ in netSwitch }
+    }
+
     /// Bind a unix stream socket and give **every** guest that connects a port
     /// on a switch, so one gateway serves a whole network rather than one VM.
     ///

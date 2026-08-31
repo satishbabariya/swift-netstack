@@ -39,6 +39,19 @@ public struct MACAddress: Hashable, Sendable, CustomStringConvertible {
 
     public static let broadcast = MACAddress(bytes: [0xff, 0xff, 0xff, 0xff, 0xff, 0xff])!
 
+    /// An address nobody else is using, for a guest that has to be given one.
+    ///
+    /// The vpnkit wire tells the guest what its address is rather than learning
+    /// it, so one has to come from somewhere. Locally administered (bit 1 of the
+    /// first octet set) and unicast (bit 0 clear), which is what those two bits
+    /// are for: it says this address was invented here and is not a
+    /// manufacturer's, so it cannot collide with real hardware.
+    public static func randomLocallyAdministered() -> MACAddress {
+        var bytes = (0..<6).map { _ in UInt8.random(in: 0...255) }
+        bytes[0] = (bytes[0] | 0b0000_0010) & 0b1111_1110
+        return MACAddress(bytes: bytes)!
+    }
+
     public var isBroadcast: Bool { raw == MACAddress.broadcast.raw }
 
     /// The low bit of the first octet. Broadcast is a special case of it.

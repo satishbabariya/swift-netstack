@@ -323,3 +323,70 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// hyperkit's opening exchange, byte for byte.
+//
+// The sizes are hyperkit's and they are exact: 49 in, 49 back, 41 in, 258 out.
+// There is nothing to negotiate and no version to check, which means a
+// generously-written implementation -- one that accepted a short message, or
+// replied with as many bytes as it had -- would be wrong in a way that only
+// hyperkit itself could tell you about.
+@Test func theVpnKitHandshakeIsExactlyTheSizesHyperkitExpects() async throws {
+    let path = temporaryPath("vpnkit")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let told = MACAddress("aa:bb:cc:dd:ee:01")!
+    let uuid = "1e0a4f1a-0000-4000-8000-0123456789ab"
+    let netSwitch = try await WireBootstrap.vpnKitStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500,
+        macForUUID: { asked in asked == uuid ? told : MACAddress("00:00:00:00:00:00")! }
+    ).get()
+
+    let guest = dial(path, type: .stream)
+
+    // Sent in two writes, deliberately: a socket delivers bytes, not messages,
+    // and an implementation that read whatever one `read` returned would pass a
+    // single-write test and fail on a real hyperkit.
+    let initial = [UInt8]("VMN3T".utf8) + [UInt8](repeating: 0, count: 44)
+    #expect(initial.count == 49)
+    _ = Array(initial[0..<20]).withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+    try await Task.sleep(nanoseconds: 20_000_000)
+    _ = Array(initial[20...]).withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+
+    func readExactly(_ count: Int) async throws -> [UInt8] {
+        var collected = [UInt8]()
+        var buffer = [UInt8](repeating: 0, count: count)
+        for _ in 0..<400 where collected.count < count {
+            let read = buffer.withUnsafeMutableBytes {
+                recv(guest, $0.baseAddress, count - collected.count, dontWait)
+            }
+            if read > 0 {
+                collected.append(contentsOf: buffer[0..<read])
+            } else {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+        }
+        return collected
+    }
+
+    let echoed = try await readExactly(49)
+    #expect(echoed == initial, "the init message was not echoed back verbatim")
+
+    let command = [UInt8(1)] + [UInt8](uuid.utf8) + [UInt8](repeating: 0, count: 4)
+    #expect(command.count == 41)
+    _ = command.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+
+    let reply = try await readExactly(258)
+    #expect(reply.count == 258, "the reply was \(reply.count) bytes where hyperkit reads 258")
+    #expect(reply.first == 0x01)
+    #expect(UInt16(reply[1]) | UInt16(reply[2]) << 8 == 1500, "the MTU was not what the switch was built with")
+    // The frame size, which is the MTU plus an ethernet header. A reply that
+    // forgot the header would have hyperkit truncating every full-sized frame.
+    #expect(UInt16(reply[3]) | UInt16(reply[4]) << 8 == 1514)
+    #expect(Array(reply[5..<11]) == told.bytes, "the guest was given the wrong address for its UUID")
+    #expect(Array(reply[11...]).allSatisfy { $0 == 0 }, "the tail of the reply is meant to be zero")
+
+    close(guest)
+    _ = try? await netSwitch.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

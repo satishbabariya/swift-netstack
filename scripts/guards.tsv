@@ -30,3 +30,4 @@ Sources/Netstack/Gateway/Gateway.swift	aGatewayGivenOnlyASubnetPlacesItselfAndTh
 Sources/Netstack/Channel/NetstackStreamChannel.swift	aWriteBeforeTheConnectionIsEstablishedIsQueuedRatherThanDropped	        guard state != .closed else {	        guard state == .active else {
 Sources/Netstack/Wire/WireBootstrap.swift	aGuestThatGoesAwayReleasesTheWireForTheNextOne	                channel.closeFuture.whenComplete { _ in accepted.taken = false }	                _ = channel
 Sources/Netstack/Wire/WireBootstrap.swift	guestsArrivingAtOnceAreBoundedByTheLimitRatherThanAllAdmitted	                guard netSwitch.portCount + admitting.pending < limit else {	                guard netSwitch.portCount < limit else {
+Sources/Netstack/Wire/VpnKitHandshake.swift	theVpnKitHandshakeIsExactlyTheSizesHyperkitExpects	                reply.writeBytes([UInt8](repeating: 0, count: Self.replyLength - reply.readableBytes))	                // padding removed

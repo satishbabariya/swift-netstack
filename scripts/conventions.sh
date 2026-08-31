@@ -193,6 +193,59 @@ if [[ -n "$direct" ]]; then
     fail "library logging that does not go through the rate limiter" "$direct"
 fi
 
+
+# 10. Every datagram wire writes through its own descriptor.
+#
+# NIO closes a datagram channel when a write returns ENOBUFS, and a full unix
+# datagram queue returns exactly that on BSD -- so a guest that pauses takes the
+# gateway's network down for good unless the link writes to the descriptor
+# itself, with a bounded retry.
+#
+# That fix was made once, for the adopted socket, and three other datagram wires
+# did not have it: the LISTENING one, which is --listen-vfkit and the default;
+# the dialling one; and bess. The first killed the default wire. Nothing
+# connected them, because each is a separate call with its own argument list and
+# the missing argument is invisible.
+#
+# `framed: false` is what makes a wire a datagram wire here -- there is no length
+# prefix because the socket carries the boundaries -- so that is what this looks
+# for. Per CALL rather than per line: a `configure(...)` spans several lines, so
+# a line-by-line version reported every datagram wire as missing the argument
+# that was three lines below it, and matched the word in a comment as well.
+missing=$(python3 - <<'CHECK'
+import re
+import sys
+
+source = open("Sources/Netstack/Wire/WireBootstrap.swift").read()
+# Comments first: the phrase appears in prose explaining the very rule.
+source = re.sub(r"//[^\n]*", "", source)
+
+bad = []
+for call in re.finditer(r"configure\(", source):
+    depth, i = 0, call.end() - 1
+    while i < len(source):
+        if source[i] == "(":
+            depth += 1
+        elif source[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    body = " ".join(source[call.end():i].split())
+    if "framed: false" not in body:
+        continue
+    if "framed: Bool" in body or "rawDescriptor" in body:
+        continue
+    bad.append(body[:110])
+
+for line in bad:
+    print(line)
+CHECK
+)
+if [[ -n "$missing" ]]; then
+    fail "a datagram wire that writes through NIO rather than its own descriptor" "$missing"
+fi
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

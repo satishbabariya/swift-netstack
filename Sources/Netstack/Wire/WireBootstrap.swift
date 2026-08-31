@@ -73,18 +73,62 @@ public enum WireBootstrap {
     public static func connectingDatagramSocket(
         toPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500
     ) -> EventLoopFuture<WireLinkEndpoint> {
-        let frameSize = Int(mtu) + EthernetHeader.length
         do {
             let remote = try SocketAddress(unixDomainSocketPath: path)
-            return DatagramBootstrap(group: group)
-                .channelOption(.recvAllocator, value: FixedSizeRecvByteBufferAllocator(capacity: frameSize))
-                .connect(to: remote)
-                .flatMap { channel in
-                    // A `DatagramBootstrap.connect` DOES go through `connect0`,
-                    // so this channel knows its peer and writes on it are safe.
-                    // It is the adopted-descriptor path above that cannot.
-                    configure(channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false, remote: remote)
-                }
+
+            // Bound to an address of its own before it dials, and that is the
+            // whole of what was wrong here.
+            //
+            // A unix datagram socket that only connects has no address, so the
+            // far end has nowhere to send its answers: this carried frames out
+            // and received nothing, ever. Measured -- the outward frame arrived
+            // and the reply never did. macOS does not autobind the way Linux
+            // does, so nothing filled the gap.
+            //
+            // In the temporary directory rather than beside the target, because
+            // `sun_path` is about a hundred bytes and a name derived from a path
+            // that is already long does not fit.
+            let localPath = FileManager.default.temporaryDirectory
+                .appendingPathComponent("netstack-\(getpid())-\(UInt32.random(in: 0..<UInt32.max)).sock")
+                .path
+            let local = try SocketAddress(unixDomainSocketPath: localPath)
+
+            #if canImport(Darwin)
+                let descriptor = socket(AF_UNIX, SOCK_DGRAM, 0)
+            #else
+                let descriptor = socket(AF_UNIX, Int32(SOCK_DGRAM.rawValue), 0)
+            #endif
+            guard descriptor >= 0 else {
+                return group.any().makeFailedFuture(IOError(errnoCode: errno, reason: "socket"))
+            }
+            let bound = local.withSockAddr { address, size in
+                bind(descriptor, address, socklen_t(size))
+            }
+            guard bound == 0 else {
+                let failure = errno
+                close(descriptor)
+                return group.any().makeFailedFuture(
+                    IOError(errnoCode: failure, reason: "bind \(localPath)"))
+            }
+            let connected = remote.withSockAddr { address, size in
+                connect(descriptor, address, socklen_t(size))
+            }
+            guard connected == 0 else {
+                let failure = errno
+                close(descriptor)
+                try? FileManager.default.removeItem(atPath: localPath)
+                return group.any().makeFailedFuture(IOError(errnoCode: failure, reason: "connect \(path)"))
+            }
+
+            // Adopted, so this shares the direct-write path rather than growing
+            // a second copy of it -- which is how the listening wire came to be
+            // missing the ENOBUFS handling the adopted one had.
+            return adoptingDatagramSocket(
+                descriptor, group: group, linkAddress: linkAddress, mtu: mtu
+            ).map { link in
+                link.localSocketPath = localPath
+                return link
+            }
         } catch {
             return group.any().makeFailedFuture(error)
         }
@@ -410,9 +454,15 @@ public enum WireBootstrap {
                             // `framed: false`: the socket type is the framing.
                             // `flushPerFrame`: a gathering write would put two
                             // frames in one message.
+                            // `rawDescriptor` for the same reason every other
+                            // datagram wire has one: a write that cannot fit
+                            // returns ENOBUFS, and NIO answers that by closing
+                            // the channel. The socket is connected here -- it
+                            // came from `accept` -- so the direct write is a
+                            // plain `send`.
                             _ = configure(
                                 channel: channel, linkAddress: linkAddress, mtu: mtu,
-                                framed: false, flushPerFrame: true
+                                framed: false, flushPerFrame: true, rawDescriptor: guest
                             ).map { link in
                                 release()
                                 let id = netSwitch.addPort(link)

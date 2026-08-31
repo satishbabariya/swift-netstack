@@ -330,7 +330,12 @@ the answers grew that queue as fast as it could ask: four hundred thousand ARP
 requests took the gateway from 8 MiB to 150 MiB. Every multi-guest wire is a
 stream wire, so this was the one that mattered most and the one nothing looked
 at. The link drops when its queue is full now, which is what a link does; the
-same flood costs 1.7 MiB. A full unix
+same flood costs 1.7 MiB. The same fix had to be made twice: the direct-write path was written for the
+*adopted* datagram socket and the **listening** one — `--listen-vfkit`, the
+default, and the one vfkit uses — never got it. A guest that paused took the
+gateway's network down for good, and worse than down: the socket was gone, so a
+replacement guest could not connect either, and nothing said anything. A full
+unix
 datagram queue reports `ENOBUFS` on BSD where Linux reports `EAGAIN`; NIO retries
 the second and treats the first as fatal, closing the channel — so a paused or
 slow VM used to leave this gateway permanently off the network, with nothing
@@ -468,7 +473,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-777 tests, plus a differential harness in `differential/` that drives gVisor's
+778 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The
@@ -499,7 +504,7 @@ gateway and host addresses, the NAT entry, link-local being off, the two
 to happen: `Gateway.Configuration` gained eight parameters in a day, each one in
 the middle of an initialiser these samples call.
 
-`scripts/falsify.sh --all` deletes each of the twenty-six guards in
+`scripts/falsify.sh --all` deletes each of the twenty-seven guards in
 `scripts/guards.tsv` in turn and requires that the named test notices — the
 bounds on half-open connections, established connections, UDP flows in both
 directions, reassembly entries and fragments, outstanding DNS queries, log

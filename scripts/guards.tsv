@@ -34,3 +34,4 @@ Sources/Netstack/Wire/VpnKitHandshake.swift	theVpnKitHandshakeIsExactlyTheSizesH
 Sources/Netstack/Wire/VpnKitHandshake.swift	aPeerThatNeverFinishesTheVpnKitHandshakeGivesItsPlaceBack	            channel.close(promise: nil)	            _ = channel
 Sources/Netstack/Link/NetworkSwitch.swift	closingASwitchStopsItsListener	        let listener = stopListening?() ?? eventLoop.makeSucceededVoidFuture()	        let listener = eventLoop.makeSucceededVoidFuture()
 Sources/Netstack/Wire/WireLinkEndpoint.swift	aStreamWireDropsRatherThanQueueingForAGuestThatIsNotReading	            guard channel.isWritable else {	            guard true else {
+Sources/Netstack/Wire/WireBootstrap.swift	theListeningDatagramWireSurvivesAGuestThatStopsReading	                        flushPerFrame: true, learnsPeer: true, rawDescriptor: descriptor)	                        flushPerFrame: true, learnsPeer: true)

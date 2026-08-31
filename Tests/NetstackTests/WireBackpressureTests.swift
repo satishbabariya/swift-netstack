@@ -140,3 +140,75 @@ private let backpressureMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+// The same question again for the wire the program actually uses.
+//
+// `adoptingDatagramSocket` was given a direct-write path because NIO closes a
+// datagram channel when a write returns ENOBUFS, and a full unix datagram queue
+// returns exactly that on BSD. The LISTENING datagram wire -- `--listen-vfkit`,
+// the default, and the one vfkit uses -- was not, and the test above could not
+// see it because it adopts a socketpair.
+//
+// So the fix was in the library and absent from the default path. A guest that
+// paused took the gateway's network down for good:
+//
+//     guest A drained 27 frames it had ignored
+//     guest A got no answer -- the wire is dead
+//     guest B could not join: ECONNREFUSED
+//
+// Down for good, and worse than down: the socket was gone, so a replacement
+// guest could not connect either. Nothing said anything.
+@Test func theListeningDatagramWireSurvivesAGuestThatStopsReading() async throws {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("netstack-flood-\(getpid())-\(UInt32.random(in: 0..<UInt32.max)).sock")
+        .path
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let link = try await WireBootstrap.listeningDatagramSocket(
+        atPath: path, group: group, linkAddress: backpressureMAC, mtu: 1500
+    ).get()
+
+    // A guest that speaks once, so the peer is learned, and then never reads.
+    let guest = makeSocket(AF_UNIX, .datagram)
+    let guestPath = path + ".guest"
+    try? FileManager.default.removeItem(atPath: guestPath)
+    #expect(bindTo(guest, unixAddress(path: guestPath)) == 0)
+    #expect(connectTo(guest, unixAddress(path: path)) == 0)
+    _ = sendBytes(guest, [UInt8](repeating: 0, count: 64))
+
+    // Waited for, so the link has somewhere to send.
+    for _ in 0..<200 {
+        let learned = try await link.eventLoop.submit { link.bytesReceived > 0 }.get()
+        if learned { break }
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+
+    let frame: ByteBuffer = {
+        var buffer = ByteBuffer()
+        buffer.writeBytes([UInt8](repeating: 0xCD, count: 1400))
+        return buffer
+    }()
+    try await link.eventLoop.submit {
+        for _ in 0..<5000 {
+            link.write([PacketBuffer(allocator: ByteBufferAllocator(), payload: frame)])
+        }
+    }.get()
+
+    // The wire is still there. That is the whole claim: not that every frame
+    // arrived -- a link drops when its queue is full -- but that the link is
+    // still a link afterwards.
+    let alive = try await link.eventLoop.submit { link.isActiveForTesting }.get()
+    #expect(alive, "a guest that stopped reading closed the gateway's wire")
+    // `outboundBackedUp` rather than `outboundDropped`: the direct-write path
+    // keeps them apart on purpose. A frame the kernel refused for a reason that
+    // is not "full" is rejected and counted as dropped; a frame the queue had no
+    // room for is backed up. Only the second happens here, and asserting on the
+    // first passed nothing and proved nothing.
+    let backedUp = try await link.eventLoop.submit { link.outboundBackedUp }.get()
+    #expect(backedUp > 0, "five thousand frames into a queue of about forty and none backed up")
+
+    close(guest)
+    _ = try? await link.close().get()
+    try? FileManager.default.removeItem(atPath: guestPath)
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

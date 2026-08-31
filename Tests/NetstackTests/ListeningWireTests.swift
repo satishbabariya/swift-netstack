@@ -363,6 +363,13 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     let uuid = "1e0a4f1a-0000-4000-8000-0123456789ab"
     let netSwitch = try await WireBootstrap.vpnKitStreamSocket(
         atPath: path, group: group, linkAddress: listenMAC, mtu: 1500,
+        // Generous on purpose. This test is about the message SIZES, and the
+        // handshake allowance is another test's subject -- leaving it at the
+        // ten-second default couples this one to how long the runner takes to
+        // schedule it between two writes. CI stalled nineteen seconds over tests
+        // that finish here in milliseconds, and the gateway closed a connection
+        // that had done nothing wrong.
+        handshakeAllowance: .minutes(5),
         macForUUID: { asked in asked == uuid ? told : MACAddress("00:00:00:00:00:00")! }
     ).get()
 

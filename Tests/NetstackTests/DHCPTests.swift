@@ -18,19 +18,23 @@ private final class DHCPFixture {
     let stack: Stack
     let server: DHCPServer
 
+    let clock = ManualClock()
+
     init(
         cidr: String = "192.168.127.0/24", staticLeases: [MACAddress: IPv4Address] = [:],
-        searchDomains: [String] = []
+        searchDomains: [String] = [], leaseSeconds: UInt32 = 3600,
+        reserved: [IPv4Address] = []
     ) throws {
         link = RecordingEndpoint(eventLoop: loop, linkAddress: dhcpGatewayMAC)
         stack = Stack(
             link: link,
             configuration: Stack.Configuration(
                 gatewayAddress: dhcpGateway, subnet: IPv4Subnet(cidr: cidr)!),
-            clock: ManualClock())
+            clock: clock)
         stack.start()
         server = try DHCPServer(
-            stack: stack, staticLeases: staticLeases, searchDomains: searchDomains)
+            stack: stack, leaseSeconds: leaseSeconds, staticLeases: staticLeases,
+            searchDomains: searchDomains, reserved: reserved)
     }
 
     /// Deliver a client message as though it arrived on the wire, broadcast
@@ -467,4 +471,64 @@ private func optionValues(in buffer: ByteBuffer) -> [UInt8: [UInt8]] {
     // pool that had lost the wrong ones.
     let expected = ["192.168.127.2", "192.168.127.3", "192.168.127.5"].map { IPv4Address($0)! }
     #expect(pool == expected, "the pool is \(pool.map(\.description))")
+}
+
+// An address that has been given out comes back.
+//
+// Nothing released one before. The table is bounded by the pool -- it cannot
+// hold more entries than there are addresses -- so it was not a leak, but the
+// pool exhausted after one entry per hardware address ever seen and never
+// recovered. A host that starts and stops containers gives each a new address,
+// so on the default /24 that is two hundred and fifty-three containers and then
+// no more networking, permanently, with nothing to do but restart the gateway.
+//
+// Upstream has the same shape: its pool has a `Release` and only its tests call
+// it. This is a deliberate step past it.
+@Test func anAddressComesBackAfterTheGuestHoldingItHasBeenGoneItsWholeTerm() throws {
+    // A /30 has two usable addresses, the gateway holds .1, so exactly one is
+    // left for a guest -- which makes exhaustion the second guest rather than
+    // the two hundred and fifty-fourth.
+    let fixture = try DHCPFixture(cidr: "192.168.127.0/30", leaseSeconds: 60)
+
+    let first = MACAddress("02:00:00:00:00:01")!
+    let second = MACAddress("02:00:00:00:00:02")!
+    let only = IPv4Address("192.168.127.2")!
+    #expect(fixture.discover(from: first) == only)
+
+    // Nothing has expired, so the second guest is refused rather than handed an
+    // address the first is still using.
+    #expect(fixture.discover(from: second) == nil, "an address in use was given away")
+
+    // Halfway through the term is not enough: a guest does not renew until then,
+    // and taking its address here would take it from a guest that is merely
+    // quiet.
+    fixture.clock.advance(by: .seconds(30))
+    #expect(fixture.discover(from: second) == nil, "an address was reclaimed before its term")
+
+    // Past the term the first guest was told, in option 51, it has been told to
+    // stop using the address.
+    fixture.clock.advance(by: .seconds(31))
+    #expect(fixture.discover(from: second) == only, "the address never came back")
+    #expect(fixture.server.expired == 1)
+}
+
+// And a guest that keeps asking keeps its address, however long it lives.
+@Test func aGuestThatKeepsRenewingIsNeverReclaimed() throws {
+    let fixture = try DHCPFixture(cidr: "192.168.127.0/30", leaseSeconds: 60)
+    let staying = MACAddress("02:00:00:00:00:01")!
+    let other = MACAddress("02:00:00:00:00:02")!
+    let only = IPv4Address("192.168.127.2")!
+    #expect(fixture.discover(from: staying) == only)
+
+    // Ten terms, renewed each time. Asking again is what a renewal is.
+    for _ in 0..<10 {
+        fixture.clock.advance(by: .seconds(59))
+        #expect(fixture.discover(from: staying) == only)
+    }
+
+    fixture.clock.advance(by: .seconds(30))
+    #expect(
+        fixture.discover(from: other) == nil,
+        "a guest that renewed on time had its address taken")
+    #expect(fixture.server.expired == 0)
 }

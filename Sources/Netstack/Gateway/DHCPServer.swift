@@ -47,6 +47,10 @@ public final class DHCPServer {
     private var leases: [MACAddress: IPv4Address] = [:]
     private var pool: [IPv4Address] = []
 
+    /// Leases reclaimed because the guest holding them had been gone longer than
+    /// the term it was given.
+    public private(set) var expired = 0
+
     /// Requests dropped because the pool had nothing left.
     public private(set) var exhausted = 0
 
@@ -174,8 +178,28 @@ public final class DHCPServer {
         }
     }
 
+    /// When each lease was last asked for, so an address can come back.
+    ///
+    /// Nothing released an address before this. The table is bounded by the pool
+    /// -- it cannot hold more entries than there are addresses -- so it was not
+    /// a leak, but the pool exhausted after one entry per hardware address ever
+    /// seen and never recovered. A host that starts and stops containers gives
+    /// each a new address, so on the default /24 that is two hundred and
+    /// fifty-three containers and then no more networking, permanently, with
+    /// nothing to do but restart the gateway.
+    ///
+    /// Upstream has the same shape: its pool has a `Release` and only its tests
+    /// call it.
+    private var leasedAt: [MACAddress: NIODeadline] = [:]
+
     private func lease(for hardware: MACAddress) -> IPv4Address? {
-        if let existing = leases[hardware] { return existing }
+        if let existing = leases[hardware] {
+            // Asking again is the guest saying it is still there, which is what
+            // a DHCP renewal is. Touched on every request, so a guest that keeps
+            // renewing keeps its address however long it lives.
+            leasedAt[hardware] = stack.clock.now()
+            return existing
+        }
         // A static lease is the operator saying where this guest lives, so it is
         // honoured whether or not the address is inside the pool and whether or
         // not something else already holds it. That last part is deliberate:
@@ -184,14 +208,36 @@ public final class DHCPServer {
         // asking for a fixed address is that something else is relying on it.
         if let fixed = staticLeases[hardware] {
             leases[hardware] = fixed
+            leasedAt[hardware] = stack.clock.now()
             return fixed
         }
         // Ascending, first free. A guest that comes back after a reboot with the
         // same hardware address gets the same entry above; this is only for one
         // it has not seen.
-        let taken = Set(leases.values)
+        var taken = Set(leases.values)
+        if pool.first(where: { !taken.contains($0) }) == nil {
+            // Only when there is nothing left, and only leases past their term.
+            //
+            // Both halves are deliberate. Reclaiming early would take an address
+            // from a guest that is merely quiet -- a VM does not renew until
+            // halfway through its lease -- and reclaiming a lease that has not
+            // expired would hand out an address something else still believes is
+            // its own. This is the DHCP term the guest was told, in option 51,
+            // so a guest that has been away longer than that has been told to
+            // stop using the address.
+            let now = stack.clock.now()
+            let term = TimeAmount.seconds(Int64(leaseSeconds))
+            for (owner, when) in leasedAt where now - when >= term {
+                if staticLeases[owner] != nil { continue }
+                leases.removeValue(forKey: owner)
+                leasedAt.removeValue(forKey: owner)
+                expired += 1
+            }
+            taken = Set(leases.values)
+        }
         guard let free = pool.first(where: { !taken.contains($0) }) else { return nil }
         leases[hardware] = free
+        leasedAt[hardware] = stack.clock.now()
         return free
     }
 

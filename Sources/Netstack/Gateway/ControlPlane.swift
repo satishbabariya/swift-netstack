@@ -853,7 +853,31 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
             default:
                 break
             }
-            plane.handle(method: head.method, path: head.uri, body: body).whenSuccess { outcome in
+            // A failure here used to reach nobody: no answer was written, and the
+            // caller waited out the request timeout for a connection that closed
+            // without a word. Every route answers its own errors, so this is the
+            // one nothing was meant to produce -- which is exactly the kind that
+            // arrives at three in the morning.
+            plane.handle(method: head.method, path: head.uri, body: body).whenComplete { result in
+                guard case .success(let outcome) = result else {
+                    // Reached nobody before this. No answer was written and the
+                    // caller waited out the request timeout for a connection
+                    // that closed without a word. Every route answers its own
+                    // errors, so this is the one nothing was meant to produce --
+                    // which is exactly the kind that arrives at three in the
+                    // morning.
+                    //
+                    // `whenComplete` and not a second `whenFailure`: attaching
+                    // one to a SECOND call to `handle` runs the request twice,
+                    // and an expose that ran twice would publish two forwards.
+                    // Written that way first.
+                    if case .failure(let error) = result {
+                        ControlPlaneHandler.respond(
+                            on: channel, status: .internalServerError,
+                            json: "{\"error\":\"\(ControlPlane.escaped("\(error)"))\"}")
+                    }
+                    return
+                }
                 // Written through the CHANNEL rather than the context: the
                 // answer arrives after the read that provoked it has returned,
                 // and a handler context is not valid to hold across that.

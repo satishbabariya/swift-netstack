@@ -254,7 +254,7 @@ because a missing row breaks nothing.
 | `--hostIP <address>` | The address that means the host. Defaults to the last usable |
 | `--subnet <cidr>` | The subnet leased to guests. Default `192.168.127.0/24` |
 | `--mtu <bytes>` | Link MTU. Default 1500 |
-| `--forward <host:guest:port>` | Publish a guest port on the host at startup |
+| `--forward <host:guest:port>` | Publish a guest port on the host at startup. Prefix `udp:` for a datagram forward, as in the config file |
 | `--pcap <path>` | Write every frame to a pcap file, capped at 64 MiB. Buffered: stop with Ctrl-C, not SIGKILL |
 | `--notification <path>` | Socket told when the network is ready and when guests come and go |
 | `--pid-file <path>` | Write this process's PID there, and remove it on a clean stop |

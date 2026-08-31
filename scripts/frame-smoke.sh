@@ -2276,7 +2276,12 @@ forward_transport_smoke() {
 {"subnet":"192.168.127.0/24",
  "forwards":{"udp:127.0.0.1:0":"192.168.127.2:53","127.0.0.1:0":"192.168.127.2:80"}}
 JSON
-    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" --config "$CONFIG" >/dev/null 2>&1 &
+    # Two from the file and two from the command line, because the prefix has to
+    # mean the same thing in both. It did not exist on the command line at all
+    # until this was written, so an operator could ask for a datagram forward in
+    # a file and not in the invocation beside it.
+    "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" --config "$CONFIG" \
+        --forward "udp:0:192.168.127.2:5354" --forward "0:192.168.127.2:81" >/dev/null 2>&1 &
     GATEWAY=$!
     for _ in $(seq 1 120); do
         [[ -S "$CONTROL" ]] && break
@@ -2296,11 +2301,12 @@ if answer.returncode != 0:
     sys.exit(1)
 forwards = json.loads(answer.stdout)
 protocols = sorted(entry.get("protocol", "?") for entry in forwards)
-if protocols != ["tcp", "udp"]:
-    print("FAIL: a config asking for one udp forward and one tcp forward produced",
+if protocols != ["tcp", "tcp", "udp", "udp"]:
+    print("FAIL: two udp forwards and two tcp ones were asked for, one of each from",
+          "the config file and one of each from the command line, and the gateway made",
           protocols, "-- the udp: prefix on the host side is what says which")
     sys.exit(1)
-print("ok: fwd   a udp: entry made a udp forward and a plain one made tcp")
+print("ok: fwd   the udp: prefix means the same in a config file and on the command line")
 PY
     local outcome=$?
     kill "$GATEWAY" 2>/dev/null

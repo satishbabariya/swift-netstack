@@ -148,6 +148,24 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
         #endif
     }
 
+    // A forward's transport, which is a prefix on the host side in the config
+    // file and now on the command line too. An operator who can ask for a
+    // datagram forward in a file and not on the command line discovers the
+    // difference the hard way: a forward listening on the right port over the
+    // wrong transport.
+    //
+    // Rejected shapes only here -- the accepted ones need a running gateway and
+    // are checked by `scripts/frame-smoke.sh`, which reads the transport back
+    // through the control API.
+    for bad in ["udp:", "udp:8080", "udp:8080:192.168.127.2", "udp:x:192.168.127.2:80"] {
+        guard let refused = run(["--listen-vfkit", "/tmp/netstack-fwd.sock", "--forward", bad])
+        else { return }
+        #expect(refused.status != 0, "--forward \(bad) was accepted")
+        #expect(
+            refused.output.contains("--forward"),
+            "the error does not name the flag: \(refused.output)")
+    }
+
     // The floor: a genuinely unknown flag is still rejected as unknown, so the
     // messages above are recognition rather than a catch-all.
     guard let nonsense = run(["--not-a-flag"]) else { return }

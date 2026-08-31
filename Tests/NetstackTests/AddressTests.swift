@@ -117,7 +117,23 @@ import Testing
     let strayLease = Gateway.Configuration(
         subnet: subnet,
         dhcpStaticLeases: [MACAddress("aa:bb:cc:dd:ee:ff")!: IPv4Address("10.0.0.9")!])
-    #expect(strayLease.inconsistencies.contains { $0.contains("static lease") })
+    #expect(strayLease.inconsistencies.contains { $0.contains("not inside the subnet") })
+
+    // A static lease names an address directly, so it walks straight past the
+    // pool's exclusions. Naming the host's address hands a guest the address
+    // host.containers.internal resolves to.
+    let collidingLease = Gateway.Configuration(
+        subnet: subnet,
+        dhcpStaticLeases: [MACAddress("aa:bb:cc:dd:ee:ff")!: IPv4Address("192.168.127.254")!])
+    #expect(
+        collidingLease.inconsistencies.contains { $0.contains("answers for itself") },
+        "\(collidingLease.inconsistencies)")
+
+    // And an ordinary static lease is silent.
+    let goodLease = Gateway.Configuration(
+        subnet: subnet,
+        dhcpStaticLeases: [MACAddress("aa:bb:cc:dd:ee:ff")!: IPv4Address("192.168.127.9")!])
+    #expect(goodLease.inconsistencies.isEmpty, "\(goodLease.inconsistencies)")
 
     // The ordinary case, and the derived one, are silent.
     #expect(Gateway.Configuration(subnet: subnet).inconsistencies.isEmpty)

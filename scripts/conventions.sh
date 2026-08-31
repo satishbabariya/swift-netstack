@@ -154,6 +154,21 @@ for referenced in $(grep -oE './scripts/[a-z-]+\.sh' .github/workflows/ci.yml | 
     fi
 done
 
+
+# 8. The smoke cases share their helpers rather than copying them.
+#
+# Every case in frame-smoke.sh is a self-contained Python program, so each one
+# grew its own copy: five identical checksum routines and the same address
+# parsing twenty-seven times. A copy that drifts fails silently -- a case whose
+# checksum is wrong does not fail, it stops testing anything, because every
+# packet it sends is discarded before it reaches the code the case is about.
+for helper in ones_complement; do
+    if grep -q "^ *def $helper" scripts/frame-smoke.sh; then
+        fail "frame-smoke.sh defines $helper instead of importing it" \
+            "a case with its own copy stops testing anything when the copy is wrong"
+    fi
+done
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

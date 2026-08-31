@@ -27,6 +27,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Where the shared helpers live. Exported once; every case inherits it.
+export SMOKE_SUPPORT="$PWD/scripts/smoke"
+
 echo "building the gateway"
 swift build -c release --product netstack-gateway >/dev/null || exit 1
 binary="$(swift build -c release --show-bin-path)/netstack-gateway"
@@ -51,11 +54,13 @@ smoke() {
     EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
         WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 wire = os.environ["WIRE"]
-expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-expected_host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+expected = address(os.environ["EXPECTED"])
+expected_host = address(os.environ["EXPECTED_HOST"])
+guest = address(os.environ["GUEST"])
 described = os.environ.get("ARGS") or "(defaults)"
 client_path = wire + ".client"
 s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -82,10 +87,10 @@ try:
         print("FAIL: the reply is not an ARP reply:", reply[:22].hex())
         sys.exit(1)
     if reply[28:32] != expected:
-        print("FAIL: the reply claims", ".".join(map(str, reply[28:32])),
-              "rather than", ".".join(map(str, expected)), "for", described)
+        print("FAIL: the reply claims", printable(reply[28:32]),
+              "rather than", printable(expected), "for", described)
         sys.exit(1)
-    print("ok: ARP  ", ".".join(map(str, expected)), "answered for", described)
+    print("ok: ARP  ", printable(expected), "answered for", described)
 
     # And a lease. The bug this file exists for produced a gateway that answered
     # its control socket while serving a subnet nobody asked for, so the address
@@ -133,11 +138,11 @@ try:
         leased = payload[16:20]
 
     if leased[:3] != expected[:3]:
-        print("FAIL: leased", ".".join(map(str, leased)),
-              "which is not on the subnet of", ".".join(map(str, expected)),
+        print("FAIL: leased", printable(leased),
+              "which is not on the subnet of", printable(expected),
               "for", described)
         sys.exit(1)
-    print("ok: lease ", ".".join(map(str, leased)), "offered for", described)
+    print("ok: lease ", printable(leased), "offered for", described)
 
     # And the names. `gateway.containers.internal` says the resolver is bound and
     # knows which address it is on -- the thing that was wrong when this file was
@@ -172,12 +177,12 @@ try:
         )
         s.send(udp_frame(leased, expected, sport, 53, query))
         s.settimeout(5)
-        printable = ".".join(part.decode() for part in labels)
+        asked = ".".join(part.decode() for part in labels)
         while True:
             try:
                 reply = s.recv(2048)
             except socket.timeout:
-                print("FAIL: no DNS answer for", printable, "within 5s for", described)
+                print("FAIL: no DNS answer for", asked, "within 5s for", described)
                 sys.exit(1)
             if len(reply) < 54 or reply[12:14] != b"\x08\x00" or reply[23] != 17:
                 continue
@@ -189,7 +194,7 @@ try:
             if len(body) < 12 or body[0:2] != transaction:
                 continue
             if int.from_bytes(body[6:8], "big") < 1:
-                print("FAIL: the resolver answered with no records for", printable,
+                print("FAIL: the resolver answered with no records for", asked,
                       "for", described)
                 sys.exit(1)
             return body[-4:]
@@ -198,13 +203,13 @@ try:
         ([b"gateway", b"containers", b"internal"], expected, 40000),
         ([b"host", b"containers", b"internal"], expected_host, 40001),
     ):
-        printable = ".".join(part.decode() for part in labels)
+        asked = ".".join(part.decode() for part in labels)
         resolved = resolve(labels, sport.to_bytes(2, "big"), sport)
         if resolved != wanted:
-            print("FAIL:", printable, "resolved to", ".".join(map(str, resolved)),
-                  "rather than", ".".join(map(str, wanted)), "for", described)
+            print("FAIL:", asked, "resolved to", printable(resolved),
+                  "rather than", printable(wanted), "for", described)
             sys.exit(1)
-        print("ok: name ", printable, "->", ".".join(map(str, resolved)),
+        print("ok: name ", asked, "->", printable(resolved),
               "for", described)
 finally:
     s.close()
@@ -269,11 +274,13 @@ ECHO
     EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
         WIRE="$WIRE" PORT="$port" ARGS="$*" python3 - <<'PY'
 import os, socket, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 wire = os.environ["WIRE"]
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
-host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
+host = address(os.environ["EXPECTED_HOST"])
 port = int(os.environ["PORT"])
 described = os.environ.get("ARGS") or "(defaults)"
 
@@ -282,17 +289,6 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 s.bind(client_path)
 GUEST_MAC = bytes.fromhex("5a94efe4bc00")
 GATEWAY_MAC = bytes.fromhex("5a94efe40cee")
-
-
-def ones_complement(data):
-    if len(data) % 2:
-        data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    while total >> 16:
-        total = (total >> 16) + (total & 0xFFFF)
-    return (~total) & 0xFFFF
 
 
 def tcp_frame(source, destination, sport, dport, seq, ack, flags, payload=b""):
@@ -363,7 +359,7 @@ try:
         print("FAIL: the SYN-ACK acknowledged", their_ack, "rather than", seq + 1,
               "for", described)
         sys.exit(1)
-    print("ok: TCP   SYN-ACK from", ".".join(map(str, host)) + ":" + str(port),
+    print("ok: TCP   SYN-ACK from", printable(host) + ":" + str(port),
           "for", described)
 
     seq += 1
@@ -442,13 +438,15 @@ forward_smoke() {
 
     EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
 import json, os, socket, subprocess, sys, threading
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 wire = os.environ["WIRE"]
 control = os.environ["CONTROL"]
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 described = os.environ.get("ARGS") or "(defaults)"
-guest_text = ".".join(map(str, guest))
+guest_text = printable(guest)
 
 GUEST_MAC = bytes.fromhex("5a94efe4bc00")
 GATEWAY_MAC = bytes.fromhex("5a94efe40cee")
@@ -458,17 +456,6 @@ SYN, ACK, PSH, FIN, RST = 0x02, 0x10, 0x08, 0x01, 0x04
 client_path = wire + ".client"
 s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 s.bind(client_path)
-
-
-def ones_complement(data):
-    if len(data) % 2:
-        data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    while total >> 16:
-        total = (total >> 16) + (total & 0xFFFF)
-    return (~total) & 0xFFFF
 
 
 def tcp_frame(source, destination, sport, dport, seq, ack, flags, payload=b""):
@@ -660,9 +647,11 @@ stream_smoke() {
 
     EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, struct, sys, time
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
-expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+expected = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 described = os.environ.get("ARGS") or "(defaults)"
 src = bytes.fromhex("5a94efe4bc00")
 
@@ -716,7 +705,7 @@ try:
             return
 
     await_reply("on the first connection")
-    print("ok: qemu  ARP", ".".join(map(str, expected)),
+    print("ok: qemu  ARP", printable(expected),
           "answered over the length-prefixed wire for", described)
 
     # And again, on a new connection, the way a rebooted VM comes back. The wire
@@ -822,27 +811,18 @@ FAKE
 
     EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 wire = os.environ["WIRE"]
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 described = os.environ.get("ARGS") or "(defaults)"
 src = bytes.fromhex("5a94efe4bc00")
 
 client_path = wire + ".client"
 s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 s.bind(client_path)
-
-
-def ones_complement(data):
-    if len(data) % 2:
-        data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    while total >> 16:
-        total = (total >> 16) + (total & 0xFFFF)
-    return (~total) & 0xFFFF
 
 
 def udp_frame(source, destination, sport, dport, payload):
@@ -888,11 +868,11 @@ try:
             sys.exit(1)
         resolved = body[-4:]
         if resolved != bytes([203, 0, 113, 7]):
-            print("FAIL: the guest was told", ".".join(map(str, resolved)),
+            print("FAIL: the guest was told", printable(resolved),
                   "rather than what the upstream said, for", described)
             sys.exit(1)
         print("ok: dns   a forwarded name resolved to",
-              ".".join(map(str, resolved)), "for", described)
+              printable(resolved), "for", described)
         break
 finally:
     s.close()
@@ -953,10 +933,12 @@ ECHO
     EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
         WIRE="$WIRE" PORT="$port" ARGS="$*" python3 - <<'PY'
 import os, socket, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 wire = os.environ["WIRE"]
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
-host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
+guest = address(os.environ["GUEST"])
+host = address(os.environ["EXPECTED_HOST"])
 port = int(os.environ["PORT"])
 described = os.environ.get("ARGS") or "(defaults)"
 src = bytes.fromhex("5a94efe4bc00")
@@ -964,17 +946,6 @@ src = bytes.fromhex("5a94efe4bc00")
 client_path = wire + ".client"
 s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 s.bind(client_path)
-
-
-def ones_complement(data):
-    if len(data) % 2:
-        data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    while total >> 16:
-        total = (total >> 16) + (total & 0xFFFF)
-    return (~total) & 0xFFFF
 
 
 def udp_frame(source, destination, sport, dport, payload):
@@ -1067,9 +1038,11 @@ pcap_smoke() {
 
     EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
-expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+expected = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 src = bytes.fromhex("5a94efe4bc00")
 wire = os.environ["WIRE"]
 client_path = wire + ".client"
@@ -1104,10 +1077,12 @@ PY
 
     CAPTURE="$CAPTURE" EXPECTED="$expected" GUEST="$guest" ARGS="$*" python3 - <<'PY'
 import os, struct, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 described = os.environ.get("ARGS") or "(defaults)"
-expected = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+expected = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 try:
     with open(os.environ["CAPTURE"], "rb") as handle:
         data = handle.read()
@@ -1201,8 +1176,10 @@ switch_smoke() {
 
     EXPECTED="$expected" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, struct, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
+gateway = address(os.environ["EXPECTED"])
 described = os.environ.get("ARGS") or "(defaults)"
 wire = os.environ["WIRE"]
 
@@ -1322,23 +1299,14 @@ icmp_smoke() {
     EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
         WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
 import json, os, socket, struct, subprocess, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
 wire = os.environ["WIRE"]
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
-host = bytes(int(part) for part in os.environ["EXPECTED_HOST"].split("."))
+guest = address(os.environ["GUEST"])
+host = address(os.environ["EXPECTED_HOST"])
 described = os.environ.get("ARGS") or "(defaults)"
 src = bytes.fromhex("5a94efe4bc00")
-
-
-def ones_complement(data):
-    if len(data) % 2:
-        data += b"\x00"
-    total = 0
-    for i in range(0, len(data), 2):
-        total += (data[i] << 8) | data[i + 1]
-    while total >> 16:
-        total = (total >> 16) + (total & 0xFFFF)
-    return (~total) & 0xFFFF
 
 
 def echo_frame(destination, identifier, payload):
@@ -1442,9 +1410,11 @@ connect_smoke() {
 
     EXPECTED="$expected" GUEST="$guest" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
 import os, socket, struct, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 described = os.environ.get("ARGS") or "(defaults)"
 mac = bytes.fromhex("5a94efe4bc09")
 
@@ -1522,9 +1492,11 @@ stdio_smoke() {
     local expected="$1" guest="$2"
     EXPECTED="$expected" GUEST="$guest" BINARY="$binary" python3 - <<'PY'
 import os, select, struct, subprocess, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 mac = bytes.fromhex("5a94efe4bc00")
 
 process = subprocess.Popen(
@@ -1572,7 +1544,7 @@ try:
     if not answered:
         print("FAIL: no ARP reply over stdio within 20s")
         sys.exit(1)
-    print("ok: stdio ARP", ".".join(map(str, gateway)),
+    print("ok: stdio ARP", printable(gateway),
           "answered over this process's own pipes")
 
     # And the program's own messages went somewhere else.
@@ -1623,9 +1595,11 @@ vpnkit_smoke() {
 
     EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" ARGS="$*" python3 - <<'PY'
 import os, socket, struct, sys
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address, ones_complement, printable
 
-gateway = bytes(int(part) for part in os.environ["EXPECTED"].split("."))
-guest = bytes(int(part) for part in os.environ["GUEST"].split("."))
+gateway = address(os.environ["EXPECTED"])
+guest = address(os.environ["GUEST"])
 described = os.environ.get("ARGS") or "(defaults)"
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1692,7 +1666,7 @@ try:
             if len(body) >= 42 and body[12:14] == b"\x08\x06" and body[20:22] == b"\x00\x02":
                 if body[28:32] != gateway:
                     continue
-                print("ok: vpnkit ARP", ".".join(map(str, gateway)),
+                print("ok: vpnkit ARP", printable(gateway),
                       "answered after the handshake for", described)
                 sys.exit(0)
         try:

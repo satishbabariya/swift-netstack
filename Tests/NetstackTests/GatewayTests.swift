@@ -671,3 +671,56 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+// Closing twice.
+//
+// `defer { gateway.close() }` beside an explicit close is how a program that
+// exits on a signal AND on an error is written, so a second close is not an
+// unusual path -- it is the ordinary one for anything that can fail partway
+// through. Every service a gateway holds gets closed again by the second call.
+//
+// Deliberately not in `scripts/guards.tsv`, and the reason is worth writing
+// down. Two independent mechanisms make this hold: the link forgets its channel
+// when the channel goes inactive, and its `close` recovers from an
+// already-closed one. Removing either alone leaves the test passing, so no
+// single mutation falsifies it -- which is the code being robust rather than the
+// test being vacuous. Removing BOTH does fail it, so it can fail; it simply
+// cannot be guarded the way a single rule can.
+@Test func closingAGatewayTwiceIsSafe() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [-1, -1]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group,
+        configuration: .init(upstreamResolvers: [])
+    ).get()
+
+    _ = try await gateway.close().get()
+    // The second one is the claim. It must not trap, must not hang, and must
+    // not fail: a caller closing again has done nothing wrong.
+    _ = try await gateway.close().get()
+
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}
+
+// And the services individually, since an embedder holds those too.
+@Test func closingEachServiceTwiceIsSafe() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [-1, -1]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group,
+        configuration: .init(upstreamResolvers: [])
+    ).get()
+
+    for _ in 0..<2 {
+        _ = try await gateway.dns.close().get()
+        _ = try await gateway.dhcp.close().get()
+        _ = try await gateway.link.close().get()
+    }
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

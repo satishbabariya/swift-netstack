@@ -397,6 +397,14 @@ public enum WireBootstrap {
         accepting.name = "netstack-bess-accept"
         accepting.start()
 
+        // Closing the descriptor is what stops the thread: it is blocked in
+        // `accept`, which returns an error when the socket it is waiting on goes
+        // away. Nothing else can reach it.
+        netSwitch.stopListening = {
+            close(listener)
+            return loop.makeSucceededVoidFuture()
+        }
+
         return loop.makeSucceededFuture(netSwitch)
     }
 
@@ -460,7 +468,10 @@ public enum WireBootstrap {
                 }
             }
             .bind(unixDomainSocketPath: path)
-            .map { _ in netSwitch }
+            .map { listener in
+                netSwitch.stopListening = { listener.close().recover { _ in () } }
+                return netSwitch
+            }
     }
 
     /// Bind a unix stream socket and give **every** guest that connects a port
@@ -516,7 +527,10 @@ public enum WireBootstrap {
                 }
             }
             .bind(unixDomainSocketPath: path)
-            .map { _ in netSwitch }
+            .map { listener in
+                netSwitch.stopListening = { listener.close().recover { _ in () } }
+                return netSwitch
+            }
     }
 
     /// Build the link and install the pipeline, on the channel's own loop.

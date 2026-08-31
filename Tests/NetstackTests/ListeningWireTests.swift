@@ -509,3 +509,43 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// Closing a switch stops the thing that puts guests on it.
+//
+// It used to close the ports and leave the listener behind: the socket path
+// stayed bound, and a guest connecting afterwards was still accepted -- onto a
+// switch whose ports had all been closed. Measured before it was fixed:
+//
+//     PROBE: connecting after the switch closed -> ACCEPTED (listener still open)
+//
+// For the seqpacket wire it is worse, because that listener is a thread blocked
+// in `accept`: every gateway a long-running embedder created and closed left one
+// behind. Nothing can reach that thread except closing the descriptor it is
+// waiting on, which is what `stopListening` does there.
+@Test func closingASwitchStopsItsListener() async throws {
+    let path = temporaryPath("switch")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let netSwitch = try await WireBootstrap.switchedStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
+
+    // Open first, so the test is about closing rather than about binding.
+    let before = dial(path, type: .stream)
+    close(before)
+
+    _ = try? await netSwitch.close().get()
+
+    // The listener is gone when a connection is refused. Retried, because the
+    // close completes on the switch's loop and the socket goes with it.
+    var refused = false
+    for _ in 0..<200 where !refused {
+        let after = makeSocket(AF_UNIX, .stream)
+        refused = connectTo(after, unixAddress(path: path)) != 0
+        close(after)
+        if !refused { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(refused, "a guest was accepted onto a switch that had been closed")
+
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

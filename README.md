@@ -425,6 +425,13 @@ socket still answers the ping and leaves `icmp_forwarded` at zero, a resolver
 that declines to forward answers REFUSED where an address belonged, and a capture
 that never flushes is zero bytes where a header belonged.
 
+`scripts/bess-smoke.sh` is the one check that cannot run where this is written.
+Darwin has no `SOCK_SEQPACKET` for `AF_UNIX`, so `--listen-bess` was implemented
+against a manual page and CI's Linux job is the only place it is ever opened. It
+says "skipped" and passes on a Mac rather than passing silently — a check that
+quietly succeeds where it cannot run reports "fine" about a wire nobody has
+tried.
+
 `./scripts/check.sh` runs every gate CI runs, in one command; `--quick` skips
 the two slow ones. It exists because the gates were seven scripts across five CI
 jobs and running "the ones I remembered" is not running them — CI builds with

@@ -154,6 +154,11 @@ jobs:
       # the sandbox rather than for the code.
       - name: Build the tests on Linux
         run: swift build --build-tests
+      # The one check that cannot run on the machine this is developed on:
+      # Darwin has no SOCK_SEQPACKET for AF_UNIX, so --listen-bess was written
+      # against a manual page and this is the only place it is ever opened.
+      - name: One frame through the seqpacket wire
+        run: ./scripts/bess-smoke.sh
 
   lint:
     name: Formatting, conventions and interop

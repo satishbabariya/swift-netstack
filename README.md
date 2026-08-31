@@ -135,8 +135,11 @@ which is what `vfkit` and `qemu` do.
 | `WireBootstrap.listeningDatagramSocket` | vfkit, upstream's `unixgram`. The peer is learned from the first frame. |
 | `WireBootstrap.connectingDatagramSocket` | The same, dialled rather than served. |
 | `WireBootstrap.adoptingStreamSocket` | A stream descriptor already connected. A four-byte big-endian length in front of each frame. |
-| `WireBootstrap.listeningStreamSocket` | qemu's `-netdev socket`, bess, stdio. One guest; a second connection is closed. |
+| `WireBootstrap.listeningStreamSocket` | qemu's `-netdev socket`. One guest at a time; a second connection is closed, and a guest that goes away releases the wire for the next. |
 | `WireBootstrap.switchedStreamSocket` | The same, but every guest that connects gets a port on a `NetworkSwitch`. |
+| `WireBootstrap.vpnKitStreamSocket` | hyperkit, over its handshake. Several guests, each on a port of a switch. |
+| `WireBootstrap.seqPacketSocket` | bess. Bare frames, one per message, with no length prefix — the socket type carries the boundaries. Linux only. |
+| `WireBootstrap.adoptingPipes` | `--listen-stdio`: the wire is a pair of descriptors, ordinarily the process's own. |
 
 Stream wires carry a length prefix, and there are **two incompatible spellings**
 of it: qemu's four-byte big-endian (the default here) and hyperkit's two-byte
@@ -220,11 +223,46 @@ earlier version of this program had `--listen` as the wire, so a `gvproxy`
 command line would have pointed the control API at the VM's socket and the VM at
 the control socket, with nothing saying so.
 
-`--listen-bess`, `--listen-stdio` and `--listen-vpnkit` are recognised and
-refused by name rather than falling through to "unknown option": bess is
-`SOCK_SEQPACKET`, stdio is a pipe, and vpnkit needs hyperkit's handshake. The
-difference between "you typed it wrong" and "this does not do that yet" is worth
-a sentence.
+`--listen-bess`, `--listen-stdio`, `--listen-vpnkit` and `--listen-switch` are
+wires too, so every wire `gvproxy` has is one this has. That paragraph used to
+say the opposite — that the first three were recognised and refused by name,
+because bess is `SOCK_SEQPACKET`, stdio is a pipe, and vpnkit needs hyperkit's
+handshake. Each of those was true and none of them was a reason.
+
+`--listen-bess` is the exception worth knowing: Darwin has no `SOCK_SEQPACKET`
+for `AF_UNIX` at all, so it fails at the `socket` call there and says so. CI's
+Linux job is where it runs.
+
+### Every flag
+
+`--help` prints this too, and `scripts/conventions.sh` fails if the program
+grows a flag this table does not name — the sort of drift nothing else notices,
+because a missing row breaks nothing.
+
+| Flag | What it does |
+|---|---|
+| `--config <path>` | Configuration file, in gvproxy's shape as JSON |
+| `--listen <endpoint>` | HTTP control API: `unix://<path>`, `tcp://<host>:<port>`, or a bare path. Repeatable |
+| `--services <endpoint>` | The same API without `/connect`, for an endpoint a guest may reach. Repeatable |
+| `--listen-vfkit <path>` | Datagram socket the guest dials. One datagram is one frame |
+| `--listen-qemu <path>` | Stream socket, four-byte big-endian length per frame. One guest at a time |
+| `--listen-vpnkit <path>` | hyperkit's wire: a handshake, then two little-endian length bytes. Several guests |
+| `--listen-stdio <ignored>` | The wire is this process's own stdin and stdout. Every message goes to stderr |
+| `--listen-bess <path>` | `SOCK_SEQPACKET`, bare frames, one per message. Linux only |
+| `--listen-switch <path>` | qemu's framing, carrying every guest that connects on its own port |
+| `--gatewayIP <address>` | The gateway's own address. Defaults to the first usable address of the subnet |
+| `--hostIP <address>` | The address that means the host. Defaults to the last usable |
+| `--subnet <cidr>` | The subnet leased to guests. Default `192.168.127.0/24` |
+| `--mtu <bytes>` | Link MTU. Default 1500 |
+| `--forward <host:guest:port>` | Publish a guest port on the host at startup |
+| `--pcap <path>` | Write every frame to a pcap file, capped at 64 MiB. Buffered: stop with Ctrl-C, not SIGKILL |
+| `--notification <path>` | Socket told when the network is ready and when guests come and go |
+| `--pid-file <path>` | Write this process's PID there, and remove it on a clean stop |
+| `--log-file <path>` | Append log messages there as well as to stderr |
+| `--log-level <level>` | `trace`\|`debug`\|`info`\|`notice`\|`warning`\|`error`. Default `notice` |
+| `--debug` | Shorthand for `--log-level debug` |
+| `--ec2-metadata-access` | Let guests reach 169.254.0.0/16. Off by default |
+| `--help`, `-h` | Print the usage |
 
 `--log-level` picks how much it says; the default is `notice`, which is every
 refusal and nothing else. It is the only place in the package that bootstraps
@@ -538,6 +576,11 @@ the thing the test was supposed to guard.
 
 Swift 6.2 toolchain, macOS 14+. CI builds the library with warnings as errors and
 runs the differential against gVisor.
+
+One thing is Linux-only rather than macOS-only: `--listen-bess` needs
+`SOCK_SEQPACKET` on `AF_UNIX`, which Darwin does not have. It is implemented,
+and CI's Linux job is the only place it can be exercised — on a Mac the flag
+parses and the bind fails with the reason.
 
 ## License
 

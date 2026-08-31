@@ -246,6 +246,36 @@ if [[ -n "$missing" ]]; then
     fail "a datagram wire that writes through NIO rather than its own descriptor" "$missing"
 fi
 
+
+# 11. Every flag the program takes is named in the README, and the reverse.
+#
+# The README said `--listen-bess`, `--listen-stdio` and `--listen-vpnkit` were
+# "recognised and refused by name" for most of a day after all three became
+# wires. It was true when written, which is what makes this kind of claim
+# dangerous: nothing fails when it stops being true, and the only reader who
+# finds out is one who believed it.
+#
+# One direction only. A flag the program takes and the README does not mention is
+# undocumented, and that is what this catches.
+#
+# The reverse -- a flag the README names and the program does not take -- was
+# written first and is not kept, because the README legitimately names flags this
+# program does not have: `--ssh-port` and the `--forward-*` family, in the
+# section saying SSH forwarding is deliberately absent, and `--quick`, which
+# belongs to `check.sh`. A rule that fought its own documentation would be
+# answered by weakening the documentation.
+# `[a-zA-Z-]` rather than `[a-z-]`: gvproxy spells two of them `--gatewayIP` and
+# `--hostIP`, and the lowercase-only version this started as reported neither of
+# them missing while both were.
+flags=$(grep -oE 'case "--[a-zA-Z-]+"' Sources/netstack-gateway/main.swift \
+    | grep -oE '\-\-[a-zA-Z-]+' | sort -u)
+for flag in $flags; do
+    if ! grep -q -- "$flag" README.md; then
+        fail "the program takes $flag and the README does not mention it" \
+            "a flag nobody has written down is a flag nobody will use"
+    fi
+done
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

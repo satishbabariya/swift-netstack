@@ -405,3 +405,87 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? FileManager.default.removeItem(atPath: path)
     try? await group.shutdownGracefully()
 }
+
+// A peer that connects to the vpnkit wire and says nothing.
+//
+// It holds a place on the switch it has not earned. Thirty-two of those -- the
+// default guest limit -- and no real guest can join, for as long as the attacker
+// leaves the sockets open, which is forever:
+//
+//     silent connections held open: 32
+//     a real guest was CLOSED OUT by peers that never spoke
+//
+// Everything else guest-reachable in this package is bounded on the premise that
+// a connection held open is a resource. This was written without a bound, in a
+// package whose threat model is that the guest is hostile, and measured before
+// it was fixed rather than reasoned about after.
+@Test func aPeerThatNeverFinishesTheVpnKitHandshakeGivesItsPlaceBack() async throws {
+    let path = temporaryPath("vpnkit")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    // Short, so the test measures the rule and not the clock.
+    let netSwitch = try await WireBootstrap.vpnKitStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500, maximumGuests: 2,
+        handshakeAllowance: .milliseconds(200)
+    ).get()
+
+    func portsSettleAt(_ wanted: Int) async throws -> Int {
+        var ports = 0
+        for _ in 0..<200 {
+            ports = try await netSwitch.eventLoop.submit { netSwitch.portCount }.get()
+            if ports == wanted { return ports }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        return ports
+    }
+
+    // Two peers that connect and never speak: the whole wire, by the limit.
+    let silent = (0..<2).map { _ in dial(path, type: .stream) }
+
+    // Waited out, because a guest arriving before the allowance has expired is
+    // refused and should be -- the wire really is full until then. The claim is
+    // that the places come back, not that they were never taken.
+    // No assertion on the port count here, and that is deliberate: a port is
+    // only granted at the END of the handshake, so a silent peer never has one
+    // and the count is zero whether the allowance works or not. An assertion
+    // there cannot fail, which makes it worse than none -- it would read as
+    // coverage of exactly the rule it cannot see.
+    //
+    // What the silent peers hold is an admission, and the thing that can be
+    // observed from outside is its consequence: whether a real guest gets in.
+    try await Task.sleep(nanoseconds: 500_000_000)
+
+    // A real guest, arriving to a wire the silent peers have been let go of.
+    let guest = dial(path, type: .stream)
+    let initial = [UInt8]("VMN3T".utf8) + [UInt8](repeating: 0, count: 44)
+    _ = initial.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+
+    var echoed = [UInt8]()
+    var buffer = [UInt8](repeating: 0, count: 49)
+    for _ in 0..<400 where echoed.count < 49 {
+        let read = buffer.withUnsafeMutableBytes {
+            recv(guest, $0.baseAddress, 49 - echoed.count, dontWait)
+        }
+        if read > 0 {
+            echoed.append(contentsOf: buffer[0..<read])
+        } else {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+    #expect(
+        echoed == initial,
+        "a guest was closed out by peers that never spoke: got \(echoed.count) of 49 bytes back")
+
+    // Finished, because the port is given out at the END of the exchange. Half a
+    // handshake earns nothing, which is the rule being tested from the other
+    // side.
+    let uuid = "1e0a4f1a-0000-4000-8000-0123456789ab"
+    let command = [UInt8(1)] + [UInt8](uuid.utf8) + [UInt8](repeating: 0, count: 4)
+    _ = command.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+    #expect(try await portsSettleAt(1) == 1, "the guest that did speak has no port")
+
+    for descriptor in silent { close(descriptor) }
+    close(guest)
+    _ = try? await netSwitch.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}

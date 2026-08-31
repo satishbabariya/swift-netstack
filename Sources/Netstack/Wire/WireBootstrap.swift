@@ -412,6 +412,7 @@ public enum WireBootstrap {
     public static func vpnKitStreamSocket(
         atPath path: String, group: EventLoopGroup, linkAddress: MACAddress, mtu: UInt32 = 1500,
         maximumGuests: Int = 32, maximumAddressesPerPort: Int = 16,
+        handshakeAllowance: TimeAmount = .seconds(10),
         macForUUID: @escaping @Sendable (String) -> MACAddress = { _ in MACAddress.randomLocallyAdministered() }
     ) -> EventLoopFuture<NetworkSwitch> {
         try? FileManager.default.removeItem(atPath: path)
@@ -433,7 +434,7 @@ public enum WireBootstrap {
                 // bytes would be read as a length.
                 let handshake = VpnKitHandshakeHandler(
                     allocator: channel.allocator, mtu: UInt16(truncatingIfNeeded: mtu),
-                    macForUUID: macForUUID
+                    allowance: handshakeAllowance, macForUUID: macForUUID
                 ) { _ in
                     release()
                     _ = configure(

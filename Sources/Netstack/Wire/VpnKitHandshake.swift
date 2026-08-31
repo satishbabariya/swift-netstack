@@ -24,6 +24,22 @@ import NIOCore
 /// The handler removes itself when the exchange is done, and the frame codec is
 /// installed behind it -- so the first frame arrives at a pipeline that has
 /// never seen the handshake bytes.
+///
+/// ## The deadline is not a nicety
+///
+/// A peer that connects and says nothing holds a place on the switch it has not
+/// earned. Thirty-two of those -- the default guest limit -- and no real guest
+/// can join, for as long as the attacker leaves the sockets open, which is
+/// forever. Measured before it was fixed:
+///
+///     silent connections held open: 32
+///     a real guest was CLOSED OUT by peers that never spoke
+///
+/// Everything else guest-reachable in this package is bounded, on the premise
+/// that a connection held open is a resource; this was written without one and
+/// is the counterexample. The deadline is generous and the peer is not being
+/// asked for much: hyperkit sends its init as its first act, so a connection
+/// that has not produced forty-nine bytes in ten seconds is not hyperkit.
 final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = ByteBuffer
     typealias InboundOut = ByteBuffer
@@ -40,6 +56,8 @@ final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandl
     }
 
     private var step = Step.awaitingInitial
+    private var deadline: Scheduled<Void>?
+    private let allowance: TimeAmount
     private var held: ByteBuffer
     private let mtu: UInt16
     private let macForUUID: @Sendable (String) -> MACAddress
@@ -54,15 +72,38 @@ final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandl
     ///     the UUID is not in it.
     ///   - finished: called with the address handed out, once, when the exchange
     ///     completes. The caller installs the rest of the pipeline here.
+    ///   - allowance: how long the peer has to complete the exchange before the
+    ///     connection is closed and its place given back.
     init(
-        allocator: ByteBufferAllocator, mtu: UInt16,
+        allocator: ByteBufferAllocator, mtu: UInt16, allowance: TimeAmount = .seconds(10),
         macForUUID: @escaping @Sendable (String) -> MACAddress,
         finished: @escaping (MACAddress) -> Void
     ) {
+        self.allowance = allowance
         self.held = allocator.buffer(capacity: Self.initialLength + Self.commandLength)
         self.mtu = mtu
         self.macForUUID = macForUUID
         self.finished = finished
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        arm(context)
+    }
+
+    func channelActive(context: ChannelHandlerContext) {
+        arm(context)
+        context.fireChannelActive()
+    }
+
+    private func arm(_ context: ChannelHandlerContext) {
+        guard deadline == nil, step != .done, context.channel.isActive else { return }
+        deadline = context.eventLoop.scheduleTask(in: allowance) { [weak self] in
+            guard let self, self.step != .done else { return }
+            // Closed, not merely abandoned: closing is what returns the place on
+            // the switch, and a handler that only stopped listening would leave
+            // the connection and the reservation exactly where they were.
+            context.close(promise: nil)
+        }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -102,6 +143,8 @@ final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandl
                 context.writeAndFlush(wrapInboundOut(reply), promise: nil)
 
                 step = .done
+                deadline?.cancel()
+                deadline = nil
                 finished(mac)
                 // Whatever arrived after the command is the first frame, or part
                 // of one. It is passed on rather than dropped, and it is passed
@@ -126,6 +169,16 @@ final class VpnKitHandshakeHandler: ChannelInboundHandler, RemovableChannelHandl
     }
 
     func channelInactive(context: ChannelHandlerContext) {
+        deadline?.cancel()
+        deadline = nil
         context.fireChannelInactive()
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        // The exchange finished and this handler is leaving. A timer left armed
+        // here would fire on a connection that is now a working wire and close
+        // a guest that did nothing wrong.
+        deadline?.cancel()
+        deadline = nil
     }
 }

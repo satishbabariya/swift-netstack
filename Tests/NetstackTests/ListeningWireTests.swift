@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import NIOCore
 import NIOPosix
@@ -268,9 +269,23 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
         atPath: path, group: group, linkAddress: listenMAC, mtu: 1500, maximumGuests: 2
     ).get()
 
-    // Dialled without waiting in between, so every connection is accepted before
-    // any of them finishes being configured. That window is the whole bug.
+    // The loop is held while the connections are made, and that is what makes
+    // this a test rather than a coin toss.
+    //
+    // The window is one hop wide: `configure` finishes on a later tick, so a
+    // connection admitted in the same burst as another sees a port count that
+    // does not include it yet. Dialling six sockets and hoping they land in one
+    // burst reproduces that on this machine and not on CI's -- the guard
+    // SURVIVED there, which is a falsification reporting the opposite of the
+    // truth. Blocking the loop first removes the timing from the question: every
+    // connection is waiting in the backlog before a single accept runs.
+    //
+    // Blocking an event loop is otherwise forbidden and is exactly the control
+    // this needs.
+    let held = DispatchSemaphore(value: 0)
+    netSwitch.eventLoop.execute { held.wait() }
     let dialled = (0..<6).map { _ in dial(path, type: .stream) }
+    held.signal()
 
     // Given time to settle: the assertion is about where it settles, and an
     // immediate read would pass with the bug simply by looking too early.

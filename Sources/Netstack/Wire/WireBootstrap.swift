@@ -246,6 +246,42 @@ public enum WireBootstrap {
         return arrived.futureResult
     }
 
+    /// Take a place on `netSwitch` for a guest that has just connected, or say
+    /// there is none.
+    ///
+    /// Returns the closure that gives the place back, to be called when the
+    /// guest has a port -- or nil when the limit is reached, in which case the
+    /// caller closes the connection.
+    ///
+    /// The counting is the point, and it is why this is one function rather than
+    /// the same four lines in two listeners. `configure` finishes on a LATER
+    /// tick, so the port does not exist yet when the next connection is checked:
+    /// against the port count alone, every guest in a burst reads zero and every
+    /// one is admitted. The limit was checkable and not enforced, under exactly
+    /// the condition it exists for, in a package whose threat model is that the
+    /// guest is hostile. Counting the admission closes the window, because that
+    /// happens here, synchronously.
+    ///
+    /// The place is returned exactly once, whichever happens first: the guest
+    /// getting its port, or the connection ending before it does. A reservation
+    /// taken and never given back is a limit that shrinks to nothing over a long
+    /// enough run.
+    private static func admit(
+        _ channel: Channel, to netSwitch: NetworkSwitch, limit: Int, admitting: AdmittedGuests
+    ) -> (@Sendable () -> Void)? {
+        guard netSwitch.portCount + admitting.pending < limit else { return nil }
+        admitting.pending += 1
+        let held = AdmittedGuests()
+        held.pending = 1
+        let release: @Sendable () -> Void = {
+            guard held.pending == 1 else { return }
+            held.pending = 0
+            admitting.pending -= 1
+        }
+        channel.closeFuture.whenComplete { _ in release() }
+        return release
+    }
+
     /// Bind a unix stream socket that speaks hyperkit's vpnkit protocol, and
     /// give every guest that connects a port on a switch.
     ///
@@ -270,21 +306,8 @@ public enum WireBootstrap {
 
         return ServerBootstrap(group: group, childGroup: loop)
             .childChannelInitializer { channel in
-                guard netSwitch.portCount + admitting.pending < limit else {
-                    return channel.close()
-                }
-                admitting.pending += 1
-                // Given back exactly once, whichever happens first: the
-                // handshake completing, or the guest going away in the middle of
-                // it. A reservation taken and never returned is a limit that
-                // shrinks to nothing over a long enough run.
-                let reservation = AdmittedGuests()
-                reservation.pending = 1
-                @Sendable func release() {
-                    guard reservation.pending == 1 else { return }
-                    reservation.pending = 0
-                    admitting.pending -= 1
-                }
+                guard let release = admit(channel, to: netSwitch, limit: limit, admitting: admitting)
+                else { return channel.close() }
 
                 // The handshake first, alone in the pipeline. The frame codec is
                 // installed by its completion, so the decoder never sees the
@@ -303,7 +326,6 @@ public enum WireBootstrap {
                         channel.closeFuture.whenComplete { _ in _ = netSwitch.removePort(id) }
                     }
                 }
-                channel.closeFuture.whenComplete { _ in release() }
                 // `syncOperations` directly, with no hop and no closure: the
                 // child is pinned to this loop and `childChannelInitializer`
                 // runs on it. `addHandler` would want the handler to be
@@ -356,26 +378,14 @@ public enum WireBootstrap {
             .childChannelInitializer { channel in
                 // Counted on the switch's loop, where `portCount` is safe to
                 // read -- and the child is already on that loop, so this is a
-                // check rather than a hop.
-                //
-                // `admitting` is the part that took a falsification to find.
-                // `configure` finishes on a LATER tick of this loop, so the port
-                // does not exist yet when the next connection is checked: every
-                // guest in a burst read `portCount == 0` and every one was
-                // admitted. The limit was checkable and not enforced, under
-                // exactly the condition it exists for -- many guests at once --
-                // in a package whose threat model is that the guest is hostile.
-                //
-                // Counting the admission rather than the port closes the window,
-                // because that happens here, synchronously, before this returns.
-                guard netSwitch.portCount + admitting.pending < limit else {
-                    return channel.close()
-                }
-                admitting.pending += 1
+                // check rather than a hop. See `admit` for why it counts
+                // admissions and not only ports.
+                guard let release = admit(channel, to: netSwitch, limit: limit, admitting: admitting)
+                else { return channel.close() }
                 return configure(
                     channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
                 ).map { link in
-                    admitting.pending -= 1
+                    release()
                     let id = netSwitch.addPort(link)
                     // A guest that goes away takes its port with it, and with it
                     // everything the switch learned on that port. Without this a
@@ -384,12 +394,6 @@ public enum WireBootstrap {
                     channel.closeFuture.whenComplete { _ in
                         _ = netSwitch.removePort(id)
                     }
-                }.flatMapErrorThrowing { error in
-                    // Released on the way out too. A reservation that is only
-                    // ever taken is a limit that shrinks to nothing over a long
-                    // enough run.
-                    admitting.pending -= 1
-                    throw error
                 }
             }
             .bind(unixDomainSocketPath: path)

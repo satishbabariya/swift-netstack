@@ -466,44 +466,34 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
 
     // A real guest, arriving to a wire the silent peers have been let go of.
     //
+    // Both messages in one write. This test is about the allowance, and sending
+    // them separately makes it about the allowance AND how fast the test can
+    // poll: the guest's own clock starts when it connects, and on a slow machine
+    // the gap between the two writes ate the two hundred milliseconds and the
+    // gateway closed a guest that was doing everything right. Partial reads are
+    // the subject of `theVpnKitHandshakeIsExactlyTheSizesHyperkitExpects`, which
+    // splits the init deliberately.
+    //
     // Retried, because the allowance expires on the gateway's own loop and a
     // guest that arrives a moment early is refused -- correctly. Bounded, and
-    // far shorter than "never": with the allowance gone the places are never
-    // given back and no number of attempts helps.
-    let initial = [UInt8]("VMN3T".utf8) + [UInt8](repeating: 0, count: 44)
+    // far short of "never": with the allowance gone the places are never given
+    // back and no number of attempts helps.
+    let uuid = "1e0a4f1a-0000-4000-8000-0123456789ab"
+    let opening =
+        [UInt8]("VMN3T".utf8) + [UInt8](repeating: 0, count: 44)
+        + [UInt8(1)] + [UInt8](uuid.utf8) + [UInt8](repeating: 0, count: 4)
     var guest: Int32 = -1
-    var echoed = [UInt8]()
-    var buffer = [UInt8](repeating: 0, count: 49)
-    for _ in 0..<20 where echoed.count < 49 {
+    var ports = 0
+    for _ in 0..<20 where ports != 1 {
         if guest >= 0 { close(guest) }
         guest = dial(path, type: .stream)
-        _ = initial.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
-        echoed.removeAll()
-        for _ in 0..<60 where echoed.count < 49 {
-            let read = buffer.withUnsafeMutableBytes {
-                recv(guest, $0.baseAddress, 49 - echoed.count, dontWait)
-            }
-            if read > 0 {
-                echoed.append(contentsOf: buffer[0..<read])
-            } else if read == 0 {
-                break  // refused: the places have not come back yet
-            } else {
-                try await Task.sleep(nanoseconds: 5_000_000)
-            }
-        }
-        if echoed.count < 49 { try await Task.sleep(nanoseconds: 25_000_000) }
+        _ = opening.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
+        ports = try await portsSettleAt(1)
+        if ports != 1 { try await Task.sleep(nanoseconds: 25_000_000) }
     }
     #expect(
-        echoed == initial,
-        "a guest was closed out by peers that never spoke: got \(echoed.count) of 49 bytes back")
-
-    // Finished, because the port is given out at the END of the exchange. Half a
-    // handshake earns nothing, which is the rule being tested from the other
-    // side.
-    let uuid = "1e0a4f1a-0000-4000-8000-0123456789ab"
-    let command = [UInt8(1)] + [UInt8](uuid.utf8) + [UInt8](repeating: 0, count: 4)
-    _ = command.withUnsafeBytes { write(guest, $0.baseAddress, $0.count) }
-    #expect(try await portsSettleAt(1) == 1, "the guest that did speak has no port")
+        ports == 1,
+        "a guest that completed the handshake got no port: the silent peers never let go")
 
     for descriptor in silent { close(descriptor) }
     close(guest)

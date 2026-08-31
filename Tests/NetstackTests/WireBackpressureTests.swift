@@ -84,3 +84,59 @@ private let backpressureMAC = MACAddress("0a:0b:0c:0d:0e:0f")!
     close(pair[1])
     try? await group.shutdownGracefully()
 }
+
+// The same question for a stream wire, which had a different and worse answer.
+//
+// A datagram queue is small and fills; NIO reports the failure and the fix there
+// was to stop closing the channel over it. A stream wire has no such limit
+// above the socket: NIO holds whatever cannot be written yet, so a guest that
+// asks questions and never reads the answers grows that queue as fast as it can
+// ask. Four hundred thousand ARP requests, reading nothing:
+//
+//     rss before:   8432 KiB
+//     rss after:  153568 KiB
+//
+// Every multi-guest wire is a stream wire, so this was the one that mattered
+// most and the one nothing looked at. The link drops when its queue is full now,
+// which is what a link does.
+@Test func aStreamWireDropsRatherThanQueueingForAGuestThatIsNotReading() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [-1, -1]
+    #expect(makeSocketPair(AF_UNIX, .stream, &pair) == 0)
+
+    let link = try await WireBootstrap.adoptingStreamSocket(
+        pair[0], group: group, linkAddress: backpressureMAC, mtu: 1500
+    ).get()
+
+    // The far end never reads. Its receive buffer fills, then the sending
+    // socket's, and after that NIO is holding everything.
+    // `let`, because the closure below is `@Sendable` and a captured `var` is
+    // not something the compiler will vouch for.
+    let frame: ByteBuffer = {
+        var buffer = ByteBuffer()
+        buffer.writeBytes([UInt8](repeating: 0xAB, count: 1500))
+        return buffer
+    }()
+
+    // Far more than any buffer between here and there.
+    let attempts = 20_000
+    try await link.eventLoop.submit {
+        for _ in 0..<attempts { link.write([PacketBuffer(allocator: ByteBufferAllocator(), payload: frame)]) }
+    }.get()
+
+    let dropped = try await link.eventLoop.submit { link.outboundDropped }.get()
+    let backedUp = try await link.eventLoop.submit { link.outboundBackedUp }.get()
+    #expect(
+        dropped > 0,
+        "\(attempts) frames were written to a wire nobody is reading and none was dropped")
+    #expect(backedUp > 0, "the wire never reported itself backed up")
+    // Bounded by the write watermark rather than by the guest's patience: what
+    // matters is that the great majority never entered a queue at all.
+    #expect(
+        dropped > attempts / 2,
+        "only \(dropped) of \(attempts) were dropped, so the rest are still queued")
+
+    _ = try? await link.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

@@ -33,3 +33,4 @@ Sources/Netstack/Wire/WireBootstrap.swift	guestsArrivingAtOnceAreBoundedByTheLim
 Sources/Netstack/Wire/VpnKitHandshake.swift	theVpnKitHandshakeIsExactlyTheSizesHyperkitExpects	                reply.writeBytes([UInt8](repeating: 0, count: Self.replyLength - reply.readableBytes))	                // padding removed
 Sources/Netstack/Wire/VpnKitHandshake.swift	aPeerThatNeverFinishesTheVpnKitHandshakeGivesItsPlaceBack	            channel.close(promise: nil)	            _ = channel
 Sources/Netstack/Link/NetworkSwitch.swift	closingASwitchStopsItsListener	        let listener = stopListening?() ?? eventLoop.makeSucceededVoidFuture()	        let listener = eventLoop.makeSucceededVoidFuture()
+Sources/Netstack/Wire/WireLinkEndpoint.swift	aStreamWireDropsRatherThanQueueingForAGuestThatIsNotReading	            guard channel.isWritable else {	            guard true else {

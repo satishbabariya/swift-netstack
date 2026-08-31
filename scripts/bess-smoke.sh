@@ -16,6 +16,20 @@ cd "$(dirname "$0")/.." || exit 1
 
 export SMOKE_SUPPORT="$PWD/scripts/smoke"
 
+# A missing interpreter is not a platform limitation, and the difference is the
+# whole point of this file. The first version conflated them: CI's Linux
+# container has no python3, the probe below failed to run at all, and the script
+# reported the same "skipped" it reports on a Mac -- passing, in the one place
+# the wire can actually be opened. It said nothing, and the wire it exists to
+# check went untried for exactly as long as nobody read the log.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "FAIL: python3 is not installed, so this check cannot run at all."
+    echo "      That is not the same as a platform without SOCK_SEQPACKET, and"
+    echo "      passing quietly here would leave --listen-bess untested where it"
+    echo "      is the only place it can be tested."
+    exit 1
+fi
+
 if ! python3 -c "
 import socket, sys
 try:

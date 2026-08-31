@@ -423,7 +423,22 @@ public final class DNSServer: @unchecked Sendable {
     /// close still in progress, and NIO's channel teardown then schedules its
     /// last step -- `removeHandlers` -- onto a loop that is gone.
     @discardableResult
+    /// Callable from anywhere.
+    ///
+    /// Everything below is loop-confined state, and this is handed to callers
+    /// who have no reason to be on that loop. `NetworkSwitch.close` had the same
+    /// shape and a bare `preconditionInEventLoop` made its ordinary use a trap;
+    /// on the loop this still runs inline, because deferring would reorder it
+    /// against the caller's own closing work.
     public func close() -> EventLoopFuture<Void> {
+        guard stack.eventLoop.inEventLoop else {
+            return stack.eventLoop.flatSubmit { self.closeOnLoop() }
+        }
+        return closeOnLoop()
+    }
+
+    private func closeOnLoop() -> EventLoopFuture<Void> {
+        stack.eventLoop.preconditionInEventLoop()
         endpoint.close()
         pending.removeAll()
         guard let channel = upstreamChannel else {

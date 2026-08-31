@@ -455,19 +455,22 @@ public final class Gateway: @unchecked Sendable {
     ) -> EventLoopFuture<Gateway> {
         wire.eventLoop.submit {
             // Wrapped before anything attaches to it, so the capture sees every
-            // frame rather than every frame after the first. A capture that
-            // fails to open is not a reason to refuse to start a network: it is
-            // reported and the gateway runs without one.
+            // frame rather than every frame after the first.
+            //
+            // A capture that cannot be opened stops the gateway, which this used
+            // to say was wrong -- "not a reason to refuse to start a network: it
+            // is reported and the gateway runs without one". Upstream returns an
+            // error here, and upstream is right. The operator asked for a
+            // capture. Handing them a working network and no capture means they
+            // debug for a while before noticing, which is the whole failure that
+            // made `--pcap` produce an empty file: believing you have a record
+            // when you do not.
             var link = wire
             if let path = configuration.captureFile {
-                if let capture = try? PacketCapture(
+                let capture = try PacketCapture(
                     path: path, snapshotLength: Int(configuration.mtu) + EthernetHeader.length,
                     maximumBytes: configuration.captureMaximumBytes)
-                {
-                    link = CapturingLink(wrapping: wire, capture: capture)
-                } else {
-                    configuration.logger.error("could not open the capture file at \(path)")
-                }
+                link = CapturingLink(wrapping: wire, capture: capture)
             }
             let stack = Stack(
                 link: link,

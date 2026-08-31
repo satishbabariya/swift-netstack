@@ -480,14 +480,31 @@ do {
 
     for forward in options.forwards + file.forwards {
         guard let address = IPv4Address(forward.guest) else { continue }
-        switch forward.transport {
-        case .tcp:
-            _ = try gateway.forward(hostPort: forward.host, toGuest: address, port: forward.guestPort)
-                .wait()
-        case .udp:
-            _ = try gateway.forwardUDP(
-                hostPort: forward.host, toGuest: address, port: forward.guestPort
-            ).wait()
+        // Reported with the forward that failed, not just the errno.
+        //
+        // A host port already in use is the ordinary way this goes wrong, and
+        // the bare failure -- "bind(descriptor:ptr:bytes:): Address already in
+        // use" -- names neither the port nor which of several --forward flags
+        // asked for it. An operator publishing four ports learns only that one
+        // of them is taken.
+        do {
+            switch forward.transport {
+            case .tcp:
+                _ = try gateway.forward(
+                    hostPort: forward.host, toGuest: address, port: forward.guestPort
+                ).wait()
+            case .udp:
+                _ = try gateway.forwardUDP(
+                    hostPort: forward.host, toGuest: address, port: forward.guestPort
+                ).wait()
+            }
+        } catch {
+            let protocolName = forward.transport == .udp ? "udp" : "tcp"
+            FileHandle.standardError.write(
+                Data(
+                    ("error: cannot publish \(forward.guest):\(forward.guestPort) on "
+                        + "127.0.0.1:\(forward.host) over \(protocolName): \(error)\n").utf8))
+            exit(1)
         }
         announce(
             "netstack-gateway: publishing \(forward.guest):\(forward.guestPort) on "

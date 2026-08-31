@@ -28,6 +28,25 @@ import NIOCore
 /// lost, and that is exactly the part someone debugging a crash wants. `flush()`
 /// is public for that reason, and `close()` calls it.
 public final class PacketCapture {
+    /// What went wrong opening the file.
+    ///
+    /// Its own type because the alternative was `StackError.notConnected`, which
+    /// is what this threw: an unrelated error reused because it was to hand. The
+    /// only caller wrote its own message and swallowed this one with `try?`, so
+    /// the lie was invisible until the swallow was removed and a gateway refused
+    /// to start saying "endpoint is not connected" about a directory that does
+    /// not exist.
+    public enum Failure: Error, CustomStringConvertible {
+        case cannotOpen(path: String)
+
+        public var description: String {
+            switch self {
+            case .cannotOpen(let path):
+                return "cannot open the capture file at \(path)"
+            }
+        }
+    }
+
     /// Microseconds since the epoch. Injectable because `NetstackClock` is
     /// monotonic -- right for timers, useless in a capture file, where the whole
     /// point is correlating with something outside this process.
@@ -60,14 +79,15 @@ public final class PacketCapture {
     ///   - now: the wall clock. Injectable because `NetstackClock` is monotonic,
     ///     which is right for timers and useless in a file somebody correlates
     ///     with something outside this process.
-    /// - Throws: if the file cannot be created or opened for writing.
+    /// - Throws: `PacketCapture.Failure` if the file cannot be created or opened
+    ///   for writing.
     public init(
         path: String, snapshotLength: Int = 1514, maximumBytes: Int = 64 * 1024 * 1024,
         bufferLimit: Int = 64 * 1024, now: @escaping WallClock = PacketCapture.systemTime
     ) throws {
         FileManager.default.createFile(atPath: path, contents: nil)
         guard let handle = FileHandle(forWritingAtPath: path) else {
-            throw StackError.notConnected
+            throw Failure.cannotOpen(path: path)
         }
         self.handle = handle
         self.snapshotLength = max(1, snapshotLength)

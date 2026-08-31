@@ -281,12 +281,29 @@ that instead.
 | **Wire** | Datagram and length-prefixed transports over real sockets, adopted from a descriptor or dialled to a path |
 | **Network** | IPv4 parse/emit, route table with spoof-aware source selection, limited broadcast, egress fragmentation, ingress reassembly with timeout and memory bounds, ICMPv4 |
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
-| **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, SWS avoidance, retransmit / persist / TIME-WAIT timers |
+| **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, RFC 1122 §4.2.3.3 receiver-side silly-window-syndrome avoidance, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | ICMP echo forwarding over unprivileged sockets, DHCP server with static leases and search domains, address translation for reaching the host, link-local blocking, host-to-guest forwarding over TCP, UDP and unix sockets, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 | **Observability** | notifications to a supervisor when the network is ready and guests arrive or leave, pcap capture of every frame, bounded so a guest cannot fill the host's disk, `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
 
-**Not yet implemented:** IPv6.
+**Not yet implemented:** IPv6, and RFC 9293 §3.8.6.2.1's MUST-38 — sender-side
+silly-window-syndrome avoidance. The receiver side is there; the sender side is
+not, and the table above used to say "SWS avoidance" without saying which. A
+peer that reopens its window one byte at a time therefore gets a
+one-byte-per-round-trip crawl. That is poor and it is not a wedge, and it is
+deliberately preferred to the alternative that was considered: staying in
+persist while the window is open, which would stall a receiver that is genuinely
+draining slowly.
+
+It is left rather than written because nothing here could check it. The
+differential pins the advertised window at its ceiling on the gVisor side — its
+auto-tuning is a heuristic with no counterpart here — and the generated
+sequences hold the guest's window above zero-window territory by a wide margin,
+so the condition MUST-38 governs never arises in either direction, deliberately
+and for reasons written down where each choice was made. Implementing it would
+rest on unit tests written by the same person who wrote the code, in the one
+part of this system that has an independent check precisely because errors there
+are hard to see.
 
 RACK itself (RFC 8985's time-based loss detection) is there and opt-in
 (`TCPEndpoint.rack`), alongside CUBIC and for the same reason: the differential

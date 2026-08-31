@@ -417,6 +417,17 @@ do {
     // to it. That is the shape vfkit and qemu expect -- they are given a path and
     // dial it -- and it is why this waits for a connection rather than adopting a
     // descriptor the way an embedding host does.
+    // Refused before anything is bound. A gateway that comes up on a
+    // configuration like this runs perfectly and serves nobody, which is the
+    // hardest kind of failure to be told about later.
+    let problems = configuration.inconsistencies
+    if !problems.isEmpty {
+        for problem in problems {
+            FileHandle.standardError.write(Data("error: \(problem)\n".utf8))
+        }
+        exit(2)
+    }
+
     let path = wires[0]
 
     announce("netstack-gateway: waiting for a guest on \(path)", toStandardError: options.listenStdio)

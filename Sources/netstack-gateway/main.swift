@@ -92,13 +92,22 @@ struct Options {
                 }
                 options.mtu = mtu
             case "--forward":
-                // `8080:192.168.127.2:80`
+                // `8080:192.168.127.2:80`, or `udp:5353:192.168.127.2:53`.
+                //
+                // The prefix is the same one the config file's forwards take,
+                // and it is here for that reason: an operator who can ask for a
+                // datagram forward in a file and not on the command line has to
+                // discover that, and the way they discover it is a forward that
+                // listens on the right port over the wrong transport.
                 let text = try value(flag)
-                let parts = text.split(separator: ":", omittingEmptySubsequences: false)
+                let transport: FileConfiguration.Transport =
+                    text.hasPrefix("udp:") ? .udp : .tcp
+                let body = transport == .udp ? String(text.dropFirst("udp:".count)) : text
+                let parts = body.split(separator: ":", omittingEmptySubsequences: false)
                 guard parts.count == 3, let host = Int(parts[0]), let guestPort = UInt16(parts[2]),
                     IPv4Address(String(parts[1])) != nil
                 else { throw OptionError.badValue(flag, text) }
-                options.forwards.append((host, String(parts[1]), guestPort, .tcp))
+                options.forwards.append((host, String(parts[1]), guestPort, transport))
             case "--help", "-h":
                 throw OptionError.help
             default:
@@ -198,7 +207,8 @@ let usage = """
     Not gvproxy's, because it takes them from the configuration file:
 
       --dns <address:port>       Resolver for names this gateway does not own
-      --forward <h:addr:g>       Publish guest addr:g on host port h, repeatable
+      --forward <h:addr:g>       Publish guest addr:g on host port h, repeatable.
+                                 Prefix with udp: for a datagram forward
 
     Exactly one of --listen-vfkit or --listen-qemu is required: they are two
     different wires, and a socket is one or the other.

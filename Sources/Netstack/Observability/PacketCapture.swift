@@ -63,6 +63,19 @@ public final class PacketCapture {
 
     /// Frames not written because the size limit had been reached.
     public private(set) var dropped = 0
+
+    /// Bytes that were meant to be in the file and are not, because a write to
+    /// it failed.
+    ///
+    /// A full disk is the ordinary way. `flush` swallowed the failure and
+    /// cleared the buffer regardless, so the capture ended wherever the last
+    /// successful write did and said nothing -- which is the same failure as the
+    /// capture that came out empty: believing you have a record when you do not.
+    ///
+    /// The bytes are still discarded. The buffer is bounded on purpose and
+    /// holding them would grow it without limit while the disk stays full. What
+    /// changes is that somebody can find out.
+    public private(set) var bytesLost = 0
     /// Whether the capture has stopped because it reached `maximumBytes`.
     public private(set) var isFull = false
 
@@ -158,7 +171,11 @@ public final class PacketCapture {
     /// Write what is buffered. Call before reading the file from anywhere else.
     public func flush() {
         guard !buffer.isEmpty else { return }
-        try? handle.write(contentsOf: Data(buffer))
+        do {
+            try handle.write(contentsOf: Data(buffer))
+        } catch {
+            bytesLost += buffer.count
+        }
         buffer.removeAll(keepingCapacity: true)
     }
 
@@ -189,7 +206,9 @@ public final class PacketCapture {
 /// sees both directions.
 public final class CapturingLink: GatewayLink, @unchecked Sendable {
     private var wrapped: GatewayLink
-    private let capture: PacketCapture
+    /// The capture underneath, so a caller can ask what it has lost. See
+    /// `PacketCapture.bytesLost`.
+    public let capture: PacketCapture
     private weak var dispatcher: (any LinkDispatcher)?
 
     public var mtu: UInt32 { wrapped.mtu }

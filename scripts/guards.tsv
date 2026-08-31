@@ -43,3 +43,4 @@ Sources/Netstack/Gateway/DHCPServer.swift	aGuestThatKeepsRenewingIsNeverReclaime
 Sources/Netstack/Gateway/DHCPServer.swift	anAddressComesBackAfterTheGuestHoldingItHasBeenGoneItsWholeTerm	        if pool.first(where: { !taken.contains($0) }) == nil {	        if false {
 Sources/Netstack/Wire/StaleSocket.swift	bindingOverAFileThatIsNotASocketLeavesItAlone	    guard info.st_mode & S_IFMT == S_IFSOCK else { return }	    if false { return }
 Sources/Netstack/Observability/PacketCapture.swift	aGatewayThatCannotDoWhatItWasAskedSaysWhichPart	            throw Failure.cannotOpen(path: path)	            throw StackError.notConnected
+Sources/Netstack/Observability/PacketCapture.swift	aCaptureThatCannotWriteSaysHowMuchItLost	            bytesLost += buffer.count	            _ = error

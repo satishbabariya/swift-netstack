@@ -197,6 +197,26 @@ if stats is None:
     print("FAIL: the gateway stopped answering its control API")
     sys.exit(1)
 
+# The floor that stops this half measuring nothing. `offer` swallows every send
+# error on purpose, because a full queue is the guest's own backpressure and not
+# a failure -- which also means a socket that accepted nothing at all leaves
+# `sent` at zero with every check below still passing: memory that never grew,
+# descriptors that never grew, and a gateway still answering ARP because nothing
+# ever asked it for anything else. Sixty thousand frames and none reported the
+# same line.
+#
+# Both numbers, because they fail differently. `sent` is what this harness
+# believes it wrote; `ipv4_delivered` is what the gateway actually parsed. A
+# wrong wire path leaves the first high and the second at zero. A working run
+# on this machine offers about sixty thousand and delivers about forty-seven
+# thousand, so a thousand is under two percent of either -- low enough to
+# survive a loaded runner, far above the zero it exists to catch.
+delivered = stats.get("ipv4_delivered", 0)
+if sent < 1000 or delivered < 1000:
+    print(f"FAIL: this measured nothing -- {sent} frames offered and {delivered}",
+          "delivered, where a working run is tens of thousands of each")
+    sys.exit(1)
+
 # Absolute growth, not a multiple. The first version allowed doubling, which
 # sounds generous and is: with the UDP flow bound removed the gateway went from
 # 7081 descriptors to 13908 and from 47 to 84 MiB over the second half, and

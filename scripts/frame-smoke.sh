@@ -422,9 +422,17 @@ PY
 # echo. The host side is an ordinary socket, on an ordinary thread.
 forward_smoke() {
     local expected="$1" guest="$2"
+    # tcp publishes on a host port; unix publishes on a host socket path. The
+    # guest side of this case does not care which -- the forward arrives as a
+    # dial to the guest either way -- so the two share everything but the two
+    # lines that differ, rather than the case being copied for the second one.
+    FORWARD_KIND="${3:-tcp}"
     shift 2
+    [[ $# -gt 0 ]] && shift
     CONTROL="${TMPDIR:-/tmp}/netstack-smoke-control-$$.sock"
     WIRE="${TMPDIR:-/tmp}/netstack-smoke-$$.sock"
+    FORWARD_PATH="${TMPDIR:-/tmp}/netstack-smoke-fwd-$$.sock"
+    rm -f "$FORWARD_PATH"
     rm -f "$WIRE" "$CONTROL"
     "$binary" --listen-vfkit "$WIRE" --listen "unix://$CONTROL" "$@" >/dev/null 2>&1 &
     GATEWAY=$!
@@ -437,7 +445,8 @@ forward_smoke() {
         return 1
     }
 
-    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" python3 - <<'PY'
+    EXPECTED="$expected" GUEST="$guest" WIRE="$WIRE" CONTROL="$CONTROL" ARGS="$*" \
+        FORWARD_KIND="$FORWARD_KIND" FORWARD_PATH="$FORWARD_PATH" python3 - <<'PY'
 import json, os, socket, subprocess, sys, threading
 sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
 from wire import address, ones_complement, printable
@@ -485,10 +494,21 @@ def arp_reply(target_mac, target_ip):
     )
 
 
+kind = os.environ.get("FORWARD_KIND", "tcp")
+forward_path = os.environ.get("FORWARD_PATH", "")
+
+
 def expose():
-    """Ask for a host port, bound to whatever is free, delivered to the guest."""
+    """Ask for a host endpoint, delivered to the guest.
+
+    For tcp that is a port bound to whatever is free; for unix it is a socket
+    path. Upstream spells both through this one route, and this port had never
+    driven the unix half of it -- the transport existed, bound its socket and
+    listed itself, and nothing had ever asked it to carry a byte.
+    """
+    local = forward_path if kind == "unix" else "127.0.0.1:0"
     request = json.dumps({
-        "local": "127.0.0.1:0", "remote": f"{guest_text}:{GUEST_PORT}", "protocol": "tcp",
+        "local": local, "remote": f"{guest_text}:{GUEST_PORT}", "protocol": kind,
     })
     answer = subprocess.run(
         ["curl", "--silent", "--fail-with-body", "--unix-socket", control,
@@ -501,6 +521,8 @@ def expose():
               "for", described)
         sys.exit(1)
     body = json.loads(answer.stdout)
+    if kind == "unix":
+        return body["local"]
     return int(body["local"].rsplit(":", 1)[1])
 
 
@@ -508,10 +530,15 @@ body = b"the host reached the guest"
 received = {}
 
 
-def host_side(port):
+def host_side(endpoint):
     """An ordinary client, on the host, that knows nothing about any of this."""
     try:
-        connection = socket.create_connection(("127.0.0.1", port), timeout=15)
+        if kind == "unix":
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(15)
+            connection.connect(endpoint)
+        else:
+            connection = socket.create_connection(("127.0.0.1", endpoint), timeout=15)
         connection.settimeout(15)
         # Sent at once, before the guest-side handshake can possibly have
         # finished. That is what every HTTP client does, and it is what the
@@ -543,7 +570,7 @@ try:
     )
 
     port = expose()
-    print("ok: fwd   expose accepted, host port", port, "->",
+    print(f"ok: fwd   expose accepted over {kind},", port, "->",
           f"{guest_text}:{GUEST_PORT}", "for", described)
 
     client = threading.Thread(target=host_side, args=(port,), daemon=True)
@@ -2533,6 +2560,11 @@ tcp_smoke 192.168.127.1 192.168.127.2 192.168.127.254 || status=1
 
 # And the other direction: a host port held open for the guest.
 forward_smoke 192.168.127.1 192.168.127.2 || status=1
+
+# The third transport of the same route. tcp and udp are both driven -- udp
+# because writing this check found that nothing drove it -- and unix was the one
+# left.
+forward_smoke 192.168.127.1 192.168.127.2 unix || status=1
 
 # And the wire nobody drives.
 stream_smoke 192.168.127.1 192.168.127.2 || status=1

@@ -80,6 +80,70 @@ private func request(
     return (status, payload)
 }
 
+@Test func aProtocolFieldThatIsNotAStringIsRefusedRatherThanTakenAsTcp() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    // Both parsers read this field as `(… as? String) ?? "tcp"`, so a value that
+    // was present and not a string failed the cast and took the default. The
+    // caller asked for something the gateway does not offer and was given TCP.
+    let exposed = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\",\"protocol\":42}", to: api)
+    #expect(
+        exposed.status == 400,
+        "a protocol of 42 was answered \(exposed.status), not refused: \(exposed.body)")
+
+    // And nothing was published by the request that was refused.
+    let listed = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(listed.body == "[]", "the refused request published a forward anyway: \(listed.body)")
+
+    // Unexpose is the same parser and the worse half. A host port is unique only
+    // within a protocol -- 8080/tcp and 8080/udp are two forwards and both can
+    // be published at once -- so falling back to tcp there does not fail, it
+    // removes the tcp forward on that port. The caller named a protocol this
+    // gateway could not read, and a working forward disappeared.
+    let tcp = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    #expect(tcp.status == 200)
+    let bound = boundPort(in: tcp.body) ?? 0
+    let udp = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\":\(bound)\",\"remote\":\"192.168.127.2:53\",\"protocol\":\"udp\"}",
+        to: api)
+    #expect(udp.status == 200, "the same port could not carry a udp forward too: \(udp.body)")
+
+    let withdrawn = try request(
+        "POST", "/services/forwarder/unexpose",
+        body: "{\"local\":\":\(bound)\",\"protocol\":42}", to: api)
+    #expect(
+        withdrawn.status == 400,
+        "a protocol of 42 was answered \(withdrawn.status), not refused")
+
+    // Both are still there. Read as tcp, that request would have taken the tcp
+    // one and answered 200, and the caller would have been told it worked.
+    //
+    // Named exactly, not by protocol. Written as `contains("tcp")` this passed
+    // against the broken parser -- the forward the refused expose had already
+    // leaked is a tcp one too, so the check was true whatever happened to the
+    // forward it was about.
+    let after = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    let tcpEntry = "{\"local\":\":\(bound)\",\"protocol\":\"tcp\"}"
+    let udpEntry = "{\"local\":\":\(bound)\",\"protocol\":\"udp\"}"
+    #expect(
+        after.body.contains(tcpEntry),
+        "the tcp forward on that port was removed by a protocol that is not a string: \(after.body)")
+    #expect(after.body.contains(udpEntry), "the udp forward on that port is gone: \(after.body)")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func aPortCanBeExposedListedAndWithdrawnOverTheApi() async throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var guestSide: Int32 = -1

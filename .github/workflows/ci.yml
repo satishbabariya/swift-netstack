@@ -56,6 +56,21 @@ jobs:
         # `set -o pipefail`, because piping into `tee` otherwise hands the
         # step `tee`'s exit status and a failing suite would go green. GitHub's
         # default shell is `bash -e`, which does not set it.
+        #
+        # The frame fuzzer gets a different seed every run, and more of them.
+        #
+        # It defaults to a fixed seed so a local run is reproducible, which meant
+        # CI explored the same four thousand mutated frames on every build since
+        # the day it was written: green after the first one by construction, and
+        # unable to find anything new however long it ran. Five million frames
+        # across five other seeds, run by hand, found nothing -- which is worth
+        # something only because the seeds differed.
+        #
+        # A failure names its own seed and says to replay with
+        # NETSTACK_FUZZ_SEED, so a red build here is reproducible on a laptop.
+        env:
+          NETSTACK_FUZZ_SEED: ${{ github.run_id }}
+          NETSTACK_FUZZ_ITERATIONS: 50000
         run: |
           set -o pipefail
           swift test 2>&1 | tee /tmp/swift-test.log

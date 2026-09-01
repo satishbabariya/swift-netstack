@@ -559,6 +559,17 @@ above and refuses if the two disagree — so the page cannot drift from what
 compiles, in either direction. Renaming `Gateway.start`'s first label breaks the
 build rather than leaving the page quietly wrong.
 
+The frame fuzzer gets **a different seed on every CI run**, from the run id, and
+fifty thousand mutants rather than four. It defaults to a fixed seed so a local
+run is reproducible — which meant CI explored the same four thousand frames on
+every build since the day it was written: green after the first one by
+construction, and unable to find anything new however long it ran. A failure
+names its own seed and says to replay with `NETSTACK_FUZZ_SEED`, so a red build
+is reproducible on a laptop.
+
+Five million mutated frames across five hand-picked seeds found nothing, which
+is worth saying only because the seeds differed.
+
 `scripts/soak.sh` runs one gateway for twenty seconds under mixed traffic — ARP,
 DHCP, DNS, TCP dials, UDP flows — and then asks what it is *holding* rather than
 what it answers. Every other executable-level check asks one question and stops,

@@ -559,6 +559,18 @@ above and refuses if the two disagree — so the page cannot drift from what
 compiles, in either direction. Renaming `Gateway.start`'s first label breaks the
 build rather than leaving the page quietly wrong.
 
+The differential's base seed stays **fixed**, and that is a different judgement
+from the fuzzer's. A crash is a bug at any seed; a frame-for-frame divergence
+from gVisor might instead be behaviour neither RFC pins down — this project has
+already found one such difference and decided not to follow it. A gate that went
+red at a random seed on an unspecified difference would block unrelated work, and
+the fix would be to pin the seed again.
+
+The seed is overridable so that "clean at this seed" can be checked against being
+an accident of this seed, which is a check nobody had run. **Thirty thousand
+fresh sequences across three other base seeds — 1, 424242 and 2⁶⁴−1 — diverge
+nowhere.** Repeat it with `NETSTACK_DIFFERENTIAL_SEED`.
+
 The frame fuzzer gets **a different seed on every CI run**, from the run id, and
 fifty thousand mutants rather than four. It defaults to a fixed seed so a local
 run is reproducible — which meant CI explored the same four thousand frames on

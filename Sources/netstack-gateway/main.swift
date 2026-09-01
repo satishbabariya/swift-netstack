@@ -29,7 +29,11 @@ struct Options {
     var upstreamResolver: String?
     var gateway: String?
     var subnet: String?
-    var mtu: UInt32 = 1500
+    // Optional, not 1500, for the reason `parsedAddress` records below: a
+    // default stored in the field cannot tell "the user asked for 1500" from
+    // "the user asked for nothing", and the merge below has to. `--mtu 1500`
+    // against a config file saying 9000 told the guest 9000.
+    var mtu: UInt32?
     var logLevel = "notice"
     var captureFile: String?
     var notifySocket: String?
@@ -417,7 +421,7 @@ let configuration = Gateway.Configuration(
     allowsLinkLocal: options.allowsLinkLocal || (file.allowsLinkLocal ?? false),
     captureFile: options.captureFile ?? file.captureFile,
     notificationSocketPath: options.notifySocket,
-    mtu: options.mtu == 1500 ? (file.mtu ?? 1500) : options.mtu,
+    mtu: options.mtu ?? file.mtu ?? 1500,
     dnsRecords: nil, upstreamResolvers: resolvers,
     dhcpStaticLeases: file.staticLeases, dnsSearchDomains: file.searchDomains,
     maximumHalfOpenConnections: file.maximumHalfOpen ?? 512,

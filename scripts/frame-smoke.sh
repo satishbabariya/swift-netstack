@@ -1940,6 +1940,66 @@ PY
     return $outcome
 }
 
+# Which MTU the guest is told, when the config file and the command line
+# disagree.
+#
+# The merge decided this by comparing the parsed flag against 1500, which cannot
+# tell "the user asked for 1500" from "the user asked for nothing" -- so a
+# `--mtu 1500` given precisely to override a config file saying 9000 was
+# discarded and the guest was told 9000. That is the failure `parsedAddress` in
+# main.swift already carried a comment about, for the addresses, a few lines from
+# the line that still had it.
+#
+# All four combinations, because this is a precedence rule and a precedence rule
+# checked in one direction is half a rule: the flag must win when both are given,
+# the file must still be read when only it is, and 1500 must survive neither.
+mtu_smoke() {
+    local directory="${TMPDIR:-/tmp}/netstack-smoke-mtu-$$"
+    rm -rf "$directory"
+    mkdir -p "$directory" || { echo "FAIL: could not make $directory"; return 1; }
+    echo '{"mtu": 9000}' > "$directory/config.json"
+    MTU_WIRE="$directory/wire.sock"
+
+    local failures=0
+    check_mtu() {
+        local want="$1" description="$2"
+        shift 2
+        rm -f "$MTU_WIRE"
+        "$binary" --listen-vpnkit "$MTU_WIRE" "$@" >/dev/null 2>&1 &
+        GATEWAY=$!
+        local waited=0
+        for _ in $(seq 1 120); do
+            [[ -S "$MTU_WIRE" ]] && { waited=1; break; }
+            sleep 0.25
+        done
+        if [[ $waited -eq 0 ]]; then
+            echo "FAIL: $description -- the gateway never came up"
+            failures=1
+            return
+        fi
+        local got
+        got="$(MTU_WIRE="$MTU_WIRE" python3 "$SMOKE_SUPPORT/vpnkit_mtu.py")"
+        kill "$GATEWAY" 2>/dev/null
+        wait "$GATEWAY" 2>/dev/null
+        GATEWAY=""
+        if [[ "$got" != "$want" ]]; then
+            echo "FAIL: $description -- the guest was told ${got:-nothing}, not $want"
+            failures=1
+        fi
+    }
+
+    check_mtu 1500 "an explicit --mtu 1500 against a config file saying 9000" \
+        --config "$directory/config.json" --mtu 1500
+    check_mtu 9000 "a config file saying 9000 and no flag" \
+        --config "$directory/config.json"
+    check_mtu 4000 "an explicit --mtu 4000 and no config file" --mtu 4000
+    check_mtu 1500 "neither a config file nor a flag"
+
+    rm -rf "$directory"
+    [[ $failures -eq 0 ]] || return 1
+    echo "ok: mtu   the flag wins over the file, the file over the default"
+}
+
 # The instance metadata service, and the flag that opens it.
 #
 # A guest that reaches 169.254.169.254 on a cloud host is asking the host's
@@ -2398,6 +2458,8 @@ notification_smoke || status=1
 tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the address a guest must not reach by accident.
+mtu_smoke || status=1
+
 metadata_smoke 192.168.127.1 192.168.127.2 "" no || status=1
 metadata_smoke 192.168.127.1 192.168.127.2 "--ec2-metadata-access" yes || status=1
 

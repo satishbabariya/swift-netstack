@@ -80,6 +80,80 @@ private func request(
     return (status, payload)
 }
 
+@Test func aZoneFieldThatIsPresentAndUnusableIsRefusedRatherThanDropped() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    // Each of these parsed to nil, and nil is how this parser spells "not
+    // given", so each was accepted as a zone the operator did not write.
+
+    // Records of the wrong type became no records, and the defaultIP then
+    // answered every name under the zone. The zone works; it just answers the
+    // wrong thing, everywhere.
+    let wrongShape = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"a.test\",\"records\":\"api\",\"defaultIP\":\"10.1.2.3\"}", to: api)
+    #expect(
+        wrongShape.status == 400,
+        "records given as a string was answered \(wrongShape.status): \(wrongShape.body)")
+
+    // An ip that is not an address, on a record that also carries a regexp: the
+    // address was dropped and the record kept.
+    let badAddress = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"b.test\",\"records\":[{\"name\":\"api\",\"ip\":\"10.1.2.999\",\"regexp\":\"^api$\"}]}",
+        to: api)
+    #expect(
+        badAddress.status == 400,
+        "an ip of 10.1.2.999 was answered \(badAddress.status): \(badAddress.body)")
+
+    // A defaultIP that is not an address, on a zone whose records are fine.
+    let badDefault = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"c.test\",\"records\":[{\"name\":\"api\",\"ip\":\"10.1.2.3\"}],\"defaultIP\":\"nonsense\"}",
+        to: api)
+    #expect(
+        badDefault.status == 400,
+        "a defaultIP of nonsense was answered \(badDefault.status): \(badDefault.body)")
+
+    // None of the three left anything behind.
+    let listed = try request("GET", "/services/dns/all", body: nil, to: api)
+    #expect(!listed.body.contains("a.test"), "a refused zone was added anyway: \(listed.body)")
+    #expect(!listed.body.contains("b.test"), "a refused zone was added anyway: \(listed.body)")
+    #expect(!listed.body.contains("c.test"), "a refused zone was added anyway: \(listed.body)")
+
+    // And a zone that is entirely well formed is still taken, so this did not
+    // become a parser that refuses everything.
+    let good = try request(
+        "POST", "/services/dns/add",
+        body: "{\"name\":\"d.test\",\"records\":[{\"name\":\"api\",\"ip\":\"10.1.2.3\"}]}", to: api)
+    #expect(good.status == 200, "a well formed zone was refused: \(good.body)")
+    let afterwards = try request("GET", "/services/dns/all", body: nil, to: api)
+    #expect(afterwards.body.contains("d.test"), "the good zone is not listed: \(afterwards.body)")
+
+    // The shape upstream's client actually sends. Go serialises a nil `net.IP`
+    // as "" rather than as null, so every zone gvproxy's client sends without a
+    // default carries `"DefaultIP":""` -- empty is how it says absent, and the
+    // first version of the strictness above refused all of them. The interop
+    // check caught that; this pins it, because a check that fails in another
+    // script does not say why.
+    let upstreamShape = try request(
+        "POST", "/services/dns/add",
+        body:
+            "{\"Name\":\"e.test.\",\"Records\":[{\"Name\":\"api\",\"IP\":\"10.1.2.3\",\"Regexp\":null}],\"DefaultIP\":\"\"}",
+        to: api)
+    #expect(
+        upstreamShape.status == 200,
+        "the shape upstream's client sends was refused: \(upstreamShape.body)")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func aProtocolFieldThatIsNotAStringIsRefusedRatherThanTakenAsTcp() async throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var guestSide: Int32 = -1

@@ -543,7 +543,8 @@ try:
     )
 
     port = expose()
-    print("ok: fwd   host port", port, "->", f"{guest_text}:{GUEST_PORT}", "for", described)
+    print("ok: fwd   expose accepted, host port", port, "->",
+          f"{guest_text}:{GUEST_PORT}", "for", described)
 
     client = threading.Thread(target=host_side, args=(port,), daemon=True)
     client.start()
@@ -2038,8 +2039,22 @@ try:
     # The gateway's own counter is what separates them, and it exists for the
     # same reason: an operator asking why a guest cannot reach the metadata
     # service has two possible answers that call for opposite actions.
-    refused = statistics().get("tcp_refused_link_local", 0)
+    counters = statistics()
+    refused = counters.get("tcp_refused_link_local", 0)
     if reachable:
+        # A floor, read before the refusal count means anything. `refused == 0`
+        # is what the flag working looks like, and it is equally what a gateway
+        # that never received the SYN looks like -- and this branch, unlike the
+        # refusal one below, has no second piece of evidence to tell them apart.
+        # Run against a stack whose link layer discarded every inbound frame,
+        # this case reported ok. `ipv4_delivered` rises before the policy is
+        # consulted, so it separates "the flag let the request through" from
+        # "there was no request to let through".
+        delivered = counters.get("ipv4_delivered", 0)
+        if delivered < 1:
+            print("FAIL: no IPv4 packet reached the gateway at all, so a refusal",
+                  "count of zero says nothing about the flag, for", described)
+            sys.exit(1)
         if refused != 0:
             print("FAIL: --ec2-metadata-access was given and the gateway refused",
                   "169.254.169.254 by policy anyway, for", described)

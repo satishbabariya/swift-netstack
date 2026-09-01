@@ -213,8 +213,9 @@ YAML**: the field names, nesting and meanings are upstream's exactly, so a YAML
 file converts with any one-line tool, and a YAML parser would be a dependency
 every program linking this library carries for a flag only the executable has. A
 YAML file is refused *as YAML* rather than as unparseable. The file is also the
-only way to reach DNS zones, static leases, NAT and virtual addresses — no flag
-says those. Flags win over the file.
+only way to reach DNS zones, static leases, NAT, virtual addresses and the TCP
+dial timeout (`tcpConnectTimeout`) — no flag says those. Flags win over the
+file.
 
 **The flag names are `gvproxy`'s**, so a command line moves across unchanged —
 which means `--listen` is the *control* endpoint and the guest wire is

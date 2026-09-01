@@ -141,6 +141,14 @@ public final class Gateway: @unchecked Sendable {
         public var maximumTCPConnections: Int
         public var maximumUDPFlows: Int
         public var maximumHalfOpenConnections: Int
+        /// How long a dial to the destination may take before the guest's
+        /// connection is refused. Five seconds, matching what a guest's own
+        /// stack would wait before giving up on a SYN it sent itself.
+        ///
+        /// The config file has parsed this as `tcpConnectTimeout` since the file
+        /// was added and there was nowhere to put it, so every value anyone set
+        /// was read, validated and dropped.
+        public var tcpDialTimeout: TimeAmount
         /// How many guests may share one switch. Only read by
         /// `start(switchListeningOnStreamSocketAt:)`.
         public var maximumGuests: Int
@@ -192,6 +200,7 @@ public final class Gateway: @unchecked Sendable {
             maximumTCPConnections: Int = 1024,
             maximumUDPFlows: Int = 512,
             maximumHalfOpenConnections: Int = 512,
+            tcpDialTimeout: TimeAmount = .seconds(5),
             maximumGuests: Int = 32,
             keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
             logger: Logger = Logger(label: "netstack"),
@@ -233,6 +242,7 @@ public final class Gateway: @unchecked Sendable {
             self.maximumTCPConnections = maximumTCPConnections
             self.maximumUDPFlows = maximumUDPFlows
             self.maximumHalfOpenConnections = maximumHalfOpenConnections
+            self.tcpDialTimeout = tcpDialTimeout
             self.maximumGuests = maximumGuests
             self.keepAlive = keepAlive
             self.logger = logger
@@ -501,7 +511,8 @@ public final class Gateway: @unchecked Sendable {
             let tcp = OutboundTCPForwarder(
                 stack: stack, maximumInFlight: configuration.maximumHalfOpenConnections,
                 maximumConnections: configuration.maximumTCPConnections,
-                keepAlive: configuration.keepAlive, nat: configuration.nat,
+                keepAlive: configuration.keepAlive,
+                dialTimeout: configuration.tcpDialTimeout, nat: configuration.nat,
                 allowsLinkLocal: configuration.allowsLinkLocal)
             let udp = UDPForwarder(
                 stack: stack, maximumFlows: configuration.maximumUDPFlows, nat: configuration.nat,

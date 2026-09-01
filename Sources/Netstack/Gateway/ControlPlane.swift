@@ -424,6 +424,30 @@ public func jsonField(_ fields: [String: Any], _ name: String) -> Any? {
     return nil
 }
 
+/// The `protocol` a forwarding request names, or `tcp` when it names none.
+///
+/// `nil` for a field that is present and not a string, which is the case both
+/// request parsers used to lose: written as
+///
+///     ForwardTransport(rawValue: (jsonField(fields, "protocol") as? String) ?? "tcp")
+///
+/// a `protocol` of `42` failed the cast, took the default, and became TCP.
+///
+/// On expose that publishes a forward the caller did not ask for. On unexpose it
+/// is worse: a host port is unique only within a protocol, so `8080/tcp` and
+/// `8080/udp` are two forwards that coexist, and reading an unreadable protocol
+/// as TCP removes the TCP one and answers 200. A working forward disappears,
+/// the forward the caller may have meant stays, and they are told it worked.
+///
+/// Upstream's decoder answers a type error with a 400, so refusing is also what
+/// a client written against gvproxy already expects. Absent stays absent: a
+/// request that omits `protocol` means TCP, and that is upstream's default too.
+func forwardTransport(_ fields: [String: Any]) -> ForwardTransport? {
+    guard let named = jsonField(fields, "protocol"), !(named is NSNull) else { return .tcp }
+    guard let text = named as? String else { return nil }
+    return ForwardTransport(rawValue: text)
+}
+
 extension ControlPlane {
     /// Enough JSON string escaping for the values this API emits, which are
     /// names and patterns rather than arbitrary text. Quotes and backslashes
@@ -711,8 +735,7 @@ private struct ExposeRequest {
             let local = jsonField(fields, "local") as? String,
             let remote = jsonField(fields, "remote") as? String
         else { return nil }
-        let transport = ForwardTransport(rawValue: (jsonField(fields, "protocol") as? String) ?? "tcp")
-        guard let transport else { return nil }
+        guard let transport = forwardTransport(fields) else { return nil }
         self.transport = transport
 
         guard let (guestHost, guestText) = ExposeRequest.split(remote),
@@ -764,8 +787,7 @@ private struct UnexposeRequest {
             let fields = object as? [String: Any],
             let local = jsonField(fields, "local") as? String
         else { return nil }
-        guard let transport = ForwardTransport(rawValue: (jsonField(fields, "protocol") as? String) ?? "tcp")
-        else { return nil }
+        guard let transport = forwardTransport(fields) else { return nil }
         self.transport = transport
         self.local = local
         if transport == .unix {

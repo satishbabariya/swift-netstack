@@ -84,20 +84,54 @@ struct FileConfiguration {
             throw Failure.malformed(path)
         }
 
-        func string(_ name: String) -> String? { jsonField(fields, name) as? String }
+        // A field that is present with the wrong shape is refused, not ignored.
+        //
+        // `mtu` was the scalar version of this: its range test sat inside the
+        // `if let` that read it, so an out-of-range value became the default and
+        // the operator was told nothing. The collections had the same silence
+        // about their type. `{"nat": "10.0.0.1"}` or a `forwards` written as the
+        // one string somebody meant to put in it left the field empty and
+        // started a gateway that quietly did none of it -- and a forward that
+        // does not happen looks, from the guest, exactly like a network problem.
+        //
+        // `jsonField` is deliberately lenient about how a name is capitalised,
+        // because Go's decoder is. That is leniency about spelling; this is
+        // strictness about meaning, and the two are not in tension.
+        //
+        // A JSON null counts as absent rather than wrong. It is how a generated
+        // file says "not set", and refusing it would fight the tools that write
+        // these.
+        func present(_ name: String) -> Any? {
+            let found = jsonField(fields, name)
+            return found is NSNull ? nil : found
+        }
+        func shaped<T>(_ name: String, _ shape: String) throws -> T? {
+            guard let found = present(name) else { return nil }
+            guard let cast = found as? T else {
+                // On one line and bounded. A dictionary or an array prints its
+                // description across several lines, and an error that spans the
+                // terminal buries the one clause that says what was wrong.
+                let flattened = "\(found)".split(whereSeparator: \.isNewline)
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: " ")
+                let text = flattened.count > 60 ? flattened.prefix(60) + "..." : flattened[...]
+                throw Failure.badValue(name, "\(text), which is not \(shape)")
+            }
+            return cast
+        }
+        func string(_ name: String) throws -> String? { try shaped(name, "a string") }
         func address(_ name: String) throws -> IPv4Address? {
-            guard let text = string(name) else { return nil }
+            guard let text = try string(name) else { return nil }
             guard let parsed = IPv4Address(text) else { throw Failure.badValue(name, text) }
             return parsed
         }
 
         gatewayAddress = try address("gatewayIP")
         hostAddress = try address("hostIP")
-        if let text = string("subnet") {
+        if let text = try string("subnet") {
             guard let parsed = IPv4Subnet(cidr: text) else { throw Failure.badValue("subnet", text) }
             subnet = parsed
         }
-        if let text = string("gatewayMacAddress") {
+        if let text = try string("gatewayMacAddress") {
             guard let parsed = MACAddress(text) else {
                 throw Failure.badValue("gatewayMacAddress", text)
             }
@@ -113,7 +147,7 @@ struct FileConfiguration {
         // value in two places answered two different ways, and the silent one
         // is the one an operator cannot see.
         func integer(_ name: String, atLeast low: Int, atMost high: Int) throws -> Int? {
-            guard let value = jsonField(fields, name) else { return nil }
+            guard let value = present(name) else { return nil }
             guard let number = value as? Int else {
                 // The type, not just the text. JSON quotes do not survive into
                 // the message, so `{"mtu": "1500"}` reported `mtu is not valid:
@@ -128,24 +162,26 @@ struct FileConfiguration {
         }
 
         mtu = try integer("mtu", atLeast: 576, atMost: 65535).map(UInt32.init)
-        debug = (jsonField(fields, "debug") as? Bool) ?? false
-        captureFile = string("capture-file") ?? string("captureFile")
-        allowsLinkLocal = jsonField(fields, "ec2MetadataAccess") as? Bool
+        debug = try shaped("debug", "true or false") ?? false
+        captureFile = try string("capture-file") ?? string("captureFile")
+        allowsLinkLocal = try shaped("ec2MetadataAccess", "true or false")
         // Upper bounds are the largest number that is not obviously a mistake
         // rather than anything this program enforces: what matters is that zero
         // and negatives are refused here instead of becoming a gateway that
         // refuses every connection, or a dial that times out before it starts.
         maximumHalfOpen = try integer("tcpMaxInFlight", atLeast: 1, atMost: 1_000_000)
         dialTimeout = try integer("tcpConnectTimeout", atLeast: 1, atMost: 86400)
-        searchDomains = (jsonField(fields, "dnsSearchDomains") as? [String]) ?? []
+        searchDomains = try shaped("dnsSearchDomains", "a list of strings") ?? []
 
-        for (mac, ip) in (jsonField(fields, "dhcpStaticLeases") as? [String: String]) ?? [:] {
+        for (mac, ip) in try shaped("dhcpStaticLeases", "a table of strings")
+            ?? [String: String]()
+        {
             guard let hardware = MACAddress(mac), let leased = IPv4Address(ip) else {
                 throw Failure.badValue("dhcpStaticLeases", "\(mac): \(ip)")
             }
             staticLeases[hardware] = leased
         }
-        if let table = jsonField(fields, "nat") as? [String: String] {
+        if let table: [String: String] = try shaped("nat", "a table of strings") {
             var translations: [IPv4Address: IPv4Address] = [:]
             for (from, to) in table {
                 guard let source = IPv4Address(from), let target = IPv4Address(to) else {
@@ -155,7 +191,9 @@ struct FileConfiguration {
             }
             nat = translations
         }
-        if let table = jsonField(fields, "vpnKitUUIDMacAddresses") as? [String: String] {
+        if let table: [String: String] = try shaped(
+            "vpnKitUUIDMacAddresses", "a table of strings")
+        {
             var addresses: [String: MACAddress] = [:]
             for (uuid, text) in table {
                 guard let address = MACAddress(text) else {
@@ -165,7 +203,7 @@ struct FileConfiguration {
             }
             vpnKitAddresses = addresses
         }
-        if let list = jsonField(fields, "gatewayVirtualIPs") as? [String] {
+        if let list: [String] = try shaped("gatewayVirtualIPs", "a list of strings") {
             virtualAddresses = try list.map {
                 guard let parsed = IPv4Address($0) else { throw Failure.badValue("gatewayVirtualIPs", $0) }
                 return parsed
@@ -173,7 +211,9 @@ struct FileConfiguration {
         }
         // `forwards` maps a host endpoint to a guest one, both `host:port`, and
         // upstream's own default omits the host on the left.
-        for (local, remote) in (jsonField(fields, "forwards") as? [String: String]) ?? [:] {
+        for (local, remote) in try shaped("forwards", "a table of strings")
+            ?? [String: String]()
+        {
             // `udp:` in front of the host side means a datagram forward, which is
             // upstream's spelling. Anything else is TCP.
             let transport: Transport = local.hasPrefix("udp:") ? .udp : .tcp
@@ -187,7 +227,7 @@ struct FileConfiguration {
                 (hostPort, String(remote[remote.startIndex..<separator]), guestPort, transport))
         }
 
-        for entry in (jsonField(fields, "dns") as? [[String: Any]]) ?? [] {
+        for entry in try shaped("dns", "a list of zones") ?? [[String: Any]]() {
             guard let name = jsonField(entry, "name") as? String else {
                 throw Failure.badValue("dns", "a zone with no name")
             }

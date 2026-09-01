@@ -70,8 +70,7 @@ else
     # Twenty seconds of mixed traffic, watching what the gateway holds rather
     # than what it answers. Slow by design and skipped by --quick.
     step "a gateway under sustained traffic" ./scripts/soak.sh
-    step "the full differential gate" \
-        env NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
+    step "the full differential gate" ./scripts/differential-gate.sh
     step "falsify the guards" ./scripts/falsify.sh --all
 fi
 

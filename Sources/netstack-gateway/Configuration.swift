@@ -103,14 +103,40 @@ struct FileConfiguration {
             }
             linkAddress = parsed
         }
-        if let value = jsonField(fields, "mtu") as? Int, value >= 576, value <= 65535 {
-            mtu = UInt32(value)
+        // A number that is present and wrong is refused, not dropped.
+        //
+        // Every structured field below already throws on bad content -- `nat`,
+        // `forwards`, `dhcpStaticLeases`, `gatewayVirtualIPs` -- and the scalars
+        // did not. The range test on `mtu` was a condition of the `if let`, so
+        // `{"mtu": 100}` left the field nil and started a gateway on 1500 while
+        // `--mtu 100` was refused outright. The same program given the same
+        // value in two places answered two different ways, and the silent one
+        // is the one an operator cannot see.
+        func integer(_ name: String, atLeast low: Int, atMost high: Int) throws -> Int? {
+            guard let value = jsonField(fields, name) else { return nil }
+            guard let number = value as? Int else {
+                // The type, not just the text. JSON quotes do not survive into
+                // the message, so `{"mtu": "1500"}` reported `mtu is not valid:
+                // 1500` -- which reads as a complaint about 1500, a perfectly
+                // good MTU, rather than about its being a string.
+                throw Failure.badValue(name, "\(value), which is not a whole number")
+            }
+            guard number >= low, number <= high else {
+                throw Failure.badValue(name, "\(number), which is outside \(low)...\(high)")
+            }
+            return number
         }
+
+        mtu = try integer("mtu", atLeast: 576, atMost: 65535).map(UInt32.init)
         debug = (jsonField(fields, "debug") as? Bool) ?? false
         captureFile = string("capture-file") ?? string("captureFile")
         allowsLinkLocal = jsonField(fields, "ec2MetadataAccess") as? Bool
-        maximumHalfOpen = jsonField(fields, "tcpMaxInFlight") as? Int
-        dialTimeout = jsonField(fields, "tcpConnectTimeout") as? Int
+        // Upper bounds are the largest number that is not obviously a mistake
+        // rather than anything this program enforces: what matters is that zero
+        // and negatives are refused here instead of becoming a gateway that
+        // refuses every connection, or a dial that times out before it starts.
+        maximumHalfOpen = try integer("tcpMaxInFlight", atLeast: 1, atMost: 1_000_000)
+        dialTimeout = try integer("tcpConnectTimeout", atLeast: 1, atMost: 86400)
         searchDomains = (jsonField(fields, "dnsSearchDomains") as? [String]) ?? []
 
         for (mac, ip) in (jsonField(fields, "dhcpStaticLeases") as? [String: String]) ?? [:] {

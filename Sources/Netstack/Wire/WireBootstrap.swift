@@ -244,6 +244,13 @@ public enum WireBootstrap {
                         channel: channel, linkAddress: linkAddress, mtu: mtu, framed: false,
                         flushPerFrame: true, learnsPeer: true, rawDescriptor: descriptor)
                 }
+                .map { link in
+                    // The path this wire bound is this wire's to remove. Closing
+                    // a unix socket does not unlink it, so a closed gateway left
+                    // a file behind that looks like a wire and answers nothing.
+                    link.localSocketPath = path
+                    return link
+                }
         } catch {
             return group.any().makeFailedFuture(error)
         }
@@ -284,7 +291,7 @@ public enum WireBootstrap {
         let loop = group.next()
         let arrived = loop.makePromise(of: WireLinkEndpoint.self)
         let accepted = FirstGuest()
-        ServerBootstrap(group: group, childGroup: loop)
+        let bound = ServerBootstrap(group: group, childGroup: loop)
             .serverChannelOption(.backlog, value: 1)
             .childChannelInitializer { channel in
                 // On `loop`, because the child was pinned to it.
@@ -312,8 +319,20 @@ public enum WireBootstrap {
                 }
             }
             .bind(unixDomainSocketPath: path)
-            .whenFailure { arrived.fail($0) }
-        return arrived.futureResult
+        bound.whenFailure { arrived.fail($0) }
+        // The listener is held so that closing the link can close it. Nothing
+        // held it before, and there was no way to reach it: a guest connecting
+        // after `close()` was accepted onto a link whose gateway had gone, and
+        // the socket path stayed bound for the life of the process. The switch
+        // wire was given this when the same defect was found there; these two
+        // were not.
+        return bound.flatMap { listener in
+            arrived.futureResult.map { link in
+                link.stopListening = { listener.close().recover { _ in () } }
+                link.localSocketPath = path
+                return link
+            }
+        }
     }
 
     /// Take a place on `netSwitch` for a guest that has just connected, or say

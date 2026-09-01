@@ -324,15 +324,36 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     /// Only the dialling wires have one: they need an address of their own so
     /// the far end has somewhere to reply, and a socket file left behind after
     /// the link is gone is litter in whatever directory it was put in.
+    ///
+    /// Also the path a LISTENING wire bound, for the same reason and with the
+    /// same remedy: closing a unix socket does not unlink it, so both listening
+    /// wires left a file behind that looks like a wire and answers nothing.
+    /// Measured across a clean shutdown of the executable, `--listen-vfkit` and
+    /// `--listen-qemu` left theirs while `--listen-vpnkit` and `--listen-switch`
+    /// did not, which is the sort of difference nobody chooses.
     public var localSocketPath: String?
 
+    /// Closes whatever lets the next guest in, for a link that came from a
+    /// listening wire.
+    ///
+    /// `NetworkSwitch` has carried one of these since closing a switch was found
+    /// to leave its listener accepting. The single-guest listening wires were
+    /// not given one at the same time, and `--listen-qemu` had the same defect:
+    /// nothing held its `ServerBootstrap` channel, so a guest connecting after
+    /// `close()` was still accepted, onto a link whose gateway had gone.
+    var stopListening: (@Sendable () -> EventLoopFuture<Void>)?
+
     public func close() -> EventLoopFuture<Void> {
+        // Stop accepting before anything else: a guest let in while the rest of
+        // this runs arrives on a link that is being taken apart.
+        let listener = stopListening?() ?? eventLoop.makeSucceededVoidFuture()
+        stopListening = nil
         if let localSocketPath {
             try? FileManager.default.removeItem(atPath: localSocketPath)
             self.localSocketPath = nil
         }
-        guard let channel else { return eventLoop.makeSucceededVoidFuture() }
-        return channel.close().recover { _ in () }
+        guard let channel else { return listener }
+        return listener.flatMap { channel.close().recover { _ in () } }
     }
 }
 

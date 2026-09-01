@@ -517,6 +517,82 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? await group.shutdownGracefully()
 }
 
+// Closing a single-guest listening wire stops the thing that lets the next guest
+// in, and takes its socket path with it.
+//
+// `closingASwitchStopsItsListener` below covers the switch, and the vpnkit and
+// bess wires were given the same treatment when it was written. The two wires
+// that were not are `--listen-qemu` and `--listen-vfkit`, and the second is the
+// default -- the one vfkit uses and the one most gateways here are started on.
+//
+// Measured before this was fixed, by asking the filesystem what survived a clean
+// shutdown of the executable:
+//
+//     vfkit    wire after exit: LEFT     control after exit: removed
+//     qemu     wire after exit: LEFT     control after exit: removed
+//     vpnkit   wire after exit: removed  control after exit: removed
+//     switch   wire after exit: removed  control after exit: removed
+//
+// For qemu it is not only litter: nothing ever held that `ServerBootstrap`
+// channel, so a guest connecting after `close()` was still accepted, onto a link
+// whose gateway had gone.
+@Test func closingAListeningStreamWireStopsItsListener() async throws {
+    let path = temporaryPath("qemu-close")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    // The future this returns is the LINK, and a link exists only once a guest
+    // has connected -- so awaiting it before dialling waits for a guest that the
+    // test has not sent yet. Written that way first, it hung.
+    let pending = WireBootstrap.listeningStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500)
+    for _ in 0..<200 where !FileManager.default.fileExists(atPath: path) {
+        try await Task.sleep(nanoseconds: 5_000_000)
+    }
+
+    // Open first, so this is about closing rather than about binding.
+    let before = dial(path, type: .stream)
+    let link = try await pending.get()
+    close(before)
+
+    _ = try? await link.close().get()
+
+    var refused = false
+    for _ in 0..<200 where !refused {
+        let after = makeSocket(AF_UNIX, .stream)
+        refused = connectTo(after, unixAddress(path: path)) != 0
+        close(after)
+        if !refused { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(refused, "a guest was accepted onto a listening wire that had been closed")
+    #expect(
+        !FileManager.default.fileExists(atPath: path),
+        "the socket path outlived the wire that bound it")
+
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
+@Test func closingAListeningDatagramWireTakesItsSocketPathWithIt() async throws {
+    let path = temporaryPath("vfkit-close")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let link = try await WireBootstrap.listeningDatagramSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
+    #expect(FileManager.default.fileExists(atPath: path), "the wire never bound its path")
+
+    _ = try? await link.close().get()
+
+    // A datagram wire has no listener to stop -- the bound socket is the link's
+    // own channel, and closing the link closes it. What was left behind is the
+    // name: closing a unix socket does not unlink it, so the path stayed as a
+    // file that looks like a wire and answers nothing.
+    #expect(
+        !FileManager.default.fileExists(atPath: path),
+        "the socket path outlived the wire that bound it")
+
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
 // Closing a switch stops the thing that puts guests on it.
 //
 // It used to close the ports and leave the listener behind: the socket path
@@ -653,12 +729,18 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     let path = temporaryPath("stale")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
-    // Bound, then abandoned without closing: the file outlives the endpoint the
-    // way it outlives a process that was killed.
-    let first = try await WireBootstrap.listeningDatagramSocket(
-        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
-    ).get()
-    _ = try await first.close().get()
+    // A socket file the way a killed process leaves one: bound by hand, then the
+    // descriptor closed. Closing a unix socket does not unlink its path, which is
+    // the whole reason a stale one can be there to bind over.
+    //
+    // This used to make the stale file by opening a listening wire and closing
+    // it, which stopped working the moment closing a wire began removing the
+    // path it bound. That is the behaviour being fixed, not a regression: the
+    // test wanted a stale socket and was getting one as a side effect of a bug.
+    let abandoned = makeSocket(AF_UNIX, .datagram)
+    #expect(abandoned >= 0)
+    #expect(bindTo(abandoned, unixAddress(path: path)) == 0, "could not bind \(path)")
+    close(abandoned)
     #expect(FileManager.default.fileExists(atPath: path), "the socket file was cleaned up already")
 
     let second = try await WireBootstrap.listeningDatagramSocket(

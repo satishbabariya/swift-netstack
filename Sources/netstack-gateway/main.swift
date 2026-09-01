@@ -425,6 +425,7 @@ let configuration = Gateway.Configuration(
     dnsRecords: nil, upstreamResolvers: resolvers,
     dhcpStaticLeases: file.staticLeases, dnsSearchDomains: file.searchDomains,
     maximumHalfOpenConnections: file.maximumHalfOpen ?? 512,
+    tcpDialTimeout: file.dialTimeout.map { .seconds(Int64($0)) } ?? .seconds(5),
     logger: Logger(label: "netstack"))
 
 do {

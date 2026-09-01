@@ -297,6 +297,37 @@ for flag in $(grep -oE '\-\-[a-zA-Z][a-zA-Z0-9-]*' README.md | sort -u); do
 done
 
 
+# 13. Every setting the config file parses is one the program applies.
+#
+# `tcpConnectTimeout` was parsed into `FileConfiguration.dialTimeout` from the
+# day the file was added, validated as an integer, and read by nothing. The
+# library had the timeout it belonged in and the two were never joined, so
+# anyone who set it got the five-second default and no indication otherwise.
+#
+# A flag the program does not take is refused loudly, and rule 11 keeps the flags
+# and the README together. A config *key* has neither: JSON the program does not
+# understand is JSON it ignores, so a setting that reaches no code is
+# indistinguishable, from outside, from a setting that does nothing.
+#
+# The struct is the list, because it is what the parser fills in. `[:=]` rather
+# than `:`, because `var debug = false` declares its type by inference and an
+# earlier version of this rule, written against annotated fields only, would not
+# have looked at it.
+fields=$(awk '/^struct FileConfiguration \{/{inside=1;next} inside&&/^\}/{exit} \
+    inside&&/^    var [a-zA-Z]+[[:space:]]*[:=]/{print $2}' \
+    Sources/netstack-gateway/Configuration.swift | tr -d ':')
+if [[ -z "$fields" ]]; then
+    fail "no fields were found in FileConfiguration" \
+        "this rule reads the struct to know what to check, and it read nothing"
+fi
+for field in $fields; do
+    if ! grep -q "file\.$field" Sources/netstack-gateway/main.swift; then
+        fail "the config file parses $field and main.swift never reads it" \
+            "a setting that reaches no code is one the operator set and did not get"
+    fi
+done
+
+
 # 12. The README's examples compile, and the copy that compiles is the README's.
 #
 # They are the first thing anybody runs. Every symbol in them has been renamed or

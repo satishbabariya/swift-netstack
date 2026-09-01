@@ -80,6 +80,49 @@ private func request(
     return (status, payload)
 }
 
+@Test func exposingTheSameUnixPathTwiceIsRefusedRatherThanReplacingTheFirst() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+    let path = NSTemporaryDirectory() + "netstack-dup-\(UInt32.random(in: 0..<UInt32.max)).sock"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let body = "{\"local\":\"\(path)\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"unix\"}"
+    let first = try request("POST", "/services/forwarder/expose", body: body, to: api)
+    #expect(first.status == 200, "the first unix forward was refused: \(first.body)")
+
+    // The tcp half refuses this by accident -- its bind fails with EADDRINUSE --
+    // and this half could not, because listening on a path unlinks whatever is
+    // already there. Both answered 200, the first forwarder's listener was left
+    // with no path pointing at it, and the dictionary `stopForwarding` looks in
+    // held the second, so nothing could reach the first again.
+    let second = try request("POST", "/services/forwarder/expose", body: body, to: api)
+    #expect(
+        second.status == 409,
+        "exposing the same unix path twice was answered \(second.status): \(second.body)")
+
+    // Still exactly one, and it is still the first: a refusal that took the
+    // forward down with it would be worse than the leak.
+    let listed = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    let entries = listed.body.components(separatedBy: "{\"local\"").count - 1
+    #expect(entries == 1, "the refused expose changed the table: \(listed.body)")
+
+    // And the path is usable again once it is given up, so this refuses a
+    // duplicate rather than burning the name.
+    let withdrawn = try request(
+        "POST", "/services/forwarder/unexpose",
+        body: "{\"local\":\"\(path)\",\"protocol\":\"unix\"}", to: api)
+    #expect(withdrawn.status == 200, "the unix forward could not be withdrawn: \(withdrawn.body)")
+    let again = try request("POST", "/services/forwarder/expose", body: body, to: api)
+    #expect(again.status == 200, "the path could not be reused after unexpose: \(again.body)")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func aZoneFieldThatIsPresentAndUnusableIsRefusedRatherThanDropped() async throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var guestSide: Int32 = -1

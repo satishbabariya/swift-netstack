@@ -605,6 +605,25 @@ public final class Gateway: @unchecked Sendable {
     public func forward(
         unixSocketPath path: String, toGuest guestAddress: IPv4Address, port guestPort: UInt16
     ) -> EventLoopFuture<PortForwarder> {
+        // Refused rather than replaced, which is what the tcp half does only by
+        // accident: its `bind` fails with EADDRINUSE and the route turns that
+        // into a 409. This half cannot fail that way, because listening on a
+        // path unlinks whatever is already there. That unlink is deliberate --
+        // a socket left by a killed previous run has to be cleared -- and it
+        // cannot tell that file from one this same process is serving.
+        //
+        // So exposing a path twice answered 200 both times. The first
+        // forwarder's listener stayed open with no path pointing at it and this
+        // dictionary, which is how `stopForwarding` finds one, now held the
+        // second: nothing could reach the first again, and its descriptor was
+        // held for the life of the process.
+        //
+        // Read on the loop for the same reason the stops are: this dictionary
+        // has no lock because the control plane runs here.
+        eventLoop.preconditionInEventLoop()
+        guard unixForwards[path] == nil else {
+            return eventLoop.makeFailedFuture(StackError.portInUse)
+        }
         let forwarder = PortForwarder(
             stack: stack, guestAddress: guestAddress, guestPort: guestPort, keepAlive: keepAlive)
         forwarder.log = log

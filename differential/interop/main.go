@@ -53,7 +53,14 @@ func main() {
 	if len(after) != len(forwards)+1 {
 		fail("List after expose", fmt.Errorf("expected %d forwards, got %d", len(forwards)+1, len(after)))
 	}
-	fmt.Printf("OK   List -> %d forward(s), and it names the protocol: %q\n", len(after), after[len(after)-1].Protocol)
+	// The line below claims the gateway names the protocol, and until this was
+	// added it printed whatever came back without reading it -- an empty or
+	// absent field would have been reported as a success naming nothing.
+	protocol := after[len(after)-1].Protocol
+	if protocol != types.TCP {
+		fail("List after expose", fmt.Errorf("expected protocol %q, got %q", types.TCP, protocol))
+	}
+	fmt.Printf("OK   List -> %d forward(s), and it names the protocol: %q\n", len(after), protocol)
 
 	zones, err := c.ListDNS()
 	if err != nil {
@@ -98,7 +105,23 @@ func main() {
 	if err := c.Unexpose(&types.UnexposeRequest{Local: local, Protocol: types.TCP}); err != nil {
 		fail("Unexpose", err)
 	}
-	fmt.Println("OK   Unexpose")
+
+	// That the call did not error is not that the forward is gone, and this
+	// half asserted only the first. Made to answer 200 and remove nothing, the
+	// gateway drove this whole driver to its closing line with the port still
+	// bound and still listed. The udp half below has always checked; the tcp
+	// half is the one that shipped without a check, which is the asymmetry the
+	// comment further down complains about in the opposite direction.
+	afterUnexpose, err := c.List()
+	if err != nil {
+		fail("List after unexpose", err)
+	}
+	for _, forward := range afterUnexpose {
+		if forward.Local == local {
+			fail("Unexpose", fmt.Errorf("the forward is still listed: %v", forward))
+		}
+	}
+	fmt.Println("OK   Unexpose, and it is gone from the list")
 
 	// UDP, which nothing exercised until this was written -- not a test, not a
 	// script, not this driver. A forward is two halves and only the TCP half of

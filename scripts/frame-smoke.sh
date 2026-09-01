@@ -2000,6 +2000,102 @@ mtu_smoke() {
     echo "ok: mtu   the flag wins over the file, the file over the default"
 }
 
+# A number in the config file that is present and wrong.
+#
+# The range test on `mtu` was a condition of the `if let` that read it, so an
+# out-of-range value left the field nil and the gateway started on 1500 -- while
+# `--mtu 100` on the command line was refused outright. The same program, the
+# same value, two answers, and the silent one is the one an operator cannot see.
+# Every structured field in that file already threw on bad content; the scalars
+# did not.
+#
+# Driven through the executable because the parser lives in it and a test target
+# cannot import it.
+config_value_smoke() {
+    local directory="${TMPDIR:-/tmp}/netstack-smoke-cfg-$$"
+    rm -rf "$directory"
+    mkdir -p "$directory" || { echo "FAIL: could not make $directory"; return 1; }
+    local failures=0
+
+    # Refused: the gateway must not start, and must say which field and why.
+    #
+    # Started in the background and waited for, rather than read through a
+    # command substitution. The first version of this was
+    #
+    #     output="$("$binary" ... 2>&1 | head -1)"
+    #
+    # which waits for the command to finish -- and the failure it is looking for
+    # is a gateway that does not refuse, so it starts and runs forever. Against
+    # the very bug this case was written for, it hung instead of reporting it,
+    # leaving gateways behind. In CI that is a job timeout rather than a failed
+    # assertion, and a check that cannot say what is wrong is most of the way to
+    # a check that says nothing.
+    refuses() {
+        local json="$1" expected="$2"
+        echo "$json" > "$directory/config.json"
+        rm -f "$directory/wire.sock"
+        "$binary" --listen-vpnkit "$directory/wire.sock" \
+            --config "$directory/config.json" >"$directory/output.txt" 2>&1 &
+        local pid=$!
+        local exited=0
+        for _ in $(seq 1 120); do
+            if ! kill -0 "$pid" 2>/dev/null; then exited=1; break; fi
+            [[ -S "$directory/wire.sock" ]] && break
+            sleep 0.25
+        done
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        if [[ $exited -eq 0 ]]; then
+            echo "FAIL: $json started a gateway instead of being refused"
+            failures=1
+            return
+        fi
+        local output
+        output="$(head -1 "$directory/output.txt")"
+        case "$output" in
+            *"$expected"*) ;;
+            *)
+                echo "FAIL: $json was refused with \"$output\", which does not mention $expected"
+                failures=1
+                ;;
+        esac
+    }
+
+    refuses '{"mtu": 100}' "outside 576...65535"
+    refuses '{"mtu": 99999}' "outside 576...65535"
+    refuses '{"mtu": "1500"}' "not a whole number"
+    refuses '{"tcpMaxInFlight": 0}' "tcpMaxInFlight"
+    refuses '{"tcpConnectTimeout": -1}' "tcpConnectTimeout"
+
+    # And the values that are fine are still taken, so this did not simply
+    # become a parser that refuses everything.
+    echo '{"mtu": 9000, "tcpMaxInFlight": 64, "tcpConnectTimeout": 3}' > "$directory/config.json"
+    rm -f "$directory/wire.sock"
+    "$binary" --listen-vpnkit "$directory/wire.sock" --config "$directory/config.json" \
+        >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$directory/wire.sock" ]] && break
+        sleep 0.25
+    done
+    local got=""
+    if [[ -S "$directory/wire.sock" ]]; then
+        got="$(MTU_WIRE="$directory/wire.sock" python3 "$SMOKE_SUPPORT/vpnkit_mtu.py")"
+    fi
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    if [[ "$got" != "9000" ]]; then
+        echo "FAIL: a config file of values that are all in range was not applied --"
+        echo "      the guest was told ${got:-nothing}, not 9000"
+        failures=1
+    fi
+
+    rm -rf "$directory"
+    [[ $failures -eq 0 ]] || return 1
+    echo "ok: cfg   a number that is present and wrong is refused, not dropped"
+}
+
 # The instance metadata service, and the flag that opens it.
 #
 # A guest that reaches 169.254.169.254 on a cloud host is asking the host's
@@ -2459,6 +2555,8 @@ tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the address a guest must not reach by accident.
 mtu_smoke || status=1
+
+config_value_smoke || status=1
 
 metadata_smoke 192.168.127.1 192.168.127.2 "" no || status=1
 metadata_smoke 192.168.127.1 192.168.127.2 "--ec2-metadata-access" yes || status=1

@@ -92,7 +92,7 @@ jobs:
       # same ten thousand sequences every run and a regression cannot hide
       # behind a lucky draw.
       - name: The full differential gate
-        run: NETSTACK_DIFFERENTIAL_SEQUENCES=10000 swift test --filter Differential
+        run: ./scripts/differential-gate.sh
 
       # Deletes each guard in `scripts/guards.tsv` and requires that the named
       # test notices. Guards drift out from under their tests as code around

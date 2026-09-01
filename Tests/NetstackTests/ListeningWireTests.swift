@@ -544,12 +544,29 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     // test has not sent yet. Written that way first, it hung.
     let pending = WireBootstrap.listeningStreamSocket(
         atPath: path, group: group, linkAddress: listenMAC, mtu: 1500)
-    for _ in 0..<200 where !FileManager.default.fileExists(atPath: path) {
-        try await Task.sleep(nanoseconds: 5_000_000)
+
+    // `try #require` rather than `#expect`, for both of these, because the await
+    // below cannot finish without a guest: an expectation that only records an
+    // issue leaves this test HANGING rather than failing.
+    //
+    // It did. Written with `#expect`, and with a one-second wait for the bind,
+    // it passed here and hung a CI job for thirty-five minutes against a six
+    // minute normal -- the socket had not appeared yet on a loaded runner, the
+    // dial failed, the issue was recorded, and the await sat there for a guest
+    // that was never going to arrive. A check that hangs instead of failing is
+    // the thing this whole test exists to remove, so it should not be one.
+    var bound = false
+    for _ in 0..<600 where !bound {
+        bound = FileManager.default.fileExists(atPath: path)
+        if !bound { try await Task.sleep(nanoseconds: 5_000_000) }
     }
+    try #require(bound, "the listening wire never bound \(path)")
 
     // Open first, so this is about closing rather than about binding.
-    let before = dial(path, type: .stream)
+    let before = makeSocket(AF_UNIX, .stream)
+    try #require(
+        connectTo(before, unixAddress(path: path)) == 0,
+        "could not dial \(path): \(String(cString: strerror(errno)))")
     let link = try await pending.get()
     close(before)
 

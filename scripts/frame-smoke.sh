@@ -2061,6 +2061,17 @@ config_value_smoke() {
         esac
     }
 
+    # The shapes, not just the numbers. A table written as the one string
+    # somebody meant to put in it used to leave the field empty and start a
+    # gateway that quietly did none of it -- and a forward that does not happen
+    # looks, from the guest, exactly like a network problem.
+    refuses '{"nat": "10.0.0.1"}' "not a table of strings"
+    refuses '{"forwards": "8080:192.168.127.2:80"}' "not a table of strings"
+    refuses '{"dnsSearchDomains": "example.com"}' "not a list of strings"
+    refuses '{"gatewayIP": 42}' "not a string"
+    refuses '{"dns": {"name": "x"}}' "not a list of zones"
+    refuses '{"ec2MetadataAccess": "true"}' "not true or false"
+
     refuses '{"mtu": 100}' "outside 576...65535"
     refuses '{"mtu": 99999}' "outside 576...65535"
     refuses '{"mtu": "1500"}' "not a whole number"
@@ -2068,8 +2079,11 @@ config_value_smoke() {
     refuses '{"tcpConnectTimeout": -1}' "tcpConnectTimeout"
 
     # And the values that are fine are still taken, so this did not simply
-    # become a parser that refuses everything.
-    echo '{"mtu": 9000, "tcpMaxInFlight": 64, "tcpConnectTimeout": 3}' > "$directory/config.json"
+    # become a parser that refuses everything. A JSON null is among them: it is
+    # how a generated file says "not set", and refusing it would fight the tools
+    # that write these.
+    echo '{"mtu": 9000, "tcpMaxInFlight": 64, "tcpConnectTimeout": 3, "nat": null}' \
+        > "$directory/config.json"
     rm -f "$directory/wire.sock"
     "$binary" --listen-vpnkit "$directory/wire.sock" --config "$directory/config.json" \
         >/dev/null 2>&1 &

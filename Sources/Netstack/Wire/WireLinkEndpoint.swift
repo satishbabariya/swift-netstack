@@ -128,6 +128,31 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
     /// The channel is the parameter rather than a socket path so that a test can
     /// pass an `EmbeddedChannel` and drive the wire without one, and so the two
     /// transports can share every line below the framing.
+    /// A link with no guest on it yet, for a wire that binds and waits.
+    ///
+    /// `--listen-qemu` had no way to make one, so its bootstrap could not
+    /// produce a link until a guest connected -- and everything downstream
+    /// waited with it. The gateway, its control API and its notification socket
+    /// all came up only once a VM had dialled in, which is not what upstream
+    /// does: gvproxy accepts in a goroutine and serves its API immediately.
+    ///
+    /// Writes to a link with no guest are dropped, which is the same thing that
+    /// happens to a link whose guest has left.
+    public init(
+        eventLoop: EventLoop, linkAddress: MACAddress, mtu: UInt32 = 1500,
+        flushPerFrame: Bool = false
+    ) {
+        self.rawDescriptor = nil
+        self.channel = nil
+        self.flushPerFrame = flushPerFrame
+        self.eventLoop = eventLoop
+        self.linkAddress = linkAddress
+        self.mtu = mtu
+        // Nobody has taken this wire yet. The channel-carrying init starts at
+        // one because its guest is already here.
+        self.guestsAdopted = 0
+    }
+
     public init(
         channel: Channel, linkAddress: MACAddress, mtu: UInt32 = 1500, flushPerFrame: Bool = false,
         rawDescriptor: NIOBSDSocket.Handle? = nil

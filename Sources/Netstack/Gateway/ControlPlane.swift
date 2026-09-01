@@ -491,16 +491,60 @@ private struct ZoneRequest {
         guard !trimmed.isEmpty, trimmed.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_" })
         else { return nil }
 
+        // Present and unusable is refused, not quietly treated as absent. Each of
+        // these was written as a cast that produced nil either way, and nil is
+        // how this parser spells "the operator did not say", so:
+        //
+        //   - `records` of the wrong type became no records at all, and a zone
+        //     with a defaultIP then answered every name under it with that
+        //     address -- the operator's records gone and the zone still working,
+        //     which is the hardest kind of wrong to notice.
+        //   - an `ip` that was not an address was dropped, and a record that
+        //     also carried a `regexp` was accepted without it.
+        //   - a `defaultIP` that was not an address was dropped, and a zone with
+        //     records was accepted without the default it was given.
+        //
+        // Upstream decodes these into `net.IP` and answers a bad one with a 400,
+        // so refusing is also what a client written against gvproxy expects.
         var records: [DNSServer.Zone.Record] = []
-        for entry in (jsonField(fields, "records") as? [[String: Any]]) ?? [] {
-            guard let recordName = jsonField(entry, "name") as? String, !recordName.isEmpty else { return nil }
-            let address = (jsonField(entry, "ip") as? String).flatMap(IPv4Address.init)
-            let pattern = jsonField(entry, "regexp") as? String
-            guard address != nil || pattern != nil else { return nil }
-            records.append(
-                DNSServer.Zone.Record(name: recordName, address: address, pattern: pattern))
+        if let named = jsonField(fields, "records"), !(named is NSNull) {
+            guard let entries = named as? [[String: Any]] else { return nil }
+            for entry in entries {
+                guard let recordName = jsonField(entry, "name") as? String, !recordName.isEmpty
+                else { return nil }
+                var address: IPv4Address?
+                if let text = jsonField(entry, "ip"), !(text is NSNull) {
+                    guard let spelled = text as? String else { return nil }
+                    // An empty string is absent, not invalid. Go serialises a
+                    // nil `net.IP` as "" rather than as null, so that is how
+                    // upstream's own client spells a record with no address --
+                    // and the interop check refused every zone gvproxy sends
+                    // the moment this guard did not allow for it.
+                    if !spelled.isEmpty {
+                        guard let parsed = IPv4Address(spelled) else { return nil }
+                        address = parsed
+                    }
+                }
+                var pattern: String?
+                if let text = jsonField(entry, "regexp"), !(text is NSNull) {
+                    guard let spelled = text as? String else { return nil }
+                    pattern = spelled
+                }
+                guard address != nil || pattern != nil else { return nil }
+                records.append(
+                    DNSServer.Zone.Record(name: recordName, address: address, pattern: pattern))
+            }
         }
-        let defaultAddress = (jsonField(fields, "defaultIP") as? String).flatMap(IPv4Address.init)
+        var defaultAddress: IPv4Address?
+        if let text = jsonField(fields, "defaultIP"), !(text is NSNull) {
+            guard let spelled = text as? String else { return nil }
+            // Empty is absent here for the same reason: every zone upstream's
+            // client sends carries `"DefaultIP":""` when it has no default.
+            if !spelled.isEmpty {
+                guard let parsed = IPv4Address(spelled) else { return nil }
+                defaultAddress = parsed
+            }
+        }
         guard !records.isEmpty || defaultAddress != nil else { return nil }
         zone = DNSServer.Zone(name: trimmed, records: records, defaultAddress: defaultAddress)
     }

@@ -199,7 +199,7 @@ public final class Gateway: @unchecked Sendable {
         public init(
             gatewayAddress: IPv4Address? = nil,
             subnet: IPv4Subnet = IPv4Subnet(cidr: "192.168.127.0/24")!,
-            linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:ee")!,
+            linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:dd")!,
             hostAddress: IPv4Address? = nil,
             nat: [IPv4Address: IPv4Address]? = nil,
             vpnKitAddresses: [String: MACAddress] = [:],

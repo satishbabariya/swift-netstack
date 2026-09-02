@@ -459,7 +459,7 @@ LoggingSystem.bootstrap { label in
 let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
 let configuration = Gateway.Configuration(
     gatewayAddress: gatewayAddress, subnet: subnet,
-    linkAddress: file.linkAddress ?? MACAddress("5a:94:ef:e4:0c:ee")!,
+    linkAddress: file.linkAddress ?? MACAddress("5a:94:ef:e4:0c:dd")!,
     hostAddress: hostAddress, nat: file.nat,
     vpnKitAddresses: file.vpnKitAddresses,
     gatewayVirtualAddresses: file.virtualAddresses,
@@ -619,8 +619,31 @@ do {
     planes.append(guestPlane)
     _ = planes
 
-    // Written after everything is listening, so a supervisor that reads it as
-    // "ready" is not told so before the sockets exist.
+    // Logged first of the three, because the two below are what something else
+    // waits on and this is what a person reads afterwards.
+    //
+    // A log file that stays empty until something goes wrong is indistinguishable
+    // from one that was never opened. One line at startup tells an operator which
+    // they have, at the only moment they can still do something about it.
+    //
+    // It used to come last. The pid file is written before it and is what a
+    // supervisor waits on -- `theOperatorsFlagsDoWhatTheirNamesSay` waits for
+    // exactly that and then reads the log -- so there was a window where the pid
+    // file was there and the log was empty. Moving `ready` between them widened
+    // it from a hop to a hop plus a wait, and the test began failing about one
+    // run in three. The window was always there; it was not always wide enough
+    // to land in.
+    Logger(label: "netstack").notice(
+        "running",
+        metadata: [
+            "wire": .string(path),
+            "gateway": .string(configuration.gatewayAddress.description),
+            "subnet": .string(configuration.subnet.description),
+        ])
+
+    // Then the pid file, which is written after everything is listening so that
+    // a supervisor reading it as "ready" is not told so before the sockets
+    // exist.
     if let pidFile = options.pidFile {
         do {
             try Data("\(getpid())\n".utf8).write(to: URL(fileURLWithPath: pidFile))
@@ -630,7 +653,8 @@ do {
         }
     }
 
-    // And now `ready`, for the reason the pid file above is written here.
+    // And `ready` last of all, for the reason the pid file above is written
+    // where it is.
     //
     // It used to be sent at the end of assembly, inside the library, which is
     // before this program binds anything. The comment at that send site said a
@@ -645,17 +669,6 @@ do {
     // The signal a supervisor actually waits on had not.
     try gateway.eventLoop.submit { gateway.announceReady() }.wait()
 
-    // Logged as well as printed, and this is the reason: a log file that stays
-    // empty until something goes wrong is indistinguishable from a log file that
-    // was never opened. One line at startup tells an operator which they have,
-    // at the only moment they can still do something about it.
-    Logger(label: "netstack").notice(
-        "running",
-        metadata: [
-            "wire": .string(path),
-            "gateway": .string(configuration.gatewayAddress.description),
-            "subnet": .string(configuration.subnet.description),
-        ])
     announce("netstack-gateway: running", toStandardError: options.listenStdio)
 
     // Interrupted rather than killed.

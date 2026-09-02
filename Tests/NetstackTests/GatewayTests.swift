@@ -70,6 +70,28 @@ private func awaitUDP(_ fd: Int32, fromPort: UInt16) async -> ByteBuffer? {
     return nil
 }
 
+@Test func theGatewaysHardwareAddressIsNotTheOneUpstreamGivesTheGuest() {
+    // gvproxy's defaults, from cmd/gvproxy/config.go:
+    //
+    //     config.Stack.GatewayMacAddress = "5a:94:ef:e4:0c:dd"
+    //     config.Stack.DHCPStaticLeases = {"192.168.127.2": "5a:94:ef:e4:0c:ee"}
+    //     config.Stack.VpnKitUUIDMacAddresses = {"c3d68012-...": "5a:94:ef:e4:0c:ee"}
+    //
+    // The gateway is `dd` and the guest is `ee`, and this had the gateway on
+    // `ee` -- one hex digit from upstream's, and exactly the address upstream
+    // hands the guest. A VM configured the way podman and vfkit configure it
+    // therefore shared a hardware address with the gateway it was talking to:
+    // it asked who-has 192.168.127.1 and was answered with its own address.
+    //
+    // Nothing here noticed, because every test and every smoke case picks its
+    // own guest address and none of them picked that one.
+    let configuration = Gateway.Configuration()
+    #expect(configuration.linkAddress == MACAddress("5a:94:ef:e4:0c:dd")!)
+    #expect(
+        configuration.linkAddress != MACAddress("5a:94:ef:e4:0c:ee")!,
+        "the gateway answers to the address upstream assigns the guest")
+}
+
 @Test func aGatewayStartedOnADescriptorLeasesAnAddressAndResolvesItsOwnName() async throws {
     // The order this type exists to hold, checked end to end: DHCP and DNS bind
     // their ports BEFORE the UDP forwarder installs its protocol handler, so

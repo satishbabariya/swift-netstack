@@ -1,0 +1,24 @@
+# The HTTP routes gvproxy's API serves, from gvisor-tap-vsock v0.8.9.
+#
+# Assembled from three files, because upstream's mux is nested: pkg/virtualnetwork/mux.go
+# has the top-level routes and mounts the services mux, pkg/virtualnetwork/services.go
+# mounts /forwarder, /dhcp and /dns under it, and each service registers its own.
+#
+#     grep -hoE '(mux\.Handle(Func)?\("[^"]+")' pkg/virtualnetwork/mux.go \
+#         pkg/virtualnetwork/services.go pkg/services/*/*.go
+#
+# `scripts/conventions.sh` checks that this program answers every one of them.
+# Nothing else does: a route that stopped being served would answer 404, which is
+# what a client sees for a route that never existed, and the flag rules next door
+# say nothing about routes.
+/cam
+/connect
+/leases
+/services/dhcp/leases
+/services/dns/add
+/services/dns/all
+/services/forwarder/all
+/services/forwarder/expose
+/services/forwarder/unexpose
+/stats
+/tunnel

@@ -363,6 +363,26 @@ while read -r flag; do
 done < scripts/upstream-flags.txt
 
 
+# 15. Every route gvproxy's API serves is one this program serves.
+#
+# Rule 14 does this for the flags. A route has the same drift and a quieter
+# failure: one that stopped being served answers 404, which is exactly what a
+# client sees for a route that never existed, so a tool written against gvproxy
+# would report "not found" and nobody would know whether that was the answer or
+# the absence of one.
+#
+# The list is upstream's, assembled from its three nested muxes; its header says
+# how. Both spellings of the lease table are in it because upstream serves both,
+# and this program had only the top-level one once.
+while read -r route; do
+    [[ -z "$route" || "$route" == \#* ]] && continue
+    if ! grep -q -- "\"$route\"" Sources/Netstack/Gateway/ControlPlane.swift; then
+        fail "gvproxy serves $route and this program does not" \
+            "a route that is gone answers 404, which is what a route that never existed answers"
+    fi
+done < scripts/upstream-routes.txt
+
+
 # 12. The README's examples compile, and the copy that compiles is the README's.
 #
 # They are the first thing anybody runs. Every symbol in them has been renamed or

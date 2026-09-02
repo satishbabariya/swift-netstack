@@ -45,3 +45,10 @@ Sources/Netstack/Wire/StaleSocket.swift	bindingOverAFileThatIsNotASocketLeavesIt
 Sources/Netstack/Observability/PacketCapture.swift	aGatewayThatCannotDoWhatItWasAskedSaysWhichPart	            throw Failure.cannotOpen(path: path)	            throw StackError.notConnected
 Sources/Netstack/Observability/PacketCapture.swift	aCaptureThatCannotWriteSaysHowMuchItLost	            bytesLost += buffer.count	            _ = error
 Sources/Netstack/Gateway/DNSServer.swift	aServiceClosesSafelyFromAThreadThatIsNotItsLoop	        guard stack.eventLoop.inEventLoop else {	        if false {
+Sources/Netstack/Gateway/ControlPlane.swift	aGuestPublishesOnLoopbackAndNowhereElse	                guard request.hostInterface == "127.0.0.1" else {	                guard true else {
+Sources/Netstack/Gateway/ControlPlane.swift	aGuestCannotPublishForwardsWithoutLimit	            if fromGuest, !gateway.admitGuestForward() {	            if false, !gateway.admitGuestForward() {
+Sources/Netstack/Gateway/ControlPlane.swift	aGuestCannotWithdrawWhatTheHostPublished	            if fromGuest, !gateway.isGuestForward(endpoint) {	            if false, !gateway.isGuestForward(endpoint) {
+Sources/Netstack/Gateway/ControlPlane.swift	theGuestsListingLeavesOutTheHostsFilesystem	            if !fromGuest {	            if true {
+Sources/Netstack/Gateway/Gateway.swift	theGatewaysHardwareAddressIsNotTheOneUpstreamGivesTheGuest	            linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:dd")!,	            linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:ee")!,
+Sources/Netstack/Link/NetworkSwitch.swift	aGuestClaimingTheGatewaysAddressDoesNotGetTheOtherGuestsTraffic	        if destination != linkAddress {	        if true {
+Sources/Netstack/Gateway/Gateway.swift	readyIsAnnouncedOnceHoweverManyTimesItIsAsked	        guard !announcedReady else { return }	        guard true else { return }

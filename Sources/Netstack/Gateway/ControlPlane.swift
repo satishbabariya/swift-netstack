@@ -439,6 +439,36 @@ public final class ControlPlane: @unchecked Sendable {
                 return loop.makeSucceededFuture(
                     (.badRequest, "{\"error\":\"expected local and remote as host:port\"}"))
             }
+            // A guest publishes its own port on the host's loopback, and that
+            // is all it publishes.
+            //
+            // `local` carries the interface to bind and the transport to bind
+            // it with, and a guest choosing either goes past what this endpoint
+            // is for. Measured before this, both answered 200:
+            //
+            //     guest asking for 0.0.0.0 -> {"local":":51883"}
+            //     guest choosing a host filesystem path -> file created: true
+            //
+            // The first publishes the guest to the host's whole network rather
+            // than to the host, which turns "reach my container from this
+            // machine" into "reach my container from the office". The second
+            // creates a socket wherever the gateway can write.
+            //
+            // The README's reading of `":8080"` is already that an unstated
+            // interface means loopback, "the safe reading of a request that did
+            // not say". This is the same reading applied to a request that did
+            // say, by a caller whose say-so this package does not take.
+            if fromGuest {
+                guard request.transport != .unix else {
+                    return loop.makeSucceededFuture(
+                        (.forbidden, "{\"error\":\"a guest cannot publish on a host path\"}"))
+                }
+                guard request.hostInterface == "127.0.0.1" else {
+                    return loop.makeSucceededFuture(
+                        (.forbidden, "{\"error\":\"a guest publishes on loopback\"}"))
+                }
+            }
+
             // Bounded when the guest is asking, and only then.
             //
             // Each forward is a bound listening socket. Publishing them was the

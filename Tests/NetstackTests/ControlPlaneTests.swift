@@ -83,6 +83,61 @@ private func request(
     return (status, payload)
 }
 
+@Test func aGuestPublishesOnLoopbackAndNowhereElse() async throws {
+    // `local` carries the interface to bind and the transport to bind it with,
+    // and a guest choosing either goes past what this endpoint is for.
+    // Measured before this, both answered 200:
+    //
+    //     guest asking for 0.0.0.0 -> {"local":":51883","protocol":"tcp"}
+    //     guest choosing a host filesystem path -> file created: true
+    //
+    // The first publishes the guest to the host's whole network rather than to
+    // the host. The second creates a socket wherever the gateway can write.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+    let gateway = try #require(holder.gateway)
+
+    func askAsGuest(_ body: String) async throws -> (status: HTTPResponseStatus, body: String) {
+        try await gateway.eventLoop.submit {
+            holder.plane!.handleForTesting(
+                method: .POST, path: "/services/forwarder/expose", body: body, fromGuest: true)
+        }.get().get()
+    }
+
+    let everywhere = try await askAsGuest(
+        "{\"local\":\"0.0.0.0:0\",\"remote\":\"192.168.127.2:80\"}")
+    #expect(
+        everywhere.status == .forbidden,
+        "a guest published on every interface and was answered \(everywhere.status)")
+
+    let path = NSTemporaryDirectory() + "netstack-guest-\(UInt32.random(in: 0..<UInt32.max)).sock"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    let onDisk = try await askAsGuest(
+        "{\"local\":\"\(path)\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"unix\"}")
+    #expect(
+        onDisk.status == .forbidden,
+        "a guest chose a host path and was answered \(onDisk.status)")
+    #expect(
+        !FileManager.default.fileExists(atPath: path),
+        "the refused request created the socket anyway")
+
+    // What it is for still works, and the host is not held to either rule.
+    let ordinary = try await askAsGuest(
+        "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}")
+    #expect(ordinary.status == .ok, "a guest could not publish on loopback: \(ordinary.body)")
+    let fromHost = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"0.0.0.0:0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    #expect(fromHost.status == 200, "the host was refused an interface it is allowed")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func aGuestCannotWithdrawWhatTheHostPublished() async throws {
     // Upstream serves this route to the guest with the same handler the host
     // gets, so a guest there can withdraw a forward the operator published.

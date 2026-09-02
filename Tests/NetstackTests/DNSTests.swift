@@ -142,6 +142,41 @@ private func responseCode(_ reply: ByteBuffer) -> UInt16? {
     reply.getInteger(at: reply.readerIndex + 2, endianness: .big, as: UInt16.self).map { $0 & 0x000F }
 }
 
+@Test func aNameThisGatewayHoldsHasNoAaaaRatherThanNotExisting() throws {
+    // NXDOMAIN says the name does not exist, for every type at once, and a
+    // resolver caches that. A name this gateway holds an address for exists --
+    // it has no record of the type asked for, which is NODATA: NOERROR with no
+    // answers.
+    //
+    // Found by asking a real Linux guest rather than a synthetic one. Every
+    // check here asked for A, and a real resolver asks for AAAA as well:
+    //
+    //     nslookup host.containers.internal
+    //     ** server can't find host.containers.internal: NXDOMAIN
+    //
+    // while the A query beside it answered 192.168.127.254 correctly.
+    let fixture = try DNSFixture(records: [
+        .init(name: "host.containers.internal", address: dnsGateway)
+    ])
+    defer { fixture.drain() }
+
+    fixture.ask(dnsQuery("host.containers.internal", type: 28))
+    // `replies()` empties the link, so it is read once and kept. Reading it
+    // twice is how the first version of this test lost its own answer.
+    let reply = try #require(fixture.replies().first)
+    #expect(responseCode(reply) == 0, "a name this gateway holds was answered as though absent")
+    #expect(
+        reply.getInteger(at: reply.readerIndex + 6, endianness: .big, as: UInt16.self) == 0,
+        "an AAAA answer was invented for a stack that does not do IPv6")
+
+    // And a name that really is not there keeps saying so, or this would have
+    // turned every mistyped name into a lookup that waits on records which are
+    // never coming.
+    fixture.ask(dnsQuery("nosuchname.containers.internal"))
+    let absent = try #require(fixture.replies().first)
+    #expect(responseCode(absent) == 3, "an unknown name in an owned zone was not NXDOMAIN")
+}
+
 @Test func theHostsSearchListIsReadFromResolvConf() {
     // A guest gets this in DHCP option 119, and without it a short name the host
     // can resolve is a name the guest cannot. gvproxy reads the host's

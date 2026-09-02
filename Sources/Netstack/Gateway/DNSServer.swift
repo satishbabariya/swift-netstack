@@ -272,8 +272,29 @@ public final class DNSServer: @unchecked Sendable {
                 reply = DNSCodec.answer(
                     to: query, in: payload, address: address, ttl: ttl, allocator: allocator)
             } else {
+                // NXDOMAIN says the name does not exist, for every type at
+                // once, and a resolver caches that. A name this gateway holds an
+                // address for exists -- it just has no record of the type asked
+                // for, which is NODATA: NOERROR with no answers.
+                //
+                // Found by asking a real Linux guest rather than a synthetic
+                // one. Every check here asked for A, and a real resolver asks
+                // for AAAA as well:
+                //
+                //     nslookup host.containers.internal
+                //     ** server can't find host.containers.internal: NXDOMAIN
+                //
+                // while the A query beside it answered 192.168.127.254. This
+                // package does not do IPv6 and says so; a guest asking for it
+                // should be told this name has no AAAA, not that the name it
+                // just resolved does not exist.
+                let known =
+                    records[query.question.name] != nil
+                    || owner.answer(for: query.question.name) != nil
                 reply = DNSCodec.failure(
-                    to: query, in: payload, code: DNSCodec.responseCodeNameError, allocator: allocator)
+                    to: query, in: payload,
+                    code: known ? DNSCodec.responseCodeNoError : DNSCodec.responseCodeNameError,
+                    allocator: allocator)
             }
             if let reply { try? endpoint.send(reply, to: source, port: port) }
             return

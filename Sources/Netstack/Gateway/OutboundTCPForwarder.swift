@@ -188,7 +188,6 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             endpoint.keepAlive = keepAlive
             let channel = NetstackStreamChannel(
                 eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
-            channel.installCallbacks()
             channel.acceptedAddresses(
                 local: try? SocketAddress(
                     ipAddress: request.destination.description, port: Int(request.destinationPort)),
@@ -201,7 +200,13 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
                 self?.servedLocally.removeValue(forKey: ObjectIdentifier(slot))
                 slot.release()
             }
+            // Handlers first, then delivery. `installCallbacks` is what arms the
+            // endpoint to hand data up, and handing data up before there is
+            // anything to hand it to loses it -- which is only safe here because
+            // `serve` puts the pipeline in on this tick, and stating the order
+            // is cheaper than depending on that from another file.
             serve(channel).whenFailure { _ in channel.close(promise: nil) }
+            channel.installCallbacks()
             return
         }
 

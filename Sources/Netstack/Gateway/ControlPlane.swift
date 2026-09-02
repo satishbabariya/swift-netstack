@@ -204,7 +204,40 @@ public final class ControlPlane: @unchecked Sendable {
         // way `WireBootstrap.configure` does: NIO's HTTP handlers are
         // not `Sendable`, so chaining `addHandler` futures would carry
         // them across a boundary the compiler is right to object to.
-        channel.eventLoop.submit {
+        //
+        // Inline when this is already the channel's loop, and that check is
+        // load-bearing rather than an optimisation -- `StackBootstrap.bind`
+        // carries the same one for a related reason. A guest's connection to
+        // the gateway's own API is handed here by the forwarder, which is
+        // already on this loop and has already armed delivery on the endpoint:
+        // `submit` puts the handlers in on a LATER tick, and a request that
+        // arrives in between is fired at a channel with no handlers and is
+        // gone. The gateway then waits out its ten second idle timeout and
+        // answers 408, which is what a loaded machine produced:
+        //
+        //     FAIL: the guest asked for the forward list and got
+        //           HTTP/1.1 408 Request Timeout
+        //
+        // The splice path in `OutboundTCPForwarder` never had the problem: it
+        // adds its handlers synchronously in the tick that builds the channel.
+        // Off the loop, hop and come back rather than keeping a second copy of
+        // the installation. Two copies is what the first version of this did,
+        // because the closure cannot be `Sendable` -- NIO's HTTP handlers are
+        // not -- and CI answered immediately:
+        //
+        //     SURVIVED  everyMutatedRequestIsAnsweredOrClosedRatherThanHeld
+        //
+        // The guard for the request timeout anchors on one of those lines, and
+        // the tests take the other: every listener here configures its
+        // connections from the child's own loop, so mutating the copy the
+        // anchor found changed nothing that ran. A duplicated line is a guard
+        // pointing at whichever half nobody exercises.
+        guard channel.eventLoop.inEventLoop else {
+            return channel.eventLoop.flatSubmit {
+                self.configureConnection(channel, forwardingOnly: forwardingOnly)
+            }
+        }
+        do {
             let sync = channel.pipeline.syncOperations
             try sync.addHandler(
                 IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)
@@ -215,6 +248,9 @@ public final class ControlPlane: @unchecked Sendable {
             try sync.addHandler(
                 ControlPlaneHandler(plane: self, forwardingOnly: forwardingOnly),
                 name: Self.handlerName)
+            return channel.eventLoop.makeSucceededVoidFuture()
+        } catch {
+            return channel.eventLoop.makeFailedFuture(error)
         }
     }
 

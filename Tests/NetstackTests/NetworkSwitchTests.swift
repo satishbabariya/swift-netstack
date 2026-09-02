@@ -74,6 +74,42 @@ private func makeSwitch(ports count: Int, addressesPerPort: Int = 16) throws -> 
         loop: loop, netSwitch: netSwitch, channels: channels, ids: ids, upstream: upstream)
 }
 
+@Test func aGuestClaimingTheGatewaysAddressDoesNotGetTheOtherGuestsTraffic() throws {
+    // Every routed frame a guest sends is addressed to the gateway, so a guest
+    // that could get the gateway's address into the table would get a copy of
+    // everything every other guest sends anywhere -- and the gateway would go on
+    // receiving too, so nothing would look wrong.
+    //
+    // It cannot, and the reason is one line: `receive` consults the table only
+    // `if destination != linkAddress`, so a frame for the gateway is never
+    // forwarded across the fabric whatever the table says. Nothing stops a guest
+    // claiming the address; claiming it just buys nothing.
+    //
+    // Asserted because that is a property of one condition rather than of
+    // anything named: with the condition removed this test reports the attacker
+    // holding the other guest's frame. Learning a guest's address on a new port
+    // is a move this switch cannot distinguish from a reconnection and it says
+    // so -- but the gateway is not on a port at all, so no station legitimately
+    // sends from its address, and nothing here has to decide.
+    let fixture = try makeSwitch(ports: 2)
+
+    // The attacker on port 0 claims it.
+    try fixture.deliver(ethernetFrame(to: swGuestB, from: swGateway), toPort: 0)
+    _ = try fixture.written(0)
+    _ = try fixture.written(1)
+    fixture.upstream.frames.removeAll()
+
+    // The other guest sends what it always sends: a frame to the gateway.
+    try fixture.deliver(ethernetFrame(to: swGateway, from: swGuestB), toPort: 1)
+
+    #expect(
+        try fixture.written(0).isEmpty,
+        "a guest claiming the gateway's address was given another guest's traffic")
+    #expect(
+        fixture.upstream.frames.count == 1,
+        "the gateway did not get the frame that was addressed to it")
+}
+
 @Test func aFrameFromOneGuestToAnotherIsForwardedAndNeverReachesTheStack() throws {
     let fixture = try makeSwitch(ports: 2)
 

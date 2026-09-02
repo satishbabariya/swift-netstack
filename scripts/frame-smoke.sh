@@ -2137,6 +2137,90 @@ config_value_smoke() {
     echo "ok: cfg   a number that is present and wrong is refused, not dropped"
 }
 
+# What a supervisor is told when the hypervisor's socket cannot be served.
+#
+# `ready` is sent by the gateway once it is assembled, so a wire that could not
+# bind produced a message on stderr and silence on the socket a supervisor is
+# watching -- there was no sender yet to say anything with. gvproxy sends
+# `hypervisor_error` on exactly that path, before returning the listen error.
+#
+# And not on the others: a mistyped flag is not a hypervisor failure, and a
+# supervisor told that its hypervisor died because somebody wrote `--mtu 100`
+# would act on it.
+hypervisor_error_smoke() {
+    local directory="${TMPDIR:-/tmp}/netstack-smoke-hyp-$$"
+    rm -rf "$directory"
+    mkdir -p "$directory" || { echo "FAIL: could not make $directory"; return 1; }
+    echo '{"mtu": 100}' > "$directory/bad-config.json"
+
+    BINARY="$binary" DIRECTORY="$directory" python3 - <<'PY'
+import json, os, socket, subprocess, sys
+
+binary, directory = os.environ["BINARY"], os.environ["DIRECTORY"]
+
+
+def heard(arguments, wait_for):
+    """Run the gateway with a supervisor listening, and return what it said."""
+    notify = os.path.join(directory, "notify.sock")
+    if os.path.exists(notify):
+        os.unlink(notify)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(notify)
+    server.listen(4)
+    server.settimeout(wait_for)
+    process = subprocess.Popen(
+        [binary] + arguments + ["--notification", notify],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        try:
+            connection, _ = server.accept()
+        except socket.timeout:
+            return None
+        connection.settimeout(5)
+        said = b""
+        while b"\n" not in said:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            said += chunk
+        connection.close()
+        return json.loads(said)
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+        server.close()
+
+
+unbindable = os.path.join(directory, "no-such-directory", "wire.sock")
+message = heard(["--listen-vfkit", unbindable], 20)
+if message is None:
+    print("FAIL: a wire that could not bind said nothing to the supervisor")
+    sys.exit(1)
+if message.get("notification_type") != "hypervisor_error":
+    print("FAIL: a wire that could not bind announced", message)
+    sys.exit(1)
+
+# The other direction, which is the half that can go wrong quietly: this must
+# stay silent rather than blaming the hypervisor for a typo. Five seconds,
+# because a wrong answer here is a message arriving and there is nothing to
+# wait for when the right answer is silence.
+for arguments, described in (
+    (["--listen-vfkit", os.path.join(directory, "a.sock"), "--mtu", "100"], "a bad --mtu"),
+    (["--listen-vfkit", os.path.join(directory, "b.sock"),
+      "--config", os.path.join(directory, "bad-config.json")], "a bad config value"),
+):
+    message = heard(arguments, 5)
+    if message is not None:
+        print("FAIL:", described, "was reported to the supervisor as", message)
+        sys.exit(1)
+
+print("ok: notify a wire that cannot bind says hypervisor_error, a bad flag says nothing")
+PY
+    local outcome=$?
+    rm -rf "$directory"
+    return $outcome
+}
+
 # The instance metadata service, and the flag that opens it.
 #
 # A guest that reaches 169.254.169.254 on a cloud host is asking the host's
@@ -2595,6 +2679,8 @@ vpnkit_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the socket a supervisor waits on.
 notification_smoke || status=1
+
+hypervisor_error_smoke || status=1
 
 # And a host-side client dialled into the guest.
 tunnel_smoke 192.168.127.1 192.168.127.2 || status=1

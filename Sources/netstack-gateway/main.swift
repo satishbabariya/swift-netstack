@@ -317,6 +317,29 @@ if wires.count > 1 {
 /// `SIG_IGN` first is not decoration either: a Dispatch signal source is *in
 /// addition* to the disposition, so without it the default action kills the
 /// process before the handler is ever reached.
+/// Send one `hypervisor_error` and wait for it to leave.
+///
+/// Synchronous, unlike `NotificationSender`, which queues and delivers later:
+/// the caller of this is about to exit, and a queued notification would go with
+/// it. Same socket, same one-object-per-connection shape and same trailing
+/// newline, so a supervisor written against gvproxy reads it the same way.
+///
+/// Every failure here is silent on purpose. Nothing is listening is the
+/// ordinary case -- `--notification` names where to send, not a promise that
+/// somebody is there -- and the error being reported has already been printed.
+func reportHypervisorError(toSocketAt path: String?, group: EventLoopGroup) {
+    guard let path else { return }
+    guard let address = try? SocketAddress(unixDomainSocketPath: path) else { return }
+    guard let channel = try? ClientBootstrap(group: group).connect(to: address).wait() else {
+        return
+    }
+    var buffer = channel.allocator.buffer(capacity: 64)
+    buffer.writeString(NetstackNotification(kind: .hypervisorError).json)
+    buffer.writeString("\n")
+    try? channel.writeAndFlush(buffer).wait()
+    try? channel.close().wait()
+}
+
 func awaitTerminationSignal() -> Int32 {
     let received = NIOLockedValueBox<Int32>(SIGTERM)
     let arrived = DispatchSemaphore(value: 0)
@@ -470,7 +493,31 @@ do {
         starting = Gateway.start(
             listeningOnDatagramSocketAt: path, group: group, configuration: configuration)
     }
-    let gateway = try starting.wait()
+    let gateway: Gateway
+    do {
+        gateway = try starting.wait()
+    } catch {
+        // Tell the supervisor the hypervisor's socket could not be served,
+        // which is what gvproxy does on exactly this path:
+        //
+        //     qemuListener, err := transport.Listen(config.Interfaces.Qemu)
+        //     if err != nil {
+        //         notificationSender.Send(types.NotificationMessage{
+        //             NotificationType: types.HypervisorError})
+        //         return fmt.Errorf("qemu listen error: %w", err)
+        //     }
+        //
+        // Only here, not from the outer catch: that one also covers a bad flag
+        // and an unreadable config file, and telling a supervisor its
+        // hypervisor failed because somebody mistyped an address would be
+        // worse than telling it nothing.
+        //
+        // `ready` is sent by the gateway once it is assembled, so nothing on
+        // this path had a sender at all -- a wire that could not bind produced
+        // a message on stderr and silence on the socket a supervisor watches.
+        reportHypervisorError(toSocketAt: options.notifySocket, group: group)
+        throw error
+    }
 
     // Zones from the file, added before any guest can ask.
     //

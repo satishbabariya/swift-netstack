@@ -2343,6 +2343,79 @@ PY
     return $outcome
 }
 
+# The gateway's hardware address, against a guest configured the way upstream
+# configures one.
+#
+# gvproxy's gateway is 5a:94:ef:e4:0c:dd and the address it hands the guest --
+# in its default static lease and its default vpnkit UUID mapping -- is
+# 5a:94:ef:e4:0c:ee. This gateway used `ee`: one hex digit from upstream's, and
+# exactly the guest's. A VM configured the way podman and vfkit configure it
+# asked who-has the gateway and was answered with its own address, which is a
+# guest whose ARP table points at itself and a network that carries nothing.
+#
+# Every other case here picks its own guest address, and none of them picked
+# that one, so nothing saw it.
+gateway_mac_smoke() {
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-mac-$$.sock"
+    rm -f "$WIRE"
+    "$binary" --listen-vfkit "$WIRE" >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: the mac gateway never came up"; return 1; }
+
+    WIRE="$WIRE" python3 - <<'PY'
+import os, socket, sys
+
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import address
+
+gateway = address("192.168.127.1")
+guest = address("192.168.127.2")
+# The address upstream gives the guest, in its own defaults.
+GUEST_MAC = bytes.fromhex("5a94efe40cee")
+UPSTREAM_GATEWAY_MAC = bytes.fromhex("5a94efe40cdd")
+
+wire = os.environ["WIRE"]
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+try:
+    s.connect(wire)
+    s.settimeout(10)
+    s.send(
+        b"\xff" * 6 + GUEST_MAC + b"\x08\x06"
+        + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+        + GUEST_MAC + guest + bytes(6) + gateway)
+    try:
+        frame = s.recv(2048)
+    except socket.timeout:
+        print("FAIL: the gateway did not answer ARP from a guest using upstream's address")
+        sys.exit(1)
+    answered = frame[22:28]
+    if answered == GUEST_MAC:
+        print("FAIL: the gateway answered who-has with the guest's own address,",
+              answered.hex(":"))
+        sys.exit(1)
+    if answered != UPSTREAM_GATEWAY_MAC:
+        print("FAIL: the gateway answers to", answered.hex(":"), "rather than upstream's",
+              UPSTREAM_GATEWAY_MAC.hex(":"))
+        sys.exit(1)
+    print("ok: mac   the gateway is", answered.hex(":"), "and the guest keeps its own")
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    rm -f "$WIRE"
+    return $outcome
+}
+
 # The instance metadata service, and the flag that opens it.
 #
 # A guest that reaches 169.254.169.254 on a cloud host is asking the host's
@@ -2808,6 +2881,8 @@ hypervisor_error_smoke || status=1
 tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the address a guest must not reach by accident.
+gateway_mac_smoke || status=1
+
 mtu_smoke || status=1
 
 config_value_smoke || status=1

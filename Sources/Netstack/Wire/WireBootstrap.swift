@@ -258,9 +258,13 @@ public enum WireBootstrap {
 
     /// Bind a unix stream socket at `path` and serve the first guest to connect.
     ///
-    /// The returned future completes when that connection arrives, not when the
-    /// socket is bound -- there is no link until there is a guest, and a link
-    /// with no wire behind it would be a thing callers could write to and lose.
+    /// The returned future completes when the socket is **bound**, not when a
+    /// guest arrives. It used to be the other way round, on the grounds that a
+    /// link with no wire behind it is a thing callers can write to and lose --
+    /// but writes with no guest are dropped either way, exactly as they are once
+    /// a guest leaves, and waiting meant the gateway above it did not exist
+    /// until a VM connected. Upstream binds, hands the accept to a goroutine and
+    /// serves its API immediately; this now does the same.
     ///
     /// One guest **at a time**. A second connection while one is live is closed
     /// rather than served: this wire carries one ethernet segment, and two
@@ -289,9 +293,20 @@ public enum WireBootstrap {
         // loop-confined state and the lock is not needed. `scripts/conventions.sh`
         // now fails the build if another appears.
         let loop = group.next()
-        let arrived = loop.makePromise(of: WireLinkEndpoint.self)
         let accepted = FirstGuest()
-        let bound = ServerBootstrap(group: group, childGroup: loop)
+        // The link exists before any guest does, so this returns when the socket
+        // is bound rather than when a VM dials in. Every guest, including the
+        // first, is adopted onto it.
+        //
+        // It used to be built by the first connection, which meant the future
+        // this returns completed only then -- and `Gateway.start` waits on it,
+        // and `main.swift` waits on that. The control API, the notification
+        // socket and everything else came up only once a VM had connected, so a
+        // tool that starts this and then publishes a forward hung until the VM
+        // booted. Upstream does not do that: gvproxy binds, hands the accept to
+        // a goroutine, and serves its API straight away.
+        let link = WireLinkEndpoint(eventLoop: loop, linkAddress: linkAddress, mtu: mtu)
+        return ServerBootstrap(group: group, childGroup: loop)
             .serverChannelOption(.backlog, value: 1)
             .childChannelInitializer { channel in
                 // On `loop`, because the child was pinned to it.
@@ -301,38 +316,25 @@ public enum WireBootstrap {
                 // served rather than closed.
                 channel.closeFuture.whenComplete { _ in accepted.taken = false }
 
-                // The first guest builds the link; every later one takes over
-                // the same link, because that is what the stack above is
-                // attached to. Building a second would leave the gateway talking
-                // to a wire nobody is on.
-                if let existing = accepted.link {
-                    return configure(
-                        channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true,
-                        framing: framing, adopting: existing
-                    ).map { _ in }
-                }
+                // Every guest takes over the same link, because that is what the
+                // stack above is attached to. Building a second would leave the
+                // gateway talking to a wire nobody is on.
                 return configure(
-                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true, framing: framing
-                ).map { link in
-                    accepted.link = link
-                    arrived.succeed(link)
-                }
+                    channel: channel, linkAddress: linkAddress, mtu: mtu, framed: true,
+                    framing: framing, adopting: link
+                ).map { _ in }
             }
             .bind(unixDomainSocketPath: path)
-        bound.whenFailure { arrived.fail($0) }
-        // The listener is held so that closing the link can close it. Nothing
-        // held it before, and there was no way to reach it: a guest connecting
-        // after `close()` was accepted onto a link whose gateway had gone, and
-        // the socket path stayed bound for the life of the process. The switch
-        // wire was given this when the same defect was found there; these two
-        // were not.
-        return bound.flatMap { listener in
-            arrived.futureResult.map { link in
+            .map { listener in
+                // The listener is held so that closing the link can close it.
+                // Nothing held it before, and there was no way to reach it: a
+                // guest connecting after `close()` was accepted onto a link whose
+                // gateway had gone, and the socket path stayed bound for the life
+                // of the process.
                 link.stopListening = { listener.close().recover { _ in () } }
                 link.localSocketPath = path
                 return link
             }
-        }
     }
 
     /// Take a place on `netSwitch` for a guest that has just connected, or say

@@ -517,6 +517,47 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     try? await group.shutdownGracefully()
 }
 
+// The wire is usable before a guest connects.
+//
+// This future used to complete on the first connection, so `Gateway.start` --
+// and `main.swift`, which waits on that -- produced nothing until a VM dialled
+// in. Measured on the executable before the change, with `--listen-qemu` and a
+// control endpoint and no guest:
+//
+//     wire bound:    yes
+//     control bound: no
+//
+// A tool that starts this and then publishes a forward hung until the VM booted.
+// gvproxy binds, hands the accept to a goroutine, and serves its API at once.
+@Test func aListeningStreamWireIsBoundBeforeAnyGuestConnects() async throws {
+    let path = temporaryPath("stream-early")
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+    // No dial before this, and no timeout around it: if it completes only on a
+    // guest, this test hangs -- so it is written to be the thing that proves it
+    // does not, and `swift test` reports the hang as a failure of this name.
+    let link = try await WireBootstrap.listeningStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
+    #expect(FileManager.default.fileExists(atPath: path), "the wire is not bound")
+    #expect(link.guestsAdopted == 0, "a wire nobody has connected to reports a guest")
+
+    // And a guest still takes it over afterwards, which is the behaviour that
+    // had to survive the change.
+    let first = dial(path, type: .stream)
+    var adopted = 0
+    for _ in 0..<400 where adopted == 0 {
+        adopted = try await link.eventLoop.submit { link.guestsAdopted }.get()
+        if adopted == 0 { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(adopted == 1, "the guest was not adopted onto the waiting wire")
+
+    close(first)
+    _ = try? await link.close().get()
+    try? FileManager.default.removeItem(atPath: path)
+    try? await group.shutdownGracefully()
+}
+
 // Closing a single-guest listening wire stops the thing that lets the next guest
 // in, and takes its socket path with it.
 //

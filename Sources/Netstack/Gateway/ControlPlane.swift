@@ -77,6 +77,29 @@ public final class ControlPlane: @unchecked Sendable {
     /// network, which is a different privilege entirely.
     public var allowsGuestAttach = true
 
+    /// Whether this endpoint serves only the three forwarding routes.
+    ///
+    /// For the listener inside the virtual network, which the guest reaches at
+    /// the gateway's own address. gvproxy binds one there and gives it a mux of
+    /// exactly three routes rather than the whole API:
+    ///
+    ///     mux.Handle("/services/forwarder/all", vn.Mux())
+    ///     mux.Handle("/services/forwarder/expose", vn.Mux())
+    ///     mux.Handle("/services/forwarder/unexpose", vn.Mux())
+    ///
+    /// The rest is not there for a guest to reach: `/leases` and `/cam` say who
+    /// else is on the network, `/services/dns/add` decides what names resolve
+    /// to for every guest, and `/connect` and `/tunnel` are the two that hand
+    /// out a place on the wire. A guest publishing its own port is ordinary; a
+    /// guest reading the lease table is not.
+    public var servesForwardingOnly = false
+
+    /// The routes a `servesForwardingOnly` endpoint answers.
+    static let forwardingRoutes: Set<String> = [
+        "/services/forwarder/all", "/services/forwarder/expose",
+        "/services/forwarder/unexpose",
+    ]
+
     public init(gateway: Gateway) {
         self.gateway = gateway
     }
@@ -103,6 +126,44 @@ public final class ControlPlane: @unchecked Sendable {
         }
     }
 
+    /// Serve the guest, on the gateway's own address inside the virtual network.
+    ///
+    /// Every other listener here is a socket on the host. This one is a channel
+    /// in this gateway's own stack, so the client is a guest: a container
+    /// publishing its port asks the gateway for it, over the same network it
+    /// already has, with no socket on the host at all.
+    ///
+    /// gvproxy binds this at `<gatewayIP>:80` and it was the one thing of its
+    /// own that this port did not have -- the README said "everything else
+    /// gvproxy has is here", and this was the exception nobody had checked.
+    ///
+    /// `servesForwardingOnly` is set here rather than left to the caller,
+    /// because the caller cannot see who is on the other end and this can: the
+    /// far side of this listener is always a guest.
+    public func listenForGuests(port: UInt16 = 80) -> EventLoopFuture<Void> {
+        servesForwardingOnly = true
+        // Not a `NetstackServerChannel`. Binding one is refused while a TCP
+        // protocol handler is installed, and this gateway's outbound forwarder
+        // is that handler -- it has to be, to see SYNs for destinations no
+        // listener could be bound to. That refusal is deliberate rather than a
+        // limitation: displacing the forwarder would be silent, and a gateway
+        // that stopped forwarding the moment its guest API came up would be a
+        // hard thing to find.
+        //
+        // So the forwarder serves this destination itself, where it already has
+        // the destination and is already deciding what to do with it.
+        let loop = gateway.eventLoop
+        let address = gateway.stack.configuration.gatewayAddress
+        let gateway = self.gateway
+        return loop.submit { [weak self] in
+            gateway.tcp.locallyServed = (address, port)
+            gateway.tcp.serveLocally = { [weak self] channel in
+                guard let self else { return channel.close() }
+                return self.configureConnection(channel)
+            }
+        }
+    }
+
     /// Where the listener ended up, which is how a caller learns the port when
     /// it asked for zero.
     public var listeningAddress: SocketAddress? { channel?.localAddress }
@@ -118,27 +179,37 @@ public final class ControlPlane: @unchecked Sendable {
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { [weak self] channel in
                 guard let self else { return channel.close() }
-                // Named handlers rather than `configureHTTPServerPipeline`,
-                // because `/tunnel` and `/connect` take the connection away from
-                // HTTP and hand it to the network -- and removing handlers by
-                // name is the only way to do that without knowing what a
-                // convenience method happened to install.
-                //
-                // Added through `syncOperations` on the channel's own loop, the
-                // way `WireBootstrap.configure` does: NIO's HTTP handlers are
-                // not `Sendable`, so chaining `addHandler` futures would carry
-                // them across a boundary the compiler is right to object to.
-                return channel.eventLoop.submit {
-                    let sync = channel.pipeline.syncOperations
-                    try sync.addHandler(
-                        IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)
-                    try sync.addHandler(HTTPMessageFramer(), name: Self.framerName)
-                    try sync.addHandler(HTTPResponseEncoder(), name: Self.encoderName)
-                    try sync.addHandler(
-                        ByteToMessageHandler(HTTPRequestDecoder()), name: Self.decoderName)
-                    try sync.addHandler(ControlPlaneHandler(plane: self), name: Self.handlerName)
-                }
+                return self.configureConnection(channel)
             }
+    }
+
+    /// Put the HTTP pipeline on one accepted connection.
+    ///
+    /// Shared by the host listeners and the guest-facing one, which is not a
+    /// `ServerBootstrap` at all -- it is a channel inside this gateway's own
+    /// stack -- so the pipeline had to stop being written inline to be usable
+    /// from both.
+    private func configureConnection(_ channel: Channel) -> EventLoopFuture<Void> {
+        // Named handlers rather than `configureHTTPServerPipeline`,
+        // because `/tunnel` and `/connect` take the connection away from
+        // HTTP and hand it to the network -- and removing handlers by
+        // name is the only way to do that without knowing what a
+        // convenience method happened to install.
+        //
+        // Added through `syncOperations` on the channel's own loop, the
+        // way `WireBootstrap.configure` does: NIO's HTTP handlers are
+        // not `Sendable`, so chaining `addHandler` futures would carry
+        // them across a boundary the compiler is right to object to.
+        channel.eventLoop.submit {
+            let sync = channel.pipeline.syncOperations
+            try sync.addHandler(
+                IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)
+            try sync.addHandler(HTTPMessageFramer(), name: Self.framerName)
+            try sync.addHandler(HTTPResponseEncoder(), name: Self.encoderName)
+            try sync.addHandler(
+                ByteToMessageHandler(HTTPRequestDecoder()), name: Self.decoderName)
+            try sync.addHandler(ControlPlaneHandler(plane: self), name: Self.handlerName)
+        }
     }
 
     static let idleName = "netstack.http.idle"
@@ -271,6 +342,21 @@ public final class ControlPlane: @unchecked Sendable {
         method: HTTPMethod, path: String, body: ByteBuffer?
     ) -> EventLoopFuture<(status: HTTPResponseStatus, body: String)> {
         let loop = gateway.eventLoop
+
+        // A guest gets the three forwarding routes and nothing else. Refused
+        // here rather than by not registering the others, because this dispatch
+        // is one switch and a route that is absent from it for one listener and
+        // present for another would be two dispatches to keep in step.
+        //
+        // 404 rather than 403: upstream's guest mux simply has no handler for
+        // these, and that is what Go's ServeMux answers. A guest learning which
+        // routes exist but are forbidden is a small thing to give away, and
+        // there is no reason to give it.
+        if servesForwardingOnly, !Self.forwardingRoutes.contains(path) {
+            return loop.makeSucceededFuture(
+                (.notFound, "{\"error\":\"this endpoint serves forwarding only\"}"))
+        }
+
         switch (method, path) {
         case (.GET, "/stats"):
             // Read on the gateway's own loop, which `handle` is already on, so

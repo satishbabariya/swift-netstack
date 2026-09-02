@@ -583,6 +583,14 @@ do {
         planes.append(plane)
         announce("netstack-gateway: \(attaches ? "control API" : "services API") on \(endpoint)", toStandardError: options.listenStdio)
     }
+    // The endpoint the guest reaches, at the gateway's own address inside the
+    // virtual network. gvproxy binds one at <gatewayIP>:80 carrying exactly the
+    // three forwarding routes, so a container can publish its own port over the
+    // network it already has, with no socket on the host. Not behind a flag
+    // there, so not behind one here.
+    let guestPlane = ControlPlane(gateway: gateway)
+    try guestPlane.listenForGuests().wait()
+    planes.append(guestPlane)
     _ = planes
 
     // Written after everything is listening, so a supervisor that reads it as

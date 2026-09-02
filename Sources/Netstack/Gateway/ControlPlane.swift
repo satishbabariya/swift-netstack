@@ -77,11 +77,10 @@ public final class ControlPlane: @unchecked Sendable {
     /// network, which is a different privilege entirely.
     public var allowsGuestAttach = true
 
-    /// Whether this endpoint serves only the three forwarding routes.
+    /// The three routes a guest endpoint answers, and the only three.
     ///
-    /// For the listener inside the virtual network, which the guest reaches at
-    /// the gateway's own address. gvproxy binds one there and gives it a mux of
-    /// exactly three routes rather than the whole API:
+    /// gvproxy gives the listener inside the virtual network a mux of exactly
+    /// these rather than the whole API:
     ///
     ///     mux.Handle("/services/forwarder/all", vn.Mux())
     ///     mux.Handle("/services/forwarder/expose", vn.Mux())
@@ -93,14 +92,11 @@ public final class ControlPlane: @unchecked Sendable {
     /// out a place on the wire. A guest publishing its own port is ordinary; a
     /// guest reading the lease table is not.
     ///
-    /// Carried on the connection rather than on this object. As a property here
-    /// it applied to every listener the plane had, so calling `listenForGuests`
-    /// on a plane that was already serving the host turned `/stats` on the host
-    /// socket into a 404 -- silently, and for a caller who had asked for
-    /// something else entirely. The restriction belongs to the endpoint a
-    /// request arrived on, and travels with it now.
-    ///
-    /// The routes such an endpoint answers.
+    /// Which connections are held to this travels with the connection, not with
+    /// the plane. As a property of the plane it applied to every listener the
+    /// plane had, so asking one that was already serving the host to serve
+    /// guests turned `/stats` on the host socket into a 404 -- silently, and
+    /// for a caller who had asked for something else entirely.
     static let forwardingRoutes: Set<String> = [
         "/services/forwarder/all", "/services/forwarder/expose",
         "/services/forwarder/unexpose",
@@ -143,9 +139,10 @@ public final class ControlPlane: @unchecked Sendable {
     /// own that this port did not have -- the README said "everything else
     /// gvproxy has is here", and this was the exception nobody had checked.
     ///
-    /// `servesForwardingOnly` is set here rather than left to the caller,
-    /// because the caller cannot see who is on the other end and this can: the
-    /// far side of this listener is always a guest.
+    /// The connections this admits are held to `forwardingRoutes`, and that is
+    /// decided here rather than left to the caller: the caller cannot see who is
+    /// on the other end and this can, because the far side of this endpoint is
+    /// always a guest.
     public func listenForGuests(port: UInt16 = 80) -> EventLoopFuture<Void> {
         // Not a `NetstackServerChannel`. Binding one is refused while a TCP
         // protocol handler is installed, and this gateway's outbound forwarder

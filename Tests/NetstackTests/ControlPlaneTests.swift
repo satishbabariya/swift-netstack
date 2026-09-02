@@ -22,12 +22,15 @@ private final class CPHolder: @unchecked Sendable {
     var plane: ControlPlane?
 }
 
-private func controlPlaneFixture(group: EventLoopGroup, guestSide: inout Int32) async throws -> CPHolder {
+private func controlPlaneFixture(
+    group: EventLoopGroup, guestSide: inout Int32, guestForwards: Int = 64
+) async throws -> CPHolder {
     var pair: [Int32] = [0, 0]
     #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
     guestSide = pair[1]
     let gateway = try await Gateway.start(
-        adoptingDatagramSocket: pair[0], group: group, configuration: .init()
+        adoptingDatagramSocket: pair[0], group: group,
+        configuration: .init(maximumGuestForwards: guestForwards)
     ).get()
     let plane = ControlPlane(gateway: gateway)
     try await plane.listen(port: 0).get()
@@ -78,6 +81,59 @@ private func request(
     let status = Int(statusLine.split(separator: " ").dropFirst().first ?? "0") ?? 0
     let payload = response.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
     return (status, payload)
+}
+
+@Test func aGuestCannotPublishForwardsWithoutLimit() async throws {
+    // Publishing a host port was the host's alone until the forwarding routes
+    // were served to guests as well. Each forward is a bound listening socket:
+    // measured through the executable, two hundred of them cost two hundred
+    // descriptors, and a guest looping on this takes the gateway's descriptors
+    // until it cannot accept anything from anybody.
+    //
+    // The host is not bounded here. It reaches this over a unix socket, which is
+    // behind the filesystem where an operator decides who may use it -- which is
+    // the reason the README gives for the control API being a unix socket at
+    // all.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide, guestForwards: 4)
+    let api = holder.plane!.listeningAddress!
+    let gateway = try #require(holder.gateway)
+
+    // As the guest: the plane serves it through the forwarder, so the requests
+    // that count are the ones marked as having come from there.
+    var refused = 0
+    var published = 0
+    for _ in 0..<12 {
+        let answer = try await gateway.eventLoop.submit {
+            holder.plane!.handleForTesting(
+                method: .POST, path: "/services/forwarder/expose",
+                body: "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}",
+                fromGuest: true)
+        }.get().get()
+        if answer.status == .tooManyRequests {
+            refused += 1
+        } else if answer.status == .ok {
+            published += 1
+        }
+    }
+    #expect(published == 4, "a guest published \(published) forwards against a limit of 4")
+    #expect(refused == 8, "\(refused) of twelve were refused")
+
+    // The host is not held to it.
+    var fromHost = 0
+    for _ in 0..<6 {
+        let answer = try request(
+            "POST", "/services/forwarder/expose",
+            body: "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+        if answer.status == 200 { fromHost += 1 }
+    }
+    #expect(fromHost == 6, "the host was refused \(6 - fromHost) forwards it should have got")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
 }
 
 @Test func servingGuestsDoesNotNarrowTheEndpointTheHostIsUsing() async throws {

@@ -125,48 +125,51 @@ is `--listen-switch`, where nothing expects `.2` in particular.
 
 **The guest reaches it too**, at the gateway's own address on port 80, and gets
 exactly three routes there: `/services/forwarder/all`, `/expose` and
-`/unexpose`. That is upstream's mux for the same endpoint, and the restriction
-is the point — `/leases` and `/cam` say who else is on the network,
-`/services/dns/add` decides what every guest resolves, and `/connect` and
-`/tunnel` hand out a place on the wire. A container publishing its own port is
-ordinary; a guest reading the lease table is not. What a guest publishes is
-bounded — `maximumGuestForwards`, sixty-four by default — because each forward
-is a bound listening socket and a guest looping on `expose` would take the
-gateway's descriptors until it could accept nothing from anybody. The host is
-not bounded: it reaches this over a unix socket, which is the point of the
-socket being a unix one.
+`/unexpose`. That is upstream's mux for the same endpoint. A container publishing
+its own port over the network it already has is the point of it; everything else
+the API can do is withheld, because `/leases` and `/cam` say who else is on the
+network, `/services/dns/add` decides what every guest resolves, and `/connect`
+and `/tunnel` hand out a place on the wire.
 
-A guest publishes on loopback, over tcp or udp, and nowhere else. `local`
-carries the interface to bind and the transport to bind it with, and upstream
-takes both from whoever asked — so a guest there publishes itself on `0.0.0.0`,
-which turns "reach my container from this machine" into "reach my container from
-the office", or names a filesystem path and gets a socket wherever the gateway
-can write. Both were measured here answering `200` before they were refused. The
-README's reading of `":8080"` was already that an unstated interface means
-loopback, "the safe reading of a request that did not say"; this is the same
-reading applied to a request that did say, by a caller whose say-so this package
-does not take.
+It is served by the outbound forwarder rather than by a listener bound inside the
+stack, because that forwarder is the stack's TCP handler and a second one cannot
+be bound without silently displacing it.
 
-A guest's listing leaves out the unix forwards, because those are host
-filesystem paths — podman publishes
-`/Users/<name>/.local/share/containers/podman/machine/podman.sock`, which tells a
-guest the operator's name and where their things live — and a guest can neither
-publish nor withdraw one. The tcp and udp entries stay: they are port numbers on
-a host the guest can already dial.
+Serving it to the guest moves a capability that was the host's alone to something
+this package's threat model calls hostile, so three things about it are stricter
+than upstream, each measured against this port before it was changed:
 
-A guest also withdraws only what guests published. Upstream serves this route to
-the guest with the same handler the host gets, so a guest there can withdraw a
-forward the operator published — measured before this changed: `200 OK`, and the
-forward gone. That is the host's own configuration taken apart by something this
-package's threat model calls hostile, and refusing costs a legitimate guest
-nothing, because a container withdraws what it published. It is *what guests
-published* rather than *what this guest published*: several guests share a
-switch and nothing on the wire distinguishes them, so one guest can still
-withdraw another's. What it stops is the host's being reachable at all. It is
-served by the outbound
-forwarder rather than by a listener bound inside the stack, because that
-forwarder is the stack's TCP handler and a second one cannot be bound without
-silently displacing it.
+- **What a guest publishes is bounded** — `maximumGuestForwards`, sixty-four by
+  default. Each forward is a bound listening socket, and two hundred of them cost
+  two hundred descriptors: a guest looping on `expose` takes the gateway's
+  descriptors until it can accept nothing from anybody.
+- **A guest publishes on loopback, over tcp or udp, and nowhere else.** `local`
+  carries the interface to bind and the transport to bind it with, and upstream
+  takes both from whoever asked — so a guest there publishes itself on `0.0.0.0`,
+  which turns "reach my container from this machine" into "reach my container
+  from the office", or names a filesystem path and gets a socket wherever the
+  gateway can write. Both answered `200` here before they were refused. The
+  reading of `":8080"` above is already that an unstated interface means
+  loopback; this is the same reading applied to a request that did say, by a
+  caller whose say-so this package does not take.
+- **A guest withdraws only what guests published, and is not shown the host's
+  filesystem.** Upstream serves `unexpose` to the guest with the same handler the
+  host gets, so a guest there withdraws a forward the operator published — `200
+  OK`, and the forward gone. The listing has the same shape of problem: podman
+  publishes `/Users/<name>/.local/share/containers/podman/machine/podman.sock`,
+  which tells a guest the operator's name and where their things live, for no use
+  a guest has once it can neither publish nor withdraw one. The tcp and udp
+  entries stay, because they are port numbers on a host the guest can already
+  dial.
+
+The withdrawal rule is *what guests published* rather than *what this guest
+published*: several guests share a switch and nothing on the wire distinguishes
+them, so one guest can still withdraw another's. What it stops is the host's
+being reachable at all.
+
+The host is held to none of the three. It reaches this over a unix socket, which
+is behind the filesystem where an operator decides who may use it — the reason
+the control API is a unix socket in the first place.
 
 `Gateway` is an assembly of public parts, and unusual arrangements should reach
 past it: `WireBootstrap` for the wire, `Stack` for the stack, and

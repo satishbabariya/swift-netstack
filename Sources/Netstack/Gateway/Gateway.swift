@@ -120,6 +120,23 @@ public final class Gateway: @unchecked Sendable {
         /// A unix socket to tell about guests arriving and leaving. Upstream's
         /// notification socket; `nil` means send nothing at all.
         public var notificationSocketPath: String?
+        /// Whether `ready` is announced as soon as this gateway is assembled.
+        ///
+        /// True for an embedder, where assembly is when the network starts
+        /// working and there is nothing else to wait for.
+        ///
+        /// The executable sets it false and announces once its own control
+        /// endpoints are listening, because those are bound after this gateway
+        /// exists and only it knows when they are up. Measured before that
+        /// change, with `--listen` and `--notification` given together:
+        ///
+        ///     notification:            {"notification_type":"ready"}
+        ///     control socket exists:   False
+        ///
+        /// A supervisor acts on `ready` by talking to the API, and that one was
+        /// told the gateway was ready before the socket it would use existed.
+        /// gvproxy binds its listeners and sends `ready` after them.
+        public var announcesReadyWhenAssembled = true
         public var mtu: UInt32
         /// Names this gateway answers itself. The zone of each is also owned:
         /// with `gateway.containers.internal` here, any other name under
@@ -191,6 +208,7 @@ public final class Gateway: @unchecked Sendable {
             captureFile: String? = nil,
             captureMaximumBytes: Int = 64 * 1024 * 1024,
             notificationSocketPath: String? = nil,
+            announcesReadyWhenAssembled: Bool = true,
             mtu: UInt32 = 1500,
             dnsRecords: [DNSServer.StaticRecord]? = nil,
             upstreamResolvers: [SocketAddress] = [],
@@ -219,6 +237,7 @@ public final class Gateway: @unchecked Sendable {
             self.captureFile = captureFile
             self.captureMaximumBytes = captureMaximumBytes
             self.notificationSocketPath = notificationSocketPath
+            self.announcesReadyWhenAssembled = announcesReadyWhenAssembled
             self.mtu = mtu
             // The two names upstream publishes, so a guest written against
             // gvisor-tap-vsock finds what it expects. Both resolve to the
@@ -270,6 +289,17 @@ public final class Gateway: @unchecked Sendable {
     public let log: RateLimitedLogger
     /// Where this gateway reports guests arriving and leaving, if anywhere.
     public let notifications: NotificationSender?
+
+    /// Say `ready` on the notification socket.
+    ///
+    /// For a caller that has more to bring up after this gateway exists and so
+    /// knows better than assembly does when a supervisor may act. Sending it
+    /// twice would tell a supervisor the gateway restarted, so a caller that
+    /// uses this sets `announcesReadyWhenAssembled` to false.
+    public func announceReady() {
+        eventLoop.preconditionInEventLoop()
+        notifications?.send(.init(kind: .ready))
+    }
 
     /// Live forwards, keyed by the host port they publish on. A dictionary
     /// rather than an array because the control plane addresses them by that
@@ -552,8 +582,14 @@ public final class Gateway: @unchecked Sendable {
             // `ready` last, and on the loop: a supervisor that acts on it -- by
             // starting the VM, usually -- must not do so before the services it
             // will talk to are listening.
+            //
+            // Which is why it is skippable. This is the end of assembly, not
+            // necessarily the end of starting up: the executable binds its
+            // control endpoints after this returns, so for it, announcing here
+            // says ready before the API exists -- the thing this comment says
+            // must not happen.
             gateway.eventLoop.submit {
-                gateway.notifications?.send(.init(kind: .ready))
+                if configuration.announcesReadyWhenAssembled { gateway.announceReady() }
                 return gateway
             }
         }

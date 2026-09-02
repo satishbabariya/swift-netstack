@@ -444,6 +444,9 @@ let configuration = Gateway.Configuration(
     allowsLinkLocal: options.allowsLinkLocal || (file.allowsLinkLocal ?? false),
     captureFile: options.captureFile ?? file.captureFile,
     notificationSocketPath: options.notifySocket,
+    // Announced by this program once its endpoints are listening, not by
+    // assembly: see below.
+    announcesReadyWhenAssembled: false,
     mtu: options.mtu ?? file.mtu ?? 1500,
     dnsRecords: nil, upstreamResolvers: resolvers,
     dhcpStaticLeases: file.staticLeases, dnsSearchDomains: file.searchDomains,
@@ -592,6 +595,21 @@ do {
             exit(2)
         }
     }
+
+    // And now `ready`, for the reason the pid file above is written here.
+    //
+    // It used to be sent at the end of assembly, inside the library, which is
+    // before this program binds anything. The comment at that send site said a
+    // supervisor acting on `ready` "must not do so before the services it will
+    // talk to are listening" -- true, and not something assembly can arrange,
+    // because these endpoints are bound out here. Measured before the change:
+    //
+    //     notification:            {"notification_type":"ready"}
+    //     control socket exists:   False
+    //
+    // The pid file had already been moved down here for exactly this reason.
+    // The signal a supervisor actually waits on had not.
+    try gateway.eventLoop.submit { gateway.announceReady() }.wait()
 
     // Logged as well as printed, and this is the reason: a log file that stays
     // empty until something goes wrong is indistinguishable from a log file that

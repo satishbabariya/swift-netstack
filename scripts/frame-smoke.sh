@@ -1732,19 +1732,22 @@ PY
 notification_smoke() {
     NOTIFY="${TMPDIR:-/tmp}/netstack-smoke-notify-$$.sock"
     WIRE="${TMPDIR:-/tmp}/netstack-smoke-notify-wire-$$.sock"
-    rm -f "$NOTIFY" "$WIRE"
+    CONTROL="${TMPDIR:-/tmp}/netstack-smoke-notify-ctl-$$.sock"
+    rm -f "$NOTIFY" "$WIRE" "$CONTROL"
 
-    BINARY="$binary" NOTIFY="$NOTIFY" WIRE="$WIRE" python3 - <<'PY'
+    BINARY="$binary" NOTIFY="$NOTIFY" WIRE="$WIRE" CONTROL="$CONTROL" python3 - <<'PY'
 import json, os, socket, subprocess, sys
 
 notify, wire = os.environ["NOTIFY"], os.environ["WIRE"]
+control = os.environ["CONTROL"]
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(notify)
 server.listen(8)
 server.settimeout(20)
 
 process = subprocess.Popen(
-    [os.environ["BINARY"], "--listen-vfkit", wire, "--notification", notify],
+    [os.environ["BINARY"], "--listen-vfkit", wire, "--notification", notify,
+     "--listen", "unix://" + control],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
     try:
@@ -1776,7 +1779,30 @@ try:
     if message.get("notification_type") != "ready":
         print("FAIL: the gateway announced", message, "rather than ready")
         sys.exit(1)
-    print("ok: notify the gateway announced itself ready, as newline-delimited JSON")
+
+    # What `ready` is for. A supervisor acts on it by talking to the control
+    # API, so the API has to be there when it arrives -- and it was not: this
+    # was sent at the end of library assembly, which is before this program
+    # binds anything.
+    #
+    #     notification:            {"notification_type":"ready"}
+    #     control socket exists:   False
+    #
+    # Connected, not just present: a path can exist a moment before anything is
+    # accepting on it, and that is the same race one step further along.
+    if not os.path.exists(control):
+        print("FAIL: ready arrived before the control socket existed")
+        sys.exit(1)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(5)
+    try:
+        probe.connect(control)
+    except OSError as error:
+        print("FAIL: ready arrived before the control API would answer:", error)
+        sys.exit(1)
+    finally:
+        probe.close()
+    print("ok: notify the gateway announced itself ready, with its API already listening")
 finally:
     process.terminate()
     process.wait()

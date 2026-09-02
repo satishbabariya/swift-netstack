@@ -327,6 +327,28 @@ if wires.count > 1 {
 /// Every failure here is silent on purpose. Nothing is listening is the
 /// ordinary case -- `--notification` names where to send, not a promise that
 /// somebody is there -- and the error being reported has already been printed.
+/// The host's DNS search list, as a guest should inherit it.
+///
+/// Reading the file is here rather than in the library: a library that opens
+/// `/etc/resolv.conf` has decided something for every program that links it, and
+/// this program is the one that is meant to behave like gvproxy. The parsing and
+/// the limits are `DNSServer.searchDomains(inResolvConf:applyingDarwinLimits:)`.
+///
+/// An unreadable file is an empty list rather than an error. A host with no
+/// search list is ordinary, and a gateway that refused to start because it could
+/// not read one would be worse than a guest with no search domains.
+func hostSearchDomains() -> [String] {
+    #if canImport(Darwin)
+        let darwin = true
+    #else
+        let darwin = false
+    #endif
+    guard let text = try? String(contentsOfFile: "/etc/resolv.conf", encoding: .utf8) else {
+        return []
+    }
+    return DNSServer.searchDomains(inResolvConf: text, applyingDarwinLimits: darwin)
+}
+
 func reportHypervisorError(toSocketAt path: String?, group: EventLoopGroup) {
     guard let path else { return }
     guard let address = try? SocketAddress(unixDomainSocketPath: path) else { return }
@@ -449,7 +471,11 @@ let configuration = Gateway.Configuration(
     announcesReadyWhenAssembled: false,
     mtu: options.mtu ?? file.mtu ?? 1500,
     dnsRecords: nil, upstreamResolvers: resolvers,
-    dhcpStaticLeases: file.staticLeases, dnsSearchDomains: file.searchDomains,
+    dhcpStaticLeases: file.staticLeases,
+    // The host's list when nothing else named one, which is what gvproxy does
+    // for every gateway it starts without a config file. Without it a guest
+    // resolving a short name the host can resolve gets nothing.
+    dnsSearchDomains: file.searchDomains.isEmpty ? hostSearchDomains() : file.searchDomains,
     maximumHalfOpenConnections: file.maximumHalfOpen ?? 512,
     tcpDialTimeout: file.dialTimeout.map { .seconds(Int64($0)) } ?? .seconds(5),
     logger: Logger(label: "netstack"))

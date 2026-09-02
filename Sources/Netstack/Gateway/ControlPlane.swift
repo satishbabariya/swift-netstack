@@ -204,7 +204,43 @@ public final class ControlPlane: @unchecked Sendable {
         // way `WireBootstrap.configure` does: NIO's HTTP handlers are
         // not `Sendable`, so chaining `addHandler` futures would carry
         // them across a boundary the compiler is right to object to.
-        channel.eventLoop.submit {
+        //
+        // Inline when this is already the channel's loop, and that check is
+        // load-bearing rather than an optimisation -- `StackBootstrap.bind`
+        // carries the same one for a related reason. A guest's connection to
+        // the gateway's own API is handed here by the forwarder, which is
+        // already on this loop and has already armed delivery on the endpoint:
+        // `submit` puts the handlers in on a LATER tick, and a request that
+        // arrives in between is fired at a channel with no handlers and is
+        // gone. The gateway then waits out its ten second idle timeout and
+        // answers 408, which is what a loaded machine produced:
+        //
+        //     FAIL: the guest asked for the forward list and got
+        //           HTTP/1.1 408 Request Timeout
+        //
+        // The splice path in `OutboundTCPForwarder` never had the problem: it
+        // adds its handlers synchronously in the tick that builds the channel.
+        // Written twice rather than shared, because the closure cannot be
+        // `Sendable`: NIO's HTTP handlers are not, which is the reason the
+        // original was a literal inside `submit` in the first place.
+        if channel.eventLoop.inEventLoop {
+            do {
+                let sync = channel.pipeline.syncOperations
+                try sync.addHandler(
+                    IdleStateHandler(readTimeout: requestTimeout), name: Self.idleName)
+                try sync.addHandler(HTTPMessageFramer(), name: Self.framerName)
+                try sync.addHandler(HTTPResponseEncoder(), name: Self.encoderName)
+                try sync.addHandler(
+                    ByteToMessageHandler(HTTPRequestDecoder()), name: Self.decoderName)
+                try sync.addHandler(
+                    ControlPlaneHandler(plane: self, forwardingOnly: forwardingOnly),
+                    name: Self.handlerName)
+                return channel.eventLoop.makeSucceededVoidFuture()
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
+        }
+        return channel.eventLoop.submit {
             let sync = channel.pipeline.syncOperations
             try sync.addHandler(
                 IdleStateHandler(readTimeout: self.requestTimeout), name: Self.idleName)

@@ -169,6 +169,10 @@ enum DNSCodec {
         return out
     }
 
+    /// The name exists. With no answers beside it this is NODATA: the record
+    /// type asked for is not held, which is not the same as the name being
+    /// absent and must not be answered as though it were.
+    static let responseCodeNoError: UInt16 = 0
     static let responseCodeNameError: UInt16 = 3
     static let responseCodeRefused: UInt16 = 5
 }

@@ -111,10 +111,15 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     @discardableResult
     public func close() -> EventLoopFuture<Void> {
         forwarder = nil
-        let closing = spliced.values.flatMap {
+        var closing = spliced.values.flatMap {
             [$0.guest.close().recover { _ in () }, $0.host.close().recover { _ in () }]
         }
         spliced.removeAll()
+        // Emptied before the closes are awaited, so a `closeFuture` callback
+        // that runs while this is in flight finds nothing left to remove rather
+        // than mutating what is being walked.
+        closing += servedLocally.values.map { $0.close().recover { _ in () } }
+        servedLocally.removeAll()
         return EventLoopFuture.andAllSucceed(closing, on: eventLoop)
     }
 
@@ -134,6 +139,16 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
 
     /// Connections the guest opened to `locallyServed`, still being served.
     public private(set) var localConnections = 0
+
+    /// The channels those connections are, so `close` can reach them.
+    ///
+    /// They were counted and not kept, which made the count the only trace of
+    /// them: `close` walks `spliced`, these are not in it, and a guest's
+    /// connection to this gateway's own API therefore outlived the gateway. The
+    /// comment on `close` says why that is wrong for the spliced ones -- "the
+    /// guest on the other end of every one of these connections is going with
+    /// it" -- and it is the same guest.
+    private var servedLocally: [ObjectIdentifier: Channel] = [:]
 
     private func handle(_ request: ForwarderRequest) {
         // Link-local is refused before anything else is spent on it.
@@ -180,8 +195,10 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
                 remote: try? SocketAddress(
                     ipAddress: request.source.description, port: Int(request.sourcePort)))
             localConnections += 1
+            servedLocally[ObjectIdentifier(slot)] = channel
             channel.closeFuture.whenComplete { [weak self] _ in
                 self?.localConnections -= 1
+                self?.servedLocally.removeValue(forKey: ObjectIdentifier(slot))
                 slot.release()
             }
             serve(channel).whenFailure { _ in channel.close(promise: nil) }

@@ -505,6 +505,33 @@ public final class ControlPlane: @unchecked Sendable {
             // Dispatched on the protocol, because a host port is only unique
             // within one: withdrawing ":8080" without saying which would take
             // down whichever table happened to be looked at first.
+            // A guest withdraws what guests published, and nothing else.
+            //
+            // Upstream serves this route to the guest with the same handler the
+            // host gets, so a guest there can withdraw a forward the operator
+            // published -- measured here before this: 200 OK, and the forward
+            // gone. That is not a bounded resource being exhausted, it is the
+            // host's own configuration being taken apart by something this
+            // package's threat model calls hostile, and it costs a legitimate
+            // guest nothing to be told no: a container withdraws what it
+            // published.
+            //
+            // "What guests published", not "what this guest published". Several
+            // guests share a switch and nothing on the wire distinguishes them,
+            // so this does not stop one guest withdrawing another's. It stops
+            // the host's from being reachable at all, which is the part an
+            // operator cannot otherwise defend.
+            let endpoint: String
+            switch request.transport {
+            case .tcp: endpoint = "tcp:\(request.hostPort)"
+            case .udp: endpoint = "udp:\(request.hostPort)"
+            case .unix: endpoint = "unix:\(request.socketPath)"
+            }
+            if fromGuest, !gateway.isGuestForward(endpoint) {
+                return loop.makeSucceededFuture(
+                    (.notFound, "{\"error\":\"no such forward published by a guest\"}"))
+            }
+
             let stopped: Bool
             switch request.transport {
             case .tcp: stopped = gateway.stopForwarding(hostPort: request.hostPort)
@@ -514,13 +541,7 @@ public final class ControlPlane: @unchecked Sendable {
             // Given back whoever withdrew it. A place released only when the
             // guest asks is a place a guest never gets back, because the host
             // withdrawing a guest's forward is the ordinary way one ends.
-            if stopped {
-                switch request.transport {
-                case .tcp: gateway.forgetGuestForward("tcp:\(request.hostPort)")
-                case .udp: gateway.forgetGuestForward("udp:\(request.hostPort)")
-                case .unix: gateway.forgetGuestForward("unix:\(request.socketPath)")
-                }
-            }
+            if stopped { gateway.forgetGuestForward(endpoint) }
             guard stopped else {
                 return loop.makeSucceededFuture(
                     (

@@ -382,6 +382,12 @@ public final class Gateway: @unchecked Sendable {
         pendingGuestForwards = max(0, pendingGuestForwards - 1)
     }
 
+    /// Whether a forward was published by a guest.
+    func isGuestForward(_ endpoint: String) -> Bool {
+        eventLoop.preconditionInEventLoop()
+        return guestForwards.contains(endpoint)
+    }
+
     /// Give one back, whoever withdrew it.
     func forgetGuestForward(_ endpoint: String) {
         eventLoop.preconditionInEventLoop()

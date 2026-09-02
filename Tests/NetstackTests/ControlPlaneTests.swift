@@ -83,6 +83,66 @@ private func request(
     return (status, payload)
 }
 
+@Test func aGuestCannotWithdrawWhatTheHostPublished() async throws {
+    // Upstream serves this route to the guest with the same handler the host
+    // gets, so a guest there can withdraw a forward the operator published.
+    // Measured here before this:
+    //
+    //     PROBE: guest unexpose of a host forward answered 200 OK; still listed: false
+    //
+    // That is not a bounded resource being exhausted, it is the host's own
+    // configuration taken apart by something this package's threat model calls
+    // hostile -- and it costs a legitimate guest nothing to be told no, because
+    // a container withdraws what it published.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+    let gateway = try #require(holder.gateway)
+
+    let published = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    let hostPort = boundPort(in: published.body) ?? 0
+    try #require(hostPort > 0, "the host forward was not published: \(published.body)")
+
+    let refused = try await gateway.eventLoop.submit {
+        holder.plane!.handleForTesting(
+            method: .POST, path: "/services/forwarder/unexpose",
+            body: "{\"local\":\":\(hostPort)\"}", fromGuest: true)
+    }.get().get()
+    #expect(
+        refused.status == .notFound,
+        "a guest withdrew the host's forward and was answered \(refused.status)")
+    let listed = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(
+        listed.body.contains(":\(hostPort)"),
+        "the host's forward is gone: \(listed.body)")
+
+    // And a guest still withdraws its own, or the endpoint would be useless.
+    let mine = try await gateway.eventLoop.submit {
+        holder.plane!.handleForTesting(
+            method: .POST, path: "/services/forwarder/expose",
+            body: "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}",
+            fromGuest: true)
+    }.get().get()
+    let guestPort = boundPort(in: mine.body) ?? 0
+    try #require(guestPort > 0, "the guest could not publish one: \(mine.body)")
+    let withdrawn = try await gateway.eventLoop.submit {
+        holder.plane!.handleForTesting(
+            method: .POST, path: "/services/forwarder/unexpose",
+            body: "{\"local\":\":\(guestPort)\"}", fromGuest: true)
+    }.get().get()
+    #expect(
+        withdrawn.status == .ok,
+        "a guest could not withdraw its own forward: \(withdrawn.status)")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func aGuestCannotPublishForwardsWithoutLimit() async throws {
     // Publishing a host port was the host's alone until the forwarding routes
     // were served to guests as well. Each forward is a bound listening socket:

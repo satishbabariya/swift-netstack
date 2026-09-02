@@ -134,7 +134,18 @@ bounded — `maximumGuestForwards`, sixty-four by default — because each forwa
 is a bound listening socket and a guest looping on `expose` would take the
 gateway's descriptors until it could accept nothing from anybody. The host is
 not bounded: it reaches this over a unix socket, which is the point of the
-socket being a unix one. It is served by the outbound
+socket being a unix one.
+
+A guest also withdraws only what guests published. Upstream serves this route to
+the guest with the same handler the host gets, so a guest there can withdraw a
+forward the operator published — measured before this changed: `200 OK`, and the
+forward gone. That is the host's own configuration taken apart by something this
+package's threat model calls hostile, and refusing costs a legitimate guest
+nothing, because a container withdraws what it published. It is *what guests
+published* rather than *what this guest published*: several guests share a
+switch and nothing on the wire distinguishes them, so one guest can still
+withdraw another's. What it stops is the host's being reachable at all. It is
+served by the outbound
 forwarder rather than by a listener bound inside the stack, because that
 forwarder is the stack's TCP handler and a second one cannot be bound without
 silently displacing it.
@@ -642,7 +653,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-806 tests, plus a differential harness in `differential/` that drives gVisor's
+807 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

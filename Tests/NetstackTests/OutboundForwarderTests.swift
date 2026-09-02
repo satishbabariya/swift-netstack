@@ -24,6 +24,9 @@ private final class Holder: @unchecked Sendable {
     var stack: Stack?
     var forwarder: OutboundTCPForwarder?
     var link: WireLinkEndpoint?
+    /// The channel a locally served connection arrived on, for the test that
+    /// closes the forwarder and asks whether it went with it.
+    var served: Channel?
 }
 
 /// Everything a guest needs to reach the host: a socketpair for the wire, a
@@ -111,6 +114,64 @@ private func awaitSegments(
         try? await Task.sleep(nanoseconds: 5_000_000)
     }
     return collected
+}
+
+@Test func closingTheForwarderClosesTheConnectionsItServedItself() async throws {
+    // A connection to the gateway's own API is served by this forwarder rather
+    // than dialled out, so it is not in `spliced` -- and `close` walks
+    // `spliced`. It was counted and not kept, so the count was the only trace
+    // of it and nothing could reach it to close it.
+    //
+    // The comment on `close` says why that is wrong for the spliced ones: "the
+    // guest on the other end of every one of these connections is going with
+    // it". It is the same guest.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide)
+    let served = Holder()
+
+    try await holder.stack!.eventLoop.submit {
+        holder.forwarder!.locallyServed = (IPv4Address("192.168.127.1")!, 80)
+        holder.forwarder!.serveLocally = { channel in
+            served.served = channel
+            return channel.eventLoop.makeSucceededVoidFuture()
+        }
+    }.get()
+
+    send(
+        guestSide,
+        guestFrame(to: IPv4Address("192.168.127.1")!, destinationPort: 80, sequence: 9000, flags: [.syn]))
+    let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+    let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
+
+    // The third leg, without which the connection never establishes and the
+    // channel never activates -- and "not active" after closing would then be
+    // true because it had never been anything else.
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("192.168.127.1")!, destinationPort: 80, sequence: 9001,
+            acknowledgement: answer.header.sequence.value &+ 1, flags: [.ack]))
+
+    var channel: Channel?
+    for _ in 0..<400 where channel?.isActive != true {
+        channel = try await holder.stack!.eventLoop.submit { served.served }.get()
+        if channel?.isActive != true { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    let opened = try #require(channel, "the forwarder never served the connection")
+    try #require(opened.isActive, "the served connection never established")
+
+    _ = try? await holder.forwarder!.close().get()
+
+    var closed = false
+    for _ in 0..<400 where !closed {
+        closed = !opened.isActive
+        if !closed { try await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(closed, "a connection the gateway served itself outlived the gateway")
+
+    close(guestSide)
+    try? await group.shutdownGracefully()
 }
 
 @Test func aGuestConnectionReachesARealListenerAndCarriesBytesBothWays() async throws {

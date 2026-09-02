@@ -185,6 +185,25 @@ public final class Gateway: @unchecked Sendable {
         /// How many guests may share one switch. Only read by
         /// `start(switchListeningOnStreamSocketAt:)`.
         public var maximumGuests: Int
+        /// How many forwards a guest may have published at once.
+        ///
+        /// Publishing a host port used to be the host's alone: the control API
+        /// is a unix socket, and the README says why -- "anything that can reach
+        /// it can publish any guest port on the host, and a unix socket puts
+        /// that behind the filesystem where an operator can see and set who may
+        /// use it".
+        ///
+        /// Serving the forwarding routes to the guest, which upstream does and
+        /// this now does too, hands that to something the threat model says is
+        /// hostile. Each forward is a bound listening socket: two hundred of
+        /// them cost two hundred descriptors, and a guest looping on `expose`
+        /// takes the gateway's descriptors until it cannot accept anything from
+        /// anybody.
+        ///
+        /// Counted per guest-published forward rather than over the whole table,
+        /// so an operator publishing a hundred ports from the host does not
+        /// leave a container with none.
+        public var maximumGuestForwards: Int
         /// Applied to every forwarded connection's guest-side endpoint. On by
         /// default -- see `OutboundTCPForwarder.init` for why that is the
         /// opposite of `TCPEndpoint`'s default and right here.
@@ -236,6 +255,7 @@ public final class Gateway: @unchecked Sendable {
             maximumHalfOpenConnections: Int = 512,
             tcpDialTimeout: TimeAmount = .seconds(5),
             maximumGuests: Int = 32,
+            maximumGuestForwards: Int = 64,
             keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
             logger: Logger = Logger(label: "netstack"),
             logWindow: TimeAmount = .seconds(10)
@@ -290,6 +310,7 @@ public final class Gateway: @unchecked Sendable {
             self.maximumHalfOpenConnections = maximumHalfOpenConnections
             self.tcpDialTimeout = tcpDialTimeout
             self.maximumGuests = maximumGuests
+            self.maximumGuestForwards = maximumGuestForwards
             self.keepAlive = keepAlive
             self.logger = logger
             self.logWindow = logWindow
@@ -314,6 +335,64 @@ public final class Gateway: @unchecked Sendable {
     /// an embedder assembling extra pieces can share the same window rather
     /// than opening a second, unbounded one alongside it.
     public let log: RateLimitedLogger
+
+    /// How many forwards a guest may have published at once.
+    public internal(set) var maximumGuestForwards = 64
+
+    /// The forwards guests published, by the endpoint each is on.
+    ///
+    /// A set rather than a count, so a forward withdrawn by the host is
+    /// forgotten too: a counter would only come down when the guest asked, and a
+    /// guest that never asks is the case this exists for.
+    private var guestForwards: Set<String> = []
+
+    /// Guest forwards asked for and not yet bound.
+    ///
+    /// Counted as well as recorded, for the reason `WireBootstrap.admit` counts
+    /// its admissions: binding is asynchronous, so the endpoint does not exist
+    /// yet when the next request is checked. Against the set alone every request
+    /// in a burst reads the same count and every one is admitted, which is the
+    /// bound being checkable and not enforced under exactly the condition it
+    /// exists for.
+    private var pendingGuestForwards = 0
+
+    /// Take a place for a guest-published forward, or say there is none.
+    ///
+    /// Given back by `recordGuestForward` when the listener is bound, or by
+    /// `abandonGuestForward` when it could not be.
+    func admitGuestForward() -> Bool {
+        eventLoop.preconditionInEventLoop()
+        guard guestForwards.count + pendingGuestForwards < maximumGuestForwards else {
+            return false
+        }
+        pendingGuestForwards += 1
+        return true
+    }
+
+    /// The place is now a forward, under the endpoint it ended up on.
+    func recordGuestForward(_ endpoint: String) {
+        eventLoop.preconditionInEventLoop()
+        pendingGuestForwards = max(0, pendingGuestForwards - 1)
+        guestForwards.insert(endpoint)
+    }
+
+    /// The place is given back: the listener could not be bound.
+    func abandonGuestForward() {
+        eventLoop.preconditionInEventLoop()
+        pendingGuestForwards = max(0, pendingGuestForwards - 1)
+    }
+
+    /// Give one back, whoever withdrew it.
+    func forgetGuestForward(_ endpoint: String) {
+        eventLoop.preconditionInEventLoop()
+        guestForwards.remove(endpoint)
+    }
+
+    /// How many forwards guests have published. For tests and `/stats`.
+    public var guestForwardCount: Int {
+        eventLoop.preconditionInEventLoop()
+        return guestForwards.count
+    }
     /// Where this gateway reports guests arriving and leaving, if anywhere.
     public let notifications: NotificationSender?
 
@@ -617,9 +696,11 @@ public final class Gateway: @unchecked Sendable {
             tcp.log = log
             udp.log = log
             icmp.log = log
-            return Gateway(
+            let gateway = Gateway(
                 link: link, stack: stack, dhcp: dhcp, dns: dns, tcp: tcp, udp: udp, icmp: icmp,
                 keepAlive: configuration.keepAlive, log: log, notifications: notifications)
+            gateway.maximumGuestForwards = configuration.maximumGuestForwards
+            return gateway
         }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in
             gateway.dns.startForwarding(group: group).map { _ in gateway }
         }.flatMap { (gateway: Gateway) -> EventLoopFuture<Gateway> in

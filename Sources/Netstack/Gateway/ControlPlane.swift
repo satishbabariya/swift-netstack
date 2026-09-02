@@ -347,8 +347,21 @@ public final class ControlPlane: @unchecked Sendable {
     /// answering "done" before the bind completes would report success for a
     /// port that may fail to bind a millisecond later, with nowhere for the
     /// caller to learn that.
+    /// Answer one request as though it had arrived on a given endpoint.
+    ///
+    /// For the tests that are about which endpoint asked rather than about HTTP:
+    /// driving the guest half for real needs a wire, a handshake and a parser,
+    /// none of which is the subject.
+    func handleForTesting(
+        method: HTTPMethod, path: String, body: String?, fromGuest: Bool
+    ) -> EventLoopFuture<(status: HTTPResponseStatus, body: String)> {
+        var buffer: ByteBuffer?
+        if let body { buffer = ByteBufferAllocator().buffer(string: body) }
+        return handle(method: method, path: path, body: buffer, fromGuest: fromGuest)
+    }
+
     fileprivate func handle(
-        method: HTTPMethod, path: String, body: ByteBuffer?
+        method: HTTPMethod, path: String, body: ByteBuffer?, fromGuest: Bool = false
     ) -> EventLoopFuture<(status: HTTPResponseStatus, body: String)> {
         let loop = gateway.eventLoop
 
@@ -426,6 +439,24 @@ public final class ControlPlane: @unchecked Sendable {
                 return loop.makeSucceededFuture(
                     (.badRequest, "{\"error\":\"expected local and remote as host:port\"}"))
             }
+            // Bounded when the guest is asking, and only then.
+            //
+            // Each forward is a bound listening socket. Publishing them was the
+            // host's alone until this API was served to guests as well, and a
+            // guest looping on this takes the gateway's descriptors until it
+            // cannot accept anything from anybody -- two hundred forwards cost
+            // two hundred descriptors, measured. The host is not bounded here:
+            // it reaches this over a unix socket, which is behind the filesystem
+            // where an operator decides who may use it.
+            //
+            // The place is taken before the listener is bound, for the reason
+            // the TCP forwarder takes its slot before dialling: binding is
+            // asynchronous, so a burst that all passed the check before any of
+            // them finished would all be admitted.
+            if fromGuest, !gateway.admitGuestForward() {
+                return loop.makeSucceededFuture(
+                    (.tooManyRequests, "{\"error\":\"too many forwards published by guests\"}"))
+            }
             switch request.transport {
             case .tcp:
                 return gateway.forward(
@@ -433,9 +464,11 @@ public final class ControlPlane: @unchecked Sendable {
                     host: request.hostInterface
                 ).map { forwarder -> (status: HTTPResponseStatus, body: String) in
                     let bound = forwarder.listeningAddress?.port ?? request.hostPort
+                    if fromGuest { self.gateway.recordGuestForward("tcp:\(bound)") }
                     return (.ok, "{\"local\":\":\(bound)\",\"protocol\":\"tcp\"}")
                 }.flatMapError { error in
-                    loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+                    if fromGuest { self.gateway.abandonGuestForward() }
+                    return loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
                 }
             case .udp:
                 return gateway.forwardUDP(
@@ -443,18 +476,25 @@ public final class ControlPlane: @unchecked Sendable {
                     host: request.hostInterface
                 ).map { forwarder -> (status: HTTPResponseStatus, body: String) in
                     let bound = forwarder.listeningAddress?.port ?? request.hostPort
+                    if fromGuest { self.gateway.recordGuestForward("udp:\(bound)") }
                     return (.ok, "{\"local\":\":\(bound)\",\"protocol\":\"udp\"}")
                 }.flatMapError { error in
-                    loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+                    if fromGuest { self.gateway.abandonGuestForward() }
+                    return loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
                 }
             case .unix:
                 return gateway.forward(
                     unixSocketPath: request.socketPath, toGuest: request.guestAddress,
                     port: request.guestPort
                 ).map { _ -> (status: HTTPResponseStatus, body: String) in
-                    (.ok, "{\"local\":\"\(ControlPlane.escaped(request.socketPath))\",\"protocol\":\"unix\"}")
+                    if fromGuest { self.gateway.recordGuestForward("unix:\(request.socketPath)") }
+                    return (
+                        .ok,
+                        "{\"local\":\"\(ControlPlane.escaped(request.socketPath))\",\"protocol\":\"unix\"}"
+                    )
                 }.flatMapError { error in
-                    loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
+                    if fromGuest { self.gateway.abandonGuestForward() }
+                    return loop.makeSucceededFuture((.conflict, "{\"error\":\"\(error)\"}"))
                 }
             }
 
@@ -470,6 +510,16 @@ public final class ControlPlane: @unchecked Sendable {
             case .tcp: stopped = gateway.stopForwarding(hostPort: request.hostPort)
             case .udp: stopped = gateway.stopForwardingUDP(hostPort: request.hostPort)
             case .unix: stopped = gateway.stopForwarding(unixSocketPath: request.socketPath)
+            }
+            // Given back whoever withdrew it. A place released only when the
+            // guest asks is a place a guest never gets back, because the host
+            // withdrawing a guest's forward is the ordinary way one ends.
+            if stopped {
+                switch request.transport {
+                case .tcp: gateway.forgetGuestForward("tcp:\(request.hostPort)")
+                case .udp: gateway.forgetGuestForward("udp:\(request.hostPort)")
+                case .unix: gateway.forgetGuestForward("unix:\(request.socketPath)")
+                }
             }
             guard stopped else {
                 return loop.makeSucceededFuture(
@@ -1023,7 +1073,9 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
                     json: "{\"error\":\"this endpoint serves forwarding only\"}")
                 return
             }
-            plane.handle(method: head.method, path: head.uri, body: body).whenComplete { result in
+            plane.handle(
+                method: head.method, path: head.uri, body: body, fromGuest: forwardingOnly
+            ).whenComplete { result in
                 guard case .success(let outcome) = result else {
                     // Reached nobody before this. No answer was written and the
                     // caller waited out the request timeout for a connection

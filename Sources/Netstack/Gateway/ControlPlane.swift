@@ -429,8 +429,21 @@ public final class ControlPlane: @unchecked Sendable {
             // field for the same reason.
             var entries = gateway.forwardedPorts.map { "{\"local\":\":\($0)\",\"protocol\":\"tcp\"}" }
             entries += gateway.forwardedUDPPorts.map { "{\"local\":\":\($0)\",\"protocol\":\"udp\"}" }
-            entries += gateway.forwardedUnixPaths.map {
-                "{\"local\":\"\(ControlPlane.escaped($0))\",\"protocol\":\"unix\"}"
+            // The guest is not shown the unix ones, because they are host
+            // filesystem paths and it cannot publish or withdraw one anyway.
+            // The path podman publishes is
+            // `/Users/<name>/.local/share/containers/podman/machine/podman.sock`,
+            // so listing it tells a guest the operator's name and where their
+            // things live -- for no use the guest has, since every other route
+            // that touches a unix forward now refuses it.
+            //
+            // The tcp and udp ones stay: they are port numbers on a host the
+            // guest can already dial, so withholding them would buy nothing and
+            // cost a container the list it publishes into.
+            if !fromGuest {
+                entries += gateway.forwardedUnixPaths.map {
+                    "{\"local\":\"\(ControlPlane.escaped($0))\",\"protocol\":\"unix\"}"
+                }
             }
             return loop.makeSucceededFuture((.ok, "[" + entries.joined(separator: ",") + "]"))
 

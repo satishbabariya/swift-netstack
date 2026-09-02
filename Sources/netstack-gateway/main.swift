@@ -52,13 +52,38 @@ struct Options {
     static func parse(_ arguments: [String]) throws -> Options {
         var options = Options()
         var index = 0
+        // A value attached with `=`, when the caller wrote one.
+        var attached: String?
         func value(_ flag: String) throws -> String {
+            if let attached { return attached }
             index += 1
             guard index < arguments.count else { throw OptionError.missingValue(flag) }
             return arguments[index]
         }
         while index < arguments.count {
-            let flag = arguments[index]
+            let argument = arguments[index]
+
+            // One dash or two, and a value beside the flag or after it.
+            //
+            // Go's `flag` package treats `-x` and `--x` as the same flag and
+            // accepts `-x=v` as well as `-x v`, so every gvproxy command line
+            // in the wild uses whichever its author preferred -- its own README
+            // uses one dash, and so does the `sandbox` that spawns it:
+            //
+            //     "-listen-vfkit", "unixgram://\(gatewaySocket.path)",
+            //
+            // This took two dashes and a separate value, and answered anything
+            // else with `unknown option -listen-vfkit`. The flag names were
+            // gvproxy's and the command lines still did not move across.
+            attached = nil
+            var flag = argument
+            if let equals = flag.firstIndex(of: "="), flag.hasPrefix("-") {
+                attached = String(flag[flag.index(after: equals)...])
+                flag = String(flag[flag.startIndex..<equals])
+            }
+            if flag.hasPrefix("-"), !flag.hasPrefix("--"), flag.count > 1 {
+                flag = "-" + flag
+            }
             switch flag {
             // gvproxy's spellings. `--listen` is the CONTROL endpoint there and
             // the guest wire is `--listen-vfkit` or `--listen-qemu`; this had
@@ -120,7 +145,10 @@ struct Options {
             case "--help", "-h":
                 throw OptionError.help
             default:
-                throw OptionError.unknown(flag)
+                // The spelling the caller used, not the one this normalised it
+                // to: an error naming `--bogus` when they wrote `-bogus` sends
+                // them looking for a flag they did not type.
+                throw OptionError.unknown(argument)
             }
             index += 1
         }

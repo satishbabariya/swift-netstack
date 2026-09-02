@@ -2649,10 +2649,14 @@ wire_scheme_smoke() {
     mkdir -p "$directory" || { echo "FAIL: could not make $directory"; return 1; }
     local failures=0
 
+    # The command line as a whole rather than a flag and a value, because one of
+    # the spellings being checked carries its value in the flag and there is no
+    # second argument to take.
     binds() {
-        local description="$1" flag="$2" endpoint="$3"
+        local description="$1"
+        shift
         rm -f "$directory/s.sock"
-        "$binary" "$flag" "$endpoint" >"$directory/err.txt" 2>&1 &
+        "$binary" "$@" >"$directory/err.txt" 2>&1 &
         GATEWAY=$!
         local bound=0
         for _ in $(seq 1 120); do
@@ -2670,9 +2674,10 @@ wire_scheme_smoke() {
     }
 
     refuses() {
-        local description="$1" flag="$2" endpoint="$3"
+        local description="$1"
+        shift
         rm -f "$directory/s.sock"
-        "$binary" "$flag" "$endpoint" >"$directory/err.txt" 2>&1 &
+        "$binary" "$@" >"$directory/err.txt" 2>&1 &
         GATEWAY=$!
         for _ in $(seq 1 120); do
             kill -0 "$GATEWAY" 2>/dev/null || break
@@ -2696,6 +2701,19 @@ wire_scheme_smoke() {
         fi
     }
 
+    # One dash or two, and the value beside the flag or after it. Go's `flag`
+    # package treats all four as the same command line, so every gvproxy
+    # invocation in the wild uses whichever its author preferred -- upstream's
+    # own README uses one dash, and so does the `sandbox` that spawns it:
+    #
+    #     "-listen-vfkit", "unixgram://\(gatewaySocket.path)",
+    #
+    # This answered that with `unknown option -listen-vfkit`.
+    binds "vfkit with one dash" -listen-vfkit "unixgram://$directory/s.sock"
+    binds "vfkit with an attached value" "--listen-vfkit=$directory/s.sock"
+    binds "vfkit with one dash and an attached url" \
+        "-listen-vfkit=unixgram://$directory/s.sock"
+
     binds "vfkit with unixgram://" --listen-vfkit "unixgram://$directory/s.sock"
     binds "vfkit with a bare path" --listen-vfkit "$directory/s.sock"
     binds "qemu with unix://" --listen-qemu "unix://$directory/s.sock"
@@ -2707,6 +2725,23 @@ wire_scheme_smoke() {
     # Binding a file called `tcp://0.0.0.0:1234` would be a worse answer than
     # saying so.
     refuses "vfkit with tcp://" --listen-vfkit "tcp://0.0.0.0:1234"
+
+    # And an unknown flag is reported as it was typed. Normalising one dash to
+    # two before the error is built would send somebody looking for `--bogus`
+    # when they wrote `-bogus`.
+    # Captured before it is matched. Piping into grep here reports the failure
+    # of the binary -- which is the point, it was given a bad flag -- rather than
+    # whether the text matched, under the `pipefail` this file sets. Written that
+    # way it failed while printing the very message it was looking for.
+    local said
+    said="$("$binary" -bogus 2>&1 | head -1)"
+    case "$said" in
+        *"unknown option -bogus"*) ;;
+        *)
+            echo "FAIL: an unknown flag was not reported as it was typed: $said"
+            failures=1
+            ;;
+    esac
     refuses "qemu with unixgram://" --listen-qemu "unixgram://$directory/s.sock"
 
     rm -rf "$directory"

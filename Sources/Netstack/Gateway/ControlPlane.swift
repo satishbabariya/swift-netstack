@@ -92,9 +92,15 @@ public final class ControlPlane: @unchecked Sendable {
     /// to for every guest, and `/connect` and `/tunnel` are the two that hand
     /// out a place on the wire. A guest publishing its own port is ordinary; a
     /// guest reading the lease table is not.
-    public var servesForwardingOnly = false
-
-    /// The routes a `servesForwardingOnly` endpoint answers.
+    ///
+    /// Carried on the connection rather than on this object. As a property here
+    /// it applied to every listener the plane had, so calling `listenForGuests`
+    /// on a plane that was already serving the host turned `/stats` on the host
+    /// socket into a 404 -- silently, and for a caller who had asked for
+    /// something else entirely. The restriction belongs to the endpoint a
+    /// request arrived on, and travels with it now.
+    ///
+    /// The routes such an endpoint answers.
     static let forwardingRoutes: Set<String> = [
         "/services/forwarder/all", "/services/forwarder/expose",
         "/services/forwarder/unexpose",
@@ -141,7 +147,6 @@ public final class ControlPlane: @unchecked Sendable {
     /// because the caller cannot see who is on the other end and this can: the
     /// far side of this listener is always a guest.
     public func listenForGuests(port: UInt16 = 80) -> EventLoopFuture<Void> {
-        servesForwardingOnly = true
         // Not a `NetstackServerChannel`. Binding one is refused while a TCP
         // protocol handler is installed, and this gateway's outbound forwarder
         // is that handler -- it has to be, to see SYNs for destinations no
@@ -159,7 +164,7 @@ public final class ControlPlane: @unchecked Sendable {
             gateway.tcp.locallyServed = (address, port)
             gateway.tcp.serveLocally = { [weak self] channel in
                 guard let self else { return channel.close() }
-                return self.configureConnection(channel)
+                return self.configureConnection(channel, forwardingOnly: true)
             }
         }
     }
@@ -189,7 +194,9 @@ public final class ControlPlane: @unchecked Sendable {
     /// `ServerBootstrap` at all -- it is a channel inside this gateway's own
     /// stack -- so the pipeline had to stop being written inline to be usable
     /// from both.
-    private func configureConnection(_ channel: Channel) -> EventLoopFuture<Void> {
+    private func configureConnection(
+        _ channel: Channel, forwardingOnly: Bool = false
+    ) -> EventLoopFuture<Void> {
         // Named handlers rather than `configureHTTPServerPipeline`,
         // because `/tunnel` and `/connect` take the connection away from
         // HTTP and hand it to the network -- and removing handlers by
@@ -208,7 +215,9 @@ public final class ControlPlane: @unchecked Sendable {
             try sync.addHandler(HTTPResponseEncoder(), name: Self.encoderName)
             try sync.addHandler(
                 ByteToMessageHandler(HTTPRequestDecoder()), name: Self.decoderName)
-            try sync.addHandler(ControlPlaneHandler(plane: self), name: Self.handlerName)
+            try sync.addHandler(
+                ControlPlaneHandler(plane: self, forwardingOnly: forwardingOnly),
+                name: Self.handlerName)
         }
     }
 
@@ -342,20 +351,6 @@ public final class ControlPlane: @unchecked Sendable {
         method: HTTPMethod, path: String, body: ByteBuffer?
     ) -> EventLoopFuture<(status: HTTPResponseStatus, body: String)> {
         let loop = gateway.eventLoop
-
-        // A guest gets the three forwarding routes and nothing else. Refused
-        // here rather than by not registering the others, because this dispatch
-        // is one switch and a route that is absent from it for one listener and
-        // present for another would be two dispatches to keep in step.
-        //
-        // 404 rather than 403: upstream's guest mux simply has no handler for
-        // these, and that is what Go's ServeMux answers. A guest learning which
-        // routes exist but are forbidden is a small thing to give away, and
-        // there is no reason to give it.
-        if servesForwardingOnly, !Self.forwardingRoutes.contains(path) {
-            return loop.makeSucceededFuture(
-                (.notFound, "{\"error\":\"this endpoint serves forwarding only\"}"))
-        }
 
         switch (method, path) {
         case (.GET, "/stats"):
@@ -937,6 +932,8 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
     typealias OutboundOut = HTTPServerResponsePart
 
     private weak var plane: ControlPlane?
+    /// Whether this connection arrived on the endpoint the guest reaches.
+    private let forwardingOnly: Bool
     private var head: HTTPRequestHead?
     private var body: ByteBuffer?
     /// Set when the body passed its cap. The rest of the request is read and
@@ -944,7 +941,8 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
     /// client gets an answer it can act on.
     private var overlong = false
 
-    init(plane: ControlPlane) {
+    init(plane: ControlPlane, forwardingOnly: Bool = false) {
+        self.forwardingOnly = forwardingOnly
         self.plane = plane
     }
 
@@ -1010,6 +1008,21 @@ private final class ControlPlaneHandler: ChannelInboundHandler, RemovableChannel
             // without a word. Every route answers its own errors, so this is the
             // one nothing was meant to produce -- which is exactly the kind that
             // arrives at three in the morning.
+            // A guest gets the three forwarding routes and nothing else, and the
+            // refusal is here because this is where the connection is: the same
+            // plane serves the host, and a check on the plane refused the host
+            // too.
+            //
+            // 404 rather than 403: upstream's guest mux simply has no handler
+            // for these, and that is what Go's ServeMux answers. A guest
+            // learning which routes exist but are forbidden is a small thing to
+            // give away, and there is no reason to give it.
+            if forwardingOnly, !ControlPlane.forwardingRoutes.contains(head.uri) {
+                respond(
+                    context: context, status: .notFound,
+                    json: "{\"error\":\"this endpoint serves forwarding only\"}")
+                return
+            }
             plane.handle(method: head.method, path: head.uri, body: body).whenComplete { result in
                 guard case .success(let outcome) = result else {
                     // Reached nobody before this. No answer was written and the

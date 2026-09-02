@@ -80,6 +80,40 @@ private func request(
     return (status, payload)
 }
 
+@Test func servingGuestsDoesNotNarrowTheEndpointTheHostIsUsing() async throws {
+    // The guest endpoint answers three routes and nothing else. That restriction
+    // was a property of the plane, and a plane can have more than one listener:
+    // asking one that was already serving the host to serve guests as well
+    // turned `/stats` on the host socket into a 404.
+    //
+    //     PROBE: /stats over the host socket answered 404
+    //
+    // Silently, and for a caller who had asked for something else entirely. The
+    // restriction belongs to the endpoint a request arrived on, so it travels
+    // with the connection now.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    let before = try request("GET", "/stats", body: nil, to: api)
+    try #require(before.status == 200, "the host endpoint did not answer to begin with")
+
+    _ = try await holder.plane!.listenForGuests().get()
+
+    let after = try request("GET", "/stats", body: nil, to: api)
+    #expect(
+        after.status == 200,
+        "serving guests took /stats away from the host endpoint: \(after.status)")
+    let leases = try request("GET", "/leases", body: nil, to: api)
+    #expect(leases.status == 200, "serving guests took /leases away from the host endpoint")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func exposingTheSameUnixPathTwiceIsRefusedRatherThanReplacingTheFirst() async throws {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     var guestSide: Int32 = -1

@@ -70,6 +70,27 @@ private func awaitUDP(_ fd: Int32, fromPort: UInt16) async -> ByteBuffer? {
     return nil
 }
 
+@Test func theUuidPodmanSendsGetsTheAddressUpstreamGivesIt() {
+    // gvproxy's default map, which this had as empty:
+    //
+    //     config.Stack.VpnKitUUIDMacAddresses = map[string]string{
+    //         "c3d68012-0208-11ea-9fd7-f2189899ab08": "5a:94:ef:e4:0c:ee",
+    //     }
+    //
+    // A UUID that is not in the map gets an invented address, which is upstream's
+    // behaviour too -- but this one is in upstream's map, and it is the UUID
+    // podman sends. Handed an invented address instead, a guest got a different
+    // one on every run, and the address upstream's DHCP reservation keys on was
+    // never the address the handshake gave out.
+    let configuration = Gateway.Configuration()
+    #expect(
+        configuration.vpnKitAddresses["c3d68012-0208-11ea-9fd7-f2189899ab08"]
+            == MACAddress("5a:94:ef:e4:0c:ee")!)
+    #expect(
+        configuration.vpnKitAddresses["11111111-2222-3333-4444-555555555555"] == nil,
+        "a uuid upstream does not map was given an address anyway")
+}
+
 @Test func theGatewaysHardwareAddressIsNotTheOneUpstreamGivesTheGuest() {
     // gvproxy's defaults, from cmd/gvproxy/config.go:
     //

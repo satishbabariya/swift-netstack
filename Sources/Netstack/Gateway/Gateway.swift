@@ -60,7 +60,23 @@ public final class Gateway: @unchecked Sendable {
         /// The address to hand a vpnkit guest, by the UUID hyperkit sends.
         /// Upstream's `vpnKitUUIDMacAddresses`. A UUID not here gets an
         /// invented address.
-        public var vpnKitAddresses: [String: MACAddress] = [:]
+        ///
+        /// Upstream's own default is carried here, because the UUID in it is the
+        /// one podman sends and the address is the one its DHCP reservation
+        /// keys on:
+        ///
+        ///     config.Stack.VpnKitUUIDMacAddresses = map[string]string{
+        ///         "c3d68012-0208-11ea-9fd7-f2189899ab08": "5a:94:ef:e4:0c:ee",
+        ///     }
+        ///
+        /// Without it that guest was handed an invented address, so the one
+        /// thing the handshake exists to tell it was different on every run.
+        public var vpnKitAddresses: [String: MACAddress] = Configuration.upstreamVpnKitAddresses
+
+        /// Upstream's default UUID-to-address map.
+        public static let upstreamVpnKitAddresses: [String: MACAddress] = [
+            "c3d68012-0208-11ea-9fd7-f2189899ab08": MACAddress("5a:94:ef:e4:0c:ee")!
+        ]
 
         /// Ways this configuration cannot work, in words an operator can act on.
         ///
@@ -202,7 +218,7 @@ public final class Gateway: @unchecked Sendable {
             linkAddress: MACAddress = MACAddress("5a:94:ef:e4:0c:dd")!,
             hostAddress: IPv4Address? = nil,
             nat: [IPv4Address: IPv4Address]? = nil,
-            vpnKitAddresses: [String: MACAddress] = [:],
+            vpnKitAddresses: [String: MACAddress] = Configuration.upstreamVpnKitAddresses,
             gatewayVirtualAddresses: [IPv4Address]? = nil,
             allowsLinkLocal: Bool = false,
             captureFile: String? = nil,

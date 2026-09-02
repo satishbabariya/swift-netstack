@@ -1750,7 +1750,12 @@ try:
         print("FAIL: the init message was not echoed back verbatim for", described)
         sys.exit(1)
 
-    uuid = b"1e0a4f1a-0000-4000-8000-0123456789ab"
+    # The UUID podman sends, so the address that comes back is checkable rather
+    # than merely well-formed. Upstream maps this one to 5a:94:ef:e4:0c:ee and
+    # its DHCP reservation keys on that address; this port invented one instead,
+    # so the single thing this handshake exists to tell a guest was different on
+    # every run.
+    uuid = b"c3d68012-0208-11ea-9fd7-f2189899ab08"
     s.sendall(bytes([1]) + uuid + bytes(4))
     reply = exactly(258)
     mtu = struct.unpack("<H", reply[1:3])[0]
@@ -1767,8 +1772,12 @@ try:
         print("FAIL: the guest was given", mac.hex(":"), "which is not a locally",
               "administered unicast address, for", described)
         sys.exit(1)
-    print("ok: vpnkit the handshake gave an MTU of", mtu, "and the address", mac.hex(":"),
-          "for", described)
+    if mac.hex(":") != "5a:94:ef:e4:0c:ee":
+        print("FAIL: podman's uuid was answered with", mac.hex(":"), "rather than",
+              "upstream's 5a:94:ef:e4:0c:ee, for", described)
+        sys.exit(1)
+    print("ok: vpnkit the handshake gave an MTU of", mtu, "and upstream's address for",
+          "podman's uuid,", described)
 
     # And now it is an ordinary hyperkit wire, using the address it was handed.
     frame = (

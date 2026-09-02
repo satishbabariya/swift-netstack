@@ -461,7 +461,11 @@ let configuration = Gateway.Configuration(
     gatewayAddress: gatewayAddress, subnet: subnet,
     linkAddress: file.linkAddress ?? MACAddress("5a:94:ef:e4:0c:dd")!,
     hostAddress: hostAddress, nat: file.nat,
-    vpnKitAddresses: file.vpnKitAddresses,
+    // The file's map when it has one, upstream's default when it does not: the
+    // UUID in that default is the one podman sends, and a guest handed an
+    // invented address instead gets a different one on every run.
+    vpnKitAddresses: file.vpnKitAddresses.isEmpty
+        ? Gateway.Configuration.upstreamVpnKitAddresses : file.vpnKitAddresses,
     gatewayVirtualAddresses: file.virtualAddresses,
     allowsLinkLocal: options.allowsLinkLocal || (file.allowsLinkLocal ?? false),
     captureFile: options.captureFile ?? file.captureFile,

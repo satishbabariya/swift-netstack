@@ -114,6 +114,15 @@ an operator can see and set who may use it. `":8080"` — upstream's spelling wi
 no host — means loopback rather than `0.0.0.0`, which is the safe reading of a
 request that did not say.
 
+One default of upstream's is deliberately not carried: its DHCP reservation of
+`192.168.127.2` for the guest's hardware address. Upstream reserves that pair in
+its pool, so a guest with any other address starts at `.3`. Here the pool simply
+offers the lowest free address, which gives the same result for the one guest a
+single wire carries, and `--subnet` is a flag rather than a config key — a
+reservation hard-coded to `192.168.127.2` would be off-subnet the moment anyone
+used it. The guarantee it buys only differs under several guests at once, which
+is `--listen-switch`, where nothing expects `.2` in particular.
+
 **The guest reaches it too**, at the gateway's own address on port 80, and gets
 exactly three routes there: `/services/forwarder/all`, `/expose` and
 `/unexpose`. That is upstream's mux for the same endpoint, and the restriction
@@ -628,7 +637,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-801 tests, plus a differential harness in `differential/` that drives gVisor's
+802 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

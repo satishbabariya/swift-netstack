@@ -328,6 +328,41 @@ for field in $fields; do
 done
 
 
+# 14. Every flag gvproxy takes is one this program takes, or one the README
+#     says is deliberately absent.
+#
+# The README says "Everything else gvproxy has is here". That sentence was true
+# of the flags and false of the program: gvproxy also serves the three
+# forwarding routes to the guest at <gatewayIP>:80, and this port had nothing
+# there for its whole life underneath that claim. Nothing checked it, because
+# the claim was prose.
+#
+# This checks the part that can be checked mechanically. `scripts/upstream-flags.txt`
+# is upstream's flagSet, read out of its source and carried here because CI has
+# no Go module to read it from; its header says how to regenerate it against a
+# newer upstream.
+#
+# A flag this program does not take passes only if the README names it in a
+# sentence about being absent, which is how the SSH family passes: the point is
+# that dropping one silently is not possible, not that everything must exist.
+absent_section=$(sed -n '/^### What is not here/,/^## /p' README.md)
+while read -r flag; do
+    [[ -z "$flag" || "$flag" == \#* ]] && continue
+    if echo "$flags" | grep -qx -- "--$flag"; then
+        continue
+    fi
+    # Whole token, not substring. Written as a plain grep, a README that had
+    # renamed `--ssh-port` to `--ssh-port-renamed` still excused `--ssh-port`,
+    # because the old name is a prefix of the new one -- the rule passed while
+    # the sentence it depends on had stopped existing.
+    if echo "$absent_section" | grep -qE -- "--$flag([^a-zA-Z0-9-]|$)"; then
+        continue
+    fi
+    fail "gvproxy takes --$flag and this program neither takes it nor says why not" \
+        "a flag that quietly stopped existing is the drift this file is for"
+done < scripts/upstream-flags.txt
+
+
 # 12. The README's examples compile, and the copy that compiles is the README's.
 #
 # They are the first thing anybody runs. Every symbol in them has been renamed or

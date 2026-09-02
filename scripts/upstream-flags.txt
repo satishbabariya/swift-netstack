@@ -1,0 +1,34 @@
+# The flags gvproxy takes, from gvisor-tap-vsock v0.8.9.
+#
+# Read out of cmd/gvproxy/config.go rather than from its README, because the
+# README is prose and this is the flagSet. Regenerate against a newer upstream
+# with:
+#
+#     sed -n '/flagSet\./p' cmd/gvproxy/config.go \
+#         | grep -oE '"[a-z][a-z0-9-]+"' | tr -d '"' | sort -u
+#
+# `scripts/conventions.sh` checks that every name here is either a flag this
+# program takes or one the README says is deliberately absent. The README claims
+# "Everything else gvproxy has is here", and until this file existed nothing
+# checked that sentence -- the guest-facing forwarder API was missing from this
+# port for its whole life underneath it.
+config
+debug
+ec2-metadata-access
+forward-dest
+forward-identity
+forward-sock
+forward-user
+listen
+listen-bess
+listen-qemu
+listen-stdio
+listen-vfkit
+listen-vpnkit
+log-file
+mtu
+notification
+pcap
+pid-file
+services
+ssh-port

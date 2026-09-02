@@ -181,3 +181,46 @@ private final class NotificationListener: @unchecked Sendable {
             == "{\"notification_type\":\"connection_closed\",\"mac_address\":\"0a:0b:0c:0d:0e:0f\"}")
     #expect(NetstackNotification.Kind.hypervisorError.rawValue == "hypervisor_error")
 }
+
+@Test func readyIsAnnouncedOnceHoweverManyTimesItIsAsked() async throws {
+    // A supervisor watches one gateway come up. Two `ready` messages say it came
+    // up twice, which is a thing a supervisor acts on.
+    //
+    // This was left to the caller: the doc said to turn
+    // `announcesReadyWhenAssembled` off if you were going to announce yourself.
+    // A rule enforced by nobody is one an embedder who left the flag alone
+    // breaks, and there is no reading of `ready` under which two are better than
+    // one -- a gateway becomes ready once and then is.
+    let path = notificationPath("ready-once")
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    let listener = NotificationListener(path: path)
+    defer { listener.stop() }
+
+    var pair: [Int32] = [0, 0]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group,
+        configuration: .init(notificationSocketPath: path)
+    ).get()
+
+    // Assembly announced it. Now ask twice more, the way an embedder does who
+    // did not also turn the automatic one off.
+    _ = await listener.waitFor { !$0.isEmpty }
+    for _ in 0..<2 {
+        try await gateway.eventLoop.submit { gateway.announceReady() }.get()
+    }
+
+    // Waited for rather than sampled: a second message that has been sent and
+    // not yet delivered would otherwise be counted as absent, which is the
+    // failure this is looking for reported as a pass.
+    let settled = await listener.waitFor { messages in
+        messages.filter { $0.contains("\"ready\"") }.count > 1
+    }
+    let announced = settled.filter { $0.contains("\"ready\"") }.count
+    #expect(announced == 1, "ready was announced \(announced) times: \(settled)")
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}

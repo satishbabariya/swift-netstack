@@ -320,13 +320,30 @@ public final class Gateway: @unchecked Sendable {
     /// Say `ready` on the notification socket.
     ///
     /// For a caller that has more to bring up after this gateway exists and so
-    /// knows better than assembly does when a supervisor may act. Sending it
-    /// twice would tell a supervisor the gateway restarted, so a caller that
-    /// uses this sets `announcesReadyWhenAssembled` to false.
+    /// knows better than assembly does when a supervisor may act. Announced once
+    /// however many times this is called, so a caller does not also have to
+    /// remember to set `announcesReadyWhenAssembled` to false.
     public func announceReady() {
         eventLoop.preconditionInEventLoop()
+        // Once, whoever asks and however often.
+        //
+        // The comment here used to say that sending it twice would tell a
+        // supervisor the gateway had restarted, and leave that to the caller:
+        // set `announcesReadyWhenAssembled` to false if you are going to call
+        // this yourself. That is a rule enforced by nobody, and an embedder who
+        // left the flag alone and called this got two -- a supervisor watching
+        // one gateway told it came up twice, which is a thing supervisors act
+        // on.
+        //
+        // There is no reading of `ready` under which two are better than one:
+        // this gateway becomes ready once and then is.
+        guard !announcedReady else { return }
+        announcedReady = true
         notifications?.send(.init(kind: .ready))
     }
+
+    /// Whether `ready` has been announced for this gateway.
+    private var announcedReady = false
 
     /// Live forwards, keyed by the host port they publish on. A dictionary
     /// rather than an array because the control plane addresses them by that

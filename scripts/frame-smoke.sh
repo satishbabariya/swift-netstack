@@ -274,7 +274,7 @@ ECHO
 
     EXPECTED="$expected" GUEST="$guest" EXPECTED_HOST="$expected_host" \
         WIRE="$WIRE" PORT="$port" ARGS="$*" python3 - <<'PY'
-import os, socket, sys
+import os, socket, sys, time
 sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
 from wire import address, ones_complement, printable
 
@@ -314,9 +314,17 @@ def tcp_frame(source, destination, sport, dport, seq, ack, flags, payload=b""):
     return GATEWAY_MAC + GUEST_MAC + b"\x08\x00" + bytes(ip) + segment
 
 
-def receive(sport, dport, timeout=10):
-    """The next TCP segment of this connection, as (flags, seq, ack, payload)."""
+def receive(sport, dport, timeout=10, source=None):
+    """The next TCP segment of this connection, as (flags, seq, ack, payload).
+
+    `source` is who the segment must be from, and defaults to the host this
+    case forwards to. It exists because the gateway answers for itself as well:
+    written with the host address hard-coded, the check below for the API on
+    the gateway's own address saw every reply filtered out and reported that
+    no answer arrived, when the answer was there and addressed differently.
+    """
     s.settimeout(timeout)
+    expected = source if source is not None else host
     while True:
         try:
             frame = s.recv(4096)
@@ -326,7 +334,7 @@ def receive(sport, dport, timeout=10):
             continue
         ip = frame[14:]
         length = (ip[0] & 0x0F) * 4
-        if ip[9] != 6 or ip[12:16] != host or ip[16:20] != guest:
+        if ip[9] != 6 or ip[12:16] != expected or ip[16:20] != guest:
             continue
         segment = ip[length:int.from_bytes(ip[2:4], "big")]
         if int.from_bytes(segment[0:2], "big") != dport:
@@ -393,6 +401,87 @@ try:
         print("FAIL: the host echoed", echoed, "rather than", body, "for", described)
         sys.exit(1)
     print("ok: TCP  ", len(echoed), "bytes echoed by a real host listener for", described)
+
+    # And the listener the guest reaches inside the network: gvproxy binds an
+    # HTTP server at <gatewayIP>:80 carrying exactly the three forwarding
+    # routes, so a container can publish its own port over the network it
+    # already has, with no socket on the host at all. This port did not have one
+    # -- the README said "everything else gvproxy has is here", and this was the
+    # exception.
+    #
+    # Written here rather than in a case of its own because the guest-side TCP
+    # this needs -- the frame builder, the receive loop, the handshake -- is all
+    # in scope, and copying it would be the thing convention 8 exists to stop.
+    requests_made = []
+
+    def request(line, port=80):
+        """Open a connection to the gateway itself, send one request, read the
+        answer, and give back the status line and body.
+
+        A fresh source port each time. Reusing one meant the second request's
+        SYN arrived on a four-tuple whose connection was still open, was taken
+        for a duplicate, and went unanswered -- which reads exactly like the
+        gateway refusing the route being asked about.
+        """
+        requests_made.append(1)
+        api_port = 41000 + (os.getpid() % 1000) + len(requests_made)
+        api_seq = 900
+        s.send(tcp_frame(guest, gateway, api_port, port, api_seq, 0, SYN))
+        answer = receive(api_port, port, source=gateway)
+        if answer is None:
+            return None, "no answer to the SYN"
+        flags, their_seq, their_ack, _ = answer
+        if flags & RST:
+            return None, "the gateway refused the connection"
+        if flags & (SYN | ACK) != (SYN | ACK):
+            return None, "expected SYN-ACK, got flags " + hex(flags)
+        api_seq += 1
+        theirs = their_seq + 1
+        s.send(tcp_frame(guest, gateway, api_port, port, api_seq, theirs, ACK))
+        s.send(tcp_frame(guest, gateway, api_port, port, api_seq, theirs, PSH | ACK, line))
+
+        collected = b""
+        deadline = time.time() + 10
+        while b"\r\n\r\n" not in collected and time.time() < deadline:
+            answer = receive(api_port, port, timeout=2, source=gateway)
+            if answer is None:
+                break
+            flags, segment_seq, _, payload = answer
+            if flags & RST:
+                return None, "reset while reading the answer"
+            if payload and segment_seq == theirs:
+                collected += payload
+                theirs += len(payload)
+                s.send(tcp_frame(guest, gateway, api_port, port,
+                                 api_seq + len(line), theirs, ACK))
+        if not collected:
+            return None, "the gateway answered nothing"
+        head, _, rest = collected.partition(b"\r\n\r\n")
+        return head.split(b"\r\n")[0].decode(), rest.decode()
+
+    status, answer = request(
+        b"GET /services/forwarder/all HTTP/1.1\r\nHost: gateway\r\n\r\n")
+    if status is None:
+        print("FAIL: the guest could not reach the API on the gateway:", answer,
+              "for", described)
+        sys.exit(1)
+    if "200" not in status:
+        print("FAIL: the guest asked for the forward list and got", status, "for", described)
+        sys.exit(1)
+    print("ok: api   the guest reached", printable(gateway) + ":80 and listed forwards,",
+          "for", described)
+
+    # And only those three routes. The rest is not for a guest: /leases and /cam
+    # say who else is on the network, /services/dns/add decides what every guest
+    # resolves, and /connect hands out a place on the wire.
+    status, _ = request(b"GET /leases HTTP/1.1\r\nHost: gateway\r\n\r\n")
+    if status is None:
+        print("FAIL: the guest got no answer at all asking for /leases for", described)
+        sys.exit(1)
+    if "404" not in status:
+        print("FAIL: a guest asking for /leases got", status, "rather than 404, for", described)
+        sys.exit(1)
+    print("ok: api   and /leases is not one of them")
 finally:
     s.close()
     os.unlink(client_path)

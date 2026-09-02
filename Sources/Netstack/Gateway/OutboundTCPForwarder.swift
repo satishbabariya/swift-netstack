@@ -118,6 +118,23 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         return EventLoopFuture.andAllSucceed(closing, on: eventLoop)
     }
 
+    /// An address and port this forwarder answers itself instead of dialling.
+    ///
+    /// The gateway's own address on port 80, in practice: gvproxy serves the
+    /// three forwarding routes there so a guest can publish its own port over
+    /// the network it already has. A `NetstackServerChannel` cannot be bound
+    /// for it, and that refusal is deliberate -- see its `bind0`, which will not
+    /// displace a protocol handler silently, and this forwarder is that handler.
+    /// So the interception belongs here, where the destination is already known
+    /// and the decision is already being made.
+    public var locallyServed: (address: IPv4Address, port: UInt16)?
+
+    /// What to put on a connection that `locallyServed` matched.
+    public var serveLocally: (@Sendable (Channel) -> EventLoopFuture<Void>)?
+
+    /// Connections the guest opened to `locallyServed`, still being served.
+    public private(set) var localConnections = 0
+
     private func handle(_ request: ForwarderRequest) {
         // Link-local is refused before anything else is spent on it.
         //
@@ -140,6 +157,37 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             request.refuse()
             return
         }
+        // Served here rather than dialled, after the limit above rather than
+        // before it: this makes no host connection, but it does make a guest one
+        // and the guest is assumed hostile. A destination that answers without
+        // bounding what it hands out is the same hazard by another route.
+        if let served = locallyServed, let serve = serveLocally,
+            request.destination == served.address, request.destinationPort == served.port
+        {
+            live += 1
+            let slot = ConnectionSlot(forwarder: self)
+            guard let endpoint = (try? request.complete()) ?? nil else {
+                slot.release()
+                return
+            }
+            endpoint.keepAlive = keepAlive
+            let channel = NetstackStreamChannel(
+                eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
+            channel.installCallbacks()
+            channel.acceptedAddresses(
+                local: try? SocketAddress(
+                    ipAddress: request.destination.description, port: Int(request.destinationPort)),
+                remote: try? SocketAddress(
+                    ipAddress: request.source.description, port: Int(request.sourcePort)))
+            localConnections += 1
+            channel.closeFuture.whenComplete { [weak self] _ in
+                self?.localConnections -= 1
+                slot.release()
+            }
+            serve(channel).whenFailure { _ in channel.close(promise: nil) }
+            return
+        }
+
         // The slot is taken HERE, where the decision is made, not when the
         // splice succeeds.
         //

@@ -114,6 +114,17 @@ an operator can see and set who may use it. `":8080"` — upstream's spelling wi
 no host — means loopback rather than `0.0.0.0`, which is the safe reading of a
 request that did not say.
 
+**The guest reaches it too**, at the gateway's own address on port 80, and gets
+exactly three routes there: `/services/forwarder/all`, `/expose` and
+`/unexpose`. That is upstream's mux for the same endpoint, and the restriction
+is the point — `/leases` and `/cam` say who else is on the network,
+`/services/dns/add` decides what every guest resolves, and `/connect` and
+`/tunnel` hand out a place on the wire. A container publishing its own port is
+ordinary; a guest reading the lease table is not. It is served by the outbound
+forwarder rather than by a listener bound inside the stack, because that
+forwarder is the stack's TCP handler and a second one cannot be bound without
+silently displacing it.
+
 `Gateway` is an assembly of public parts, and unusual arrangements should reach
 past it: `WireBootstrap` for the wire, `Stack` for the stack, and
 `DHCPServer` / `DNSServer` / `OutboundTCPForwarder` / `UDPForwarder` /

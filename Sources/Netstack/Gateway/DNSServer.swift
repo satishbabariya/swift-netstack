@@ -494,3 +494,42 @@ extension DNSCodec {
         return parseQuery(rewritten)
     }
 }
+
+extension DNSServer {
+    /// The search list in a `resolv.conf`, sanitised the way upstream sanitises
+    /// it.
+    ///
+    /// A guest gets this in DHCP option 119, and without it a short name the
+    /// host can resolve is a name the guest cannot: gvproxy reads the host's
+    /// `/etc/resolv.conf` for every gateway it starts without a config file, and
+    /// this port sent an empty list unless somebody wrote one out.
+    ///
+    /// The limits are macOS's and upstream applies them there only: at most six
+    /// domains, and at most 256 characters in the line they came from, cut back
+    /// to the last space rather than through the middle of a name.
+    ///
+    /// Parsing here and reading the file in the executable, because a library
+    /// that reads `/etc/resolv.conf` has decided something for every program
+    /// that links it -- and because a pure function over the text is one a test
+    /// can put every shape into.
+    public static func searchDomains(inResolvConf text: String, applyingDarwinLimits: Bool) -> [String] {
+        let prefix = "search "
+        guard
+            var line = text.split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+                .first(where: { $0.hasPrefix(prefix) })
+        else { return [] }
+
+        if applyingDarwinLimits, line.count > 256 {
+            line = String(line.prefix(256))
+            if let lastSpace = line.lastIndex(of: " ") { line = String(line[..<lastSpace]) }
+        }
+
+        // Empty fields dropped, which upstream's split does not do: two spaces
+        // between two domains would otherwise become a zero-length label, and
+        // option 119 encodes labels by length.
+        var domains = line.dropFirst(prefix.count).split(separator: " ").map(String.init)
+        if applyingDarwinLimits, domains.count > 6 { domains = Array(domains.prefix(6)) }
+        return domains
+    }
+}

@@ -147,6 +147,13 @@ loopback, "the safe reading of a request that did not say"; this is the same
 reading applied to a request that did say, by a caller whose say-so this package
 does not take.
 
+A guest's listing leaves out the unix forwards, because those are host
+filesystem paths — podman publishes
+`/Users/<name>/.local/share/containers/podman/machine/podman.sock`, which tells a
+guest the operator's name and where their things live — and a guest can neither
+publish nor withdraw one. The tcp and udp entries stay: they are port numbers on
+a host the guest can already dial.
+
 A guest also withdraws only what guests published. Upstream serves this route to
 the guest with the same handler the host gets, so a guest there can withdraw a
 forward the operator published — measured before this changed: `200 OK`, and the
@@ -664,7 +671,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-808 tests, plus a differential harness in `differential/` that drives gVisor's
+809 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

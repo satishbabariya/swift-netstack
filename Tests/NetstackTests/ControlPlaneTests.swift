@@ -83,6 +83,55 @@ private func request(
     return (status, payload)
 }
 
+@Test func theGuestsListingLeavesOutTheHostsFilesystem() async throws {
+    // The path podman publishes is
+    // /Users/<name>/.local/share/containers/podman/machine/podman.sock, so
+    // listing it tells a guest the operator's name and where their things live.
+    // Measured before this:
+    //
+    //     PROBE: the guest sees the host's unix path: true
+    //
+    // For no use the guest has: every other route that touches a unix forward
+    // refuses it now. The tcp and udp entries stay, because they are port
+    // numbers on a host the guest can already dial.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+    let gateway = try #require(holder.gateway)
+
+    let path = NSTemporaryDirectory() + "netstack-host-\(UInt32.random(in: 0..<UInt32.max)).sock"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    let onDisk = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"\(path)\",\"remote\":\"192.168.127.2:80\",\"protocol\":\"unix\"}",
+        to: api)
+    try #require(onDisk.status == 200, "the host could not publish it: \(onDisk.body)")
+    let overTcp = try request(
+        "POST", "/services/forwarder/expose",
+        body: "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}", to: api)
+    let port = boundPort(in: overTcp.body) ?? 0
+
+    let seen = try await gateway.eventLoop.submit {
+        holder.plane!.handleForTesting(
+            method: .GET, path: "/services/forwarder/all", body: nil, fromGuest: true)
+    }.get().get()
+    #expect(!seen.body.contains(path), "the guest was shown a host path: \(seen.body)")
+    #expect(
+        seen.body.contains(":\(port)"),
+        "the guest was not shown the tcp forwards it can use: \(seen.body)")
+
+    // And the host still sees everything, or this would have hidden the forward
+    // rather than hidden it from the guest.
+    let hostSees = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(hostSees.body.contains(path), "the host cannot see its own forward: \(hostSees.body)")
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}
+
 @Test func aGuestPublishesOnLoopbackAndNowhereElse() async throws {
     // `local` carries the interface to bind and the transport to bind it with,
     // and a guest choosing either goes past what this endpoint is for.

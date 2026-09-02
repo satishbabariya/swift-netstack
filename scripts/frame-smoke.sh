@@ -200,9 +200,16 @@ try:
                 sys.exit(1)
             return body[-4:]
 
+    # Both zones. gvproxy publishes the same pair of records under
+    # `containers.internal.` and `docker.internal.`, and this port had only the
+    # first -- so `host.docker.internal`, the name a container image is most
+    # likely to have been written against, was forwarded to a public resolver
+    # and answered with whatever that said.
     for labels, wanted, sport in (
         ([b"gateway", b"containers", b"internal"], expected, 40000),
         ([b"host", b"containers", b"internal"], expected_host, 40001),
+        ([b"gateway", b"docker", b"internal"], expected, 40002),
+        ([b"host", b"docker", b"internal"], expected_host, 40003),
     ):
         asked = ".".join(part.decode() for part in labels)
         resolved = resolve(labels, sport.to_bytes(2, "big"), sport)

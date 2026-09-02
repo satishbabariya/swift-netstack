@@ -239,9 +239,18 @@ public final class Gateway: @unchecked Sendable {
             self.notificationSocketPath = notificationSocketPath
             self.announcesReadyWhenAssembled = announcesReadyWhenAssembled
             self.mtu = mtu
-            // The two names upstream publishes, so a guest written against
-            // gvisor-tap-vsock finds what it expects. Both resolve to the
-            // gateway: the host is reachable through it and only through it.
+            // The four names upstream publishes, so a guest written against
+            // gvisor-tap-vsock finds what it expects.
+            //
+            // Two zones, not one. gvproxy builds `containers.internal.` and
+            // `docker.internal.` with the same pair of records in each, and this
+            // had only the first -- so `host.docker.internal`, which is the name
+            // a container image is most likely to have been written against,
+            // resolved here by being forwarded to a public resolver and coming
+            // back with whatever that said. The zones are derived from these
+            // records' parent domains, so the second pair also makes
+            // `anything.docker.internal` this gateway's to say no to, which is
+            // what upstream's zone does.
             // `host.containers.internal` resolves to the HOST address, not to
             // the gateway. They were the same here once, and that was wrong in a
             // way nothing failed on: a guest that resolved the name got the
@@ -253,6 +262,8 @@ public final class Gateway: @unchecked Sendable {
                 dnsRecords ?? [
                     .init(name: "gateway.containers.internal", address: gatewayAddress),
                     .init(name: "host.containers.internal", address: hostAddress),
+                    .init(name: "gateway.docker.internal", address: gatewayAddress),
+                    .init(name: "host.docker.internal", address: hostAddress),
                 ]
             self.upstreamResolvers = upstreamResolvers
             self.leaseSeconds = leaseSeconds

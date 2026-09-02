@@ -68,10 +68,19 @@ private func readmeUsingIt() async throws {
     // "Guests cannot reach 169.254.0.0/16 by default."
     #expect(!configuration.allowsLinkLocal)
 
-    // The two names upstream publishes, which the README quotes.
+    // The four names upstream publishes, which the README quotes.
+    //
+    // gvproxy builds `containers.internal.` and `docker.internal.` with the same
+    // pair of records in each. This had only the first pair, and this assertion
+    // said "the two names upstream publishes" while checking exactly the two it
+    // knew about -- so `host.docker.internal`, the name a container image is
+    // most likely to have been written against, was resolved by forwarding it
+    // to a public resolver.
     let names = Set(configuration.dnsRecords.map(\.name))
     #expect(names.contains("gateway.containers.internal"))
     #expect(names.contains("host.containers.internal"))
+    #expect(names.contains("gateway.docker.internal"))
+    #expect(names.contains("host.docker.internal"))
 
     // "Reno is the default and CUBIC is opt-in", "RACK ... is there and opt-in".
     let endpoint = TCPEndpoint.self

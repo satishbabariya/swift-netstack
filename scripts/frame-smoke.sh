@@ -449,9 +449,20 @@ try:
 
         collected = b""
         deadline = time.time() + 20
+        quiet = 0
         while b"\r\n\r\n" not in collected and time.time() < deadline:
             answer = receive(api_port, port, timeout=2, source=gateway)
             if answer is None:
+                # Sent again, because nothing else will send it. This is a TCP
+                # client written by hand and it does not retransmit, so a single
+                # frame lost on a loaded machine is a request the gateway never
+                # completes -- it answers 408 after its own idle timeout, and
+                # this reported that as the gateway refusing the route. A real
+                # stack would have resent it long before.
+                quiet += 1
+                if quiet % 2 == 0:
+                    s.send(
+                        tcp_frame(guest, gateway, api_port, port, api_seq, theirs, PSH | ACK, line))
                 # A quiet two seconds is not an answer of "nothing" -- it is two
                 # seconds. Written as a `break`, the deadline above was never
                 # the deadline: the first gap ended the wait, and a loaded CI

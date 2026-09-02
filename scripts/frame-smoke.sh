@@ -448,11 +448,17 @@ try:
         s.send(tcp_frame(guest, gateway, api_port, port, api_seq, theirs, PSH | ACK, line))
 
         collected = b""
-        deadline = time.time() + 10
+        deadline = time.time() + 20
         while b"\r\n\r\n" not in collected and time.time() < deadline:
             answer = receive(api_port, port, timeout=2, source=gateway)
             if answer is None:
-                break
+                # A quiet two seconds is not an answer of "nothing" -- it is two
+                # seconds. Written as a `break`, the deadline above was never
+                # the deadline: the first gap ended the wait, and a loaded CI
+                # runner produced one, reporting that the gateway had answered
+                # nothing when it had not yet been given the time this claims to
+                # give it.
+                continue
             flags, segment_seq, _, payload = answer
             if flags & RST:
                 return None, "reset while reading the answer"

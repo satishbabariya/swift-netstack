@@ -118,8 +118,49 @@ private func answeredAddress(_ reply: ByteBuffer) -> IPv4Address? {
     return IPv4Address(bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
+private func answeredTimeToLive(_ reply: ByteBuffer) -> UInt32? {
+    var buffer = reply
+    guard buffer.readableBytes > 12 else { return nil }
+    _ = buffer.readSlice(length: 4)
+    guard let questions = buffer.readInteger(endianness: .big, as: UInt16.self),
+        let answers = buffer.readInteger(endianness: .big, as: UInt16.self),
+        questions == 1, answers == 1
+    else { return nil }
+    _ = buffer.readSlice(length: 4)
+    while let length = buffer.readInteger(as: UInt8.self), length != 0 {
+        guard buffer.readSlice(length: Int(length)) != nil else { return nil }
+    }
+    guard buffer.readSlice(length: 4) != nil else { return nil }
+    // Name pointer, type, class, then the TTL.
+    guard buffer.readSlice(length: 2) != nil, buffer.readSlice(length: 2) != nil,
+        buffer.readSlice(length: 2) != nil
+    else { return nil }
+    return buffer.readInteger(endianness: .big, as: UInt32.self)
+}
+
 private func responseCode(_ reply: ByteBuffer) -> UInt16? {
     reply.getInteger(at: reply.readerIndex + 2, endianness: .big, as: UInt16.self).map { $0 & 0x000F }
+}
+
+@Test func anAnswerThisGatewayMakesItselfIsNotCached() async throws {
+    // These records change while the gateway runs -- `/services/dns/add` is how
+    // podman points a name at a container that has just started -- so an answer
+    // a guest cached is an answer that can be wrong, with no second lookup to
+    // correct it until the cache expires.
+    //
+    // This defaulted to 60 seconds: a minute of a guest resolving a name to
+    // wherever it used to point. Every answer gvproxy builds carries Ttl: 0, in
+    // all four places it builds one.
+    let fixture = try DNSFixture(records: [
+        .init(name: "gateway.containers.internal", address: dnsGateway)
+    ])
+    defer { fixture.drain() }
+
+    fixture.ask(dnsQuery("gateway.containers.internal"))
+
+    let reply = try #require(fixture.replies().first)
+    #expect(answeredAddress(reply) == dnsGateway, "the name was not answered locally")
+    #expect(answeredTimeToLive(reply) == 0, "a record that can change was given a lifetime")
 }
 
 @Test func aNameTheGatewayOwnsIsAnsweredWithItsAddress() throws {

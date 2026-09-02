@@ -158,6 +158,18 @@ public final class DNSServer: @unchecked Sendable {
     private let upstream: [SocketAddress]
     private let maximumPending: Int
     private let timeout: TimeAmount
+    /// The TTL on an answer this gateway makes itself. Zero, as upstream's is.
+    ///
+    /// These records are mutable while the gateway runs -- `/services/dns/add`
+    /// is how podman points a name at a container that has just started -- so an
+    /// answer cached by a guest is an answer that can be wrong, and there is no
+    /// second lookup to correct it until the cache expires. It defaulted to 60
+    /// here, which is a minute of a guest resolving a name to wherever it used
+    /// to point.
+    ///
+    /// Every answer gvproxy builds carries `Ttl: 0`, in all four places it
+    /// builds one. The cost is a query per lookup, answered from a table in this
+    /// process without touching the network.
     private let ttl: UInt32
 
     private var upstreamChannel: Channel?
@@ -184,7 +196,7 @@ public final class DNSServer: @unchecked Sendable {
 
     public init(
         stack: Stack, records: [StaticRecord], upstream: [SocketAddress] = [],
-        maximumPending: Int = 256, timeout: TimeAmount = .seconds(5), ttl: UInt32 = 60
+        maximumPending: Int = 256, timeout: TimeAmount = .seconds(5), ttl: UInt32 = 0
     ) throws {
         self.stack = stack
         self.records = Dictionary(records.map { ($0.name, $0.address) }, uniquingKeysWith: { first, _ in first })

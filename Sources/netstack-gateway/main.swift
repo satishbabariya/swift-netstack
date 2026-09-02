@@ -52,13 +52,38 @@ struct Options {
     static func parse(_ arguments: [String]) throws -> Options {
         var options = Options()
         var index = 0
+        // A value attached with `=`, when the caller wrote one.
+        var attached: String?
         func value(_ flag: String) throws -> String {
+            if let attached { return attached }
             index += 1
             guard index < arguments.count else { throw OptionError.missingValue(flag) }
             return arguments[index]
         }
         while index < arguments.count {
-            let flag = arguments[index]
+            let argument = arguments[index]
+
+            // One dash or two, and a value beside the flag or after it.
+            //
+            // Go's `flag` package treats `-x` and `--x` as the same flag and
+            // accepts `-x=v` as well as `-x v`, so every gvproxy command line
+            // in the wild uses whichever its author preferred -- its own README
+            // uses one dash, and so does the `sandbox` that spawns it:
+            //
+            //     "-listen-vfkit", "unixgram://\(gatewaySocket.path)",
+            //
+            // This took two dashes and a separate value, and answered anything
+            // else with `unknown option -listen-vfkit`. The flag names were
+            // gvproxy's and the command lines still did not move across.
+            attached = nil
+            var flag = argument
+            if let equals = flag.firstIndex(of: "="), flag.hasPrefix("-") {
+                attached = String(flag[flag.index(after: equals)...])
+                flag = String(flag[flag.startIndex..<equals])
+            }
+            if flag.hasPrefix("-"), !flag.hasPrefix("--"), flag.count > 1 {
+                flag = "-" + flag
+            }
             switch flag {
             // gvproxy's spellings. `--listen` is the CONTROL endpoint there and
             // the guest wire is `--listen-vfkit` or `--listen-qemu`; this had
@@ -70,16 +95,21 @@ struct Options {
             case "--services": options.servicesEndpoints.append(try value(flag))
             case "--pid-file": options.pidFile = try value(flag)
             case "--log-file": options.logFile = try value(flag)
-            case "--listen-vfkit": options.listenPath = try value(flag)
-            case "--listen-qemu": options.listenStream = try value(flag)
-            case "--listen-switch": options.listenSwitch = try value(flag)
+            case "--listen-vfkit":
+                options.listenPath = try wirePath(value(flag), flag, datagram: true)
+            case "--listen-qemu":
+                options.listenStream = try wirePath(value(flag), flag, datagram: false)
+            case "--listen-switch":
+                options.listenSwitch = try wirePath(value(flag), flag, datagram: false)
             case "--listen-stdio":
                 // Upstream takes a value here and only checks that it is not
                 // empty, so the value is consumed and ignored the same way.
                 _ = try value(flag)
                 options.listenStdio = true
-            case "--listen-vpnkit": options.listenVpnKit = try value(flag)
-            case "--listen-bess": options.listenBess = try value(flag)
+            case "--listen-vpnkit":
+                options.listenVpnKit = try wirePath(value(flag), flag, datagram: false)
+            case "--listen-bess":
+                options.listenBess = try wirePath(value(flag), flag, datagram: false)
             case "--dns": options.upstreamResolver = try value(flag)
             case "--gatewayIP": options.gateway = try value(flag)
             case "--hostIP": options.host = try value(flag)
@@ -115,7 +145,10 @@ struct Options {
             case "--help", "-h":
                 throw OptionError.help
             default:
-                throw OptionError.unknown(flag)
+                // The spelling the caller used, not the one this normalised it
+                // to: an error naming `--bogus` when they wrote `-bogus` sends
+                // them looking for a flag they did not type.
+                throw OptionError.unknown(argument)
             }
             index += 1
         }
@@ -327,6 +360,38 @@ if wires.count > 1 {
 /// Every failure here is silent on purpose. Nothing is listening is the
 /// ordinary case -- `--notification` names where to send, not a promise that
 /// somebody is there -- and the error being reported has already been printed.
+/// The path in a wire endpoint, in either spelling.
+///
+/// Upstream requires a URL and this took a bare path, so a gvproxy command line
+/// did not move across for any wire -- the flag names matched and the values did
+/// not parse. `-listen-vfkit unixgram:///run/vm.sock` tried to bind a socket
+/// named `unixgram:///run/vm.sock`:
+///
+///     error: bind unixgram:///.../w.sock: No such file or directory (errno: 2)
+///
+/// That is what a VM host actually passes. `VZFileHandleNetworkDeviceAttachment`
+/// takes a datagram socket, and the tools that drive it hand gvproxy the URL its
+/// transport requires: `unixgram://` for the vfkit wire, `unix://` for the
+/// stream ones.
+///
+/// A bare path still works. It is what every example here uses, it is what
+/// somebody types by hand, and refusing it to match upstream exactly would be
+/// pedantry rather than compatibility.
+///
+/// A scheme that belongs to neither is refused with the scheme named, because
+/// upstream serves the stream wires over `tcp://` as well and this does not: a
+/// gateway that bound a file called `tcp://0.0.0.0:1234` would be a worse answer
+/// than saying so.
+func wirePath(_ text: String, _ flag: String, datagram: Bool) throws -> String {
+    let expected = datagram ? "unixgram" : "unix"
+    guard let separator = text.range(of: "://") else { return text }
+    let scheme = String(text[text.startIndex..<separator.lowerBound])
+    guard scheme == expected else {
+        throw OptionError.badValue(flag, "\(text) -- \(flag) takes a path or \(expected)://")
+    }
+    return String(text[separator.upperBound...])
+}
+
 /// The host's DNS search list, as a guest should inherit it.
 ///
 /// Reading the file is here rather than in the library: a library that opens

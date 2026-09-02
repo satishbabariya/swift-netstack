@@ -2442,6 +2442,313 @@ PY
     return $outcome
 }
 
+# A guest booting, using only what it was told.
+#
+# Every other case here sets its own addresses up from the arguments it was
+# given, so each checks one exchange against a value the test already knew. That
+# is the shape of check that stayed green while `host.containers.internal`
+# answered 192.168.127.254 on a 10.7.0.0/24 network: DNS was asked for a name and
+# gave an address, the case compared it against the address it had computed the
+# same way the gateway had, and nothing dialled it.
+#
+# This one hard-codes one thing, the name. The lease says which address the guest
+# has and which router and resolver to use; the router is ARPed for; the resolver
+# is asked for the host's name; and the address that comes back is dialled. A
+# gateway that hands out a coherent lease and then names something unreachable
+# fails here and nowhere else.
+boot_smoke() {
+    local described="$1"
+    shift
+    LISTENER="${TMPDIR:-/tmp}/netstack-smoke-boot-$$.py"
+    cat > "$LISTENER" <<'ECHO'
+import socket, sys
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", 0))
+server.listen(4)
+with open(sys.argv[1], "w") as out:
+    out.write(str(server.getsockname()[1]))
+connection, _ = server.accept()
+data = connection.recv(4096)
+connection.sendall(data.upper())
+connection.close()
+ECHO
+    python3 "$LISTENER" "$LISTENER.port" &
+    ECHO_PID=$!
+    local port=""
+    for _ in $(seq 1 120); do
+        [[ -s "$LISTENER.port" ]] && { port="$(cat "$LISTENER.port")"; break; }
+        sleep 0.25
+    done
+    [[ -n "$port" ]] || { echo "FAIL: the boot listener never bound"; return 1; }
+
+    WIRE="${TMPDIR:-/tmp}/netstack-smoke-boot-$$.sock"
+    rm -f "$WIRE"
+    # shellcheck disable=SC2086
+    "$binary" --listen-vfkit "$WIRE" $* >/dev/null 2>&1 &
+    GATEWAY=$!
+    for _ in $(seq 1 120); do
+        [[ -S "$WIRE" ]] && break
+        sleep 0.25
+    done
+    [[ -S "$WIRE" ]] || { echo "FAIL: the boot gateway never came up"; return 1; }
+
+    WIRE="$WIRE" PORT="$port" ARGS="$described" python3 - <<'PY'
+import os, socket, sys, time
+
+sys.path.insert(0, os.environ["SMOKE_SUPPORT"])
+from wire import (
+    arp_request, dhcp, dhcp_options, dns_answer, dns_query, ethernet, ipv4, ones_complement,
+    printable,
+)
+
+MAC = bytes.fromhex("5a94efe4bc00")
+described = os.environ["ARGS"] or "(defaults)"
+host_port = int(os.environ["PORT"])
+
+wire = os.environ["WIRE"]
+client_path = wire + ".client"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(client_path)
+
+
+def wait_for(predicate, what, seconds=10):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        s.settimeout(max(0.1, deadline - time.time()))
+        try:
+            frame = s.recv(4096)
+        except socket.timeout:
+            break
+        found = predicate(frame)
+        if found is not None:
+            return found
+    print("FAIL:", what, "for", described)
+    sys.exit(1)
+
+
+try:
+    s.connect(wire)
+
+    # 1. The lease. Everything after this comes out of it.
+    s.send(dhcp(MAC, 1))
+    offered, options = wait_for(
+        lambda f: (lambda o: o if o[1].get(53, b"\x00")[0] == 2 else None)(dhcp_options(f))
+        if len(f) > 280 and f[12:14] == b"\x08\x00" else None,
+        "no DHCP offer arrived")
+    router = options.get(3)
+    resolver = options.get(6)
+    if router is None or resolver is None:
+        print("FAIL: the offer named no router or no resolver for", described)
+        sys.exit(1)
+    s.send(dhcp(MAC, 3, requested=offered, server=options.get(54)))
+    leased, _ = wait_for(
+        lambda f: (lambda o: o if o[1].get(53, b"\x00")[0] == 5 else None)(dhcp_options(f))
+        if len(f) > 280 and f[12:14] == b"\x08\x00" else None,
+        "the request was not acknowledged")
+    if leased != offered:
+        print("FAIL: offered", printable(offered), "and acknowledged", printable(leased),
+              "for", described)
+        sys.exit(1)
+    print("ok: boot  leased", printable(leased), "router", printable(router),
+          "resolver", printable(resolver), "for", described)
+
+    # 2. The router, by ARP, at the address the lease gave.
+    s.send(arp_request(MAC, leased, router))
+    router_mac = wait_for(
+        lambda f: f[22:28] if len(f) >= 42 and f[12:14] == b"\x08\x06"
+        and f[20:22] == b"\x00\x02" and f[28:32] == router else None,
+        "the router did not answer ARP")
+
+    # 3. The host's name, asked of the resolver the lease gave.
+    s.send(ethernet(router_mac, MAC, b"\x08\x00",
+                    dns_query("host.containers.internal", leased, resolver, 41000)))
+    host = wait_for(
+        lambda f: dns_answer(f) if len(f) > 42 and f[12:14] == b"\x08\x00"
+        and f[14 + (f[14] & 0x0F) * 4:][0:2] == b"\x00\x35" else None,
+        "the resolver did not answer host.containers.internal")
+    print("ok: boot  host.containers.internal ->", printable(host), "for", described)
+
+    # 4. A connection to it, on a port a real listener holds.
+    SYN, ACK, PSH = 0x02, 0x10, 0x08
+
+    def segment(flags, seq, ack, payload=b""):
+        header = (
+            (40000).to_bytes(2, "big") + host_port.to_bytes(2, "big")
+            + seq.to_bytes(4, "big") + ack.to_bytes(4, "big")
+            + bytes([5 << 4, flags]) + (65535).to_bytes(2, "big") + b"\x00\x00\x00\x00"
+        )
+        body = header + payload
+        pseudo = leased + host + b"\x00\x06" + len(body).to_bytes(2, "big")
+        body = body[:16] + ones_complement(pseudo + body).to_bytes(2, "big") + body[18:]
+        return ethernet(router_mac, MAC, b"\x08\x00", ipv4(leased, host, 6, body))
+
+    def inbound(frame):
+        if len(frame) < 54 or frame[12:14] != b"\x08\x00":
+            return None
+        body = frame[14:]
+        if body[9] != 6 or body[12:16] != host or body[16:20] != leased:
+            return None
+        piece = body[(body[0] & 0x0F) * 4:]
+        if int.from_bytes(piece[0:2], "big") != host_port:
+            return None
+        return piece
+
+    s.send(segment(SYN, 1000, 0))
+    answer = wait_for(
+        lambda f: (lambda p: p if p is not None and p[13] & (SYN | ACK) == (SYN | ACK) else None)(
+            inbound(f)),
+        "the connection to the host was not answered")
+    theirs = int.from_bytes(answer[4:8], "big") + 1
+    s.send(segment(ACK, 1001, theirs))
+    body = b"a guest that believed what it was told"
+    s.send(segment(PSH | ACK, 1001, theirs, body))
+
+    echoed = b""
+    deadline = time.time() + 15
+    while len(echoed) < len(body) and time.time() < deadline:
+        piece = wait_for(lambda f: inbound(f), "the echo did not come back", seconds=5)
+        payload = piece[(piece[12] >> 4) * 4:]
+        if payload:
+            echoed += payload
+            s.send(segment(ACK, 1001 + len(body), theirs + len(echoed)))
+    if echoed != body.upper():
+        print("FAIL: the host echoed", echoed, "rather than", body.upper(), "for", described)
+        sys.exit(1)
+    print("ok: boot ", len(echoed), "bytes to the host at the address the gateway named,",
+          "for", described)
+finally:
+    s.close()
+    os.unlink(client_path)
+PY
+    local outcome=$?
+    kill "$GATEWAY" 2>/dev/null
+    wait "$GATEWAY" 2>/dev/null
+    GATEWAY=""
+    kill "$ECHO_PID" 2>/dev/null
+    wait "$ECHO_PID" 2>/dev/null
+    ECHO_PID=""
+    rm -f "$WIRE" "$LISTENER" "$LISTENER.port"
+    return $outcome
+}
+
+# The two spellings of a wire endpoint.
+#
+# Upstream requires a URL and this took a bare path, so a gvproxy command line
+# did not move across for any wire: the flag names matched and the values did
+# not parse. Measured before this, with what a VM host actually passes:
+#
+#     error: bind unixgram:///.../w.sock: No such file or directory (errno: 2)
+#
+# `transport.ListenUnixgram` refuses anything but `unixgram://` and
+# `transport.Listen` anything but `unix://` or `tcp://`, so that is what the
+# tools driving `VZFileHandleNetworkDeviceAttachment` hand it.
+wire_scheme_smoke() {
+    local directory="${TMPDIR:-/tmp}/netstack-smoke-scheme-$$"
+    rm -rf "$directory"
+    mkdir -p "$directory" || { echo "FAIL: could not make $directory"; return 1; }
+    local failures=0
+
+    # The command line as a whole rather than a flag and a value, because one of
+    # the spellings being checked carries its value in the flag and there is no
+    # second argument to take.
+    binds() {
+        local description="$1"
+        shift
+        rm -f "$directory/s.sock"
+        "$binary" "$@" >"$directory/err.txt" 2>&1 &
+        GATEWAY=$!
+        local bound=0
+        for _ in $(seq 1 120); do
+            [[ -S "$directory/s.sock" ]] && { bound=1; break; }
+            kill -0 "$GATEWAY" 2>/dev/null || break
+            sleep 0.25
+        done
+        kill "$GATEWAY" 2>/dev/null
+        wait "$GATEWAY" 2>/dev/null
+        GATEWAY=""
+        if [[ $bound -eq 0 ]]; then
+            echo "FAIL: $description did not bind: $(head -1 "$directory/err.txt")"
+            failures=1
+        fi
+    }
+
+    refuses() {
+        local description="$1"
+        shift
+        rm -f "$directory/s.sock"
+        "$binary" "$@" >"$directory/err.txt" 2>&1 &
+        GATEWAY=$!
+        for _ in $(seq 1 120); do
+            kill -0 "$GATEWAY" 2>/dev/null || break
+            [[ -S "$directory/s.sock" ]] && break
+            sleep 0.25
+        done
+        local started=0
+        [[ -S "$directory/s.sock" ]] && started=1
+        kill "$GATEWAY" 2>/dev/null
+        wait "$GATEWAY" 2>/dev/null
+        GATEWAY=""
+        if [[ $started -eq 1 ]]; then
+            echo "FAIL: $description bound a socket instead of being refused"
+            failures=1
+            return
+        fi
+        if ! grep -q "takes a path or" "$directory/err.txt"; then
+            echo "FAIL: $description was refused without saying what it takes:" \
+                "$(head -1 "$directory/err.txt")"
+            failures=1
+        fi
+    }
+
+    # One dash or two, and the value beside the flag or after it. Go's `flag`
+    # package treats all four as the same command line, so every gvproxy
+    # invocation in the wild uses whichever its author preferred -- upstream's
+    # own README uses one dash, and so does the `sandbox` that spawns it:
+    #
+    #     "-listen-vfkit", "unixgram://\(gatewaySocket.path)",
+    #
+    # This answered that with `unknown option -listen-vfkit`.
+    binds "vfkit with one dash" -listen-vfkit "unixgram://$directory/s.sock"
+    binds "vfkit with an attached value" "--listen-vfkit=$directory/s.sock"
+    binds "vfkit with one dash and an attached url" \
+        "-listen-vfkit=unixgram://$directory/s.sock"
+
+    binds "vfkit with unixgram://" --listen-vfkit "unixgram://$directory/s.sock"
+    binds "vfkit with a bare path" --listen-vfkit "$directory/s.sock"
+    binds "qemu with unix://" --listen-qemu "unix://$directory/s.sock"
+    binds "qemu with a bare path" --listen-qemu "$directory/s.sock"
+    binds "switch with unix://" --listen-switch "unix://$directory/s.sock"
+    binds "vpnkit with unix://" --listen-vpnkit "unix://$directory/s.sock"
+
+    # Upstream serves the stream wires over tcp:// as well and this does not.
+    # Binding a file called `tcp://0.0.0.0:1234` would be a worse answer than
+    # saying so.
+    refuses "vfkit with tcp://" --listen-vfkit "tcp://0.0.0.0:1234"
+
+    # And an unknown flag is reported as it was typed. Normalising one dash to
+    # two before the error is built would send somebody looking for `--bogus`
+    # when they wrote `-bogus`.
+    # Captured before it is matched. Piping into grep here reports the failure
+    # of the binary -- which is the point, it was given a bad flag -- rather than
+    # whether the text matched, under the `pipefail` this file sets. Written that
+    # way it failed while printing the very message it was looking for.
+    local said
+    said="$("$binary" -bogus 2>&1 | head -1)"
+    case "$said" in
+        *"unknown option -bogus"*) ;;
+        *)
+            echo "FAIL: an unknown flag was not reported as it was typed: $said"
+            failures=1
+            ;;
+    esac
+    refuses "qemu with unixgram://" --listen-qemu "unixgram://$directory/s.sock"
+
+    rm -rf "$directory"
+    [[ $failures -eq 0 ]] || return 1
+    echo "ok: wire  a path and upstream's url both name the same socket"
+}
+
 # The instance metadata service, and the flag that opens it.
 #
 # A guest that reaches 169.254.169.254 on a cloud host is asking the host's
@@ -2908,6 +3215,15 @@ tunnel_smoke 192.168.127.1 192.168.127.2 || status=1
 
 # And the address a guest must not reach by accident.
 gateway_mac_smoke || status=1
+
+wire_scheme_smoke || status=1
+
+# The whole sequence, on the default network and on one where every address is
+# derived rather than defaulted -- which is where a name that points off-subnet
+# hides.
+boot_smoke "(defaults)" || status=1
+boot_smoke "--gatewayIP 10.7.0.1 --subnet 10.7.0.0/24 --hostIP 10.7.0.254" \
+    --gatewayIP 10.7.0.1 --subnet 10.7.0.0/24 --hostIP 10.7.0.254 || status=1
 
 mtu_smoke || status=1
 

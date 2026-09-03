@@ -66,6 +66,352 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func aSecondCloseWhileTheFirstIsWaitingDoesNotStrandIt() async throws {
+    // A deferred close stores its promise. A second close arriving while the
+    // first still waits used to overwrite it, and the first caller was then
+    // waiting on a completion that had been discarded -- a promise that never
+    // reaches a terminal state, which in NIO is a leak with a precondition
+    // failure attached to it.
+    //
+    // Closing twice is not exotic: a splice closes from either side, and both
+    // sides can end at once.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture, installRecorder: false)
+        try withExtendedLifetime(server) {
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = fixture.drainSegments().first { $0.header.flags.contains(.syn) }
+            let iss = synAck?.header.sequence.value ?? 0
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack], window: 200))
+            let child = try #require(collector.children.first)
+            _ = fixture.drainSegments()
+
+            var written = 0
+            while written < TCPEndpoint.sendBufferBytes + 64 * 1024 {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                child.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            _ = fixture.drainSegments()
+
+            let first = child.eventLoop.makePromise(of: Void.self)
+            let firstOutcome = Outcome()
+            first.futureResult.whenComplete { firstOutcome.result = $0 }
+            child.close(promise: first)
+
+            let second = child.eventLoop.makePromise(of: Void.self)
+            let secondOutcome = Outcome()
+            second.futureResult.whenComplete { secondOutcome.result = $0 }
+            child.close(promise: second)
+
+            guard case .failure(let error) = secondOutcome.result else {
+                Issue.record("the second close was accepted: \(String(describing: secondOutcome.result))")
+                return
+            }
+            #expect(error as? ChannelError == .alreadyClosed)
+
+            // And the first still finishes, rather than being forgotten.
+            var acknowledged = UInt32(0)
+            for _ in 0..<400 where firstOutcome.result == nil {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: iss &+ 1 &+ acknowledged, flags: [.ack],
+                        window: 32000))
+                acknowledged += UInt32(
+                    fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes })
+            }
+            #expect(
+                firstOutcome.result != nil,
+                "the first close never completed, so its caller waits for ever")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aClosedChannelDoesNotTakeItsConnectionWithItMidSend() async throws {
+    // The channel is normally the last strong reference to its endpoint -- the
+    // demuxer holds delegates weakly, deliberately -- and `close()` is
+    // asynchronous, because the FIN waits behind the payload and the payload
+    // waits on the peer's window. So releasing the channel the moment its own
+    // queue empties deallocates a connection with bytes still to send.
+    //
+    // What this test does NOT do is prove that, and neither does anything else
+    // here. It was written to, and it cannot: mutating the retention away
+    // leaves it passing, because ARC is under no obligation to release a local
+    // at the end of its scope and in a debug build it generally does not. The
+    // acceptance script's reset check does not falsify it either -- the
+    // symptom it was written for is a race, seen twice and not reproducible on
+    // demand.
+    //
+    // So the retention is justified by the endpoint's contract rather than by a
+    // guard: the demuxer holds its delegates weakly, this channel is the last
+    // strong reference, and `close()` is asynchronous by that type's own
+    // documentation -- "`onClosed` is the only way to learn it finished".
+    // Releasing the endpoint before then can only end a connection early. It is
+    // not in `guards.tsv`, because a row there would report an outcome it did
+    // not earn.
+    //
+    // What this test does keep is worth keeping on its own: the connection
+    // finishes what it was given, and ends, with the channel closed.
+    let fixture = TCPFixture()
+    do {
+        var acknowledged = UInt32(0)
+        var written = 0
+        weak var observed: TCPEndpoint?
+        do {
+            let endpoint = try listeningEndpoint(fixture)
+            let channel = NetstackStreamChannel(
+                eventLoop: fixture.stack.eventLoop, endpoint: endpoint, owns: true, parent: nil)
+            channel.installCallbacks()
+            channel.registerAlreadyConfigured0(promise: nil)
+
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 200))
+            _ = fixture.drainSegments()
+
+            while written < TCPEndpoint.sendBufferBytes {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                channel.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            acknowledged = UInt32(fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes })
+            channel.close(promise: nil)
+            #expect(
+                endpoint.owedBytes > 0,
+                "positive control: the connection should still owe bytes when the channel goes")
+            observed = endpoint
+        }
+        // Driven so that `finish`'s deferred handler removal actually runs.
+        // That is what breaks the channel <-> pipeline cycle and releases the
+        // channel, and with it the only strong reference to the endpoint --
+        // without it the references linger and this test measures nothing.
+        fixture.advance(by: .milliseconds(1))
+        #expect(
+            observed != nil,
+            "the connection was deallocated with bytes still owed, so nothing can send them")
+
+        // The channel and every reference this test held are gone.
+        var delivered = Int(acknowledged)
+        var sawFin = false
+        for _ in 0..<400 where !sawFin {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS &+ 1 &+ UInt32(delivered), flags: [.ack],
+                    window: 32000))
+            let more = fixture.drainSegments()
+            delivered += more.reduce(0) { $0 + $1.payload.readableBytes }
+            sawFin = more.contains { $0.header.flags.contains(.fin) }
+        }
+        #expect(delivered == written, "\(written - delivered) bytes died with the channel")
+        #expect(sawFin, "the connection stopped mid-stream and never ended")
+    }
+    fixture.drain()
+}
+
+@Test func aDeferredCloseEndsWithAFinRatherThanSilence() async throws {
+    // The channel the outbound forwarder builds OWNS its endpoint, so its close
+    // is the whole close: nobody else will send the FIN. A close deferred
+    // behind a full queue therefore has to arrive at one, or the peer is left
+    // waiting on a stream nothing will ever end.
+    //
+    // A real guest saw exactly that. A host reset mid-transfer, the gateway
+    // handed on the 539,085 bytes it was holding, and then sent nothing at all
+    // -- no FIN, no reset -- until the guest's own timeout gave up 40 seconds
+    // later. Note the shape: the server-child tests above cannot see this,
+    // because a child does not own its endpoint and its owner sends the FIN.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let channel = NetstackStreamChannel(
+            eventLoop: fixture.stack.eventLoop, endpoint: endpoint, owns: true, parent: nil)
+        withExtendedLifetime(channel) {
+            channel.allowHalfClosure()
+            channel.installCallbacks()
+            channel.registerAlreadyConfigured0(promise: nil)
+
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 200))
+            _ = fixture.drainSegments()
+
+            var written = 0
+            while written < TCPEndpoint.sendBufferBytes + 128 * 1024 {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                channel.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            var delivered = fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes }
+
+            channel.close(promise: nil)
+
+            var acknowledged = UInt32(delivered)
+            var sawFin = false
+            for _ in 0..<400 where !sawFin {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: gatewayISS &+ 1 &+ acknowledged, flags: [.ack],
+                        window: 32000))
+                let more = fixture.drainSegments()
+                delivered += more.reduce(0) { $0 + $1.payload.readableBytes }
+                acknowledged = UInt32(delivered)
+                sawFin = more.contains { $0.header.flags.contains(.fin) }
+            }
+            #expect(delivered == written, "\(written - delivered) bytes were discarded by the close")
+            #expect(sawFin, "the queue drained and the connection was left open in silence")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aCloseWaitingOnAPeerThatStopsReadingGivesUp() async throws {
+    // The deferral above waits for the peer's window, and a peer can decline to
+    // open it for ever. That would be a channel, an endpoint and -- on a
+    // gateway -- the host socket spliced to it, held by a guest that has only
+    // to stop reading.
+    //
+    // The first version of this test asserted that the CONNECTION bounded it:
+    // persist, then keep-alive, then a reset. It does not, and it must not --
+    // RFC 1122 §4.2.2.17 makes timing out a zero-window connection a MUST NOT,
+    // and this package honours that deliberately. The counterweight RFC 6429 §4
+    // names is the application's close, which is exactly what the deferral had
+    // taken away. So the bound is the channel's own, and this test is what
+    // found that out: written to confirm a claim, it failed, and the claim was
+    // wrong rather than the test.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture, installRecorder: false)
+        try withExtendedLifetime(server) {
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = fixture.drainSegments().first { $0.header.flags.contains(.syn) }
+            let iss = synAck?.header.sequence.value ?? 0
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack], window: 200))
+            let child = try #require(collector.children.first)
+            _ = fixture.drainSegments()
+
+            var written = 0
+            while written < TCPEndpoint.sendBufferBytes + 128 * 1024 {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                child.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            _ = fixture.drainSegments()
+
+            let closed = child.eventLoop.makePromise(of: Void.self)
+            // Read through a box rather than waited on. Without the linger this
+            // promise is never settled at all, so a `wait()` here would hang
+            // the falsification instead of failing it -- and a gate that hangs
+            // reports nothing. It hung, which is how this got noticed.
+            let outcome = Outcome()
+            closed.futureResult.whenComplete { outcome.result = $0 }
+            child.close(promise: closed)
+            #expect(child.isActive, "positive control: the close is waiting, not done")
+
+            // A guest that is present, answering, and simply not reading:
+            // every probe is acknowledged with a window of zero. This is the
+            // case the linger is for, and the only one where it is the thing
+            // that ends the wait -- a guest that stopped answering ALTOGETHER
+            // is ended by the connection's own retransmission budget instead,
+            // which would have made this test pass without a linger at all.
+            var acknowledged = UInt32(0)
+            for _ in 0..<20 where child.isActive {
+                fixture.advance(by: .seconds(10))
+                acknowledged = UInt32(fixture.link.drainTransmitted().count)
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: iss &+ 1 &+ min(acknowledged, 200),
+                        flags: [.ack], window: 0))
+            }
+            #expect(
+                !child.isActive,
+                "the close is still waiting on a guest that has taken nothing for minutes")
+            guard case .success = outcome.result else {
+                Issue.record("the close never completed: \(String(describing: outcome.result))")
+                return
+            }
+        }
+    }
+    fixture.drain()
+}
+
+@Test func closingAChannelWithWritesStillQueuedSendsThemFirst() async throws {
+    // A close is not a discard. The splice writes with no promise, so a close
+    // that failed what was queued lost the bytes AND said nothing -- and this
+    // is the ordinary end of every proxied connection: the far side finishes,
+    // the glue closes this side, and whatever the peer's window had not yet
+    // allowed out went with it.
+    //
+    // Measured against a real guest before this: a host sending 1,000,000
+    // bytes had its `sendall` complete, and the guest received 400,160 of
+    // them. The gateway's own log said `finish … pending=10`, ten chunks
+    // failed on the way out.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture, installRecorder: false)
+        try withExtendedLifetime(server) {
+            // A window of 200 bytes, so most of what is written cannot go yet.
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = fixture.drainSegments().first { $0.header.flags.contains(.syn) }
+            let iss = synAck?.header.sequence.value ?? 0
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack], window: 200))
+            let child = try #require(collector.children.first)
+            _ = fixture.drainSegments()
+
+            // More than the send buffer holds, so the writes past it stay in
+            // the CHANNEL's queue rather than the endpoint's. That is the queue
+            // a close discards, and reaching it is the whole point: 4000 bytes
+            // would sit entirely in the send buffer and this test would pass
+            // without ever touching the path it is named for.
+            let total = TCPEndpoint.sendBufferBytes + 128 * 1024
+            let chunk = 64 * 1024
+            var written = 0
+            while written < total {
+                var payload = ByteBufferAllocator().buffer(capacity: chunk)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: chunk))
+                child.writeAndFlush(payload, promise: nil)
+                written += chunk
+            }
+            let firstBurst = fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes }
+            #expect(
+                firstBurst < written,
+                "positive control: the window let all \(firstBurst) bytes out at once")
+
+            // The far side of the splice has finished, so the glue closes this.
+            child.close(promise: nil)
+
+            // The guest reads what it took and opens up, repeatedly, the way a
+            // draining reader does.
+            var delivered = firstBurst
+            var acknowledged = UInt32(firstBurst)
+            for _ in 0..<400 where delivered < written {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: iss &+ 1 &+ acknowledged, flags: [.ack],
+                        window: 32000))
+                let more = fixture.drainSegments()
+                delivered += more.reduce(0) { $0 + $1.payload.readableBytes }
+                acknowledged = UInt32(delivered)
+            }
+            #expect(
+                delivered == written,
+                "the close discarded \(written - delivered) of \(written) bytes it had accepted")
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aWriteAfterTheOutputIsClosedIsRefusedRatherThanQueued() async throws {
     // Half-closure gives this channel a state it never had: open for reading,
     // finished for writing. A write there cannot be honoured. Queueing it would

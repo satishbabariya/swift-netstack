@@ -837,6 +837,19 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         onWritable = nil
     }
 
+    /// Schedule work against this endpoint's clock and event loop.
+    ///
+    /// Exposed because a caller above this type sometimes has to bound a wait,
+    /// and a bound measured by any other clock is one a test driving
+    /// `ManualClock` cannot advance -- which is precisely how a bound comes to
+    /// be claimed and never checked. The one here is the channel's lingering
+    /// close; it is written against this so the same test that advances the
+    /// connection advances the bound.
+    func schedule(after amount: TimeAmount, _ work: @escaping () -> Void) -> Scheduled<Void> {
+        let body = EndpointTimerBody(run: work)
+        return stack.eventLoop.scheduleTask(deadline: stack.clock.now() + amount) { body.run() }
+    }
+
     /// Claims the peer's FIN, if it arrived before anyone was listening for it.
     ///
     /// A FIN is an event and it is over: `onPeerFinished` fires when the
@@ -934,6 +947,21 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// alike. Not `private`, because `@testable import` elevates `internal` and
     /// not `private`, and "the backlog refused it" is otherwise
     /// indistinguishable from "the segment was silently mis-parsed".
+    /// Whether this endpoint still holds a connection, live or lingering.
+    ///
+    /// Not `connectionCountForTesting`: a caller deciding whether there is
+    /// anything left to wait for is production behaviour, and reaching for a
+    /// testing hook to decide it would make the decision depend on
+    /// `@testable`.
+    var hasConnections: Bool { !connections.isEmpty }
+
+    /// Bytes this endpoint still owes its peer, across its one connection.
+    ///
+    /// For a caller that has closed and is waiting for the queue to clear: the
+    /// number falling is the connection making progress, and the number not
+    /// falling is a peer that has stopped taking anything.
+    var owedBytes: Int { connections.values.first?.sender.owedBytes ?? 0 }
+
     var connectionCountForTesting: Int { connections.count }
 
     /// The congestion window of the single connection this endpoint holds, or
@@ -2251,4 +2279,10 @@ enum TCPWire {
             options: [])
         try? send(header, payload: ByteBuffer(), from: source, to: destination, via: ipv4, allocator: allocator)
     }
+}
+
+/// A `Sendable` carrier for one scheduled body, for the same reason and with
+/// the same confinement argument as `TCPTimers`' own.
+private struct EndpointTimerBody: @unchecked Sendable {
+    let run: () -> Void
 }

@@ -416,6 +416,12 @@ struct Sender {
     /// Written but not yet transmitted. Non-zero means there is data the
     /// window, not the application, is holding back.
     var unsentBytes: Int { max(0, queuedBytes - outstanding) }
+    /// Everything this sender still owes the peer: written and not yet
+    /// acknowledged, whether it has been transmitted or not. A caller watching
+    /// for progress watches this, because a transfer can be moving with the
+    /// unsent count flat -- bytes leaving in flight and being acknowledged is
+    /// progress too.
+    var owedBytes: Int { queuedBytes }
 
     /// Total charge held: every queued chunk's allocation plus
     /// `perChunkOverhead` each. This is the figure `maximumBufferedBytes`

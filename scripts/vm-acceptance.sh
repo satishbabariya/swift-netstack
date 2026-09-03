@@ -132,9 +132,15 @@ echo "GATEWAY_NAME=$(resolve gateway.containers.internal)"
 echo "HOST_NAME=$(resolve host.containers.internal)"
 echo "ABSENT_NAME=$(resolve nothing.containers.internal)"' "$work/basics.out"
 
+# NOT "by DHCP", which is what this said first and is not true: the capture
+# holds no DHCP exchange at all, because `sandbox` addresses its guest itself.
+# What this checks is that the address the guest ends up with is the one this
+# gateway expects to be talking to. The DHCP server has frame-level tests of its
+# own in `frame-smoke.sh`; no real guest here has ever asked it for anything,
+# and this script must not be read as saying otherwise.
 grep -qE "inet 192\.168\.127\.2(/| )" "$work/basics.out" \
-    && pass "the guest gets 192.168.127.2 by DHCP" \
-    || fail "the guest did not get 192.168.127.2" "$(head -5 "$work/basics.out")"
+    && pass "the guest is addressed at 192.168.127.2 on the gateway's subnet" \
+    || fail "the guest is not at 192.168.127.2" "$(head -5 "$work/basics.out")"
 
 grep -qE "default via 192.168.127.1" "$work/basics.out" \
     && pass "the default route is the gateway" \

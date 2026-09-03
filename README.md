@@ -625,8 +625,18 @@ guest's third leg landed, and NXDOMAIN returned for a name that exists without
 the record type asked for -- which a resolver caches as "no such name".
 
 The script is falsified the same way the guards are: reverting the half-close
-fix makes its four TCP checks fail and leaves the other five passing, so it
-fails at the thing that broke rather than at everything.
+fix makes its TCP checks fail and leaves the others passing, so it fails at the
+thing that broke rather than at everything. Within an afternoon of existing it
+found two more, both the same shape and neither reachable from a composed
+frame: a port published into the guest never carried a connection, because an
+active open's SYN was dropped while ARP was unresolved and nothing retransmitted
+it; and the first datagram to a published UDP port was lost every time, because
+nothing held it either.
+
+One thing it does **not** cover, despite booting a guest: DHCP. `sandbox`
+addresses its guest itself, so no real guest here has ever asked this gateway
+for a lease -- `/leases` is empty during these runs and that is correct. The
+DHCP server's tests are the frame-level ones in `frame-smoke.sh`.
 
 The Swift examples on this page are **compiled**. They sit in a function nothing
 calls in `Tests/NetstackTests/READMEExample.swift`, so the test build type-checks

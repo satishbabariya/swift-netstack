@@ -66,6 +66,71 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func aSecondCloseWhileTheFirstIsWaitingDoesNotStrandIt() async throws {
+    // A deferred close stores its promise. A second close arriving while the
+    // first still waits used to overwrite it, and the first caller was then
+    // waiting on a completion that had been discarded -- a promise that never
+    // reaches a terminal state, which in NIO is a leak with a precondition
+    // failure attached to it.
+    //
+    // Closing twice is not exotic: a splice closes from either side, and both
+    // sides can end at once.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture, installRecorder: false)
+        try withExtendedLifetime(server) {
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = fixture.drainSegments().first { $0.header.flags.contains(.syn) }
+            let iss = synAck?.header.sequence.value ?? 0
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack], window: 200))
+            let child = try #require(collector.children.first)
+            _ = fixture.drainSegments()
+
+            var written = 0
+            while written < TCPEndpoint.sendBufferBytes + 64 * 1024 {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                child.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            _ = fixture.drainSegments()
+
+            let first = child.eventLoop.makePromise(of: Void.self)
+            let firstOutcome = Outcome()
+            first.futureResult.whenComplete { firstOutcome.result = $0 }
+            child.close(promise: first)
+
+            let second = child.eventLoop.makePromise(of: Void.self)
+            let secondOutcome = Outcome()
+            second.futureResult.whenComplete { secondOutcome.result = $0 }
+            child.close(promise: second)
+
+            guard case .failure(let error) = secondOutcome.result else {
+                Issue.record("the second close was accepted: \(String(describing: secondOutcome.result))")
+                return
+            }
+            #expect(error as? ChannelError == .alreadyClosed)
+
+            // And the first still finishes, rather than being forgotten.
+            var acknowledged = UInt32(0)
+            for _ in 0..<400 where firstOutcome.result == nil {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: iss &+ 1 &+ acknowledged, flags: [.ack],
+                        window: 32000))
+                acknowledged += UInt32(
+                    fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes })
+            }
+            #expect(
+                firstOutcome.result != nil,
+                "the first close never completed, so its caller waits for ever")
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aClosedChannelDoesNotTakeItsConnectionWithItMidSend() async throws {
     // The channel is normally the last strong reference to its endpoint -- the
     // demuxer holds delegates weakly, deliberately -- and `close()` is

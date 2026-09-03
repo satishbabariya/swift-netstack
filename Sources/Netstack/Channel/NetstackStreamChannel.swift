@@ -460,6 +460,19 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     /// Only a graceful close waits. `peerClosed` and a refused connect still
     /// go straight to `finish`, because there is nowhere left to send to.
     private func closeGracefully(error: Error, promise: EventLoopPromise<Void>?) {
+        // A second close, while the first is still waiting. NIO's own answer
+        // for closing twice is `alreadyClosed`, and this is that -- overwriting
+        // the stored promise would leave the first caller's on nothing, waiting
+        // for a completion that had been discarded.
+        if pendingClose != nil {
+            promise?.fail(ChannelError.alreadyClosed)
+            return
+        }
+        // One attempt before deferring, because the caller may not have
+        // flushed. Bytes the send buffer can take should go now rather than
+        // wait on a window that has nothing to do with them -- and if the queue
+        // empties here, there is nothing to defer for.
+        if state == .active { drainPendingWrites() }
         guard state == .active, !pendingWrites.isEmpty else {
             finish(error: error, promise: promise)
             return
@@ -586,7 +599,13 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         state = .closed
         if ownsEndpoint {
             endpoint.close()
-            retainUntilFinished(endpoint)
+            // Only when there is something left to finish. `close()` deletes
+            // the TCB outright from LISTEN and SYN-SENT -- nothing was ever
+            // established -- and reports closed on the way out, so the callback
+            // this retention waits for has already fired. Installing it then
+            // would hold the endpoint for a callback that never comes again,
+            // which is a leak rather than a safeguard.
+            if endpoint.hasConnections { retainUntilFinished(endpoint) }
         }
         endpoint.onData = nil
         endpoint.onWritable = nil

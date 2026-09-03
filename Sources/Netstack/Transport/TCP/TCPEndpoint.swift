@@ -947,6 +947,14 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// alike. Not `private`, because `@testable import` elevates `internal` and
     /// not `private`, and "the backlog refused it" is otherwise
     /// indistinguishable from "the segment was silently mis-parsed".
+    /// Whether this endpoint still holds a connection, live or lingering.
+    ///
+    /// Not `connectionCountForTesting`: a caller deciding whether there is
+    /// anything left to wait for is production behaviour, and reaching for a
+    /// testing hook to decide it would make the decision depend on
+    /// `@testable`.
+    var hasConnections: Bool { !connections.isEmpty }
+
     /// Bytes this endpoint still owes its peer, across its one connection.
     ///
     /// For a caller that has closed and is waiting for the queue to clear: the

@@ -34,12 +34,16 @@ public final class IPv4Protocol {
         let destination: IPv4Address
         let source: IPv4Address?
         let protocolNumber: IPProtocol
+        /// Insertion order across every next hop, so the global cap can evict
+        /// the oldest rather than refuse the newest.
+        let sequence: UInt64
     }
 
     /// Keyed by NEXT HOP, which is what ARP resolves -- not by destination,
     /// which for anything off-link is a different address entirely.
     private var deferred: [IPv4Address: [Deferred]] = [:]
     private var deferredBytes = 0
+    private var deferredSequence: UInt64 = 0
 
     /// The first datagram to a guest is the one that has to wait for ARP, so
     /// without this it is always the one that is lost. TCP survived that by
@@ -312,16 +316,55 @@ public final class IPv4Protocol {
         payload: ByteBuffer, to destination: IPv4Address, from source: IPv4Address?,
         protocolNumber: IPProtocol, nextHop: IPv4Address
     ) -> Bool {
+        // Per next hop this refuses, as Linux does: three is the depth one
+        // conversation is worth, and a fourth says the address is not coming.
         let waiting = deferred[nextHop]?.count ?? 0
-        guard waiting < Self.maximumDeferredPerNextHop,
-            deferredCount < Self.maximumDeferredDatagrams,
-            deferredBytes + payload.readableBytes <= Self.maximumDeferredBytes
-        else { return false }
+        guard waiting < Self.maximumDeferredPerNextHop else { return false }
+        guard payload.readableBytes <= Self.maximumDeferredBytes else { return false }
+
+        // The global caps EVICT rather than refuse. Nothing else releases an
+        // entry -- a datagram leaves this queue when its address resolves, and
+        // an address that never resolves never releases anything -- so a cap
+        // that only refused would let a peer pin the whole budget permanently
+        // and shut the queue for everybody else.
+        //
+        // Guest-reachable, and that is why it matters here: a guest that sends
+        // SYNs with spoofed on-link sources makes this gateway answer addresses
+        // only that guest could ARP for, and it simply does not answer. Eleven
+        // of those would have taken every slot for good.
+        while deferredCount >= Self.maximumDeferredDatagrams
+            || deferredBytes + payload.readableBytes > Self.maximumDeferredBytes
+        {
+            guard evictOldestDeferred() else { return false }
+        }
+
+        deferredSequence &+= 1
         deferred[nextHop, default: []].append(
             Deferred(
                 payload: payload, destination: destination, source: source,
-                protocolNumber: protocolNumber))
+                protocolNumber: protocolNumber, sequence: deferredSequence))
         deferredBytes += payload.readableBytes
+        return true
+    }
+
+    /// Drop the datagram that has been waiting longest, anywhere. Returns false
+    /// when there is nothing left to drop, which stops the caller looping.
+    private func evictOldestDeferred() -> Bool {
+        var oldestHop: IPv4Address?
+        var oldest = UInt64.max
+        for (hop, waiting) in deferred {
+            guard let first = waiting.first, first.sequence < oldest else { continue }
+            oldest = first.sequence
+            oldestHop = hop
+        }
+        guard let hop = oldestHop, var waiting = deferred[hop], !waiting.isEmpty else { return false }
+        deferredBytes -= waiting.removeFirst().payload.readableBytes
+        if waiting.isEmpty {
+            deferred.removeValue(forKey: hop)
+        } else {
+            deferred[hop] = waiting
+        }
+        counters.droppedUnresolved += 1
         return true
     }
 

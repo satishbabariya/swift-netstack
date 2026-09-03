@@ -9,9 +9,13 @@ private struct Fixture {
     let link: RecordingEndpoint
     let ip: IPv4Protocol
     let clock: ManualClock
+    let cache: ARPCache
 }
 
-private func makeFixture(promiscuous: Bool = true, spoofing: Bool = true) -> Fixture {
+/// `resolving: false` leaves the guest's link address unknown, which is what it
+/// is for the FIRST datagram to any guest -- the one case every other test in
+/// this file arranges away.
+private func makeFixture(promiscuous: Bool = true, spoofing: Bool = true, resolving: Bool = true) -> Fixture {
     let clock = ManualClock()
     let link = RecordingEndpoint(eventLoop: EmbeddedEventLoop(), linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
     let nic = NIC(id: 1, link: link)
@@ -24,13 +28,16 @@ private func makeFixture(promiscuous: Bool = true, spoofing: Bool = true) -> Fix
     routes.add(Route(destination: IPv4Subnet(cidr: "192.168.127.0/24")!, gateway: nil, nicID: 1))
 
     let cache = ARPCache(clock: clock)
-    cache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+    if resolving {
+        cache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+    }
     let responder = ARPResponder(nic: nic, cache: cache, allocator: ByteBufferAllocator())
     let ip = IPv4Protocol(
         nic: nic, routes: routes, arpCache: cache, arpResponder: responder,
         reassembler: Reassembler(clock: clock), allocator: ByteBufferAllocator())
     nic.setHandler(for: .ipv4) { packet, ethernet in ip.handleInbound(packet, ethernet) }
-    return Fixture(nic: nic, link: link, ip: ip, clock: clock)
+    cache.onRecorded = { [weak ip] address, _ in ip?.resolved(address) }
+    return Fixture(nic: nic, link: link, ip: ip, clock: clock, cache: cache)
 }
 
 private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UInt8], ttl: UInt8 = 64) -> ByteBuffer {
@@ -225,9 +232,14 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
     }
 }
 
-@Test func sendWithAnUnresolvedNextHopRequestsARPAndThrows() {
+@Test func sendWithAnUnresolvedNextHopRequestsARP() {
+    // This used to expect `noRoute`, and that expectation was the bug written
+    // down: an address that is not resolved YET was reported exactly like one
+    // that can never be reached, and the datagram was dropped. The request is
+    // still sent -- that part was always right -- and the datagram now waits
+    // for the answer. What happens when it never comes has its own test.
     let f = makeFixture()
-    #expect(throws: StackError.noRoute) {
+    #expect(throws: Never.self) {
         try f.ip.send(payload: ByteBuffer(bytes: [0x01]), to: IPv4Address("192.168.127.55")!, from: nil, protocolNumber: .udp)
     }
     // An ARP request went out for the unresolved address.
@@ -309,4 +321,63 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
     #expect(ethernet.destination == .broadcast)
     let ip = try #require(IPv4Header.parse(&packet))
     #expect(ip.destination == .broadcast)
+}
+
+// MARK: - The first datagram to a guest, which has to wait for ARP
+
+@Test func aDatagramSentBeforeArpAnswersIsDeliveredWhenItDoes() throws {
+    // `send` had nowhere to put this, so it emitted an ARP request and threw.
+    // TCP survived that by retransmitting its SYN; UDP has nothing to
+    // retransmit with, so the first datagram to a guest was lost every time --
+    // and the first datagram to a guest is the one that always has to wait.
+    //
+    // Measured against a real guest: `nc -u` into a published port received
+    // nothing, and a second datagram three seconds later arrived.
+    let fixture = makeFixture(resolving: false)
+    var payload = ByteBufferAllocator().buffer(capacity: 4)
+    payload.writeString("KNOCK")
+
+    #expect(throws: Never.self) {
+        try fixture.ip.send(
+            payload: payload, to: IPv4Address("192.168.127.2")!, from: nil, protocolNumber: .udp)
+    }
+    let beforeArp = fixture.link.drainTransmitted()
+    #expect(
+        beforeArp.count == 1,
+        "positive control: only the ARP request can have gone out, not \(beforeArp.count) frames")
+    #expect(fixture.ip.deferredCount == 1, "the datagram was dropped rather than held")
+
+    // The guest answers, by any route -- a reply, or any packet from it.
+    fixture.cache.record(IPv4Address("192.168.127.2")!, MACAddress("0a:0b:0c:0d:0e:0f")!)
+
+    let afterArp = fixture.link.drainTransmitted()
+    #expect(afterArp.count == 1, "the held datagram was not sent when the address arrived")
+    #expect(fixture.ip.deferredCount == 0, "the queue still holds it")
+    #expect(fixture.ip.counters.deferredForResolution == 1)
+}
+
+@Test func onlyAFewDatagramsWaitOnAnAddressThatNeverAnswers() throws {
+    // A queue with no bound is a queue whose size a peer chooses. Linux holds
+    // three per neighbour and so does this; what matters more is that the
+    // refusal is a refusal -- `send` throws, the caller drops, and nothing
+    // accumulates for an address that is never going to answer.
+    let fixture = makeFixture(resolving: false)
+    var payload = ByteBufferAllocator().buffer(capacity: 4)
+    payload.writeString("KNOCK")
+
+    for attempt in 1...IPv4Protocol.maximumDeferredPerNextHop {
+        #expect(throws: Never.self) {
+            try fixture.ip.send(
+                payload: payload, to: IPv4Address("192.168.127.2")!, from: nil, protocolNumber: .udp)
+        }
+        #expect(fixture.ip.deferredCount == attempt)
+    }
+    #expect(throws: StackError.self) {
+        try fixture.ip.send(
+            payload: payload, to: IPv4Address("192.168.127.2")!, from: nil, protocolNumber: .udp)
+    }
+    #expect(
+        fixture.ip.deferredCount == IPv4Protocol.maximumDeferredPerNextHop,
+        "the bound did not hold")
+    #expect(fixture.ip.counters.droppedUnresolved == 1)
 }

@@ -265,6 +265,42 @@ else
     fail "the control plane never appeared at $api, so nothing was published"
 fi
 
+# --- A UDP port published into the guest, first datagram and all -------------
+#
+# The same root cause as the check above, without the thing that hid it. TCP
+# retransmits its SYN and so eventually gets through; UDP has nothing to
+# retransmit with, so the FIRST datagram to a guest -- the one that has to wait
+# for ARP -- was lost every time. Exactly one datagram is sent here on purpose.
+
+udp_port=24690
+rm -f "$api"
+SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c \
+    '(timeout 40 nc -u -l -p 9998 > /tmp/udp.seen 2>&1) & sleep 34; echo "SEEN=$(cat /tmp/udp.seen 2>/dev/null)"' \
+    >"$work/udp.out" 2>&1 &
+for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
+sleep 12
+
+if [[ -S "$api" ]] && command -v curl >/dev/null 2>&1; then
+    curl -s -X POST --unix-socket "$api" http://x/services/forwarder/expose \
+        -d "{\"local\":\"127.0.0.1:$udp_port\",\"remote\":\"192.168.127.2:9998\",\"protocol\":\"udp\"}" >/dev/null
+    sleep 1
+    cat > "$work/knock.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# One datagram, deliberately. A second would arrive whatever happens to the
+# first, and would turn this into a check that cannot fail.
+s.sendto(b"FIRST-DATAGRAM", ("127.0.0.1", int(sys.argv[1])))
+s.close()
+PY
+    python3 "$work/knock.py" "$udp_port"
+    for _ in $(seq 1 12); do grep -q "^SEEN=" "$work/udp.out" && break; sleep 5; done
+    grep -q "^SEEN=FIRST-DATAGRAM$" "$work/udp.out" \
+        && pass "the first datagram to a published UDP port arrives" \
+        || fail "the guest saw '$(grep '^SEEN=' "$work/udp.out" | cut -d= -f2-)'"
+else
+    fail "the control plane never appeared at $api, so no UDP port was published"
+fi
+
 echo
 if [[ $status -eq 0 ]]; then
     echo "✔ a real guest sees what it should"

@@ -175,11 +175,21 @@ public final class ARPCache {
         self.capacity = max(1, capacity)
     }
 
+    /// Called whenever an address is recorded, so anything holding a packet
+    /// that had nowhere to go can send it now.
+    ///
+    /// A callback rather than the sender polling, because there are two places
+    /// an address is learned -- an ARP reply, and the source of any packet that
+    /// arrives -- and a caller that watched only one of them would wait for a
+    /// reply that had already been overtaken.
+    public var onRecorded: ((IPv4Address, MACAddress) -> Void)?
+
     public func record(_ ip: IPv4Address, _ mac: MACAddress) {
         let expiresAt = clock.now() + ttl
         if entries[ip] != nil {
             entries[ip] = Entry(mac: mac, expiresAt: expiresAt, sequence: nextTouchSequence(for: ip))
             compactOrderIfNeeded()
+            onRecorded?(ip, mac)
             return
         }
         if entries.count >= capacity {
@@ -187,6 +197,7 @@ public final class ARPCache {
         }
         entries[ip] = Entry(mac: mac, expiresAt: expiresAt, sequence: nextTouchSequence(for: ip))
         compactOrderIfNeeded()
+        onRecorded?(ip, mac)
     }
 
     public func lookup(_ ip: IPv4Address) -> MACAddress? {

@@ -36,7 +36,6 @@ private func makeFixture(promiscuous: Bool = true, spoofing: Bool = true, resolv
         nic: nic, routes: routes, arpCache: cache, arpResponder: responder,
         reassembler: Reassembler(clock: clock), allocator: ByteBufferAllocator())
     nic.setHandler(for: .ipv4) { packet, ethernet in ip.handleInbound(packet, ethernet) }
-    cache.onRecorded = { [weak ip] address, _ in ip?.resolved(address) }
     return Fixture(nic: nic, link: link, ip: ip, clock: clock, cache: cache)
 }
 

@@ -1239,11 +1239,22 @@ func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = ga
             // any frame from it.
             fixture.stack.arpCache.record(tcpGuest, tcpGuestMAC)
 
+            // Discarded, and the discarding is the point. Recording the address
+            // releases the datagram the IP layer was holding, so the SYN that
+            // appears here is the FIRST one finally going out -- not a
+            // retransmission. Leaving it in the collection would let this test
+            // pass with the retransmit timer removed, which is the one thing it
+            // is here to notice.
+            let released = fixture.drainSegments()
+            #expect(
+                released.contains { $0.header.flags.contains(.syn) },
+                "positive control: the held SYN goes out when the address arrives")
+
             fixture.advance(by: .seconds(2))
             let retried = fixture.drainSegments()
             #expect(
                 retried.contains { $0.header.flags.contains(.syn) },
-                "the SYN was dropped once and never retransmitted")
+                "the SYN went out once and was never retransmitted")
         }
     }
     fixture.drain()

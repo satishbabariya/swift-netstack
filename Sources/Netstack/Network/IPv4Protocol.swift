@@ -112,6 +112,7 @@ public final class IPv4Protocol {
         self.arpResponder = arpResponder
         self.reassembler = reassembler
         self.allocator = allocator
+        observeResolutions()
     }
 
     public func setHandler(for protocolNumber: IPProtocol, _ handler: @escaping (IPv4Header, ByteBuffer) -> Void) {
@@ -342,4 +343,18 @@ public final class IPv4Protocol {
 
     /// How many datagrams are waiting on an address, over every address.
     var deferredCount: Int { deferred.values.reduce(0) { $0 + $1.count } }
+
+    /// Subscribe to the cache's resolutions.
+    ///
+    /// Done here rather than by whoever assembles the graph, because a queue
+    /// that is only drained when someone remembers to wire it is a queue that
+    /// silently holds datagrams for ever -- and `onRecorded` has one owner, so
+    /// a second assignment elsewhere would not add a listener, it would replace
+    /// this one. Every `IPv4Protocol` therefore claims it itself, including the
+    /// ones tests build directly.
+    private func observeResolutions() {
+        arpCache.onRecorded = { [weak self] address, _ in
+            self?.resolved(address)
+        }
+    }
 }

@@ -150,18 +150,14 @@ public final class Stack {
         self.arpResponder = arpResponder
         self.reassembler = reassembler
 
-        let ipv4 = IPv4Protocol(
+        // No `onRecorded` wiring here on purpose. `IPv4Protocol` claims it in
+        // its own initialiser: the callback has a single owner, so wiring it
+        // from outside would work for the graph this file builds and silently
+        // not for any other -- including a second assignment here, which would
+        // replace the delivery rather than add to it.
+        self.ipv4 = IPv4Protocol(
             nic: nic, routes: routes, arpCache: arpCache, arpResponder: arpResponder,
             reassembler: reassembler, allocator: allocator)
-        self.ipv4 = ipv4
-
-        // `[weak ipv4]` for the reason every other closure in this file is:
-        // `ARPCache` is held by `IPv4Protocol`, so a strong capture here would
-        // be a cycle from the cache back to the thing that owns it. The cache
-        // outlives nothing this does not.
-        arpCache.onRecorded = { [weak ipv4] address, _ in
-            ipv4?.resolved(address)
-        }
     }
 
     /// Wire the protocol handlers to the NIC and start the maintenance timer.

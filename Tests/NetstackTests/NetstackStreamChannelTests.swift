@@ -66,6 +66,74 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func closingAChannelWithWritesStillQueuedSendsThemFirst() async throws {
+    // A close is not a discard. The splice writes with no promise, so a close
+    // that failed what was queued lost the bytes AND said nothing -- and this
+    // is the ordinary end of every proxied connection: the far side finishes,
+    // the glue closes this side, and whatever the peer's window had not yet
+    // allowed out went with it.
+    //
+    // Measured against a real guest before this: a host sending 1,000,000
+    // bytes had its `sendall` complete, and the guest received 400,160 of
+    // them. The gateway's own log said `finish … pending=10`, ten chunks
+    // failed on the way out.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture, installRecorder: false)
+        try withExtendedLifetime(server) {
+            // A window of 200 bytes, so most of what is written cannot go yet.
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = fixture.drainSegments().first { $0.header.flags.contains(.syn) }
+            let iss = synAck?.header.sequence.value ?? 0
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack], window: 200))
+            let child = try #require(collector.children.first)
+            _ = fixture.drainSegments()
+
+            // More than the send buffer holds, so the writes past it stay in
+            // the CHANNEL's queue rather than the endpoint's. That is the queue
+            // a close discards, and reaching it is the whole point: 4000 bytes
+            // would sit entirely in the send buffer and this test would pass
+            // without ever touching the path it is named for.
+            let total = TCPEndpoint.sendBufferBytes + 128 * 1024
+            let chunk = 64 * 1024
+            var written = 0
+            while written < total {
+                var payload = ByteBufferAllocator().buffer(capacity: chunk)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: chunk))
+                child.writeAndFlush(payload, promise: nil)
+                written += chunk
+            }
+            let firstBurst = fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes }
+            #expect(
+                firstBurst < written,
+                "positive control: the window let all \(firstBurst) bytes out at once")
+
+            // The far side of the splice has finished, so the glue closes this.
+            child.close(promise: nil)
+
+            // The guest reads what it took and opens up, repeatedly, the way a
+            // draining reader does.
+            var delivered = firstBurst
+            var acknowledged = UInt32(firstBurst)
+            for _ in 0..<400 where delivered < written {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: iss &+ 1 &+ acknowledged, flags: [.ack],
+                        window: 32000))
+                let more = fixture.drainSegments()
+                delivered += more.reduce(0) { $0 + $1.payload.readableBytes }
+                acknowledged = UInt32(delivered)
+            }
+            #expect(
+                delivered == written,
+                "the close discarded \(written - delivered) of \(written) bytes it had accepted")
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aWriteAfterTheOutputIsClosedIsRefusedRatherThanQueued() async throws {
     // Half-closure gives this channel a state it never had: open for reading,
     // finished for writing. A write there cannot be honoured. Queueing it would

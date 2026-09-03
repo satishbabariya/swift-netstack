@@ -54,6 +54,9 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     /// A `.output` close that arrived with writes still queued. The FIN has to
     /// follow the bytes it terminates, so it waits here until they drain.
     private var pendingOutputClose: EventLoopPromise<Void>??
+    /// A full close that arrived with writes still queued, for the same reason
+    /// and with a larger consequence: closing discards them.
+    private var pendingClose: EventLoopPromise<Void>??
     private var writable = true
     private var connectPromise: EventLoopPromise<Void>?
     private var local: SocketAddress?
@@ -238,7 +241,7 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         }
         switch mode {
         case .all:
-            finish(error: error, promise: promise)
+            closeGracefully(error: error, promise: promise)
         case .output:
             closeOutput(promise: promise)
         case .input:
@@ -380,6 +383,11 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             pendingOutputClose = nil
             finishOutput(promise: promise)
         }
+        // The queue is empty and someone is waiting to close on that.
+        if case .some(let promise) = pendingClose {
+            pendingClose = nil
+            finish(error: ChannelError.eof, promise: promise)
+        }
     }
 
     private func setWritable(_ value: Bool) {
@@ -407,6 +415,36 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         readPending = readPending || autoRead
         deliverAvailable()
         finish(error: ChannelError.eof, promise: nil)
+    }
+
+    /// A close is not a discard.
+    ///
+    /// Bytes this channel has already accepted are owed to the peer, and the
+    /// splice writes with no promise -- so failing them lost the data and said
+    /// nothing about it. That is the ordinary end of a proxied connection, not
+    /// an edge: the far side finishes, the glue closes this side, and whatever
+    /// the peer's window had not yet allowed out went with it. Measured against
+    /// a real guest: a host sent 1,000,000 bytes and the guest received
+    /// 400,160, with ten chunks failed on the way out.
+    ///
+    /// So a close with a queue waits for it. What bounds the wait is TCP
+    /// itself, not a timer invented here: a peer that stops reading is met by
+    /// the persist timer, then the keep-alive, then the FIN retry budget, and
+    /// each of those ends in `onClosed` -- which finishes this channel and
+    /// fails what is left. Nothing waits for a peer that is gone.
+    ///
+    /// Only a graceful close waits. `peerClosed` and a refused connect still
+    /// go straight to `finish`, because there is nowhere left to send to.
+    private func closeGracefully(error: Error, promise: EventLoopPromise<Void>?) {
+        guard state == .active, !pendingWrites.isEmpty else {
+            finish(error: error, promise: promise)
+            return
+        }
+        // Refuse anything further, exactly as a `.output` close does: the
+        // caller has said it is done, and a write accepted now would be one
+        // more thing the close is waiting on.
+        outputClosed = true
+        pendingClose = promise
     }
 
     /// Sends this side's FIN and leaves the channel active for reading.
@@ -481,6 +519,14 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         if case .some(let outputPromise) = pendingOutputClose {
             pendingOutputClose = nil
             outputPromise?.fail(ChannelError.ioOnClosedChannel)
+        }
+        // And a full close still waiting on writes that will now never go. It
+        // SUCCEEDS rather than fails: the caller asked for a close and is
+        // getting one. What failed is the data, and those promises are failed
+        // just above.
+        if case .some(let closePromise) = pendingClose {
+            pendingClose = nil
+            closePromise?.succeed(())
         }
         connectPromise?.fail(error)
         connectPromise = nil

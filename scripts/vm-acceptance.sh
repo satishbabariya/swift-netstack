@@ -220,6 +220,45 @@ if command -v tcpdump >/dev/null 2>&1 && [[ -s "$pcap" ]]; then
         || fail "the FIN is at ${finish:-unknown}, the data ends at 200001"
 fi
 
+# --- A megabyte to a guest that stops reading ---------------------------------
+#
+# The 200,000-byte check above crosses without the peer's window ever closing,
+# so nothing is ever held in the channel's own queue. This one holds the reader
+# still for fifteen seconds, which fills the send buffer and pushes the rest
+# into that queue -- and a close used to discard exactly that.
+#
+# The failure it guards was silent from both ends: the host's `sendall` returned
+# having written every byte, and the guest simply had fewer. Measured before the
+# fix, 400,160 of 1,000,000, varying run to run.
+
+port=24750
+if command -v python3 >/dev/null 2>&1; then
+cat > "$work/megabyte.py" <<'PY'
+import socket, sys
+PAYLOAD = bytes((i * 31 + 7) % 256 for i in range(1000000))
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(1)
+c, _ = s.accept()
+c.sendall(PAYLOAD)
+c.shutdown(socket.SHUT_WR)
+c.close()
+s.close()
+PY
+python3 "$work/megabyte.py" "$port" &
+sleep 1
+# The reader stalls, so the guest's window closes and the gateway has to hold
+# what it has accepted rather than drop it.
+guest "nc -w 60 192.168.127.254 $port | (sleep 15; wc -c)" "$work/megabyte.out"
+carried="$(grep -oE '^ *[0-9]+' "$work/megabyte.out" | tr -d ' ' | tail -1)"
+[[ "${carried:-0}" == "1000000" ]] \
+    && pass "a megabyte survives a guest that stops reading" \
+    || fail "the guest received ${carried:-0} of 1000000 bytes"
+else
+    fail "python3 is not available, so the megabyte check did not run"
+fi
+
 # --- A host that speaks first ------------------------------------------------
 
 port=24686

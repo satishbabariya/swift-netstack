@@ -63,3 +63,4 @@ Sources/Netstack/Transport/TCP/TCPEndpoint.swift	aSynDroppedBecauseTheGuestsAddr
 Sources/Netstack/Network/IPv4Protocol.swift	aDatagramSentBeforeArpAnswersIsDeliveredWhenItDoes	        guard let waiting = deferred.removeValue(forKey: address) else { return }	        guard let waiting = deferred[address], false else { return }
 Sources/Netstack/Network/IPv4Protocol.swift	onlyAFewDatagramsWaitOnAnAddressThatNeverAnswers	        guard waiting < Self.maximumDeferredPerNextHop else { return false }	        guard waiting < Int.max else { return false }
 Sources/Netstack/Network/IPv4Protocol.swift	anAddressThatNeverAnswersCannotPinTheQueueForEveryoneElse	            guard evictOldestDeferred() else { return false }	            return false
+Sources/Netstack/Channel/NetstackStreamChannel.swift	closingAChannelWithWritesStillQueuedSendsThemFirst	        guard state == .active, !pendingWrites.isEmpty else {	        guard false, !pendingWrites.isEmpty else {

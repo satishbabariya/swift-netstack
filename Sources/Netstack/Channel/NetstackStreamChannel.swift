@@ -494,6 +494,33 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         }
     }
 
+    /// Keep a closed endpoint alive until it has finished what it was given.
+    ///
+    /// `close()` is asynchronous -- its own documentation says so, and says
+    /// `onClosed` is the only way to learn it finished -- because a FIN waits
+    /// behind the payload it terminates and the payload waits on the peer's
+    /// window. Meanwhile the demuxer holds its delegates weakly, deliberately,
+    /// so this channel is usually the last strong reference. Dropping it the
+    /// instant the channel's own queue empties deallocates a connection with
+    /// bytes still to send: transmission stops mid-stream, no FIN is ever sent,
+    /// and the peer waits on a connection nothing will end.
+    ///
+    /// A real guest saw exactly that. A host reset a 600,000-byte transfer, the
+    /// gateway had handed 539,085 bytes on and still owed 212,168, and it then
+    /// sent nothing at all -- no FIN, no reset -- until the guest's own timeout
+    /// gave up forty seconds later.
+    ///
+    /// The reference is the closure itself, and it is broken by the callback it
+    /// waits for. Nothing waits forever: every route out of a connection ends in
+    /// `onClosed`, including the FIN retry budget and the keep-alive.
+    private func retainUntilFinished(_ endpoint: TCPEndpoint) {
+        var held: TCPEndpoint? = endpoint
+        endpoint.onClosed = {
+            held?.onClosed = nil
+            held = nil
+        }
+    }
+
     /// Everything still owed to the peer: what this channel holds, plus what it
     /// has already handed to the connection.
     private var outstandingBytes: Int {
@@ -557,7 +584,10 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         }
         let wasActive = state == .active
         state = .closed
-        if ownsEndpoint { endpoint.close() }
+        if ownsEndpoint {
+            endpoint.close()
+            retainUntilFinished(endpoint)
+        }
         endpoint.onData = nil
         endpoint.onWritable = nil
         endpoint.onEstablished = nil

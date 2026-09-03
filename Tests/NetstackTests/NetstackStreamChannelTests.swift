@@ -66,6 +66,146 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func aClosedChannelDoesNotTakeItsConnectionWithItMidSend() async throws {
+    // The channel is normally the last strong reference to its endpoint -- the
+    // demuxer holds delegates weakly, deliberately -- and `close()` is
+    // asynchronous, because the FIN waits behind the payload and the payload
+    // waits on the peer's window. So releasing the channel the moment its own
+    // queue empties deallocates a connection with bytes still to send.
+    //
+    // What this test does NOT do is prove that, and neither does anything else
+    // here. It was written to, and it cannot: mutating the retention away
+    // leaves it passing, because ARC is under no obligation to release a local
+    // at the end of its scope and in a debug build it generally does not. The
+    // acceptance script's reset check does not falsify it either -- the
+    // symptom it was written for is a race, seen twice and not reproducible on
+    // demand.
+    //
+    // So the retention is justified by the endpoint's contract rather than by a
+    // guard: the demuxer holds its delegates weakly, this channel is the last
+    // strong reference, and `close()` is asynchronous by that type's own
+    // documentation -- "`onClosed` is the only way to learn it finished".
+    // Releasing the endpoint before then can only end a connection early. It is
+    // not in `guards.tsv`, because a row there would report an outcome it did
+    // not earn.
+    //
+    // What this test does keep is worth keeping on its own: the connection
+    // finishes what it was given, and ends, with the channel closed.
+    let fixture = TCPFixture()
+    do {
+        var acknowledged = UInt32(0)
+        var written = 0
+        weak var observed: TCPEndpoint?
+        do {
+            let endpoint = try listeningEndpoint(fixture)
+            let channel = NetstackStreamChannel(
+                eventLoop: fixture.stack.eventLoop, endpoint: endpoint, owns: true, parent: nil)
+            channel.installCallbacks()
+            channel.registerAlreadyConfigured0(promise: nil)
+
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 200))
+            _ = fixture.drainSegments()
+
+            while written < TCPEndpoint.sendBufferBytes {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                channel.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            acknowledged = UInt32(fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes })
+            channel.close(promise: nil)
+            #expect(
+                endpoint.owedBytes > 0,
+                "positive control: the connection should still owe bytes when the channel goes")
+            observed = endpoint
+        }
+        // Driven so that `finish`'s deferred handler removal actually runs.
+        // That is what breaks the channel <-> pipeline cycle and releases the
+        // channel, and with it the only strong reference to the endpoint --
+        // without it the references linger and this test measures nothing.
+        fixture.advance(by: .milliseconds(1))
+        #expect(
+            observed != nil,
+            "the connection was deallocated with bytes still owed, so nothing can send them")
+
+        // The channel and every reference this test held are gone.
+        var delivered = Int(acknowledged)
+        var sawFin = false
+        for _ in 0..<400 where !sawFin {
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS &+ 1 &+ UInt32(delivered), flags: [.ack],
+                    window: 32000))
+            let more = fixture.drainSegments()
+            delivered += more.reduce(0) { $0 + $1.payload.readableBytes }
+            sawFin = more.contains { $0.header.flags.contains(.fin) }
+        }
+        #expect(delivered == written, "\(written - delivered) bytes died with the channel")
+        #expect(sawFin, "the connection stopped mid-stream and never ended")
+    }
+    fixture.drain()
+}
+
+@Test func aDeferredCloseEndsWithAFinRatherThanSilence() async throws {
+    // The channel the outbound forwarder builds OWNS its endpoint, so its close
+    // is the whole close: nobody else will send the FIN. A close deferred
+    // behind a full queue therefore has to arrive at one, or the peer is left
+    // waiting on a stream nothing will ever end.
+    //
+    // A real guest saw exactly that. A host reset mid-transfer, the gateway
+    // handed on the 539,085 bytes it was holding, and then sent nothing at all
+    // -- no FIN, no reset -- until the guest's own timeout gave up 40 seconds
+    // later. Note the shape: the server-child tests above cannot see this,
+    // because a child does not own its endpoint and its owner sends the FIN.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let channel = NetstackStreamChannel(
+            eventLoop: fixture.stack.eventLoop, endpoint: endpoint, owns: true, parent: nil)
+        withExtendedLifetime(channel) {
+            channel.allowHalfClosure()
+            channel.installCallbacks()
+            channel.registerAlreadyConfigured0(promise: nil)
+
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 200))
+            _ = fixture.drainSegments()
+
+            var written = 0
+            while written < TCPEndpoint.sendBufferBytes + 128 * 1024 {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                channel.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            var delivered = fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes }
+
+            channel.close(promise: nil)
+
+            var acknowledged = UInt32(delivered)
+            var sawFin = false
+            for _ in 0..<400 where !sawFin {
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: gatewayISS &+ 1 &+ acknowledged, flags: [.ack],
+                        window: 32000))
+                let more = fixture.drainSegments()
+                delivered += more.reduce(0) { $0 + $1.payload.readableBytes }
+                acknowledged = UInt32(delivered)
+                sawFin = more.contains { $0.header.flags.contains(.fin) }
+            }
+            #expect(delivered == written, "\(written - delivered) bytes were discarded by the close")
+            #expect(sawFin, "the queue drained and the connection was left open in silence")
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aCloseWaitingOnAPeerThatStopsReadingGivesUp() async throws {
     // The deferral above waits for the peer's window, and a peer can decline to
     // open it for ever. That would be a channel, an endpoint and -- on a
@@ -202,7 +342,6 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
             #expect(
                 delivered == written,
                 "the close discarded \(written - delivered) of \(written) bytes it had accepted")
-
         }
     }
     fixture.drain()

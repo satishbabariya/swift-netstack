@@ -259,6 +259,62 @@ else
     fail "python3 is not available, so the megabyte check did not run"
 fi
 
+# --- A host that resets mid-transfer -----------------------------------------
+#
+# The guest must find out that the stream is over. It used to not: the gateway
+# handed on the bytes it had, and then sent nothing at all -- no FIN, no reset
+# -- because the channel released its endpoint while the connection still owed
+# 212,168 bytes, and the demuxer holds delegates weakly. The connection was
+# deallocated mid-send and the guest waited out its own timeout.
+#
+# Timed rather than counted, deliberately. How much arrives before a reset is
+# not a property of this gateway -- the host's RST discards whatever was still
+# in its socket buffer -- so counting bytes here would be a check that fails on
+# a fast day. What is a property of this gateway is that the guest is told.
+
+port=24762
+if command -v python3 >/dev/null 2>&1; then
+cat > "$work/reset.py" <<'PY'
+import socket, struct, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(1)
+c, _ = s.accept()
+c.sendall(b"A" * 600000)
+# SO_LINGER with a zero timeout makes close() send a RST rather than a FIN,
+# with the guest still well behind.
+c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+c.close()
+s.close()
+PY
+python3 "$work/reset.py" "$port" &
+sleep 1
+guest "nc -w 40 192.168.127.254 $port | (sleep 5; wc -c)" "$work/reset.out"
+
+# Read out of the capture rather than timed. How long the transfer takes is not
+# a property of this gateway -- the guest's reader is deliberately slow -- and a
+# timing threshold would fail on a slow day and pass on a fast one. What IS a
+# property of this gateway is that the last thing it says on this connection
+# ends the stream, rather than the stream simply stopping.
+if command -v tcpdump >/dev/null 2>&1 && [[ -s "$pcap" ]]; then
+    # The BRACKET CONTENTS, not the whole `Flags [..]` -- the word "Flags"
+    # carries an F of its own, so matching the phrase made `*F*` true of every
+    # segment ever sent and the check could not fail. It did not, for one run.
+    ending="$(tcpdump -r "$pcap" -n 2>/dev/null |
+        grep "192.168.127.254.$port > " | tail -1 |
+        sed -E 's/.*Flags \[([^]]*)\].*/\1/')"
+    case "$ending" in
+        *F*|*R*) pass "a host that resets leaves the guest a finished stream ($ending)" ;;
+        *) fail "the gateway's last word was ${ending:-nothing}, so the stream just stopped" ;;
+    esac
+else
+    fail "no capture, so the reset check could not be read"
+fi
+else
+    fail "python3 is not available, so the reset check did not run"
+fi
+
 # --- A host that speaks first ------------------------------------------------
 
 port=24686

@@ -44,7 +44,13 @@ final class TCPFixture {
     let link: RecordingEndpoint
     let stack: Stack
 
-    init() {
+    /// Whether every `advance` re-primes the ARP cache, and whether it was
+    /// primed at all to begin with. A test about what happens when the guest's
+    /// link address is NOT known turns this off; everything else wants it on.
+    private let primesARP: Bool
+
+    init(primingARP: Bool = true) {
+        primesARP = primingARP
         link = RecordingEndpoint(eventLoop: loop, linkAddress: tcpGatewayMAC)
         stack = Stack(
             link: link,
@@ -65,6 +71,7 @@ final class TCPFixture {
     }
 
     private func primeARP() {
+        guard primesARP else { return }
         for guest in [tcpGuest, tcpOtherGuest] {
             stack.arpCache.record(guest, tcpGuestMAC)
         }
@@ -1202,6 +1209,45 @@ func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = ga
 }
 
 // MARK: - Active open
+
+@Test func aSynDroppedBecauseTheGuestsAddressIsNotYetKnownIsSentAgain() throws {
+    // The first connection to a guest is always this one. `IPv4Protocol.send`
+    // has nowhere to send a segment until ARP resolves, so it emits a request
+    // and throws; `emit` swallows that with `try?`, which is right -- a send
+    // failure is not a reason to fail a connection TCP is entitled to retry.
+    //
+    // It is only right if something retries. `connect` armed no retransmit
+    // timer, so the SYN was dropped once and never spoken of again: the
+    // connection sat in SYN-SENT until its caller gave up, and the ARP reply
+    // that arrived 158 microseconds later had nothing waiting for it.
+    //
+    // The visible consequence was that a port published into the guest never
+    // worked at all. A real guest, a real `expose`, and a capture with the ARP
+    // exchange in it and no SYN anywhere.
+    let fixture = TCPFixture(primingARP: false)
+    do {
+        let endpoint = TCPEndpoint(
+            stack: fixture.stack, initialSequenceNumbers: FixedInitialSequenceNumbers(gatewayISS))
+        try withExtendedLifetime(endpoint) {
+            try endpoint.bind(address: tcpGateway, port: tcpLocalPort)
+            try endpoint.connect(to: tcpGuest, port: tcpPeerPort)
+            #expect(
+                fixture.drainSegments().isEmpty,
+                "positive control: with the address unknown the SYN cannot have gone out")
+
+            // The guest answers the ARP, which is what `handleInbound` does with
+            // any frame from it.
+            fixture.stack.arpCache.record(tcpGuest, tcpGuestMAC)
+
+            fixture.advance(by: .seconds(2))
+            let retried = fixture.drainSegments()
+            #expect(
+                retried.contains { $0.header.flags.contains(.syn) },
+                "the SYN was dropped once and never retransmitted")
+        }
+    }
+    fixture.drain()
+}
 
 @Test func connectSendsASynAndTheHandshakeCompletesOnTheSynAck() throws {
     let fixture = TCPFixture()

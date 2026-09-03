@@ -56,7 +56,12 @@ pass() { echo "✔ $1"; }
 
 work="$(mktemp -d)"
 pcap="$work/guest.pcap"
-trap 'rm -rf "$work"; jobs -p | xargs -r kill 2>/dev/null' EXIT
+# The control plane, so a check can publish a guest port the way `gvproxy`'s
+# callers do. The path is short on purpose: an AF_UNIX path is capped near 104
+# bytes and `mktemp -d` under TMPDIR eats most of that.
+api="/tmp/netstack-acceptance-$$.sock"
+trap 'rm -rf "$work" "$api"; jobs -p | xargs -r kill 2>/dev/null' EXIT
+rm -f "$api"
 
 echo "building the gateway"
 if ! swift build -c release --product netstack-gateway >"$work/build.log" 2>&1; then
@@ -65,22 +70,38 @@ if ! swift build -c release --product netstack-gateway >"$work/build.log" 2>&1; 
     exit 1
 fi
 gateway="$PWD/.build/arm64-apple-macosx/release/netstack-gateway"
-[[ -x "$gateway" ]] || gateway="$PWD/$(swift build -c release --show-bin-path)/netstack-gateway"
+# `--show-bin-path` answers with an absolute path, so prepending $PWD to it
+# produced a path that does not exist -- and the shim would have failed inside
+# the guest, where the error is much harder to read than it is here.
+[[ -x "$gateway" ]] || gateway="$(swift build -c release --show-bin-path)/netstack-gateway"
+if [[ ! -x "$gateway" ]]; then
+    echo "✘ no netstack-gateway at $gateway"
+    exit 1
+fi
 
-cat > "$work/shim" <<SHIM
+# Written with a QUOTED heredoc and then substituted, rather than letting the
+# outer shell expand it. An unquoted heredoc expands `${args[@]+...}` here,
+# where there is no `args` -- which under `set -u` is an error reported against
+# this line, for a variable belonging to a script that has not run yet.
+cat > "$work/shim" <<'SHIM'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 args=()
 skip=0
-for argument in "\$@"; do
-    if [[ \$skip -eq 1 ]]; then skip=0; continue; fi
-    case "\$argument" in
+for argument in "$@"; do
+    if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+    case "$argument" in
         -config|--config) skip=1 ;;
-        *) args+=("\$argument") ;;
+        *) args+=("$argument") ;;
     esac
 done
-exec "$gateway" --pcap "$pcap" "\${args[@]}"
+# `${args[@]+...}` rather than a bare expansion: in the bash 3.2 that macOS
+# ships an empty array is an unbound variable under `set -u`, and so is
+# `${#args[@]}` on one, so counting first does not help. The array can be
+# empty, because sandbox may pass nothing but the config this drops.
+exec "@GATEWAY@" --pcap "@PCAP@" --listen "unix://@API@" ${args[@]+"${args[@]}"}
 SHIM
+sed -i '' -e "s|@GATEWAY@|$gateway|" -e "s|@PCAP@|$pcap|" -e "s|@API@|$api|" "$work/shim"
 chmod +x "$work/shim"
 
 # One boot per check would be honest and unusably slow -- a guest takes several
@@ -94,9 +115,24 @@ guest() {
 # --- What the guest is given -------------------------------------------------
 
 echo "booting a guest"
-guest 'ip -4 addr show dev eth0; ip route; cat /etc/resolv.conf; ping -c 3 -W 2 192.168.127.1; nslookup gateway.containers.internal 192.168.127.1' "$work/basics.out"
+# The DNS answers are reduced to a token inside the guest rather than grepped
+# out of the transcript here. Grepping the transcript is what this did first,
+# and it could not fail: `192.168.127.1` is in `resolv.conf`, and the name being
+# asked about is echoed by `nslookup` whether it resolves or not, so the check
+# passed on its own inputs.
+guest 'ip -4 addr show dev eth0
+ip route
+cat /etc/resolv.conf
+ping -c 3 -W 2 192.168.127.1
+resolve() {
+    nslookup "$1" 192.168.127.1 2>/dev/null |
+        awk "/^Name:/ { seen = 1; next } seen && /^Address/ { print \$NF; exit }"
+}
+echo "GATEWAY_NAME=$(resolve gateway.containers.internal)"
+echo "HOST_NAME=$(resolve host.containers.internal)"
+echo "ABSENT_NAME=$(resolve nothing.containers.internal)"' "$work/basics.out"
 
-grep -q "192.168.127.2" "$work/basics.out" \
+grep -qE "inet 192\.168\.127\.2(/| )" "$work/basics.out" \
     && pass "the guest gets 192.168.127.2 by DHCP" \
     || fail "the guest did not get 192.168.127.2" "$(head -5 "$work/basics.out")"
 
@@ -112,9 +148,19 @@ grep -qE "3 packets received|3 received" "$work/basics.out" \
     && pass "the gateway answers ICMP echo" \
     || fail "ping lost packets" "$(grep -A 2 'ping statistics' "$work/basics.out" | head -3)"
 
-grep -q "192.168.127.1" "$work/basics.out" && grep -q "gateway.containers.internal" "$work/basics.out" \
-    && pass "the gateway's own name resolves" \
-    || fail "gateway.containers.internal did not resolve"
+grep -q "^GATEWAY_NAME=192.168.127.1$" "$work/basics.out" \
+    && pass "gateway.containers.internal resolves to the gateway" \
+    || fail "gateway.containers.internal resolved to $(grep '^GATEWAY_NAME=' "$work/basics.out" | cut -d= -f2-)"
+
+grep -q "^HOST_NAME=192.168.127.254$" "$work/basics.out" \
+    && pass "host.containers.internal resolves to the host" \
+    || fail "host.containers.internal resolved to $(grep '^HOST_NAME=' "$work/basics.out" | cut -d= -f2-)"
+
+# The negative control, without which the two above would pass against a
+# resolver that answered everything with the gateway's own address.
+grep -q "^ABSENT_NAME=$" "$work/basics.out" \
+    && pass "a name that does not exist resolves to nothing" \
+    || fail "an absent name resolved to $(grep '^ABSENT_NAME=' "$work/basics.out" | cut -d= -f2-)"
 
 # --- The half-close, which is what a real guest found ------------------------
 
@@ -128,7 +174,14 @@ grep -q "T   W   E   N   T   Y" "$work/halfclose.out" \
 
 # --- The same, with enough payload that the FIN has to queue behind it -------
 
+# `nc` cannot serve this one: it quits when the client half-closes, and a
+# truncated transfer would read as a gateway defect. So the listener is Python,
+# and its absence is reported rather than skipped past.
+if ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 is not available, so the bulk half-close check did not run"
+fi
 port=24684
+if command -v python3 >/dev/null 2>&1; then
 python3 - "$port" <<'PY' &
 import socket, sys
 s = socket.socket()
@@ -149,6 +202,7 @@ received="$(grep -oE '^ *[0-9]+' "$work/bulk.out" | tr -d ' ' | tail -1)"
 [[ "${received:-0}" == "200000" ]] \
     && pass "200,000 bytes cross a half-closed connection" \
     || fail "the guest received ${received:-0} of 200000 bytes"
+fi
 
 # The FIN must sit at the end of the data, not on top of it. This is the check
 # that a unit test can state and only a real transfer can put under pressure:
@@ -169,6 +223,47 @@ guest "nc -w 8 192.168.127.254 $port | head -1" "$work/banner.out"
 grep -q "GREETINGS" "$work/banner.out" \
     && pass "a host that speaks first is heard" \
     || fail "the banner never arrived" "$(tail -3 "$work/banner.out")"
+
+# --- A port published into the guest -----------------------------------------
+#
+# The reason this check exists: it did not work at all, and nothing here noticed
+# until a guest was booted and asked. The gateway bound the host port, accepted,
+# ARPed for the guest, got its reply -- and never sent a SYN, because an active
+# open's SYN was emitted once, dropped while ARP was still unresolved, and never
+# retransmitted.
+
+port=24688
+guest_out="$work/published.out"
+rm -f "$api"
+SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c \
+    '(while true; do echo GUEST-LISTENER | nc -l -p 9999; done) & sleep 45' >"$guest_out" 2>&1 &
+for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
+sleep 12
+
+if [[ -S "$api" ]] && command -v curl >/dev/null 2>&1; then
+    curl -s -X POST --unix-socket "$api" http://x/services/forwarder/expose \
+        -d "{\"local\":\"127.0.0.1:$port\",\"remote\":\"192.168.127.2:9999\"}" >/dev/null
+    sleep 1
+    cat > "$work/reach.py" <<'PY'
+import socket, sys
+s = socket.socket()
+s.settimeout(10)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+    # Never closes its own send side: the guest's listener speaks first, so
+    # this must not depend on half-closure to get an answer.
+    print(s.recv(64).decode(errors="replace").strip())
+except Exception as error:
+    print("error: %s" % type(error).__name__)
+s.close()
+PY
+    answer="$(python3 "$work/reach.py" "$port")"
+    [[ "$answer" == "GUEST-LISTENER" ]] \
+        && pass "a port published into the guest carries a connection" \
+        || fail "the published port answered '$answer'"
+else
+    fail "the control plane never appeared at $api, so nothing was published"
+fi
 
 echo
 if [[ $status -eq 0 ]]; then

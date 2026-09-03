@@ -23,6 +23,41 @@ public final class IPv4Protocol {
     /// found once in the reassembler.
     private static let maximumPayload = 65535 - IPv4Header.minimumLength
 
+    /// A datagram that had nowhere to go because the next hop's link address
+    /// was not yet known, held until ARP answers.
+    ///
+    /// Held before fragmentation rather than after: what is waiting is a
+    /// request to send, and re-running `send` when the address arrives is both
+    /// less state and the only version that cannot disagree with the real path.
+    private struct Deferred {
+        let payload: ByteBuffer
+        let destination: IPv4Address
+        let source: IPv4Address?
+        let protocolNumber: IPProtocol
+        /// Insertion order across every next hop, so the global cap can evict
+        /// the oldest rather than refuse the newest.
+        let sequence: UInt64
+    }
+
+    /// Keyed by NEXT HOP, which is what ARP resolves -- not by destination,
+    /// which for anything off-link is a different address entirely.
+    private var deferred: [IPv4Address: [Deferred]] = [:]
+    private var deferredBytes = 0
+    private var deferredSequence: UInt64 = 0
+
+    /// The first datagram to a guest is the one that has to wait for ARP, so
+    /// without this it is always the one that is lost. TCP survived that by
+    /// retransmitting; UDP has nothing to retransmit with, and a `nc -u` into a
+    /// published port dropped its first datagram every time.
+    ///
+    /// Bounded on three axes because the alternative is a queue a peer chooses
+    /// the size of. Linux's `unres_qlen` is 3 per neighbour and this matches it;
+    /// the global and byte caps are this package's own, since one unreachable
+    /// address must not be able to spend the budget of every other.
+    static let maximumDeferredPerNextHop = 3
+    static let maximumDeferredDatagrams = 32
+    static let maximumDeferredBytes = 256 * 1024
+
     private var handlers: [IPProtocol: (IPv4Header, ByteBuffer) -> Void] = [:]
     /// Wraps at 65535, which is what the field allows. Collisions only matter
     /// between fragments of concurrent datagrams to the same peer, and 65536
@@ -54,6 +89,12 @@ public final class IPv4Protocol {
         /// send anything -- but a rising count is usually a guest doing
         /// something the gateway was never set up to carry.
         public var unknownProtocol = 0
+        /// Held until ARP answered, rather than dropped for want of a link
+        /// address. The pair is worth having together: a rising `dropped`
+        /// against a flat `deferred` is a bound being hit, which is a different
+        /// problem from an address that never answers.
+        public var deferredForResolution = 0
+        public var droppedUnresolved = 0
     }
 
     public private(set) var counters = Counters()
@@ -75,6 +116,7 @@ public final class IPv4Protocol {
         self.arpResponder = arpResponder
         self.reassembler = reassembler
         self.allocator = allocator
+        observeResolutions()
     }
 
     public func setHandler(for protocolNumber: IPProtocol, _ handler: @escaping (IPv4Header, ByteBuffer) -> Void) {
@@ -233,7 +275,20 @@ public final class IPv4Protocol {
             guard route.sourceWasHonoured else { throw StackError.noRoute }
             guard let resolved = arpCache.lookup(route.nextHop) else {
                 arpResponder.request(route.nextHop, from: route.source)
-                throw StackError.noRoute
+                // Held rather than dropped, if there is room. `noRoute` still
+                // means what it says -- there is nowhere to send this -- but
+                // "not yet" and "never" used to be reported the same way, and
+                // the caller cannot tell them apart either.
+                guard
+                    hold(
+                        payload: payload, to: destination, from: source,
+                        protocolNumber: protocolNumber, nextHop: route.nextHop)
+                else {
+                    counters.droppedUnresolved += 1
+                    throw StackError.noRoute
+                }
+                counters.deferredForResolution += 1
+                return
             }
             nextHopMAC = resolved
             localSource = route.source
@@ -251,6 +306,98 @@ public final class IPv4Protocol {
 
         for var fragment in fragments {
             nic.send(&fragment, to: nextHopMAC, etherType: .ipv4)
+        }
+    }
+
+    /// Hold one datagram for a next hop that is not yet resolved. Returns false
+    /// when a bound refuses it, in which case the caller drops it as before.
+    ///
+    private func hold(
+        payload: ByteBuffer, to destination: IPv4Address, from source: IPv4Address?,
+        protocolNumber: IPProtocol, nextHop: IPv4Address
+    ) -> Bool {
+        // Per next hop this refuses, as Linux does: three is the depth one
+        // conversation is worth, and a fourth says the address is not coming.
+        let waiting = deferred[nextHop]?.count ?? 0
+        guard waiting < Self.maximumDeferredPerNextHop else { return false }
+        guard payload.readableBytes <= Self.maximumDeferredBytes else { return false }
+
+        // The global caps EVICT rather than refuse. Nothing else releases an
+        // entry -- a datagram leaves this queue when its address resolves, and
+        // an address that never resolves never releases anything -- so a cap
+        // that only refused would let a peer pin the whole budget permanently
+        // and shut the queue for everybody else.
+        //
+        // Guest-reachable, and that is why it matters here: a guest that sends
+        // SYNs with spoofed on-link sources makes this gateway answer addresses
+        // only that guest could ARP for, and it simply does not answer. Eleven
+        // of those would have taken every slot for good.
+        while deferredCount >= Self.maximumDeferredDatagrams
+            || deferredBytes + payload.readableBytes > Self.maximumDeferredBytes
+        {
+            guard evictOldestDeferred() else { return false }
+        }
+
+        deferredSequence &+= 1
+        deferred[nextHop, default: []].append(
+            Deferred(
+                payload: payload, destination: destination, source: source,
+                protocolNumber: protocolNumber, sequence: deferredSequence))
+        deferredBytes += payload.readableBytes
+        return true
+    }
+
+    /// Drop the datagram that has been waiting longest, anywhere. Returns false
+    /// when there is nothing left to drop, which stops the caller looping.
+    private func evictOldestDeferred() -> Bool {
+        var oldestHop: IPv4Address?
+        var oldest = UInt64.max
+        for (hop, waiting) in deferred {
+            guard let first = waiting.first, first.sequence < oldest else { continue }
+            oldest = first.sequence
+            oldestHop = hop
+        }
+        guard let hop = oldestHop, var waiting = deferred[hop], !waiting.isEmpty else { return false }
+        deferredBytes -= waiting.removeFirst().payload.readableBytes
+        if waiting.isEmpty {
+            deferred.removeValue(forKey: hop)
+        } else {
+            deferred[hop] = waiting
+        }
+        counters.droppedUnresolved += 1
+        return true
+    }
+
+    /// An address became known. Send what was waiting on it, oldest first.
+    ///
+    /// The entry is removed BEFORE anything is sent. A send that fails again
+    /// takes the ordinary path -- including deferring itself, if the address
+    /// has already expired -- and re-entering this function with the queue
+    /// still holding the frame it is delivering would recurse.
+    func resolved(_ address: IPv4Address) {
+        guard let waiting = deferred.removeValue(forKey: address) else { return }
+        for item in waiting {
+            deferredBytes -= item.payload.readableBytes
+            try? send(
+                payload: item.payload, to: item.destination, from: item.source,
+                protocolNumber: item.protocolNumber)
+        }
+    }
+
+    /// How many datagrams are waiting on an address, over every address.
+    var deferredCount: Int { deferred.values.reduce(0) { $0 + $1.count } }
+
+    /// Subscribe to the cache's resolutions.
+    ///
+    /// Done here rather than by whoever assembles the graph, because a queue
+    /// that is only drained when someone remembers to wire it is a queue that
+    /// silently holds datagrams for ever -- and `onRecorded` has one owner, so
+    /// a second assignment elsewhere would not add a listener, it would replace
+    /// this one. Every `IPv4Protocol` therefore claims it itself, including the
+    /// ones tests build directly.
+    private func observeResolutions() {
+        arpCache.onRecorded = { [weak self] address, _ in
+            self?.resolved(address)
         }
     }
 }

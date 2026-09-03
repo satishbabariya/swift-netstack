@@ -272,6 +272,13 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// timer for the life of the process.
     static let maximumFinTransmissions = 8
 
+    /// How many times an active open's SYN goes out before the connection is
+    /// given up. RFC 9293 §3.8.3 requires a handshake to be retried and to have
+    /// an end; Linux's `tcp_syn_retries` defaults to 6, and this is the same
+    /// order for the same reason -- long enough to cross a stall, short enough
+    /// that a caller waiting on a guest that is not listening finds out.
+    static let maximumSynTransmissions = 6
+
     private struct Peer: Hashable {
         let address: IPv4Address
         let port: UInt16
@@ -389,6 +396,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         var finDeadline: NIODeadline?
         var finTimeout: TimeAmount = RTTEstimator.minimumTimeout
         var finTransmissions = 0
+        /// The same three for an active open's SYN. It needs its own, for the
+        /// same reason the FIN does: neither is a segment the sender holds, so
+        /// the sender's own estimator neither times them out nor backs them off.
+        var synDeadline: NIODeadline?
+        var synTimeout: TimeAmount = RTTEstimator.minimumTimeout
+        var synTransmissions = 0
 
         /// The order in which this connection entered TIME-WAIT, or nil if it
         /// has not. An ordinary counter, so that eviction can pick the oldest
@@ -692,6 +705,30 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // the SYN-ACK answering it closes the round trip. Recorded immediately
         // before the emit rather than after it because `emit` is synchronous and
         // the clock cannot move inside it, so the two instants are the same one.
+        emitSyn(on: connection)
+        armRetransmitTimer(on: connection)
+    }
+
+    /// Send this connection's SYN and record when to send it again.
+    ///
+    /// A SYN is retransmitted like anything else in flight, and nothing
+    /// retransmitted it. That mattered far more than one lost segment would
+    /// suggest, because the FIRST segment to a guest is the one this stack is
+    /// most likely to drop itself: `IPv4Protocol.send` has nowhere to put a
+    /// frame until ARP resolves, so it emits a request and throws, and `emit`
+    /// swallows that -- correctly, since a send failure is not a reason to fail
+    /// a connection TCP is entitled to retry. Nothing retried.
+    ///
+    /// The symptom was a port published into the guest that never worked at
+    /// all. The capture holds the ARP request, the guest's reply 158
+    /// microseconds later, and no SYN anywhere in the fourteen seconds after.
+    private func emitSyn(on connection: Connection) {
+        if connection.synTransmissions == 0 {
+            connection.synTimeout = connection.sender.retransmissionTimeout
+        }
+        connection.synTransmissions += 1
+        connection.synDeadline = stack.clock.now() + connection.synTimeout
+        // Sampled per transmission, so Karn can refuse an ambiguous round trip.
         connection.handshake.recordTransmission(at: stack.clock.now())
         emit(
             [.syn], sequence: connection.tcb.iss, on: connection,
@@ -701,6 +738,10 @@ public final class TCPEndpoint: TransportEndpointDelegate {
                 + handshakeSackPermittedOption(for: connection, answeringPeerSyn: false),
             acknowledgement: SequenceNumber(0),
             window: unscaledAdvertisedWindow(of: connection))
+    }
+
+    private func synNeedsRetransmission(_ connection: Connection) -> Bool {
+        connection.tcb.state == .synSent
     }
 
     /// Queue bytes for transmission.
@@ -1651,12 +1692,8 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     private func nextRetransmitDeadline(of connection: Connection) -> NIODeadline? {
         let data = connection.sender.retransmitDeadline
         let fin = finNeedsRetransmission(connection) ? connection.finDeadline : nil
-        switch (data, fin) {
-        case (nil, nil): return nil
-        case (let data?, nil): return data
-        case (nil, let fin?): return fin
-        case (let data?, let fin?): return min(data, fin)
-        }
+        let syn = synNeedsRetransmission(connection) ? connection.synDeadline : nil
+        return [data, fin, syn].compactMap { $0 }.min()
     }
 
     private func retransmitTimerFired(peer: Peer) {
@@ -1667,6 +1704,21 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             let segment = connection.sender.retransmitTimerFired(tcb: &connection.tcb)
         {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
+        }
+
+        if synNeedsRetransmission(connection), let deadline = connection.synDeadline, deadline <= now {
+            guard connection.synTransmissions < Self.maximumSynTransmissions else {
+                // The same ending the FIN has, for the same reason: a guest that
+                // is not listening, or is not there, must not hold a four-tuple
+                // and a caller for ever. `onClosed` is how a pending connect
+                // learns it failed -- the port forwarder is exactly such a
+                // caller, and it closes the host socket that was waiting.
+                remove(connection)
+                reportClosed(connection)
+                return
+            }
+            connection.synTimeout = min(connection.synTimeout * 2, RTTEstimator.maximumTimeout)
+            emitSyn(on: connection)
         }
 
         if finNeedsRetransmission(connection), let deadline = connection.finDeadline, deadline <= now {

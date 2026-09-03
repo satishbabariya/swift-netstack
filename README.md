@@ -610,6 +610,34 @@ says "skipped" and passes on a Mac rather than passing silently — a check that
 quietly succeeds where it cannot run reports "fine" about a wire nobody has
 tried.
 
+`scripts/vm-acceptance.sh` is the other one, for the opposite reason: it boots a
+real Linux guest through
+[`sandbox`](https://github.com/satishbabariya/sandbox) and checks what that
+guest actually sees. GitHub's macOS runners are themselves virtual machines, so
+Virtualization.framework cannot nest and CI can never run it. It is a local
+gate, and it earns the inconvenience -- every other check here drives the
+gateway with frames this repository wrote, which cannot tell you what a real TCP
+stack does when it meets this one. Three defects came out of that gap and none
+were reachable from a test that composes its own segments: an answer discarded
+when the guest closed its send side (`busybox nc` with no stdin does it within a
+millisecond of the handshake), a banner dropped when the host spoke before the
+guest's third leg landed, and NXDOMAIN returned for a name that exists without
+the record type asked for -- which a resolver caches as "no such name".
+
+The script is falsified the same way the guards are: reverting the half-close
+fix makes its TCP checks fail and leaves the others passing, so it fails at the
+thing that broke rather than at everything. Within an afternoon of existing it
+found two more, both the same shape and neither reachable from a composed
+frame: a port published into the guest never carried a connection, because an
+active open's SYN was dropped while ARP was unresolved and nothing retransmitted
+it; and the first datagram to a published UDP port was lost every time, because
+nothing held it either.
+
+One thing it does **not** cover, despite booting a guest: DHCP. `sandbox`
+addresses its guest itself, so no real guest here has ever asked this gateway
+for a lease -- `/leases` is empty during these runs and that is correct. The
+DHCP server's tests are the frame-level ones in `frame-smoke.sh`.
+
 The Swift examples on this page are **compiled**. They sit in a function nothing
 calls in `Tests/NetstackTests/READMEExample.swift`, so the test build type-checks
 them, and `scripts/conventions.sh` regenerates that copy from the code blocks
@@ -674,7 +702,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-819 tests, plus a differential harness in `differential/` that drives gVisor's
+823 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

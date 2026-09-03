@@ -150,6 +150,11 @@ public final class Stack {
         self.arpResponder = arpResponder
         self.reassembler = reassembler
 
+        // No `onRecorded` wiring here on purpose. `IPv4Protocol` claims it in
+        // its own initialiser: the callback has a single owner, so wiring it
+        // from outside would work for the graph this file builds and silently
+        // not for any other -- including a second assignment here, which would
+        // replace the delivery rather than add to it.
         self.ipv4 = IPv4Protocol(
             nic: nic, routes: routes, arpCache: arpCache, arpResponder: arpResponder,
             reassembler: reassembler, allocator: allocator)

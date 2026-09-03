@@ -298,6 +298,14 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// `onClosed` fires once per connection. The peer's FIN and a reset are
         /// both "this stream is over", and a connection can meet both.
         var closedReported = false
+        /// `onPeerFinished` likewise. The peer can FIN once, but the state that
+        /// says so is reached again by every segment that arrives afterwards.
+        var peerFinishReported = false
+        /// A FIN this side has asked for and cannot send yet, because the
+        /// sender still holds payload the window has not let out. The FIN's
+        /// sequence number is `snd.nxt`, so sending it now would place it on
+        /// top of bytes that have not gone.
+        var finPending = false
 
         /// When our half of the handshake went out and how many times, so that
         /// the round trip can be sampled once it completes -- and refused when
@@ -412,6 +420,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
 
     private var boundID: TransportEndpointID?
     private var isListening = false
+    private var sendSideClosed = false
     private var backlog = 0
     private var connections: [Peer: Connection] = [:]
     /// Hands out `Connection.timeWaitOrder`. Monotonic, so "oldest" is a fact
@@ -518,6 +527,16 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// was deleted by a reset or by the end of the closing handshake. Fires at
     /// most once per connection.
     public var onClosed: (() -> Void)?
+
+    /// Called when the peer's FIN arrives on a connection whose *send* side is
+    /// still open -- the half-closed state, CLOSE-WAIT.
+    ///
+    /// Set it and the peer's FIN reports here instead of through `onClosed`; a
+    /// caller that leaves it nil sees the older behaviour, where a FIN in
+    /// either direction ends the stream. `onClosed` still fires for this
+    /// connection when it really finishes, so nothing that waits on it waits
+    /// forever.
+    public var onPeerFinished: (() -> Void)?
 
     /// Every frame this endpoint emits, header and payload, at the single
     /// egress point -- see the type's doc comment. Internal because `TCPHeader`
@@ -694,6 +713,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // The interface carries no connection identifier, so an endpoint with
         // more than one connection refuses rather than picking one.
         guard connections.count <= 1 else { throw StackError.invalidEndpointState }
+        // Past the FIN, whether it has gone out or is still waiting behind the
+        // queue. Accepting a write here would either follow a FIN that has
+        // already been sent -- data past the end of the stream -- or be counted
+        // by the deferred close below as a reason to keep waiting, which turns
+        // "shut the send side" into "shut it eventually, maybe".
+        guard !sendSideClosed else { throw StackError.notConnected }
         guard let connection = connections.values.first else { throw StackError.notConnected }
         switch connection.tcb.state {
         case .established, .closeWait:
@@ -765,7 +790,68 @@ public final class TCPEndpoint: TransportEndpointDelegate {
     /// — but `onClosed` is **not**, because `close()` is now asynchronous and
     /// that callback is the only way to learn it finished.
     public func close() {
+        shutdownWrite()
+        onData = nil
+        onEstablished = nil
+        onWritable = nil
+    }
+
+    /// Claims the peer's FIN, if it arrived before anyone was listening for it.
+    ///
+    /// A FIN is an event and it is over: `onPeerFinished` fires when the
+    /// segment is processed, and a caller that adopts an established endpoint
+    /// afterwards -- which is what the forwarder does, since it only builds the
+    /// guest channel once the host side has been dialled -- would never hear
+    /// about one that had already passed. The next segment in CLOSE-WAIT would
+    /// raise it again, but on a connection whose peer has finished speaking
+    /// there may not be a next segment.
+    ///
+    /// Returns true once per connection, and marks the FIN reported, so the
+    /// answer and the callback cannot both fire for the same one.
+    public func adoptPeerFinished() -> Bool {
+        for connection in connections.values where connection.tcb.state == .closeWait {
+            guard !connection.peerFinishReported else { continue }
+            connection.peerFinishReported = true
+            return true
+        }
+        return false
+    }
+
+    /// Sends a FIN and stops accepting writes, leaving the receive half open.
+    ///
+    /// This is the half of `close()` that TCP has always had and this endpoint
+    /// did not expose. A peer that has finished sending has not necessarily
+    /// finished listening: `nc host port` with no stdin sends its FIN in the
+    /// same millisecond as the third leg of its handshake and then waits for
+    /// the answer. Answering that FIN by tearing down both directions discards
+    /// the reply -- which is what a real Linux guest saw against this gateway
+    /// before this existed.
+    ///
+    /// `onData`, `onWritable` and `onEstablished` all survive, because the
+    /// point is to keep receiving. `onClosed` reports the connection's real
+    /// end, as it does after `close()`.
+    ///
+    /// Calling this twice, or calling `close()` after it, sends one FIN. TCP
+    /// agrees -- a second CLOSE in FIN-WAIT or LAST-ACK is defined to do
+    /// nothing -- but the registration below is not idempotent on its own, and
+    /// running it twice would hand the demuxer a tuple it already holds and
+    /// drop the connection as the failure path.
+    public func shutdownWrite() {
+        guard !sendSideClosed else { return }
+        sendSideClosed = true
         for connection in connections.values {
+            // A FIN consumes the sequence number at `snd.nxt`, and `snd.nxt` is
+            // the first byte the sender has not TRANSMITTED -- not the first it
+            // has not been given. A connection whose window or congestion
+            // window is full is holding payload behind that point, and closing
+            // here would put the FIN on top of it: the peer would see the
+            // stream end early and this side would then retransmit data past
+            // its own FIN. So the close waits, and `transmit` finishes it once
+            // the queue is empty.
+            guard connection.sender.unsentBytes == 0 else {
+                connection.finPending = true
+                continue
+            }
             for action in TCPStateMachine.close(on: &connection.tcb) {
                 switch action {
                 case .sendFin:
@@ -801,9 +887,6 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         }
         boundID = nil
         isListening = false
-        onData = nil
-        onEstablished = nil
-        onWritable = nil
     }
 
     /// How many connections this endpoint currently holds, live and lingering
@@ -1073,7 +1156,7 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         switch connection.tcb.state {
         case .closeWait, .closing, .lastAck, .timeWait, .closed:
             // The peer's FIN is past: no more data will arrive on this stream.
-            reportClosed(connection)
+            reportPeerFinished(connection)
         case .listen, .synSent, .synReceived, .established, .finWait1, .finWait2:
             break
         }
@@ -1461,6 +1544,23 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             tcb: &connection.tcb, mss: payloadSegmentSize(for: connection))
         for segment in segments {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
+        }
+        // The queue has drained, so the FIN that was waiting behind it can go.
+        // Here rather than in the write path: what releases the payload is the
+        // peer's acknowledgement opening the window, and this is the one place
+        // every route to a transmission passes through.
+        if connection.finPending, connection.sender.unsentBytes == 0 {
+            connection.finPending = false
+            for action in TCPStateMachine.close(on: &connection.tcb) {
+                switch action {
+                case .sendFin:
+                    emitFin(on: connection)
+                case .deleteTCB:
+                    remove(connection)
+                default:
+                    break
+                }
+            }
         }
         return segments.count
     }
@@ -1955,6 +2055,25 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             connection.registeredID = nil
         }
         connections.removeValue(forKey: connection.peer)
+    }
+
+    /// The peer's FIN has been processed. Whether that ends the connection
+    /// depends on who is asking.
+    ///
+    /// CLOSE-WAIT is the one state where it does not: the peer has finished
+    /// sending and this side has not, so there is still a send half to use. A
+    /// caller that asked for half-closure hears about it there and keeps its
+    /// write side; one that did not gets the older meaning, where either FIN
+    /// ends the stream. Every other state here has both halves finished, so
+    /// both callers get the same answer.
+    private func reportPeerFinished(_ connection: Connection) {
+        guard let onPeerFinished, connection.tcb.state == .closeWait else {
+            reportClosed(connection)
+            return
+        }
+        guard !connection.peerFinishReported else { return }
+        connection.peerFinishReported = true
+        onPeerFinished()
     }
 
     private func reportClosed(_ connection: Connection) {

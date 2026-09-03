@@ -40,6 +40,13 @@ final class GlueHandler: ChannelDuplexHandler {
     private var context: ChannelHandlerContext?
     private var pendingRead = false
 
+    /// This channel's peer has finished sending, and this channel has finished
+    /// sending to it. A splice ends when both are true and not before -- the
+    /// two halves of a TCP connection close independently, and treating the
+    /// first of them as the end throws away the other direction's traffic.
+    private var inputClosed = false
+    private var outputClosed = false
+
     /// Set while this side is closing, so a partner closing back does not bounce
     /// the close between the two handlers.
     private var closing = false
@@ -85,6 +92,19 @@ final class GlueHandler: ChannelDuplexHandler {
         partner?.partnerCloseFromPeer()
     }
 
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if case ChannelEvent.inputClosed = event {
+            inputClosed = true
+            // The source is done sending, so this sink has nothing left to
+            // write -- but it may still have plenty left to read. Passing the
+            // half-close through, rather than closing, is what lets `echo hi |
+            // nc host port` and busybox `nc` with no stdin see their answers.
+            partner?.partnerInputClosed()
+            closeIfFinished(context)
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         partner?.partnerCloseFromPeer()
         context.close(promise: nil)
@@ -121,6 +141,39 @@ final class GlueHandler: ChannelDuplexHandler {
         guard pendingRead else { return }
         pendingRead = false
         context?.read()
+    }
+
+    /// The partner's peer has finished sending, so this side's send half is
+    /// done: pass the FIN on and stop there.
+    private func partnerInputClosed() {
+        guard !closing, !outputClosed, let context else { return }
+        guard context.channel.isActive else {
+            // There is no half to close. This channel has not connected yet --
+            // the port forwarder installs the glue and then dials the guest --
+            // so the source hanging up is not "I have finished sending", it is
+            // the whole reason the dial existed going away. Half-closing here
+            // did nothing at all, and the dial ran on to its own timeout
+            // holding a connection slot for a client that had left.
+            partnerCloseFromPeer()
+            return
+        }
+        outputClosed = true
+        // Flushed first for the same reason a close is: the source's last bytes
+        // were written here, and a FIN that overtakes them truncates the stream
+        // at the one point where losing the tail is least acceptable.
+        context.flush()
+        context.close(mode: .output, promise: nil)
+        closeIfFinished(context)
+    }
+
+    /// Both halves are finished, so nothing more can happen on this channel and
+    /// holding it open holds a file descriptor and an endpoint for nobody. A
+    /// half-closed channel does not close itself -- that is the point of it --
+    /// so this is the only thing that releases it.
+    private func closeIfFinished(_ context: ChannelHandlerContext) {
+        guard inputClosed, outputClosed, !closing else { return }
+        closing = true
+        context.close(promise: nil)
     }
 
     private func partnerCloseFromPeer() {

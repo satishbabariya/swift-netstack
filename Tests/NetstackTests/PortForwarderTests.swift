@@ -369,6 +369,52 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     _ = holder.stack
 }
 
+@Test func aResetFromTheGuestReleasesTheSlotOfAHalfClosedForward() async throws {
+    // With half-closure, the host hanging up no longer ends the guest side: it
+    // sends a FIN and waits. So the slot is held until the guest agrees, and
+    // the fastest way a guest says "I am finished" is a reset. If this does not
+    // release the slot, nothing about the churn accounting below is measuring
+    // what it claims to.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await portForwardingGateway(
+        group: group, guestSide: &guestSide, guestPort: 8080, maximumConnections: 8)
+    let hostPort = holder.forwarder!.listeningAddress!.port!
+
+    let dialler = try await ClientBootstrap(group: group)
+        .connect(host: "127.0.0.1", port: hostPort).get()
+    let syn = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+    let opening = try #require(syn.first { $0.header.flags.contains(.syn) })
+    let accept = pfGuestSegment(
+        sourcePort: 8080, destinationPort: opening.header.sourcePort, sequence: 5000,
+        acknowledgement: opening.header.sequence.value &+ 1, flags: [.syn, .ack])
+    _ = accept.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+
+    try? await dialler.close()
+    // The gateway's FIN first: the reset is the guest's answer to it, and
+    // sending it before the FIN has been seen would leave the test passing
+    // for a reason it does not name.
+    _ = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.fin) } }
+    let reset = pfGuestSegment(
+        sourcePort: 8080, destinationPort: opening.header.sourcePort, sequence: 5001,
+        acknowledgement: 0, flags: [.rst])
+    _ = reset.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+
+    var settled = -1
+    for _ in 0..<200 where settled != 0 {
+        settled = try await holder.stack!.eventLoop.submit { holder.forwarder!.establishedCount }.get()
+        if settled != 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+    #expect(settled == 0, "the reset left \(settled) slots held")
+
+    holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
 @Test func hostSideSlotsAreReturnedExactlyOnceAcrossManyConnections() async throws {
     // The mirror of the outbound forwarder's churn test, and the same hand-kept
     // counter: taken when a host connection is accepted, returned by whichever
@@ -391,13 +437,29 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
         let syn = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
         // Half the rounds the guest accepts; half it never answers and the host
         // hangs up first. Both have to return the slot.
+        var lastGuestPort: UInt16 = 0
         if round % 2 == 0, let opening = syn.first(where: { $0.header.flags.contains(.syn) }) {
+            lastGuestPort = opening.header.sourcePort
             let bytes = pfGuestSegment(
                 sourcePort: 8080, destinationPort: opening.header.sourcePort, sequence: 5000,
                 acknowledgement: opening.header.sequence.value &+ 1, flags: [.syn, .ack])
             _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
         }
         try? await dialler.close()
+        if round % 2 == 0 {
+            _ = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.fin) } }
+            // The host hanging up is a FIN, and a FIN is half of a close: the
+            // guest side is left able to answer, which is the whole point of
+            // half-closure. So the guest has to hang up too, and a reset is how
+            // a guest that is finished says so without a four-way exchange this
+            // test would otherwise have to sequence by hand. Its sequence is
+            // exactly `rcv.nxt` -- the SYN-ACK at 5000 consumed one -- because a
+            // reset outside the window is correctly ignored.
+            let bytes = pfGuestSegment(
+                sourcePort: 8080, destinationPort: lastGuestPort, sequence: 5001,
+                acknowledgement: 0, flags: [.rst])
+            _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+        }
         _ = pfDrain(guestSide)
 
         let live = try await holder.stack!.eventLoop.submit { holder.forwarder!.establishedCount }.get()

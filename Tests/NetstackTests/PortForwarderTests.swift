@@ -391,6 +391,10 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     _ = accept.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
 
     try? await dialler.close()
+    // The gateway's FIN first: the reset is the guest's answer to it, and
+    // sending it before the FIN has been seen would leave the test passing
+    // for a reason it does not name.
+    _ = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.fin) } }
     let reset = pfGuestSegment(
         sourcePort: 8080, destinationPort: opening.header.sourcePort, sequence: 5001,
         acknowledgement: 0, flags: [.rst])
@@ -443,6 +447,7 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
         }
         try? await dialler.close()
         if round % 2 == 0 {
+            _ = await pfAwait(guestSide) { $0.contains { $0.header.flags.contains(.fin) } }
             // The host hanging up is a FIN, and a FIN is half of a close: the
             // guest side is left able to answer, which is the whole point of
             // half-closure. So the guest has to hang up too, and a reset is how

@@ -66,6 +66,46 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func aWriteAfterTheOutputIsClosedIsRefusedRatherThanQueued() async throws {
+    // Half-closure gives this channel a state it never had: open for reading,
+    // finished for writing. A write there cannot be honoured. Queueing it would
+    // be worse than refusing -- the FIN either has already gone, making these
+    // bytes data past the end of the stream, or is still waiting behind the
+    // queue this write would join, which postpones the close for as long as
+    // anything keeps writing.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture)
+        try withExtendedLifetime(server) {
+            handshakeThroughForwarder(fixture)
+            let child = try #require(collector.children.first)
+            try child.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).wait()
+
+            let closed = child.eventLoop.makePromise(of: Void.self)
+            child.close(mode: .output, promise: closed)
+            #expect(throws: Never.self) { try closed.futureResult.wait() }
+            #expect(child.isActive, "an output close is not a close")
+
+            var payload = ByteBufferAllocator().buffer(capacity: 4)
+            payload.writeString("late")
+            let refused = child.eventLoop.makePromise(of: Void.self)
+            // Not `wait()`. The behaviour this guards against is a write that is
+            // QUEUED rather than refused, and a queued write's promise is never
+            // settled at all -- so a check that waited on it would hang instead
+            // of failing, and a gate that hangs reports nothing.
+            let outcome = Outcome()
+            refused.futureResult.whenComplete { outcome.result = $0 }
+            child.writeAndFlush(payload, promise: refused)
+            guard case .failure(let error) = outcome.result else {
+                Issue.record("the write was queued rather than refused after the output was closed")
+                return
+            }
+            #expect(error as? ChannelError == .outputClosed)
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aChannelBuiltOverAnAlreadyHalfClosedEndpointStillHearsAboutIt() async throws {
     // The FIN can be older than the channel. The outbound forwarder builds the
     // guest-side channel only once the host has been dialled, so a guest that
@@ -99,6 +139,15 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
         }
     }
     fixture.drain()
+}
+
+/// A promise's outcome, read back on the same loop turn that settled it.
+///
+/// `@unchecked` for the reason everything else in this fixture is: the callback
+/// and the read both happen on the one loop this test drives, and the compiler
+/// cannot see that through `whenComplete`'s `@Sendable`.
+private final class Outcome: @unchecked Sendable {
+    var result: Result<Void, Error>?
 }
 
 /// Records the half-close events a splice depends on.

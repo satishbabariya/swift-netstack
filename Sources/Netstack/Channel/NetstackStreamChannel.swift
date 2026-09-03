@@ -192,6 +192,15 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             promise?.fail(ChannelError.ioOnClosedChannel)
             return
         }
+        // The send half is finished. Queueing this would be worse than
+        // refusing it: the FIN either has already gone -- making these bytes
+        // data past the end of the stream -- or is still waiting on the queue
+        // this write would join, which postpones the close for as long as the
+        // writer keeps writing.
+        guard !outputClosed else {
+            promise?.fail(ChannelError.outputClosed)
+            return
+        }
         // Queued, not sent. The promise means "these bytes were accepted by the
         // send buffer", which `flush0` is the first thing in a position to know.
         //
@@ -465,6 +474,14 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         let abandoned = pendingWrites
         pendingWrites.removeAll()
         for (_, writePromise) in abandoned { writePromise?.fail(ChannelError.ioOnClosedChannel) }
+        // A `.output` close still waiting for those writes. The bytes it was
+        // ordered behind have just been failed, so the FIN it wanted will
+        // never be sent, and a caller holding this promise would otherwise
+        // wait on a close that already happened by another route.
+        if case .some(let outputPromise) = pendingOutputClose {
+            pendingOutputClose = nil
+            outputPromise?.fail(ChannelError.ioOnClosedChannel)
+        }
         connectPromise?.fail(error)
         connectPromise = nil
         promise?.succeed(())

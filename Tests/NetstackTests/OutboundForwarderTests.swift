@@ -1,3 +1,4 @@
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 import Testing
@@ -217,9 +218,16 @@ private func awaitSegments(
     let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
     let theirs = answer.header.sequence.value &+ 1
 
-    // Long enough for the dial to complete and the banner to be written and
-    // queued, and only then the third leg.
-    try await Task.sleep(nanoseconds: 200_000_000)
+    // Wait for the banner to have been WRITTEN, not for a duration. A fixed
+    // sleep here is a check whose passing depends on the machine: too short and
+    // it stops exercising the dropped-write path silently, which is the failure
+    // mode this whole test exists to catch elsewhere.
+    for _ in 0..<400 where !GreetingOnConnect.greeted.withLockedValue({ $0 }) {
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    #expect(
+        GreetingOnConnect.greeted.withLockedValue { $0 },
+        "the host never wrote its banner, so the race under test never happened")
     send(
         guestSide,
         guestFrame(
@@ -277,9 +285,13 @@ private func awaitSegments(
         guestFrame(
             to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
             acknowledgement: theirs, flags: [.ack]))
-    // Long enough that the splice is established and reading before anything
-    // else happens, so the FIN below cannot be the one adopted at activation.
-    try await Task.sleep(nanoseconds: 200_000_000)
+    // The splice has to be established and reading before the FIN, or the FIN
+    // would be the one claimed at activation and this test would be a duplicate
+    // of the one above. Waiting on the handshake's own last segment says that
+    // exactly, where a fixed sleep only hopes it.
+    _ = await awaitSegments(guestSide) { segments in
+        segments.contains { $0.header.flags.contains(.ack) }
+    }
 
     send(
         guestSide,
@@ -327,10 +339,17 @@ private final class GreetingOnConnect: ChannelInboundHandler, @unchecked Sendabl
     typealias InboundIn = ByteBuffer
     typealias OutboundOut = ByteBuffer
 
+    /// Set once the banner has been written, so a test can wait on the event
+    /// rather than on a duration. Static because the listener builds its own
+    /// children and there is one of these per test.
+    static let greeted = NIOLockedValueBox(false)
+
     func channelActive(context: ChannelHandlerContext) {
         var buffer = context.channel.allocator.buffer(capacity: 16)
         buffer.writeString("GREETINGS")
-        context.writeAndFlush(wrapOutboundOut(buffer), promise: nil)
+        context.writeAndFlush(wrapOutboundOut(buffer)).whenComplete { _ in
+            Self.greeted.withLockedValue { $0 = true }
+        }
     }
 }
 

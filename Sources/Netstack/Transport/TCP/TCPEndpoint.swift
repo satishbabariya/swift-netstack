@@ -301,6 +301,11 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         /// `onPeerFinished` likewise. The peer can FIN once, but the state that
         /// says so is reached again by every segment that arrives afterwards.
         var peerFinishReported = false
+        /// A FIN this side has asked for and cannot send yet, because the
+        /// sender still holds payload the window has not let out. The FIN's
+        /// sequence number is `snd.nxt`, so sending it now would place it on
+        /// top of bytes that have not gone.
+        var finPending = false
 
         /// When our half of the handshake went out and how many times, so that
         /// the round trip can be sampled once it completes -- and refused when
@@ -708,6 +713,12 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // The interface carries no connection identifier, so an endpoint with
         // more than one connection refuses rather than picking one.
         guard connections.count <= 1 else { throw StackError.invalidEndpointState }
+        // Past the FIN, whether it has gone out or is still waiting behind the
+        // queue. Accepting a write here would either follow a FIN that has
+        // already been sent -- data past the end of the stream -- or be counted
+        // by the deferred close below as a reason to keep waiting, which turns
+        // "shut the send side" into "shut it eventually, maybe".
+        guard !sendSideClosed else { throw StackError.notConnected }
         guard let connection = connections.values.first else { throw StackError.notConnected }
         switch connection.tcb.state {
         case .established, .closeWait:
@@ -829,6 +840,18 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard !sendSideClosed else { return }
         sendSideClosed = true
         for connection in connections.values {
+            // A FIN consumes the sequence number at `snd.nxt`, and `snd.nxt` is
+            // the first byte the sender has not TRANSMITTED -- not the first it
+            // has not been given. A connection whose window or congestion
+            // window is full is holding payload behind that point, and closing
+            // here would put the FIN on top of it: the peer would see the
+            // stream end early and this side would then retransmit data past
+            // its own FIN. So the close waits, and `transmit` finishes it once
+            // the queue is empty.
+            guard connection.sender.unsentBytes == 0 else {
+                connection.finPending = true
+                continue
+            }
             for action in TCPStateMachine.close(on: &connection.tcb) {
                 switch action {
                 case .sendFin:
@@ -1521,6 +1544,23 @@ public final class TCPEndpoint: TransportEndpointDelegate {
             tcb: &connection.tcb, mss: payloadSegmentSize(for: connection))
         for segment in segments {
             emit(segment.flags.union(.ack), sequence: segment.sequence, on: connection, payload: segment.payload)
+        }
+        // The queue has drained, so the FIN that was waiting behind it can go.
+        // Here rather than in the write path: what releases the payload is the
+        // peer's acknowledgement opening the window, and this is the one place
+        // every route to a transmission passes through.
+        if connection.finPending, connection.sender.unsentBytes == 0 {
+            connection.finPending = false
+            for action in TCPStateMachine.close(on: &connection.tcb) {
+                switch action {
+                case .sendFin:
+                    emitFin(on: connection)
+                case .deleteTCB:
+                    remove(connection)
+                default:
+                    break
+                }
+            }
         }
         return segments.count
     }

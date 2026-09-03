@@ -57,3 +57,5 @@ Sources/Netstack/Channel/NetstackStreamChannel.swift	aChannelBuiltOverAnAlreadyH
 Sources/Netstack/Channel/NetstackStreamChannel.swift	aHostThatSpeaksFirstIsHeardEvenBeforeTheGuestsThirdLeg	            } catch StackError.notConnected {	            } catch StackError.invalidEndpointState {
 Sources/Netstack/Gateway/GlueHandler.swift	hostSideSlotsAreReturnedExactlyOnceAcrossManyConnections	        guard context.channel.isActive else {	        if false {
 Sources/Netstack/Transport/TCP/TCPEndpoint.swift	closingAnEndpointWhoseSendSideIsAlreadyShutKeepsItsConnection	        guard !sendSideClosed else { return }	        if sendSideClosed { _ = sendSideClosed }
+Sources/Netstack/Transport/TCP/TCPEndpoint.swift	aWriteShutdownWaitsForThePayloadItTerminates	            guard connection.sender.unsentBytes == 0 else {	            guard true else {
+Sources/Netstack/Channel/NetstackStreamChannel.swift	aWriteAfterTheOutputIsClosedIsRefusedRatherThanQueued	        // writer keeps writing.\n        guard !outputClosed else {\n            promise?.fail(ChannelError.outputClosed)\n            return\n        }	        // writer keeps writing.

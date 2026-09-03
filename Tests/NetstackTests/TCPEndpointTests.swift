@@ -234,6 +234,59 @@ func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = ga
 
 // MARK: - The handshake, and the options we do and do not advertise
 
+@Test func aWriteShutdownWaitsForThePayloadItTerminates() throws {
+    // A FIN consumes the sequence number at `snd.nxt`, which is the first byte
+    // the sender has not *transmitted*. A connection whose peer has advertised
+    // a small window is holding payload behind that point, and closing the send
+    // side there would put the FIN on top of it: the peer sees the stream end
+    // early, and this side then retransmits data past its own FIN.
+    //
+    // Reachable in a way it was not before half-closure: `close()` used to mean
+    // the connection was over, and a splice now shuts one direction while the
+    // other is still running and the window is still full.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            // A window of 10 bytes: whatever is written past that cannot go.
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 10))
+            _ = fixture.drainSegments()
+
+            var payload = ByteBufferAllocator().buffer(capacity: 100)
+            payload.writeBytes([UInt8](repeating: 0x41, count: 100))
+            #expect(throws: Never.self) { try endpoint.send(payload) }
+            let firstBurst = fixture.drainSegments()
+            let sent = firstBurst.reduce(0) { $0 + $1.payload.readableBytes }
+            #expect(sent == 10, "the peer's window let \(sent) bytes out, not 10")
+
+            endpoint.shutdownWrite()
+            #expect(
+                fixture.drainSegments().contains { $0.header.flags.contains(.fin) } == false,
+                "the FIN went out on top of 90 bytes the peer had no window for")
+
+            // The peer acknowledges what it took and opens up. The rest goes,
+            // and only then the FIN.
+            fixture.inject(
+                guestSegment(
+                    sequence: guestISS + 1, ack: gatewayISS &+ 1 &+ 10, flags: [.ack], window: 500))
+            let rest = fixture.drainSegments()
+            let delivered = rest.reduce(0) { $0 + $1.payload.readableBytes }
+            #expect(delivered == 90, "\(delivered) of the remaining 90 bytes went out")
+            let fin = try #require(rest.first { $0.header.flags.contains(.fin) })
+            let lastByte = rest.filter { $0.payload.readableBytes > 0 }.map {
+                $0.header.sequence.value &+ UInt32($0.payload.readableBytes)
+            }.max()
+            #expect(
+                fin.header.sequence.value == lastByte,
+                "the FIN sits at \(fin.header.sequence.value), the data ends at \(lastByte ?? 0)")
+        }
+    }
+    fixture.drain()
+}
+
 @Test func closingAnEndpointWhoseSendSideIsAlreadyShutKeepsItsConnection() throws {
     // `close()` is `shutdownWrite()` plus dropping the callbacks, so the two can
     // run in sequence on the same connection -- a half-closed splice closes its

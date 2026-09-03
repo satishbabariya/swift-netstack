@@ -66,6 +66,79 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func aCloseWaitingOnAPeerThatStopsReadingGivesUp() async throws {
+    // The deferral above waits for the peer's window, and a peer can decline to
+    // open it for ever. That would be a channel, an endpoint and -- on a
+    // gateway -- the host socket spliced to it, held by a guest that has only
+    // to stop reading.
+    //
+    // The first version of this test asserted that the CONNECTION bounded it:
+    // persist, then keep-alive, then a reset. It does not, and it must not --
+    // RFC 1122 §4.2.2.17 makes timing out a zero-window connection a MUST NOT,
+    // and this package honours that deliberately. The counterweight RFC 6429 §4
+    // names is the application's close, which is exactly what the deferral had
+    // taken away. So the bound is the channel's own, and this test is what
+    // found that out: written to confirm a claim, it failed, and the claim was
+    // wrong rather than the test.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture, installRecorder: false)
+        try withExtendedLifetime(server) {
+            fixture.inject(
+                guestSegment(sequence: guestISS, flags: [.syn], options: [.maximumSegmentSize(1460)]))
+            let synAck = fixture.drainSegments().first { $0.header.flags.contains(.syn) }
+            let iss = synAck?.header.sequence.value ?? 0
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack], window: 200))
+            let child = try #require(collector.children.first)
+            _ = fixture.drainSegments()
+
+            var written = 0
+            while written < TCPEndpoint.sendBufferBytes + 128 * 1024 {
+                var payload = ByteBufferAllocator().buffer(capacity: 64 * 1024)
+                payload.writeBytes([UInt8](repeating: 0x5a, count: 64 * 1024))
+                child.writeAndFlush(payload, promise: nil)
+                written += 64 * 1024
+            }
+            _ = fixture.drainSegments()
+
+            let closed = child.eventLoop.makePromise(of: Void.self)
+            // Read through a box rather than waited on. Without the linger this
+            // promise is never settled at all, so a `wait()` here would hang
+            // the falsification instead of failing it -- and a gate that hangs
+            // reports nothing. It hung, which is how this got noticed.
+            let outcome = Outcome()
+            closed.futureResult.whenComplete { outcome.result = $0 }
+            child.close(promise: closed)
+            #expect(child.isActive, "positive control: the close is waiting, not done")
+
+            // A guest that is present, answering, and simply not reading:
+            // every probe is acknowledged with a window of zero. This is the
+            // case the linger is for, and the only one where it is the thing
+            // that ends the wait -- a guest that stopped answering ALTOGETHER
+            // is ended by the connection's own retransmission budget instead,
+            // which would have made this test pass without a linger at all.
+            var acknowledged = UInt32(0)
+            for _ in 0..<20 where child.isActive {
+                fixture.advance(by: .seconds(10))
+                acknowledged = UInt32(fixture.link.drainTransmitted().count)
+                fixture.inject(
+                    guestSegment(
+                        sequence: guestISS + 1, ack: iss &+ 1 &+ min(acknowledged, 200),
+                        flags: [.ack], window: 0))
+            }
+            #expect(
+                !child.isActive,
+                "the close is still waiting on a guest that has taken nothing for minutes")
+            guard case .success = outcome.result else {
+                Issue.record("the close never completed: \(String(describing: outcome.result))")
+                return
+            }
+        }
+    }
+    fixture.drain()
+}
+
 @Test func closingAChannelWithWritesStillQueuedSendsThemFirst() async throws {
     // A close is not a discard. The splice writes with no promise, so a close
     // that failed what was queued lost the bytes AND said nothing -- and this
@@ -129,6 +202,7 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
             #expect(
                 delivered == written,
                 "the close discarded \(written - delivered) of \(written) bytes it had accepted")
+
         }
     }
     fixture.drain()

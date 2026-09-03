@@ -57,6 +57,30 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     /// A full close that arrived with writes still queued, for the same reason
     /// and with a larger consequence: closing discards them.
     private var pendingClose: EventLoopPromise<Void>??
+    private var closeLingerTask: Scheduled<Void>?
+    private var lingerWatermark = 0
+
+    /// How long a deferred close will wait without the queue moving.
+    ///
+    /// Not a deadline on the close: it is reset every time bytes actually
+    /// leave, so a slow transfer that is still making progress is never
+    /// truncated, however long it takes. What it bounds is a close waiting on a
+    /// peer that has stopped taking anything at all.
+    ///
+    /// That bound has to exist, and it has to be here rather than in the
+    /// connection. RFC 1122 §4.2.2.17 makes timing out a zero-window connection
+    /// a MUST NOT, which this package honours -- so persist probes go on for as
+    /// long as the peer keeps its window shut, and the counterweight RFC 6429 §4
+    /// names is that such a connection "needs to allow ... to be closed or
+    /// aborted by their applications". Waiting here for the peer's window would
+    /// take that escape away and hold the channel, its endpoint and, on a
+    /// gateway, the host socket spliced to it, at the choice of a guest that has
+    /// only to stop reading.
+    ///
+    /// Sixty seconds because that is the persist timer's own steady-state
+    /// interval: a peer that has taken nothing across a full probe interval is
+    /// not being slow.
+    static let closeLinger = TimeAmount.seconds(60)
     private var writable = true
     private var connectPromise: EventLoopPromise<Void>?
     private var local: SocketAddress?
@@ -445,6 +469,35 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         // more thing the close is waiting on.
         outputClosed = true
         pendingClose = promise
+        armCloseLinger()
+    }
+
+    private func armCloseLinger() {
+        closeLingerTask?.cancel()
+        lingerWatermark = outstandingBytes
+        closeLingerTask = endpoint.schedule(after: Self.closeLinger) { [weak self] in
+            guard let self, case .some(let promise) = self.pendingClose else { return }
+            // Re-armed rather than fired if anything moved. Progress is not the
+            // channel's own queue draining -- that can be empty while the
+            // connection is still working through the send buffer -- it is the
+            // whole pipeline owing less than it did.
+            guard self.outstandingBytes >= self.lingerWatermark else {
+                self.armCloseLinger()
+                return
+            }
+            // Nothing has left in a full probe interval. The bytes are owed and
+            // they are lost, which is what the caller's close asked for; what is
+            // not acceptable is holding a channel, an endpoint and the socket
+            // spliced to it for a peer that has stopped taking anything.
+            self.pendingClose = nil
+            self.finish(error: ChannelError.ioOnClosedChannel, promise: promise)
+        }
+    }
+
+    /// Everything still owed to the peer: what this channel holds, plus what it
+    /// has already handed to the connection.
+    private var outstandingBytes: Int {
+        pendingWrites.reduce(0) { $0 + $1.buffer.readableBytes } + endpoint.owedBytes
     }
 
     /// Sends this side's FIN and leaves the channel active for reading.
@@ -528,6 +581,8 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             pendingClose = nil
             closePromise?.succeed(())
         }
+        closeLingerTask?.cancel()
+        closeLingerTask = nil
         connectPromise?.fail(error)
         connectPromise = nil
         promise?.succeed(())

@@ -702,7 +702,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-824 tests, plus a differential harness in `differential/` that drives gVisor's
+825 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

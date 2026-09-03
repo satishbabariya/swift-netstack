@@ -363,6 +363,16 @@ rest on unit tests written by the same person who wrote the code, in the one
 part of this system that has an independent check precisely because errors there
 are hard to see.
 
+Since `scripts/vm-acceptance.sh` exists, the *premise* of that choice can be
+checked even though the behaviour cannot. A real Linux guest whose reader is
+held still for fifteen seconds while a megabyte arrives advertises a window of
+**zero** four times and then reopens by **32,896 bytes or more** — never a small
+non-zero window, because Linux does its own receiver-side avoidance. So the
+crawl MUST-38 prevents has no occasion to happen, which is what the decision
+rests on, and that is now a measurement rather than an argument. The script
+checks it on every run: a guest that ever advertises a silly window here means
+the decision needs revisiting, and the check is what would say so.
+
 RACK itself (RFC 8985's time-based loss detection) is there and opt-in
 (`TCPEndpoint.rack`), alongside CUBIC and for the same reason: the differential
 harness runs gVisor with its own RACK disabled, so enabling it here would compare

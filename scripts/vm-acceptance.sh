@@ -213,6 +213,12 @@ fi
 # The FIN must sit at the end of the data, not on top of it. This is the check
 # that a unit test can state and only a real transfer can put under pressure:
 # the window has to actually close for the sender to hold anything back.
+#
+# It reads the capture, which is buffered, and it gets away with that only
+# because more checks run after it and their traffic flushes what this one
+# needs. That is luck rather than design -- see the note further down about a
+# check that had none -- so this must stay ahead of at least one other check
+# that puts traffic through, and it must not become the last thing here.
 if command -v tcpdump >/dev/null 2>&1 && [[ -s "$pcap" ]]; then
     finish="$(tcpdump -r "$pcap" -n 2>/dev/null | grep "$port" | grep -oE 'Flags \[F\.\], seq [0-9]+' | tail -1 | grep -oE '[0-9]+$')"
     [[ "${finish:-0}" == "200001" ]] \
@@ -259,61 +265,59 @@ else
     fail "python3 is not available, so the megabyte check did not run"
 fi
 
+# --- The premise under which MUST-38 is left unimplemented --------------------
+#
+# RFC 9293 §3.8.6.2.1's MUST-38 -- sender-side silly-window-syndrome avoidance
+# -- is deliberately not implemented, and the README says why: the condition it
+# governs is a peer that reopens its window a few bytes at a time, and nothing
+# available could check whether that ever happens.
+#
+# A real guest can. Linux does its own receiver-side avoidance: under the stall
+# above it holds the window at ZERO and then reopens it by tens of kilobytes,
+# rather than dribbling. So the crawl MUST-38 prevents has no occasion to
+# happen, which is the premise the decision rests on.
+#
+# This check is that premise, not the RFC. If a guest ever does advertise a
+# small non-zero window here, the decision needs revisiting -- and this is what
+# would say so.
+
+if command -v tcpdump >/dev/null 2>&1 && [[ -s "$pcap" ]]; then
+    # The raw field, because the scale factor is not visible per segment. This
+    # guest negotiates wscale 7, so 12 raw is 1536 bytes -- about one segment.
+    # Unscaled it would be 12 bytes, which is absurd either way, so the
+    # threshold flags a silly window under either reading.
+    dribbles="$(tcpdump -r "$pcap" -n 2>/dev/null |
+        grep "192.168.127.2\.[0-9]* > 192.168.127.254.$port" |
+        grep -oE 'win [0-9]+' | awk '$2 > 0 && $2 < 12' | wc -l | tr -d ' ')"
+    [[ "${dribbles:-0}" == "0" ]] \
+        && pass "the guest never advertises a silly window, so MUST-38 has no occasion" \
+        || fail "the guest advertised $dribbles small non-zero windows; MUST-38 now matters"
+fi
+
 # --- A host that resets mid-transfer -----------------------------------------
 #
-# The guest must find out that the stream is over. It used to not: the gateway
-# handed on the bytes it had, and then sent nothing at all -- no FIN, no reset
-# -- because the channel released its endpoint while the connection still owed
-# 212,168 bytes, and the demuxer holds delegates weakly. The connection was
-# deallocated mid-send and the guest waited out its own timeout.
+# There is no check here, and the reason is worth writing down.
 #
-# Timed rather than counted, deliberately. How much arrives before a reset is
-# not a property of this gateway -- the host's RST discards whatever was still
-# in its socket buffer -- so counting bytes here would be a check that fails on
-# a fast day. What is a property of this gateway is that the guest is told.
+# One was written: it read the capture and required the LAST thing the gateway
+# said on the connection to carry a FIN or a RST, so that a stream could not
+# simply stop. It failed intermittently, and the intermittency was the check's,
+# not the gateway's. The capture is flushed on exit and the gateway exits when
+# the guest does, so the very last record written -- which is exactly the FIN --
+# is the one most likely to be missing. Waiting and re-reading did not help,
+# because it was never going to arrive.
+#
+# What settled it was tracing the gateway rather than the capture:
+#
+#     shutdownWrite already=false n=1 unsent=0 state=closeWait
+#     emitFin state=lastAck
+#
+# The FIN was sent. The check's evidence was absent, which is not the same
+# thing, and a check that cannot tell those apart does not belong in a gate
+# whose whole purpose is to be believed.
+#
+# The property is covered where it can be observed without a capture:
+# `aDeferredCloseEndsWithAFinRatherThanSilence` in the channel tests.
 
-port=24762
-if command -v python3 >/dev/null 2>&1; then
-cat > "$work/reset.py" <<'PY'
-import socket, struct, sys
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("0.0.0.0", int(sys.argv[1])))
-s.listen(1)
-c, _ = s.accept()
-c.sendall(b"A" * 600000)
-# SO_LINGER with a zero timeout makes close() send a RST rather than a FIN,
-# with the guest still well behind.
-c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-c.close()
-s.close()
-PY
-python3 "$work/reset.py" "$port" &
-sleep 1
-guest "nc -w 40 192.168.127.254 $port | (sleep 5; wc -c)" "$work/reset.out"
-
-# Read out of the capture rather than timed. How long the transfer takes is not
-# a property of this gateway -- the guest's reader is deliberately slow -- and a
-# timing threshold would fail on a slow day and pass on a fast one. What IS a
-# property of this gateway is that the last thing it says on this connection
-# ends the stream, rather than the stream simply stopping.
-if command -v tcpdump >/dev/null 2>&1 && [[ -s "$pcap" ]]; then
-    # The BRACKET CONTENTS, not the whole `Flags [..]` -- the word "Flags"
-    # carries an F of its own, so matching the phrase made `*F*` true of every
-    # segment ever sent and the check could not fail. It did not, for one run.
-    ending="$(tcpdump -r "$pcap" -n 2>/dev/null |
-        grep "192.168.127.254.$port > " | tail -1 |
-        sed -E 's/.*Flags \[([^]]*)\].*/\1/')"
-    case "$ending" in
-        *F*|*R*) pass "a host that resets leaves the guest a finished stream ($ending)" ;;
-        *) fail "the gateway's last word was ${ending:-nothing}, so the stream just stopped" ;;
-    esac
-else
-    fail "no capture, so the reset check could not be read"
-fi
-else
-    fail "python3 is not available, so the reset check did not run"
-fi
 
 # --- A host that speaks first ------------------------------------------------
 

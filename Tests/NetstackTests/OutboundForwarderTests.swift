@@ -289,23 +289,41 @@ private func awaitSegments(
     // would be the one claimed at activation and this test would be a duplicate
     // of the one above. Waiting on the handshake's own last segment says that
     // exactly, where a fixed sleep only hopes it.
-    _ = await awaitSegments(guestSide) { segments in
-        segments.contains { $0.header.flags.contains(.ack) }
-    }
-
     send(
         guestSide,
         guestFrame(
             to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
             acknowledgement: theirs, flags: [.ack, .psh], payload: Array("ping".utf8)))
+
+    // The splice has to be live before the FIN, or this test is a second copy
+    // of the one above -- the FIN would be the one claimed at activation, not
+    // the one delivered through the endpoint's callback.
+    //
+    // The host's prompt answer is what says so, and nothing else does: the
+    // gateway owes the guest no segment of its own for the third leg, so an
+    // earlier version of this waited for an ACK that is never sent and passed
+    // only because waiting for it took two seconds.
+    let live = await awaitSegments(guestSide) { segments in
+        segments.contains { String(buffer: $0.payload).contains("OK") }
+    }
+    let prompt = try #require(
+        live.first { String(buffer: $0.payload).contains("OK") },
+        "the splice never carried anything, so the FIN below is not the one under test")
+
+    // Acknowledged, because a guest that does not is a guest Nagle is entitled
+    // to withhold the next small segment from -- correctly, and for as long as
+    // the test is willing to wait. The answer this test is about is eleven
+    // bytes, so leaving the prompt unacknowledged made a working gateway look
+    // like a broken one.
+    let acknowledging = prompt.header.sequence.value &+ UInt32(prompt.payload.readableBytes)
     send(
         guestSide,
         guestFrame(
             to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7005,
-            acknowledgement: theirs, flags: [.fin, .ack]))
+            acknowledgement: acknowledging, flags: [.fin, .ack]))
 
     let carried = await awaitSegments(guestSide) { segments in
-        segments.contains { $0.payload.readableBytes > 0 }
+        segments.contains { String(buffer: $0.payload).contains("LATE-ANSWER") }
     }
     let late = carried.map { String(buffer: $0.payload) }.joined()
     #expect(late.contains("LATE-ANSWER"), "the answer after the guest's FIN was lost: \(late)")
@@ -327,6 +345,13 @@ private final class LateAnswer: ChannelInboundHandler, @unchecked Sendable {
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let channel = context.channel
+        // Answered at once, so the test has an observable "the splice is
+        // carrying bytes" rather than a duration to guess at.
+        var acknowledgement = channel.allocator.buffer(capacity: 4)
+        acknowledgement.writeString("OK")
+        channel.writeAndFlush(acknowledgement, promise: nil)
+        // And then the real answer, late enough that the guest's FIN lands on a
+        // live connection first.
         context.eventLoop.scheduleTask(in: .milliseconds(150)) {
             var buffer = channel.allocator.buffer(capacity: 16)
             buffer.writeString("LATE-ANSWER")

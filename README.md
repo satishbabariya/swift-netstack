@@ -339,7 +339,7 @@ that instead.
 | **Wire** | Datagram and length-prefixed transports over real sockets, adopted from a descriptor or dialled to a path |
 | **Network** | IPv4 parse/emit, route table with spoof-aware source selection, limited broadcast, egress fragmentation, ingress reassembly with timeout and memory bounds, ICMPv4 |
 | **Transport** | Four-tuple demultiplexer with protocol-handler override, UDP, ICMP port-unreachable |
-| **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, RFC 1122 §4.2.3.3 receiver-side silly-window-syndrome avoidance, retransmit / persist / TIME-WAIT timers |
+| **TCP** | RFC 9293 state machine with RFC 5961 hardening and a §7 challenge-ACK rate limit, RFC 1982 serial arithmetic, out-of-order reassembly, RFC 6298 RTO with Karn and a handshake sample, RFC 5681 Reno and RFC 9438 CUBIC, RFC 6675 SACK-based loss recovery and RFC 8985 RACK-TLP time-based loss detection and tail loss probing, RFC 2018 SACK reporting, RFC 6528 initial sequence numbers, RFC 7323 window scaling and timestamps with PAWS, RFC 1122 keep-alive, delayed ACK, Nagle, zero-window probing, RFC 1122 §4.2.3.3 receiver-side silly-window-syndrome avoidance, half-closure in both directions, retransmit / persist / TIME-WAIT timers |
 | **Bridge** | `NetstackStreamChannel`, `NetstackServerChannel` and `NetstackDatagramChannel` conforming to NIO's `Channel`, with backpressure that reaches the guest's window |
 | **Gateway** | ICMP echo forwarding over unprivileged sockets, DHCP server with static leases and search domains, address translation for reaching the host, link-local blocking, host-to-guest forwarding over TCP, UDP and unix sockets, DNS server with zones, wildcards and upstream forwarding, outbound TCP forwarding, UDP flow forwarding, host-to-guest port forwarding, and upstream's HTTP control API for managing forwards at runtime |
 | **Observability** | notifications to a supervisor when the network is ready and guests arrive or leave, pcap capture of every frame, bounded so a guest cannot fill the host's disk, `swift-log` logging of every refusal, rate-limited per event kind so a hostile guest cannot flood the host's disk, and `Gateway.statistics()` — monotonic counters read as one consistent snapshot, also served as JSON on `GET /stats` |
@@ -674,7 +674,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-811 tests, plus a differential harness in `differential/` that drives gVisor's
+817 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

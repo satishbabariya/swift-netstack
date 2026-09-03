@@ -31,6 +31,7 @@ enum GuestSplice {
         endpoint.keepAlive = keepAlive
         let guestChannel = NetstackStreamChannel(
             eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
+        guestChannel.allowHalfClosure()
         guestChannel.installCallbacks()
 
         let (guestGlue, hostGlue) = GlueHandler.matchedPair()
@@ -39,6 +40,12 @@ enum GuestSplice {
             // the reads it declines to issue. With it on the reads happen anyway
             // and the queue moves one layer down, where nothing bounds it.
             try guestChannel.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
+            // Half-closure on both sides of the splice, so a FIN in one
+            // direction is forwarded as a FIN rather than acted on as a
+            // teardown. A client that writes its request and closes its send
+            // side -- `echo … | nc`, busybox `nc` with no stdin, every
+            // HTTP/0.9-shaped protocol -- is still waiting for the answer.
+            try host.syncOptions?.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
             try guestChannel.pipeline.syncOperations.addHandler(guestGlue)
             try host.pipeline.syncOperations.addHandler(hostGlue)
         } catch {

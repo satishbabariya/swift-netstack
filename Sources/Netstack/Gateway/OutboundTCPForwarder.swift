@@ -291,6 +291,10 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         endpoint.keepAlive = keepAlive
         let guestChannel = NetstackStreamChannel(
             eventLoop: eventLoop, endpoint: endpoint, owns: true, parent: nil)
+        // Before `installCallbacks`, because the endpoint may already be in
+        // CLOSE-WAIT: this channel is built only once the host side has been
+        // dialled, and the guest's FIN can be older than the channel.
+        guestChannel.allowHalfClosure()
         guestChannel.installCallbacks()
         guestChannel.acceptedAddresses(
             local: try? SocketAddress(
@@ -304,6 +308,12 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             // letting it happen. The synchronous view is the right tool here for
             // the same reason it is right for the handlers below.
             try guestChannel.syncOptions?.setOption(ChannelOptions.autoRead, value: false)
+            // Half-closure on both sides of the splice, so a FIN in one
+            // direction is forwarded as a FIN rather than acted on as a
+            // teardown. A client that writes its request and closes its send
+            // side -- `echo … | nc`, busybox `nc` with no stdin, every
+            // HTTP/0.9-shaped protocol -- is still waiting for the answer.
+            try outbound.syncOptions?.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
             try guestChannel.pipeline.syncOperations.addHandler(guestGlue)
             try outbound.pipeline.syncOperations.addHandler(hostGlue)
         } catch {

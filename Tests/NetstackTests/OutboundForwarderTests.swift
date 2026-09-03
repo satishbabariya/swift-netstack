@@ -116,6 +116,224 @@ private func awaitSegments(
     return collected
 }
 
+@Test func aGuestThatHasFinishedSendingStillGetsTheHostsAnswer() async throws {
+    // A FIN says "I have nothing more to send", not "forget the answer". A
+    // client that writes its request and closes its side is ordinary -- it is
+    // what `echo … | nc host port` does, and what busybox nc does with no stdin
+    // at all -- and the host's reply has to keep arriving.
+    //
+    // Found by booting a real Linux guest against this gateway. The capture:
+    //
+    //     guest → gateway  [S]    wscale 7, sackOK, TS
+    //     gateway → guest  [S.]   … established
+    //     guest → gateway  [.]    ack 1
+    //     guest → gateway  [F.]   seq 1, ack 1        79µs later
+    //     gateway → guest  [.]    ack 2
+    //     gateway → guest  [F.]   seq 1, ack 2, length 0
+    //
+    // The gateway answered the guest's FIN by closing the host connection and
+    // sending its own, and the twenty bytes the host had already written were
+    // never forwarded. `od -c` in the guest printed `0000000`.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide)
+
+    // A listener that speaks first, the way a greeting server does, so the
+    // answer does not depend on the guest sending anything.
+    let listener = try await ServerBootstrap(group: group)
+        .childChannelInitializer { channel in
+            channel.eventLoop.submit {
+                let sync = channel.pipeline.syncOperations
+                try sync.addHandler(GreetingOnConnect())
+            }
+        }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
+    let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+    let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
+    let theirs = answer.header.sequence.value &+ 1
+
+    // Third leg, then the guest says it is done sending. It has sent no data at
+    // all, which is what `nc` with no stdin does.
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: theirs, flags: [.ack]))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: theirs, flags: [.fin, .ack]))
+
+    let carried = await awaitSegments(guestSide) { segments in
+        segments.contains { $0.payload.readableBytes > 0 }
+    }
+    let greeting = carried.map { String(buffer: $0.payload) }.joined()
+    #expect(
+        greeting.contains("GREETINGS"),
+        "the host's answer never reached a guest that had finished sending: \(greeting)")
+
+    close(guestSide)
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    _ = try? await listener.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func aHostThatSpeaksFirstIsHeardEvenBeforeTheGuestsThirdLeg() async throws {
+    // The forwarder dials the host the instant the guest's SYN arrives, so a
+    // host that greets on connect -- SMTP, IMAP, SSH, every protocol that opens
+    // with a banner -- can have its first bytes queued on the guest channel
+    // before the guest's ACK completes the handshake. The channel is active by
+    // then (it is registered), but the endpoint is still in SYN-RECEIVED, and a
+    // send there used to be dropped: `StackError.notConnected` read as "gone"
+    // rather than "not yet", failing a promise the splice does not pass.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide)
+
+    let listener = try await ServerBootstrap(group: group)
+        .childChannelInitializer { channel in
+            channel.eventLoop.submit {
+                try channel.pipeline.syncOperations.addHandler(GreetingOnConnect())
+            }
+        }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
+    let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+    let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
+    let theirs = answer.header.sequence.value &+ 1
+
+    // Long enough for the dial to complete and the banner to be written and
+    // queued, and only then the third leg.
+    try await Task.sleep(nanoseconds: 200_000_000)
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: theirs, flags: [.ack]))
+
+    let carried = await awaitSegments(guestSide) { segments in
+        segments.contains { $0.payload.readableBytes > 0 }
+    }
+    let greeting = carried.map { String(buffer: $0.payload) }.joined()
+    #expect(greeting.contains("GREETINGS"), "the banner was dropped during the handshake: \(greeting)")
+
+    close(guestSide)
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    _ = try? await listener.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func aGuestThatFinishesSendingMidStreamStillGetsWhatFollows() async throws {
+    // The other half of half-closure. In the test above the guest's FIN is
+    // older than the channel and is claimed at activation; here the connection
+    // is fully spliced and running before the FIN arrives, so it comes through
+    // the endpoint's callback instead. Both paths have to keep the receive half
+    // open, and only one of them is reached by any given connection.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await gateway(group: group, guestSide: &guestSide)
+
+    let listener = try await ServerBootstrap(group: group)
+        // Without this the listener's own channel closes on the guest's FIN and
+        // discards the delayed write, and the test would be measuring NIO's
+        // default rather than this gateway's behaviour.
+        .childChannelOption(.allowRemoteHalfClosure, value: true)
+        .childChannelInitializer { channel in
+            channel.eventLoop.submit {
+                try channel.pipeline.syncOperations.addHandler(LateAnswer())
+            }
+        }
+        .bind(host: "127.0.0.1", port: 0).get()
+    let port = UInt16(listener.localAddress!.port!)
+
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7000, flags: [.syn]))
+    let synAck = await awaitSegments(guestSide) { $0.contains { $0.header.flags.contains(.syn) } }
+    let answer = try #require(synAck.first { $0.header.flags.contains(.syn) })
+    let theirs = answer.header.sequence.value &+ 1
+
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: theirs, flags: [.ack]))
+    // Long enough that the splice is established and reading before anything
+    // else happens, so the FIN below cannot be the one adopted at activation.
+    try await Task.sleep(nanoseconds: 200_000_000)
+
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7001,
+            acknowledgement: theirs, flags: [.ack, .psh], payload: Array("ping".utf8)))
+    send(
+        guestSide,
+        guestFrame(
+            to: IPv4Address("127.0.0.1")!, destinationPort: port, sequence: 7005,
+            acknowledgement: theirs, flags: [.fin, .ack]))
+
+    let carried = await awaitSegments(guestSide) { segments in
+        segments.contains { $0.payload.readableBytes > 0 }
+    }
+    let late = carried.map { String(buffer: $0.payload) }.joined()
+    #expect(late.contains("LATE-ANSWER"), "the answer after the guest's FIN was lost: \(late)")
+
+    close(guestSide)
+    _ = try? await holder.forwarder?.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    _ = try? await listener.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+/// Answers only after a delay, so the client's FIN lands on a live splice
+/// before the response does.
+private final class LateAnswer: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let channel = context.channel
+        context.eventLoop.scheduleTask(in: .milliseconds(150)) {
+            var buffer = channel.allocator.buffer(capacity: 16)
+            buffer.writeString("LATE-ANSWER")
+            channel.writeAndFlush(buffer, promise: nil)
+        }
+    }
+}
+
+private final class GreetingOnConnect: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    func channelActive(context: ChannelHandlerContext) {
+        var buffer = context.channel.allocator.buffer(capacity: 16)
+        buffer.writeString("GREETINGS")
+        context.writeAndFlush(wrapOutboundOut(buffer), promise: nil)
+    }
+}
+
 @Test func closingTheForwarderClosesTheConnectionsItServedItself() async throws {
     // A connection to the gateway's own API is served by this forwarder rather
     // than dialled out, so it is not in `spliced` -- and `close` walks

@@ -66,6 +66,54 @@ private func handshakeThroughForwarder(_ fixture: TCPFixture, peerPort: UInt16 =
     return iss
 }
 
+@Test func aChannelBuiltOverAnAlreadyHalfClosedEndpointStillHearsAboutIt() async throws {
+    // The FIN can be older than the channel. The outbound forwarder builds the
+    // guest-side channel only once the host has been dialled, so a guest that
+    // hangs up its send side immediately -- `nc` with no stdin does it within a
+    // millisecond of the handshake -- reaches CLOSE-WAIT before there is a
+    // pipeline to tell. A FIN is not re-sent, and the next segment that would
+    // raise the state again may never come, so the channel has to ask.
+    //
+    // Deterministic where the forwarder tests are not: the endpoint is driven
+    // to CLOSE-WAIT here, in order, before the channel exists at all.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack]))
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.fin, .ack]))
+            _ = fixture.drainSegments()
+
+            let channel = NetstackStreamChannel(
+                eventLoop: fixture.stack.eventLoop, endpoint: endpoint, owns: false, parent: nil)
+            channel.allowHalfClosure()
+            channel.installCallbacks()
+            let watcher = HalfCloseWatcher()
+            try channel.pipeline.syncOperations.addHandler(watcher)
+            channel.registerAlreadyConfigured0(promise: nil)
+
+            #expect(watcher.inputClosed, "the FIN that arrived before the channel was never reported")
+            #expect(!watcher.inactive, "the channel closed instead of half-closing")
+        }
+    }
+    fixture.drain()
+}
+
+/// Records the half-close events a splice depends on.
+private final class HalfCloseWatcher: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    var inputClosed = false
+    var inactive = false
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if case ChannelEvent.inputClosed = event { inputClosed = true }
+        context.fireUserInboundEventTriggered(event)
+    }
+    func channelInactive(context: ChannelHandlerContext) { inactive = true }
+}
+
 @Test func aConnectionTheGuestOpensArrivesAsAChildChannel() throws {
     let fixture = TCPFixture()
     do {

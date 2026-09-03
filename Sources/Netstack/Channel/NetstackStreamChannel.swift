@@ -44,6 +44,16 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     private var flushPending = false
     private var autoRead = true
     private var readPending = false
+    private var allowRemoteHalfClosure = false
+    /// The peer's FIN arrived and was reported as `inputClosed` rather than as
+    /// the end of the channel. Only reachable with half-closure allowed.
+    private var inputClosed = false
+    /// This side's FIN has been sent, or is waiting on the queued writes that
+    /// have to go out in front of it.
+    private var outputClosed = false
+    /// A `.output` close that arrived with writes still queued. The FIN has to
+    /// follow the bytes it terminates, so it waits here until they drain.
+    private var pendingOutputClose: EventLoopPromise<Void>??
     private var writable = true
     private var connectPromise: EventLoopPromise<Void>?
     private var local: SocketAddress?
@@ -95,6 +105,9 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             readPending = value
             if autoRead { read0() }
         }
+        if let value = value as? Bool, option is ChannelOptions.Types.AllowRemoteHalfClosureOption {
+            allowRemoteHalfClosure = value
+        }
         // Everything else is a socket concern that does not apply here. Note
         // what this quietly includes: the write-buffer watermarks. They are not
         // ignored out of laziness -- this channel's writability is not a
@@ -107,6 +120,9 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
     public func getOption<Option: ChannelOption>(_ option: Option) -> EventLoopFuture<Option.Value> {
         if option is ChannelOptions.Types.AutoReadOption {
             return eventLoop.makeSucceededFuture(autoRead as! Option.Value)
+        }
+        if option is ChannelOptions.Types.AllowRemoteHalfClosureOption {
+            return eventLoop.makeSucceededFuture(allowRemoteHalfClosure as! Option.Value)
         }
         return eventLoop.makeFailedFuture(ChannelError.operationUnsupported)
     }
@@ -211,16 +227,18 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             promise?.fail(ChannelError.alreadyClosed)
             return
         }
-        guard case .all = mode else {
-            // Half-close is not offered rather than being faked. The endpoint's
-            // `close` sends a FIN and stops accepting writes in one step; there
-            // is no "stop writing, keep reading" beneath this to expose, and a
-            // `.output` close that silently closed both directions would break
-            // exactly the protocols that ask for one.
+        switch mode {
+        case .all:
+            finish(error: error, promise: promise)
+        case .output:
+            closeOutput(promise: promise)
+        case .input:
+            // Nothing beneath this can refuse bytes the peer has already been
+            // given a window for. Faking it by dropping what arrives would be
+            // worse than refusing: the peer would keep sending into a stream
+            // nobody reads, and only a full close tells it to stop.
             promise?.fail(ChannelError.operationUnsupported)
-            return
         }
-        finish(error: error, promise: promise)
     }
 
     public func triggerUserOutboundEvent0(_ event: Any, promise: EventLoopPromise<Void>?) {
@@ -242,11 +260,32 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         self.remote = remote
     }
 
+    /// Turns on half-closure without going through the pipeline.
+    ///
+    /// The option exists too, and does the same thing; this is for the callers
+    /// that have to set it before `installCallbacks`, since a FIN the endpoint
+    /// has already processed is reported the moment the callbacks are armed and
+    /// a channel that has not yet been told to allow half-closure would answer
+    /// it by closing.
+    func allowHalfClosure() {
+        allowRemoteHalfClosure = true
+    }
+
     func installCallbacks() {
-        endpoint.onEstablished = { [weak self] in self?.activate() }
+        endpoint.onEstablished = { [weak self] in self?.established() }
         endpoint.onData = { [weak self] in self?.deliverAvailable() }
         endpoint.onWritable = { [weak self] in self?.drainPendingWrites() }
         endpoint.onClosed = { [weak self] in self?.peerClosed() }
+        endpoint.onPeerFinished = { [weak self] in self?.peerFinished() }
+    }
+
+    /// The handshake completed. For a channel that dialled, this is activation;
+    /// for one registered over an endpoint that was still in SYN-RECEIVED, the
+    /// channel is long since active and what this brings is the first moment
+    /// the connection can actually carry the bytes already queued on it.
+    private func established() {
+        activate()
+        drainPendingWrites()
     }
 
     private func activate() {
@@ -261,6 +300,13 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             drainPendingWrites()
         }
         if autoRead { read0() }
+        // A FIN that arrived before this channel existed. The forwarder adopts
+        // an established endpoint -- it only builds the guest channel once the
+        // host side has been dialled -- so the guest's FIN can be older than
+        // the pipeline that needs to hear about it, and nothing re-sends one.
+        if allowRemoteHalfClosure, !inputClosed, state == .active, endpoint.adoptPeerFinished() {
+            deliverInputClosed()
+        }
     }
 
     private func deliverAvailable() {
@@ -287,6 +333,23 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         while let next = pendingWrites.first {
             do {
                 try endpoint.send(next.buffer)
+            } catch StackError.notConnected {
+                // Not "gone" -- "not yet". A channel is active from the moment
+                // it is registered, but the endpoint under an accepted
+                // connection can still be in SYN-RECEIVED: the forwarder dials
+                // the host the instant the guest's SYN arrives, so a host that
+                // speaks first -- SMTP, IMAP, SSH, every protocol with a
+                // greeting -- can have its first bytes ready before the guest's
+                // third leg lands. Dropping them here dropped exactly the
+                // greeting the client was waiting for, and the promise the
+                // splice writes with is nil, so it was silent. `established`
+                // brings us back.
+                //
+                // Nothing waits forever on this: an endpoint that dies instead
+                // of connecting reports through `onClosed`, and `finish` fails
+                // every queued write.
+                setWritable(false)
+                return
             } catch StackError.wouldBlock {
                 // Nothing was queued -- `send` refuses whole writes -- so the
                 // entry stays at the head, untouched, and `onWritable` brings
@@ -304,6 +367,10 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
             next.promise?.succeed(())
         }
         setWritable(true)
+        if case .some(let promise) = pendingOutputClose {
+            pendingOutputClose = nil
+            finishOutput(promise: promise)
+        }
     }
 
     private func setWritable(_ value: Bool) {
@@ -333,6 +400,56 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         finish(error: ChannelError.eof, promise: nil)
     }
 
+    /// Sends this side's FIN and leaves the channel active for reading.
+    ///
+    /// The FIN has to arrive behind every byte it terminates, so a close that
+    /// finds writes still queued waits for them: `drainPendingWrites` finishes
+    /// the job. A `.output` close that jumped the queue would truncate exactly
+    /// the response a half-closing protocol was in the middle of sending.
+    private func closeOutput(promise: EventLoopPromise<Void>?) {
+        guard state == .active else {
+            promise?.fail(ChannelError.alreadyClosed)
+            return
+        }
+        guard !outputClosed else {
+            promise?.fail(ChannelError.outputClosed)
+            return
+        }
+        outputClosed = true
+        guard pendingWrites.isEmpty else {
+            pendingOutputClose = promise
+            return
+        }
+        finishOutput(promise: promise)
+    }
+
+    private func finishOutput(promise: EventLoopPromise<Void>?) {
+        endpoint.shutdownWrite()
+        promise?.succeed(())
+        pipeline.fireUserInboundEventTriggered(ChannelEvent.outputClosed)
+    }
+
+    /// The peer's FIN, on a channel that asked to hear about it as the end of
+    /// the inbound half rather than the end of the connection.
+    private func peerFinished() {
+        guard allowRemoteHalfClosure, state == .active, !inputClosed else {
+            // Not asked for, or too late to matter: the old meaning, where
+            // either FIN ends the stream.
+            peerClosed()
+            return
+        }
+        deliverInputClosed()
+    }
+
+    private func deliverInputClosed() {
+        inputClosed = true
+        // The same reason `peerClosed` delivers before finishing: the FIN says
+        // no MORE will arrive, not that what arrived is void.
+        readPending = readPending || autoRead
+        deliverAvailable()
+        pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+    }
+
     private func finish(error: Error, promise: EventLoopPromise<Void>?) {
         guard state != .closed else {
             promise?.fail(ChannelError.alreadyClosed)
@@ -344,6 +461,7 @@ public final class NetstackStreamChannel: Channel, ChannelCore, @unchecked Senda
         endpoint.onData = nil
         endpoint.onWritable = nil
         endpoint.onEstablished = nil
+        endpoint.onPeerFinished = nil
         let abandoned = pendingWrites
         pendingWrites.removeAll()
         for (_, writePromise) in abandoned { writePromise?.fail(ChannelError.ioOnClosedChannel) }

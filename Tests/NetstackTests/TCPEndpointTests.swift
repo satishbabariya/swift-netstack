@@ -234,6 +234,41 @@ func listeningEndpoint(_ fixture: TCPFixture, backlog: Int = 8, iss: UInt32 = ga
 
 // MARK: - The handshake, and the options we do and do not advertise
 
+@Test func closingAnEndpointWhoseSendSideIsAlreadyShutKeepsItsConnection() throws {
+    // `close()` is `shutdownWrite()` plus dropping the callbacks, so the two can
+    // run in sequence on the same connection -- a half-closed splice closes its
+    // output first and its channel afterwards. TCP says the second CLOSE does
+    // nothing, and it does: the state machine returns no actions past
+    // FIN-WAIT-1. The registration does not have that property. Running it
+    // twice hands the demuxer a four-tuple it already holds, and the failure
+    // path for that is to drop the connection -- ending its FIN-WAIT early and
+    // freeing the tuple for reuse while the peer still believes it is open.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            _ = fixture.drainSegments()
+            fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack]))
+            _ = fixture.drainSegments()
+            #expect(endpoint.connectionCountForTesting == 1)
+
+            endpoint.shutdownWrite()
+            let fin = fixture.drainSegments().filter { $0.header.flags.contains(.fin) }
+            #expect(fin.count == 1, "the write shutdown sent \(fin.count) FINs")
+
+            endpoint.close()
+            #expect(
+                fixture.drainSegments().contains { $0.header.flags.contains(.fin) } == false,
+                "the close sent a second FIN")
+            #expect(
+                endpoint.connectionCountForTesting == 1,
+                "the close dropped a connection that was still waiting for the peer's answer")
+        }
+    }
+    fixture.drain()
+}
+
 @Test func aSynToAListeningEndpointIsAnsweredWithASynAckAdvertisingOnlyAnMss() throws {
     let fixture = TCPFixture()
     do {

@@ -427,11 +427,15 @@ private final class FakeResolver: ChannelInboundHandler, @unchecked Sendable {
 
     let address: IPv4Address
     let corrupt: Bool
+    /// Bytes of filler appended to the reply, so a test can make an answer that
+    /// will not fit a datagram without inventing a record set to fill it.
+    let padding: Int
     var seenIDs: [UInt16] = []
 
-    init(address: IPv4Address, corrupt: Bool = false) {
+    init(address: IPv4Address, corrupt: Bool = false, padding: Int = 0) {
         self.address = address
         self.corrupt = corrupt
+        self.padding = padding
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -445,6 +449,7 @@ private final class FakeResolver: ChannelInboundHandler, @unchecked Sendable {
                 allocator: context.channel.allocator)
         else { return }
         reply.setInteger(query.id, at: reply.readerIndex, endianness: .big)
+        if padding > 0 { reply.writeBytes([UInt8](repeating: 0, count: padding)) }
         context.writeAndFlush(
             wrapOutboundOut(AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: reply)),
             promise: nil)
@@ -914,4 +919,114 @@ private func replies(from channel: EmbeddedChannel) throws -> [ByteBuffer] {
         try channel.pipeline.syncOperations.handler(type: IdleStateHandler.self)
     }
     _ = try? channel.finish()
+}
+
+// MARK: - Truncation, and the datagram size the asker offered
+
+@Test func aReplyTooLargeForADatagramComesBackTruncated() async throws {
+    // Upstream truncates and this relayed whole, so an oversized answer went
+    // out as a fragmented datagram -- dropped somewhere, with nobody told why.
+    // RFC 1035 §4.2.1 makes TC the way to say "ask again over TCP", which is
+    // only worth saying now that there is a TCP listener to ask.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let resolver = FakeResolver(address: IPv4Address("93.184.216.34")!, padding: 900)
+    let upstream = try await DatagramBootstrap(group: group)
+        .channelInitializer { channel in channel.pipeline.addHandler(resolver) }
+        .bind(host: "127.0.0.1", port: 0).get()
+    var guestSide: Int32 = -1
+    let holder = try await forwardingGateway(
+        group: group, guestSide: &guestSide, upstream: upstream.localAddress!)
+
+    askOverWire(guestSide, dnsQuery("example.com", id: 0xBEEF))
+    let reply = try #require(await awaitReply(guestSide))
+
+    let flags = try #require(
+        reply.getInteger(at: reply.readerIndex + 2, endianness: .big, as: UInt16.self))
+    #expect(flags & DNSCodec.truncatedFlag != 0, "an oversized reply came back without TC set")
+    #expect(reply.readableBytes <= 512, "the truncated reply is \(reply.readableBytes) bytes")
+    #expect(
+        reply.getInteger(at: reply.readerIndex, endianness: .big, as: UInt16.self) == 0xBEEF,
+        "the guest's transaction id did not come back on the truncation")
+
+    try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func aReplyThatFitsIsNotTruncated() async throws {
+    // The positive control for the check above: without it, a resolver that
+    // truncated everything would pass it and every answer would cost a second
+    // round trip over TCP.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let resolver = FakeResolver(address: IPv4Address("93.184.216.34")!)
+    let upstream = try await DatagramBootstrap(group: group)
+        .channelInitializer { channel in channel.pipeline.addHandler(resolver) }
+        .bind(host: "127.0.0.1", port: 0).get()
+    var guestSide: Int32 = -1
+    let holder = try await forwardingGateway(
+        group: group, guestSide: &guestSide, upstream: upstream.localAddress!)
+
+    askOverWire(guestSide, dnsQuery("example.com", id: 0xBEEF))
+    let reply = try #require(await awaitReply(guestSide))
+
+    let flags = try #require(
+        reply.getInteger(at: reply.readerIndex + 2, endianness: .big, as: UInt16.self))
+    #expect(flags & DNSCodec.truncatedFlag == 0, "a reply that fits was truncated anyway")
+    #expect(answeredAddress(reply) == IPv4Address("93.184.216.34")!)
+
+    try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func theAskersOwnDatagramSizeIsHonoured() throws {
+    // RFC 6891's OPT record, whose CLASS field carries a size rather than a
+    // class. Without reading it every reply over 512 bytes would be truncated,
+    // including the ones the asker had said it would take whole.
+    let plain = dnsQuery("example.com", id: 1)
+    let parsedPlain = try #require(DNSCodec.parseQuery(plain))
+    #expect(
+        DNSCodec.advertisedUDPSize(in: plain, after: parsedPlain) == 512,
+        "a query with no OPT record asks for RFC 1035's 512")
+
+    let large = queryAdvertising(4096, id: 2)
+    let parsedLarge = try #require(DNSCodec.parseQuery(large))
+    #expect(DNSCodec.advertisedUDPSize(in: large, after: parsedLarge) == 4096)
+
+    // Below the floor is a request nothing has to honour, and honouring it
+    // would truncate every answer this gateway gives.
+    let tiny = queryAdvertising(20, id: 3)
+    let parsedTiny = try #require(DNSCodec.parseQuery(tiny))
+    #expect(DNSCodec.advertisedUDPSize(in: tiny, after: parsedTiny) == 512)
+}
+
+/// `example.com` A IN with an EDNS0 OPT record advertising `size`.
+private func queryAdvertising(_ size: UInt16, id: UInt16) -> ByteBuffer {
+    var out = ByteBufferAllocator().buffer(capacity: 64)
+    out.writeInteger(id, endianness: .big)
+    out.writeInteger(UInt16(0x0100), endianness: .big)
+    out.writeInteger(UInt16(1), endianness: .big)  // one question
+    out.writeInteger(UInt16(0), endianness: .big)
+    out.writeInteger(UInt16(0), endianness: .big)
+    out.writeInteger(UInt16(1), endianness: .big)  // one additional: the OPT
+    out.writeInteger(UInt8(7))
+    out.writeString("example")
+    out.writeInteger(UInt8(3))
+    out.writeString("com")
+    out.writeInteger(UInt8(0))
+    out.writeInteger(UInt16(1), endianness: .big)  // A
+    out.writeInteger(UInt16(1), endianness: .big)  // IN
+    // The OPT pseudo-record: root name, type 41, class = the size.
+    out.writeInteger(UInt8(0))
+    out.writeInteger(DNSCodec.optRecordType, endianness: .big)
+    out.writeInteger(size, endianness: .big)
+    out.writeInteger(UInt32(0), endianness: .big)  // extended rcode and flags
+    out.writeInteger(UInt16(0), endianness: .big)  // no rdata
+    return out
 }

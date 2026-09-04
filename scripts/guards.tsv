@@ -70,3 +70,6 @@ Sources/Netstack/Gateway/DNSServer.swift	theResolverAnswersOverTCPAsWellAsUDP	  
 Sources/Netstack/Gateway/DNSServer.swift	aQueryArrivingInPiecesIsAnsweredWhenItIsWhole	            accumulated!.writeBuffer(&incoming)	            accumulated = incoming
 Sources/Netstack/Gateway/DNSServer.swift	twoQueriesInOneReadAreBothAnswered	            accumulated = buffered.readableBytes > 0 ? buffered : nil	            accumulated = nil
 Sources/Netstack/Gateway/DNSServer.swift	aTCPConnectionIsGivenSomethingToCloseItWhenItAsksNothing	            try sync.addHandler(IdleStateHandler(readTimeout: self.tcpIdleTimeout))	            _ = self.tcpIdleTimeout
+Sources/Netstack/Gateway/DNSServer.swift	aReplyTooLargeForADatagramComesBackTruncated	        guard reply.readableBytes > limit else { return reply }	        guard false else { return reply }
+Sources/Netstack/Gateway/DNSServer.swift	aReplyThatFitsIsNotTruncated	        guard reply.readableBytes > limit else { return reply }	        guard reply.readableBytes > 0 else { return reply }
+Sources/Netstack/Gateway/DNS.swift	theAskersOwnDatagramSizeIsHonoured	                return max(floor, Int(klass))	                return floor

@@ -182,7 +182,18 @@ grep -q "^ABSENT_NAME=$" "$work/basics.out" \
 # Labelled and on one line of its own. The first version collapsed the whole
 # transcript with `tr -d`, which swept sandbox's own banner into the answer and
 # made the match fail for a reason that had nothing to do with DNS.
-guest 'echo "TCPANSWER=$(printf "\\x00\\x2d\\x2b\\x2b\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07\\x67\\x61\\x74\\x65\\x77\\x61\\x79\\x0a\\x63\\x6f\\x6e\\x74\\x61\\x69\\x6e\\x65\\x72\\x73\\x08\\x69\\x6e\\x74\\x65\\x72\\x6e\\x61\\x6c\\x00\\x00\\x01\\x00\\x01" | nc -w 6 192.168.127.1 53 | od -An -tx1 | tr -d " \\n")"' \
+# Retried inside the guest rather than asked once. Every other check here runs
+# after something that has already waited for the network -- this one is first
+# in its own boot, and asking before the interface is up answered nothing at
+# all, which read as a refusal.
+guest 'i=0
+while [ $i -lt 10 ]; do
+    answer=$(printf "\x00\x2d\x2b\x2b\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07\x67\x61\x74\x65\x77\x61\x79\x0a\x63\x6f\x6e\x74\x61\x69\x6e\x65\x72\x73\x08\x69\x6e\x74\x65\x72\x6e\x61\x6c\x00\x00\x01\x00\x01" | nc -w 6 192.168.127.1 53 | od -An -tx1 | tr -d " \n")
+    case "$answer" in *c0a87f01) break ;; esac
+    i=$((i + 1))
+    sleep 2
+done
+echo "TCPANSWER=$answer"' \
     "$work/dnstcp.out"
 
 # The answer's last four bytes are the address: c0 a8 7f 01 is 192.168.127.1.

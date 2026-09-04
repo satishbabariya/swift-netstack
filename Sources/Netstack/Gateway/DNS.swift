@@ -169,6 +169,111 @@ enum DNSCodec {
         return out
     }
 
+    /// A reply that will not fit the datagram the asker offered: the same
+    /// header and question with TC set and nothing else.
+    ///
+    /// RFC 1035 §4.1.1 defines TC as "this message was truncated due to length
+    /// greater than that permitted on the transmission channel", and §4.2.1
+    /// makes the retry over TCP the asker's answer to it -- which is why this
+    /// arrived with the TCP listener rather than before it. Sending a reply
+    /// that does not fit is not an alternative: it is fragmented at best and
+    /// dropped at worst, and the asker is never told which.
+    ///
+    /// Every record is dropped rather than as many kept as fit. Upstream keeps
+    /// what fits, and doing that means re-encoding a record set this gateway
+    /// only ever relays, with a compression pointer table it never built. The
+    /// difference is one extra round trip on a reply that was already going to
+    /// need TCP.
+    static func truncated(
+        to query: DNSQuery, in original: ByteBuffer, allocator: ByteBufferAllocator
+    ) -> ByteBuffer? {
+        guard
+            let question = original.getSlice(
+                at: original.readerIndex + query.questionRange.lowerBound,
+                length: query.questionRange.count)
+        else { return nil }
+        var out = allocator.buffer(capacity: 32)
+        out.writeInteger(query.id, endianness: .big)
+        out.writeInteger(
+            UInt16(0x8580 | truncatedFlag | (query.recursionDesired ? 0x0100 : 0)), endianness: .big)
+        out.writeInteger(UInt16(1), endianness: .big)
+        out.writeInteger(UInt16(0), endianness: .big)
+        out.writeInteger(UInt16(0), endianness: .big)
+        out.writeInteger(UInt16(0), endianness: .big)
+        out.writeImmutableBuffer(question)
+        return out
+    }
+
+    static let truncatedFlag: UInt16 = 0x0200
+
+    /// How large a datagram the asker said it would accept.
+    ///
+    /// RFC 1035 §4.2.1 caps a DNS datagram at 512 bytes, and RFC 6891 lets an
+    /// asker say otherwise by putting an OPT pseudo-record in the additional
+    /// section, whose CLASS field is the size rather than a class. Reading it
+    /// matters: without it every reply over 512 bytes would be truncated and
+    /// retried over TCP, including the ones the asker was perfectly willing to
+    /// receive whole.
+    ///
+    /// Anything malformed answers 512, which is the floor every asker accepts.
+    static func advertisedUDPSize(in original: ByteBuffer, after query: DNSQuery) -> Int {
+        let floor = 512
+        guard
+            // From ANCOUNT, not QDCOUNT: the header is ID, flags, QDCOUNT,
+            // ANCOUNT, NSCOUNT, ARCOUNT, and starting one field early read
+            // NSCOUNT as the additional count -- which is zero on every query
+            // that has an OPT record, so this returned the floor for all of
+            // them and the EDNS0 size was never honoured at all.
+            let counts = original.getSlice(at: original.readerIndex + 6, length: 6),
+            let answers = counts.getInteger(at: counts.readerIndex, as: UInt16.self),
+            let authorities = counts.getInteger(at: counts.readerIndex + 2, as: UInt16.self),
+            let additional = counts.getInteger(at: counts.readerIndex + 4, as: UInt16.self),
+            additional > 0
+        else { return floor }
+
+        var index = original.readerIndex + query.questionRange.upperBound
+        // A query normally carries neither, but one that did would put the OPT
+        // record after them, and a walk that ignored them would read a record
+        // boundary in the middle of a name.
+        var remaining = Int(answers) + Int(authorities) + Int(additional)
+        while remaining > 0 {
+            remaining -= 1
+            guard let afterName = skipName(in: original, from: index) else { return floor }
+            guard let type = original.getInteger(at: afterName, as: UInt16.self),
+                let klass = original.getInteger(at: afterName + 2, as: UInt16.self),
+                let rdLength = original.getInteger(at: afterName + 8, as: UInt16.self)
+            else { return floor }
+            if type == optRecordType {
+                // Below the floor is a request nothing has to honour, and one
+                // that would make every answer a truncation.
+                return max(floor, Int(klass))
+            }
+            index = afterName + 10 + Int(rdLength)
+        }
+        return floor
+    }
+
+    static let optRecordType: UInt16 = 41
+
+    /// Step over one name, whether it is written out or is a pointer.
+    ///
+    /// A pointer ends the name, so this does not follow it: the caller wants
+    /// the byte after the name, and where the name's text lives is a question
+    /// only a reader of the name has.
+    private static func skipName(in buffer: ByteBuffer, from start: Int) -> Int? {
+        var index = start
+        // A name is at most 255 bytes, so a well-formed one cannot need more
+        // steps than that. The bound is what stops a crafted buffer looping.
+        for _ in 0..<256 {
+            guard let length = buffer.getInteger(at: index, as: UInt8.self) else { return nil }
+            if length == 0 { return index + 1 }
+            if length & 0xC0 == 0xC0 { return index + 2 }
+            guard length & 0xC0 == 0 else { return nil }
+            index += Int(length) + 1
+        }
+        return nil
+    }
+
     /// The name exists. With no answers beside it this is NODATA: the record
     /// type asked for is not held, which is not the same as the name being
     /// absent and must not be answered as though it were.

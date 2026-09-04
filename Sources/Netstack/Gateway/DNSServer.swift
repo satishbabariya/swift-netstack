@@ -240,7 +240,9 @@ public final class DNSServer: @unchecked Sendable {
         endpoint.onDatagram = { [weak self] payload, source, port in
             guard let self else { return }
             self.handle(payload) { [weak self] reply in
-                try? self?.endpoint.send(reply, to: source, port: port)
+                guard let self else { return }
+                try? self.endpoint.send(
+                    self.fittedToDatagram(reply, answering: payload), to: source, port: port)
             }
         }
     }
@@ -260,6 +262,35 @@ public final class DNSServer: @unchecked Sendable {
                 self?.upstreamChannel = channel
             }
     }
+
+    /// A reply cut down to what the asker said a datagram may carry, with TC
+    /// set so it knows to ask again over TCP.
+    ///
+    /// Only the UDP path does this, which is the point of it being here rather
+    /// than in `handle`: TCP has no such limit, and a reply that is truncated
+    /// on the transport that cannot carry it and whole on the one that can is
+    /// the behaviour RFC 1035 §4.2.1 describes.
+    ///
+    /// Locally-answered replies are one A record and never come near the
+    /// floor; what this is for is a forwarded reply, which this gateway relays
+    /// whole and has no other say over. Upstream truncates the same way, and
+    /// without it an oversized answer goes out as a fragmented datagram that is
+    /// dropped somewhere with nobody told why.
+    private func fittedToDatagram(_ reply: ByteBuffer, answering query: ByteBuffer) -> ByteBuffer {
+        guard let parsed = DNSCodec.parseQuery(query) else { return reply }
+        let limit = DNSCodec.advertisedUDPSize(in: query, after: parsed)
+        guard reply.readableBytes > limit else { return reply }
+        truncated += 1
+        guard let cut = DNSCodec.truncated(to: parsed, in: query, allocator: allocator) else {
+            return reply
+        }
+        return cut
+    }
+
+    /// Replies cut down because they would not fit the asker's datagram. Read
+    /// alongside `forwarded`: a rising ratio is a resolver being sent to TCP
+    /// often, which is worth knowing before someone reports it as slowness.
+    public private(set) var truncated = 0
 
     /// Serve one TCP connection a guest opened to this resolver.
     ///

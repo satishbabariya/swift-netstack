@@ -1030,3 +1030,51 @@ private func queryAdvertising(_ size: UInt16, id: UInt16) -> ByteBuffer {
     out.writeInteger(UInt16(0), endianness: .big)  // no rdata
     return out
 }
+
+@Test func aQuestionOfAnyTypeIsForwardedAndItsAnswerComesBack() async throws {
+    // Every other forwarding test here asks for an A record, so a guard on the
+    // type anywhere in that path would go unnoticed -- and upstream's own suite
+    // resolves CNAME, MX, NS, SRV and TXT through exactly this route.
+    //
+    // What makes it work is that the reply is relayed rather than rebuilt: this
+    // gateway has no opinion about record types it does not serve itself. What
+    // could break it is the pending table, which matches an upstream reply
+    // against the whole question -- name, TYPE and class -- so that a stolen
+    // transaction id is not enough to answer with something else. A type this
+    // side mishandled would fail to match and the guest would hear nothing.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let resolver = FakeResolver(address: IPv4Address("93.184.216.34")!)
+    let upstream = try await DatagramBootstrap(group: group)
+        .channelInitializer { channel in channel.pipeline.addHandler(resolver) }
+        .bind(host: "127.0.0.1", port: 0).get()
+    var guestSide: Int32 = -1
+    let holder = try await forwardingGateway(
+        group: group, guestSide: &guestSide, upstream: upstream.localAddress!)
+
+    // 16 is TXT, which this gateway neither serves nor understands.
+    askOverWire(guestSide, dnsQuery("example.com", id: 0xCAFE, type: 16))
+    let reply = try #require(await awaitReply(guestSide))
+
+    #expect(
+        reply.getInteger(at: reply.readerIndex, endianness: .big, as: UInt16.self) == 0xCAFE,
+        "the guest's transaction id did not come back on a non-A question")
+    // Read out of the bytes rather than through `parseQuery`, which takes a
+    // QUERY and refuses a response -- as it should, and as the first version of
+    // this test found out.
+    //
+    // `example.com` encodes as 13 bytes, so after the 12-byte header the
+    // question's type sits at 25 and the answer count at 6.
+    #expect(
+        reply.getInteger(at: reply.readerIndex + 25, endianness: .big, as: UInt16.self) == 16,
+        "the answer came back for a different question type than was asked")
+    #expect(
+        (reply.getInteger(at: reply.readerIndex + 6, endianness: .big, as: UInt16.self) ?? 0) > 0,
+        "the reply carried no answer at all")
+
+    try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

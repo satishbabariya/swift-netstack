@@ -688,28 +688,25 @@ public final class Gateway: @unchecked Sendable {
             // that answers DNS on one transport and refuses it on the other is
             // not a resolver a stub can rely on.
             //
-            // Every address this gateway answers for, not only the primary,
-            // because that is what the UDP side already does: its socket binds
-            // `.any`, so a query to the host alias is answered here rather than
-            // forwarded. Matching it matters more than the alternative -- a
-            // resolver that got a truncated answer from one address and then
-            // reached a DIFFERENT server when it retried over TCP would be
-            // worse than either behaviour on its own.
+            // The gateway's own address, and only that, which is where
+            // upstream binds both transports too.
             //
-            // Worth knowing, and not decided here: upstream binds both
-            // transports to the gateway address alone, so under gvproxy a
-            // query to `192.168.127.254:53` reaches the HOST's resolver. This
-            // package's UDP socket has always claimed that port on every
-            // address, which is the divergence; this only declines to make the
-            // two transports disagree with each other as well.
-            for address in [configuration.gatewayAddress] + configuration.gatewayVirtualAddresses {
-                tcp.serveLocally(
-                    OutboundTCPForwarder.LocalService(address: address, port: DNSServer.port) {
-                        [weak dns] channel in
-                        guard let dns else { return channel.close() }
-                        return dns.serve(channel)
-                    })
-            }
+            // The first version of this registered every address this gateway
+            // answers for, reasoning from `DNSServer`'s UDP socket binding
+            // `.any` that a query to the host alias was already answered here.
+            // Asking a guest said otherwise: `nslookup ... 192.168.127.254`
+            // times out, because the alias is translated to the host before
+            // anything on this side sees the port. So the UDP side does NOT
+            // claim it, and claiming it for TCP took away the one thing that
+            // address is for -- a guest that wants the HOST's resolver, on a
+            // machine where something is listening for it.
+            tcp.serveLocally(
+                OutboundTCPForwarder.LocalService(
+                    address: configuration.gatewayAddress, port: DNSServer.port
+                ) { [weak dns] channel in
+                    guard let dns else { return channel.close() }
+                    return dns.serve(channel)
+                })
 
             // One limiter shared by every part, not one each. Nine components
             // with a window apiece would let a guest that can drive several

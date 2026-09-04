@@ -461,6 +461,68 @@ PY
     [[ "$answer" == "GUEST-LISTENER" ]] \
         && pass "a port published into the guest carries a connection" \
         || fail "the published port answered '$answer'"
+
+    # The daemon's tunnel, in the same boot rather than another: `POST /tunnel`
+    # turns the control-plane connection itself into a byte pipe to an address
+    # inside the guest network. Upstream tests it ("reach a http server in the
+    # VM using the tunneling of the daemon") and nothing here did.
+    #
+    # `OK` first, not an HTTP response: the connection stopped being HTTP when
+    # the request was hijacked, and a client waits for that byte pair before it
+    # sends anything.
+    cat > "$work/tunnel.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(12)
+s.connect(sys.argv[1])
+s.sendall(b"POST /tunnel?ip=192.168.127.2&port=9999 HTTP/1.1\r\nHost: x\r\n\r\n")
+got = b""
+try:
+    while len(got) < 64:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        got += chunk
+except Exception:
+    pass
+print(got.decode(errors="replace").strip())
+s.close()
+PY
+    tunnelled="$(python3 "$work/tunnel.py" "$api")"
+    case "$tunnelled" in
+        OKGUEST-LISTENER) pass "the daemon's tunnel reaches into the guest" ;;
+        *) fail "the tunnel carried '$tunnelled'" ;;
+    esac
+
+    # And a unix socket on the host forwarding to a port in the guest, which is
+    # upstream's "expose and reach an http service using unix to tcp
+    # forwarding". The route accepts `protocol: unix`; nothing here had ever
+    # opened one.
+    #
+    # Short path on purpose, beside `$api` and for the same reason: an AF_UNIX
+    # path is capped near 104 bytes and `$work` is under TMPDIR.
+    socket_forward="/tmp/netstack-acceptance-fwd-$$.sock"
+    rm -f "$socket_forward"
+    curl -s -X POST --unix-socket "$api" http://x/services/forwarder/expose \
+        -d "{\"local\":\"$socket_forward\",\"remote\":\"192.168.127.2:9999\",\"protocol\":\"unix\"}" \
+        >/dev/null
+    sleep 1
+    cat > "$work/unixfwd.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(sys.argv[1])
+    print(s.recv(64).decode(errors="replace").strip())
+except Exception as error:
+    print("error: %s" % type(error).__name__)
+s.close()
+PY
+    carried="$(python3 "$work/unixfwd.py" "$socket_forward")"
+    rm -f "$socket_forward"
+    [[ "$carried" == "GUEST-LISTENER" ]] \
+        && pass "a unix socket on the host forwards into the guest" \
+        || fail "the unix forward carried '$carried'"
 else
     fail "the control plane never appeared at $api, so nothing was published"
 fi

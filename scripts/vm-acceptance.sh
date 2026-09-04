@@ -142,14 +142,6 @@ grep -qE "inet 192\.168\.127\.2(/| )" "$work/basics.out" \
     && pass "the guest is addressed at 192.168.127.2 on the gateway's subnet" \
     || fail "the guest is not at 192.168.127.2" "$(head -5 "$work/basics.out")"
 
-grep -qE "default via 192.168.127.1" "$work/basics.out" \
-    && pass "the default route is the gateway" \
-    || fail "no default route through 192.168.127.1"
-
-grep -q "nameserver 192.168.127.1" "$work/basics.out" \
-    && pass "the resolver is the gateway" \
-    || fail "resolv.conf does not name the gateway"
-
 grep -qE "3 packets received|3 received" "$work/basics.out" \
     && pass "the gateway answers ICMP echo" \
     || fail "ping lost packets" "$(grep -A 2 'ping statistics' "$work/basics.out" | head -3)"
@@ -259,7 +251,8 @@ guest "nc -w 20 192.168.127.254 $port | wc -c" "$work/bulk.out"
 received="$(grep -oE '^ *[0-9]+' "$work/bulk.out" | tr -d ' ' | tail -1)"
 [[ "${received:-0}" == "200000" ]] \
     && pass "200,000 bytes cross a half-closed connection" \
-    || fail "the guest received ${received:-0} of 200000 bytes"
+    || fail "the half-closed bulk transfer lost data" \
+        "the guest received ${received:-0} of 200000 bytes"
 fi
 
 # The FIN must sit at the end of the data, not on top of it. This is the check
@@ -312,7 +305,8 @@ guest "nc -w 60 192.168.127.254 $port | (sleep 15; wc -c)" "$work/megabyte.out"
 carried="$(grep -oE '^ *[0-9]+' "$work/megabyte.out" | tr -d ' ' | tail -1)"
 [[ "${carried:-0}" == "1000000" ]] \
     && pass "a megabyte survives a guest that stops reading" \
-    || fail "the guest received ${carried:-0} of 1000000 bytes"
+    || fail "the megabyte to a stalled reader lost data" \
+        "the guest received ${carried:-0} of 1000000 bytes"
 else
     fail "python3 is not available, so the megabyte check did not run"
 fi
@@ -440,14 +434,51 @@ grep -q "GREETINGS" "$work/banner.out" \
 lease_out="$work/dhcp.out"
 rm -f "$api"
 SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c \
-    'sleep 8; udhcpc -i eth0 -n -q -f 2>&1 | grep -E "obtained|discover|select"; echo DHCPASKED; sleep 40' \
+    'sleep 8
+     cat > /tmp/opts.sh <<'"'"'SCRIPT'"'"'
+#!/bin/sh
+echo "OPT_ROUTER=$router"
+echo "OPT_DNS=$dns"
+echo "OPT_SUBNET=$subnet"
+echo "OPT_MTU=$mtu"
+echo "OPT_LEASE=$lease"
+SCRIPT
+     chmod +x /tmp/opts.sh
+     udhcpc -i eth0 -n -q -f -s /tmp/opts.sh 2>&1 | grep -E "obtained|discover|select|^OPT_"
+     echo DHCPASKED
+     sleep 40' \
     >"$lease_out" 2>&1 &
 for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
 for _ in $(seq 1 30); do grep -q DHCPASKED "$lease_out" && break; sleep 2; done
 
 grep -q "lease of 192.168.127.2 obtained from 192.168.127.1" "$lease_out" \
     && pass "a real DHCP client gets a lease from this gateway" \
-    || fail "udhcpc said: $(grep -v '^sandbox:' "$lease_out" | tr '\n' ' ' | tail -c 120)"
+    || fail "no lease was offered to a real DHCP client" \
+        "udhcpc said: $(grep -v '^sandbox:' "$lease_out" | tr '\n' ' ' | tail -c 120)"
+
+# And the options it is given, which is the part that decides whether the guest
+# can do anything with the address. `udhcpc` hands them to its script as
+# environment variables, so this asks for one that prints them.
+#
+# These replaced two checks that read the guest's own configuration back --
+# "the default route is the gateway", "the resolver is the gateway". Those were
+# reading what `sandbox` had written, not what this gateway offers, so nothing
+# this gateway did could make them fail. What they claimed is now checked at the
+# only place it is this gateway's to get right.
+#
+# Options 3, 6, 1, 26 and 51. Upstream sends the same set, plus 119 when there
+# are search domains -- absent here because the host has none, which is why
+# there is no assertion for it rather than an assertion that it is empty.
+dhcp_option() { grep "^OPT_$1=" "$lease_out" | tail -1 | cut -d= -f2-; }
+for expected in "ROUTER=192.168.127.1" "DNS=192.168.127.1" \
+    "SUBNET=255.255.255.0" "MTU=1500" "LEASE=3600"; do
+    name="${expected%%=*}"
+    want="${expected#*=}"
+    got="$(dhcp_option "$name")"
+    [[ "$got" == "$want" ]] \
+        && pass "the lease carries $name=$want" \
+        || fail "the lease carried $name=$got, not $want"
+done
 
 # And the lease is visible where upstream's own client looks for it. Asked
 # while the guest is still up: the gateway goes when the guest does, and an
@@ -597,7 +628,8 @@ PY
     for _ in $(seq 1 12); do grep -q "^SEEN=" "$work/udp.out" && break; sleep 5; done
     grep -q "^SEEN=FIRST-DATAGRAM$" "$work/udp.out" \
         && pass "the first datagram to a published UDP port arrives" \
-        || fail "the guest saw '$(grep '^SEEN=' "$work/udp.out" | cut -d= -f2-)'"
+        || fail "the first datagram to a published UDP port was not delivered" \
+            "the guest saw '$(grep '^SEEN=' "$work/udp.out" | cut -d= -f2-)'"
 else
     fail "the control plane never appeared at $api, so no UDP port was published"
 fi

@@ -643,10 +643,15 @@ active open's SYN was dropped while ARP was unresolved and nothing retransmitted
 it; and the first datagram to a published UDP port was lost every time, because
 nothing held it either.
 
-One thing it does **not** cover, despite booting a guest: DHCP. `sandbox`
-addresses its guest itself, so no real guest here has ever asked this gateway
-for a lease -- `/leases` is empty during these runs and that is correct. The
-DHCP server's tests are the frame-level ones in `frame-smoke.sh`.
+It covers DHCP too, though it took a second look to get there. `sandbox`
+addresses its guest itself, so nothing asks for a lease on its own and the
+first version of this script said so as a gap. But busybox's `udhcpc` is in the
+image, and a guest can be told to ask: it broadcasts a discover, selects the
+offer, and reports `lease of 192.168.127.2 obtained from 192.168.127.1, lease
+time 3600` -- the first time a real DHCP client has spoken to this server,
+whose other tests are all frames this repository wrote. The lease it gets is
+then read back from `/services/dhcp/leases`, which is where upstream's own
+client looks for it.
 
 The Swift examples on this page are **compiled**. They sit in a function nothing
 calls in `Tests/NetstackTests/READMEExample.swift`, so the test build type-checks

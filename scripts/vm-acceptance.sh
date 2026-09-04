@@ -424,6 +424,45 @@ grep -q "GREETINGS" "$work/banner.out" \
     && pass "a host that speaks first is heard" \
     || fail "the banner never arrived" "$(tail -3 "$work/banner.out")"
 
+# --- A real DHCP client asking this gateway for a lease -----------------------
+#
+# The gap this script has carried since it was written, and said so: `sandbox`
+# addresses its guest itself, so no guest here had ever asked for a lease and
+# the DHCP server's only tests were the frame-level ones in `frame-smoke.sh`.
+# Upstream's suite has "should return DHCP leases"; this is that, plus the
+# exchange behind it.
+#
+# `udhcpc` is busybox's, so it is already in the image. It reports the whole
+# exchange -- discover, select, the lease and its term -- and its own attempts
+# to reconfigure the interface fail under sandbox's restrictions, which is why
+# the check reads its output rather than its exit status.
+
+lease_out="$work/dhcp.out"
+rm -f "$api"
+SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c \
+    'sleep 8; udhcpc -i eth0 -n -q -f 2>&1 | grep -E "obtained|discover|select"; echo DHCPASKED; sleep 40' \
+    >"$lease_out" 2>&1 &
+for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
+for _ in $(seq 1 30); do grep -q DHCPASKED "$lease_out" && break; sleep 2; done
+
+grep -q "lease of 192.168.127.2 obtained from 192.168.127.1" "$lease_out" \
+    && pass "a real DHCP client gets a lease from this gateway" \
+    || fail "udhcpc said: $(grep -v '^sandbox:' "$lease_out" | tr '\n' ' ' | tail -c 120)"
+
+# And the lease is visible where upstream's own client looks for it. Asked
+# while the guest is still up: the gateway goes when the guest does, and an
+# empty answer from a socket that is no longer there reads exactly like an
+# empty lease table.
+if [[ -S "$api" ]] && command -v curl >/dev/null 2>&1; then
+    listed="$(curl -s --unix-socket "$api" http://x/services/dhcp/leases)"
+    case "$listed" in
+        *192.168.127.2*) pass "the lease is listed at /services/dhcp/leases" ;;
+        *) fail "the lease table said '$listed'" ;;
+    esac
+else
+    fail "the control plane was gone, so the lease table could not be read"
+fi
+
 # --- A port published into the guest -----------------------------------------
 #
 # The reason this check exists: it did not work at all, and nothing here noticed

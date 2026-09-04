@@ -493,6 +493,36 @@ PY
         OKGUEST-LISTENER) pass "the daemon's tunnel reaches into the guest" ;;
         *) fail "the tunnel carried '$tunnelled'" ;;
     esac
+
+    # And a unix socket on the host forwarding to a port in the guest, which is
+    # upstream's "expose and reach an http service using unix to tcp
+    # forwarding". The route accepts `protocol: unix`; nothing here had ever
+    # opened one.
+    #
+    # Short path on purpose, beside `$api` and for the same reason: an AF_UNIX
+    # path is capped near 104 bytes and `$work` is under TMPDIR.
+    socket_forward="/tmp/netstack-acceptance-fwd-$$.sock"
+    rm -f "$socket_forward"
+    curl -s -X POST --unix-socket "$api" http://x/services/forwarder/expose \
+        -d "{\"local\":\"$socket_forward\",\"remote\":\"192.168.127.2:9999\",\"protocol\":\"unix\"}" \
+        >/dev/null
+    sleep 1
+    cat > "$work/unixfwd.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(sys.argv[1])
+    print(s.recv(64).decode(errors="replace").strip())
+except Exception as error:
+    print("error: %s" % type(error).__name__)
+s.close()
+PY
+    carried="$(python3 "$work/unixfwd.py" "$socket_forward")"
+    rm -f "$socket_forward"
+    [[ "$carried" == "GUEST-LISTENER" ]] \
+        && pass "a unix socket on the host forwards into the guest" \
+        || fail "the unix forward carried '$carried'"
 else
     fail "the control plane never appeared at $api, so nothing was published"
 fi

@@ -203,6 +203,23 @@ grep -q "^TCPANSWER=.*c0a87f01$" "$work/dnstcp.out" \
     && pass "the resolver answers over TCP" \
     || fail "the TCP query answered [$(grep '^TCPANSWER=' "$work/dnstcp.out" | cut -d= -f2- | tail -c 40)]"
 
+# And the host alias is NOT the resolver. That address exists so a guest can
+# reach the HOST, and a gateway answering port 53 there takes away the one
+# thing it is for. An earlier version of the registration above claimed every
+# address this gateway answers for, and did exactly that.
+#
+# Asked as a QUERY rather than as a connection. `nc -z` to this address
+# succeeds either way -- the forwarder accepts the guest's SYN before it knows
+# whether the host will answer -- so a check on the connection cannot tell "the
+# gateway answered" from "the host was asked". The gateway's own record can.
+guest 'echo "ALIASANSWER=$(printf "\\x00\\x2d\\x2b\\x2b\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07\\x67\\x61\\x74\\x65\\x77\\x61\\x79\\x0a\\x63\\x6f\\x6e\\x74\\x61\\x69\\x6e\\x65\\x72\\x73\\x08\\x69\\x6e\\x74\\x65\\x72\\x6e\\x61\\x6c\\x00\\x00\\x01\\x00\\x01" | nc -w 6 192.168.127.254 53 | od -An -tx1 | tr -d " \\n")"' \
+    "$work/aliasdns.out"
+if grep -q "^ALIASANSWER=.*c0a87f01" "$work/aliasdns.out"; then
+    fail "the gateway answered a query on the host alias, so the host cannot"
+else
+    pass "port 53 on the host alias belongs to the host, not the gateway"
+fi
+
 # --- The half-close, which is what a real guest found ------------------------
 
 port=24682
@@ -353,6 +370,49 @@ fi
 # The property is covered where it can be observed without a capture:
 # `aDeferredCloseEndsWithAFinRatherThanSilence` in the channel tests.
 
+
+# --- A connection that says nothing for a while and then does -----------------
+#
+# What an SSH session or a database connection looks like from here. Nothing in
+# this gateway should end one: TCP keep-alive does not start probing for two
+# hours by default, and neither of the two short timers this gateway does have
+# belongs anywhere near an ordinary connection -- the resolver's ten-second read
+# idle applies to guests asking it questions, and the lingering close's sixty
+# seconds applies to a channel that is already closing.
+#
+# Ninety seconds, which is past the longer of those two on purpose. The risk
+# this guards is real rather than theoretical: destinations this gateway answers
+# itself are matched by address and port, and a service registered for the wrong
+# one would put the control plane's idle handler on a connection that was only
+# passing through.
+
+port=24780
+if command -v python3 >/dev/null 2>&1; then
+cat > "$work/idle.py" <<'PY'
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(1)
+c, _ = s.accept()
+c.sendall(b"HELLO\n")
+time.sleep(90)
+try:
+    c.sendall(b"STILL-HERE\n")
+except Exception:
+    pass
+c.close()
+s.close()
+PY
+python3 "$work/idle.py" "$port" &
+sleep 1
+guest "nc -w 130 192.168.127.254 $port" "$work/idle.out"
+grep -q "STILL-HERE" "$work/idle.out" \
+    && pass "a connection idle for ninety seconds still carries traffic" \
+    || fail "the idle connection was gone: $(grep -v '^sandbox:' "$work/idle.out" | tr '\n' ' ')"
+else
+    fail "python3 is not available, so the idle check did not run"
+fi
 
 # --- A host that speaks first ------------------------------------------------
 

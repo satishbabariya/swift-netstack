@@ -141,9 +141,20 @@ public final class DNSServer: @unchecked Sendable {
         }
     }
 
+    /// Where one query's answer goes.
+    ///
+    /// A UDP query is answered to an address and port; a TCP one is answered on
+    /// the connection it arrived on, framed with the length prefix RFC 1035
+    /// §4.2.2 requires. Every reply path here used to carry the pair, which is
+    /// UDP's shape and not TCP's -- including the forwarding path, which holds
+    /// one of these for as long as an upstream is being asked.
+    ///
+    /// Loop-confined like everything else in this type: it is called only from
+    /// the stack's own event loop.
+    typealias Responder = (ByteBuffer) -> Void
+
     private struct Pending {
-        let source: IPv4Address
-        let port: UInt16
+        let respond: Responder
         let originalID: UInt16
         let question: DNSQuestion
         let deadline: NIODeadline
@@ -190,6 +201,14 @@ public final class DNSServer: @unchecked Sendable {
 
     /// Where refusals are reported, if anywhere. `Gateway` sets this; a
     /// hand-assembled arrangement opts in by setting it too.
+    /// How long a guest's TCP connection may say nothing before it is closed.
+    ///
+    /// RFC 7766 §6.2.3 puts the responsibility on the server and suggests a few
+    /// seconds; this is that. A connection costs a descriptor and a slot in the
+    /// forwarder's limit, and a guest that opens one and then goes quiet is
+    /// spending both for nothing.
+    public var tcpIdleTimeout: TimeAmount = .seconds(10)
+
     public var log: RateLimitedLogger?
 
     public static let port: UInt16 = 53
@@ -219,7 +238,10 @@ public final class DNSServer: @unchecked Sendable {
         self.endpoint = UDPEndpoint(stack: stack)
         try endpoint.bind(address: .any, port: Self.port)
         endpoint.onDatagram = { [weak self] payload, source, port in
-            self?.handle(payload, from: source, port: port)
+            guard let self else { return }
+            self.handle(payload) { [weak self] reply in
+                try? self?.endpoint.send(reply, to: source, port: port)
+            }
         }
     }
 
@@ -239,7 +261,35 @@ public final class DNSServer: @unchecked Sendable {
             }
     }
 
-    private func handle(_ payload: ByteBuffer, from source: IPv4Address, port: UInt16) {
+    /// Serve one TCP connection a guest opened to this resolver.
+    ///
+    /// Upstream serves DNS over TCP as well as UDP, and a resolver needs it:
+    /// a reply that does not fit a datagram comes back truncated, and the
+    /// resolver's next move is to ask the same question over TCP. Without this
+    /// the second attempt is refused and the name simply does not resolve --
+    /// measured against a real guest, where `nc -z 192.168.127.1 53` could not
+    /// even connect.
+    ///
+    /// The connection is bounded like every other thing a guest can open: a
+    /// read idle timeout closes one that asks nothing, and the message length
+    /// is a 16-bit field, so a query cannot be larger than the prefix allows.
+    /// How MANY a guest may open is the forwarder's connection limit, which is
+    /// what admitted this one.
+    public func serve(_ channel: Channel) -> EventLoopFuture<Void> {
+        channel.eventLoop.submit {
+            let sync = channel.pipeline.syncOperations
+            try sync.addHandler(IdleStateHandler(readTimeout: self.tcpIdleTimeout))
+            try sync.addHandler(DNSOverTCP(server: self))
+        }
+    }
+
+    /// Answer one query, however it arrived. The TCP framing calls this; the
+    /// UDP socket calls it with a responder that sends a datagram back.
+    func answer(_ payload: ByteBuffer, respond: @escaping Responder) {
+        handle(payload, respond: respond)
+    }
+
+    private func handle(_ payload: ByteBuffer, respond: @escaping Responder) {
         guard let query = DNSCodec.parseQuery(payload) else { return }
 
         if query.question.klass == DNSQuestion.classIN, query.question.type == DNSQuestion.typeA,
@@ -249,7 +299,7 @@ public final class DNSServer: @unchecked Sendable {
             if let reply = DNSCodec.answer(
                 to: query, in: payload, address: address, ttl: ttl, allocator: allocator)
             {
-                try? endpoint.send(reply, to: source, port: port)
+                respond(reply)
             }
             return
         }
@@ -296,11 +346,11 @@ public final class DNSServer: @unchecked Sendable {
                     code: known ? DNSCodec.responseCodeNoError : DNSCodec.responseCodeNameError,
                     allocator: allocator)
             }
-            if let reply { try? endpoint.send(reply, to: source, port: port) }
+            if let reply { respond(reply) }
             return
         }
 
-        forward(query, payload: payload, to: source, port: port)
+        forward(query, payload: payload, respond: respond)
     }
 
     /// The zone that owns `name`, most specific first.
@@ -363,21 +413,21 @@ public final class DNSServer: @unchecked Sendable {
         return true
     }
 
-    private func forward(_ query: DNSQuery, payload: ByteBuffer, to source: IPv4Address, port: UInt16) {
+    private func forward(_ query: DNSQuery, payload: ByteBuffer, respond: @escaping Responder) {
         guard let channel = upstreamChannel, let server = upstream.first else {
             // Logged at a higher level than the rest, and named so it reads
             // as what it nearly always is: nobody configured an upstream, and
             // every query the guest makes is being refused because of it.
             refusedForNoUpstream += 1
             log?.record(.dnsRefusedNoUpstream, ["name": .string(sanitizedForLog(query.question.name))])
-            refuse(query, payload: payload, to: source, port: port)
+            refuse(query, payload: payload, respond: respond)
             return
         }
         expirePending()
         guard pending.count < maximumPending else {
             refusedForLimit += 1
             log?.record(.dnsRefusedByLimit, ["outstanding": .stringConvertible(maximumPending), "name": .string(sanitizedForLog(query.question.name))])
-            refuse(query, payload: payload, to: source, port: port)
+            refuse(query, payload: payload, respond: respond)
             return
         }
 
@@ -388,7 +438,7 @@ public final class DNSServer: @unchecked Sendable {
         // of what an on-path guest needs to answer its own neighbours' queries.
         let upstreamID = allocateID()
         pending[upstreamID] = Pending(
-            source: source, port: port, originalID: query.id, question: query.question,
+            respond: respond, originalID: query.id, question: query.question,
             deadline: stack.clock.now() + timeout)
 
         var outgoing = payload
@@ -397,12 +447,12 @@ public final class DNSServer: @unchecked Sendable {
         channel.writeAndFlush(AddressedEnvelope(remoteAddress: server, data: outgoing), promise: nil)
     }
 
-    private func refuse(_ query: DNSQuery, payload: ByteBuffer, to source: IPv4Address, port: UInt16) {
+    private func refuse(_ query: DNSQuery, payload: ByteBuffer, respond: Responder) {
         guard
             let reply = DNSCodec.failure(
                 to: query, in: payload, code: DNSCodec.responseCodeRefused, allocator: allocator)
         else { return }
-        try? endpoint.send(reply, to: source, port: port)
+        respond(reply)
     }
 
     private func allocateID() -> UInt16 {
@@ -445,7 +495,7 @@ public final class DNSServer: @unchecked Sendable {
 
         var outgoing = payload
         outgoing.setInteger(entry.originalID, at: outgoing.readerIndex, endianness: .big)
-        try? endpoint.send(outgoing, to: entry.source, port: entry.port)
+        entry.respond(outgoing)
     }
 
     /// Close, and complete when the **upstream socket** is closed too.
@@ -552,5 +602,66 @@ extension DNSServer {
         var domains = line.dropFirst(prefix.count).split(separator: " ").map(String.init)
         if applyingDarwinLimits, domains.count > 6 { domains = Array(domains.prefix(6)) }
         return domains
+    }
+}
+
+/// DNS's TCP framing: RFC 1035 §4.2.2's two-byte length prefix, in both
+/// directions.
+///
+/// Written out rather than assembled from NIO's length-field codecs because the
+/// framing is four lines and the bound is the point: a message is at most
+/// 65,535 bytes because the prefix cannot say more, and the accumulator
+/// therefore cannot grow past one message plus whatever of the next has
+/// arrived. A guest that sends a prefix and then stops is closed by the idle
+/// timeout above, holding one buffer until it is.
+private final class DNSOverTCP: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private let server: DNSServer
+    private var accumulated: ByteBuffer?
+
+    init(server: DNSServer) {
+        self.server = server
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var incoming = unwrapInboundIn(data)
+        if accumulated == nil {
+            accumulated = incoming
+        } else {
+            accumulated!.writeBuffer(&incoming)
+        }
+        // Every complete message in what has arrived, not just the first: RFC
+        // 7766 §6.2.1.1 allows a client to pipeline, and a resolver that sent
+        // two questions and got one answer would wait out its own timeout.
+        while var buffered = accumulated {
+            guard let length = buffered.getInteger(at: buffered.readerIndex, as: UInt16.self),
+                buffered.readableBytes >= Int(length) + 2
+            else { break }
+            buffered.moveReaderIndex(forwardBy: 2)
+            guard let message = buffered.readSlice(length: Int(length)) else { break }
+            accumulated = buffered.readableBytes > 0 ? buffered : nil
+            let channel = context.channel
+            server.answer(message) { reply in
+                var framed = channel.allocator.buffer(capacity: reply.readableBytes + 2)
+                framed.writeInteger(UInt16(truncatingIfNeeded: reply.readableBytes), endianness: .big)
+                var body = reply
+                framed.writeBuffer(&body)
+                channel.writeAndFlush(framed, promise: nil)
+            }
+        }
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if event is IdleStateHandler.IdleStateEvent {
+            context.close(promise: nil)
+            return
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
     }
 }

@@ -158,11 +158,12 @@ public final class ControlPlane: @unchecked Sendable {
         let address = gateway.stack.configuration.gatewayAddress
         let gateway = self.gateway
         return loop.submit { [weak self] in
-            gateway.tcp.locallyServed = (address, port)
-            gateway.tcp.serveLocally = { [weak self] channel in
-                guard let self else { return channel.close() }
-                return self.configureConnection(channel, forwardingOnly: true)
-            }
+            gateway.tcp.serveLocally(
+                OutboundTCPForwarder.LocalService(address: address, port: port) {
+                    [weak self] channel in
+                    guard let self else { return channel.close() }
+                    return self.configureConnection(channel, forwardingOnly: true)
+                })
         }
     }
 

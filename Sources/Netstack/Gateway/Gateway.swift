@@ -462,6 +462,7 @@ public final class Gateway: @unchecked Sendable {
         self.tcp = tcp
         self.udp = udp
         self.icmp = icmp
+
     }
 
     /// Start on an already-connected datagram socket -- the descriptor
@@ -679,6 +680,26 @@ public final class Gateway: @unchecked Sendable {
             let icmp = ICMPForwarder(
                 stack: stack, nat: configuration.nat,
                 allowsLinkLocal: configuration.allowsLinkLocal)
+
+            // The resolver over TCP, which upstream serves and a resolver
+            // needs: an answer that will not fit a datagram comes back
+            // truncated, and the asker's next move is the same question over
+            // TCP. Wired here rather than left to a caller, because a gateway
+            // that answers DNS on one transport and refuses it on the other is
+            // not a resolver a stub can rely on.
+            //
+            // Every address this gateway answers for, not only the primary. A
+            // guest pointed at one of the virtual addresses must be able to
+            // reach the resolver over TCP there too, and the DHCP server hands
+            // those out.
+            for address in [configuration.gatewayAddress] + configuration.gatewayVirtualAddresses {
+                tcp.serveLocally(
+                    OutboundTCPForwarder.LocalService(address: address, port: DNSServer.port) {
+                        [weak dns] channel in
+                        guard let dns else { return channel.close() }
+                        return dns.serve(channel)
+                    })
+            }
 
             // One limiter shared by every part, not one each. Nine components
             // with a window apiece would let a guest that can drive several

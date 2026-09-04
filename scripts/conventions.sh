@@ -397,6 +397,40 @@ if ! python3 scripts/smoke/readme_example.py; then
         "regenerate it from the code blocks, or the page and the check disagree"
 fi
 
+# 16. Every counter a component keeps is one an operator can read.
+#
+# Six were not, and three of them were added in the same week as this rule.
+# `DNSServer.truncated` came with a commit message saying it should be read as
+# a ratio against `dnsForwarded` "before someone reports it as slowness" --
+# which nobody could do, because it reached neither `Statistics` nor `/stats`.
+# `IPv4Protocol`'s two ARP-queue counters were the same. And three more had been
+# unreadable far longer: ICMP's `answered` and `declined`, and the TCP
+# forwarder's `localConnections`.
+#
+# A counter is cheap to add and invisible when it goes nowhere: nothing fails,
+# no test notices, and the only symptom is an operator who cannot answer a
+# question the code already knows the answer to.
+#
+# The pattern is the list. A gateway component's counters are declared
+# `public private(set) var <name> = 0`, and `Statistics` reads each as
+# `<component>.<name>` -- so the check is that the name appears there at all.
+# That is deliberately loose: it catches the counter nothing reads, which is
+# the failure, and does not try to police what it is called on the way out.
+counters=$(grep -hoE "public private\(set\) var [a-zA-Z]+ = 0" \
+    Sources/Netstack/Gateway/*.swift Sources/Netstack/Network/IPv4Protocol.swift 2>/dev/null |
+    awk '{print $4}' | sort -u)
+if [[ -z "$counters" ]]; then
+    fail "no counters were found" \
+        "this rule reads the components to know what to check, and it read nothing"
+fi
+for counter in $counters; do
+    if ! grep -q "\.$counter\b" Sources/Netstack/Observability/Statistics.swift; then
+        fail "$counter is counted and never exposed" \
+            "an operator cannot read it, so the code knows something nobody can ask it"
+    fi
+done
+
+
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"
 fi

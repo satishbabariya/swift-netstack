@@ -32,11 +32,28 @@ extension Gateway {
         public var ipv4AwaitingFragments: Int
         public var ipv4Delivered: Int
         public var ipv4UnknownProtocol: Int
+        /// Datagrams held until ARP answered for the next hop, rather than
+        /// dropped for want of a link address. Read with the one below: a
+        /// rising `dropped` against a flat `deferred` is a bound being reached,
+        /// which is a different problem from an address that never answers.
+        public var ipv4DeferredForResolution: Int
+        /// Datagrams dropped because there was nowhere to hold them -- the
+        /// per-next-hop depth, or the whole queue.
+        public var ipv4DroppedUnresolved: Int
 
         /// Echo requests sent to a real destination rather than answered here.
         public var icmpForwarded: Int
         /// Echo requests that got no answer before their deadline.
         public var icmpTimedOut: Int
+        /// Echo replies carried back to the guest. Read against
+        /// `icmpForwarded`: the gap between them is requests still in flight
+        /// plus those that timed out.
+        public var icmpAnswered: Int
+        /// Requests the gateway answered itself rather than forwarding -- its
+        /// own addresses, loopback, broadcast, and everything at all if the
+        /// host will not open an unprivileged ICMP socket. A large value here
+        /// with `icmpForwarded` at zero is that last case, and worth seeing.
+        public var icmpDeclined: Int
 
         /// Frames from the guest that this wire would not carry.
         public var inboundFramesRejected: Int
@@ -60,6 +77,10 @@ extension Gateway {
         public var tcpEstablished: Int
         /// Guest connections refused because the connection limit was reached.
         public var tcpRefusedByLimit: Int
+        /// Connections the guest opened to a destination this gateway answers
+        /// itself -- its control plane, and its resolver over TCP -- rather
+        /// than dialling out. A **gauge**.
+        public var tcpLocalConnections: Int
         /// Guest connections refused because the destination did not accept.
         public var tcpDialFailed: Int
         /// Guest connections refused for being to a link-local address --
@@ -95,6 +116,11 @@ extension Gateway {
         public var dnsRefusedNoUpstream: Int
         /// Replies from upstream that matched no outstanding query.
         public var dnsUnmatchedReplies: Int
+        /// Replies cut down because they would not fit the datagram the asker
+        /// offered, with TC set so it asks again over TCP. Read as a ratio
+        /// against `dnsForwarded`: a high one is a resolver being sent to TCP
+        /// often, which is worth knowing before someone reports it as slowness.
+        public var dnsTruncated: Int
 
         /// Addresses currently leased. A **gauge**.
         public var dhcpLeases: Int
@@ -135,14 +161,19 @@ extension Gateway {
             ipv4AwaitingFragments: ipv4.awaitingFragments,
             ipv4Delivered: ipv4.delivered,
             ipv4UnknownProtocol: ipv4.unknownProtocol,
+            ipv4DeferredForResolution: ipv4.deferredForResolution,
+            ipv4DroppedUnresolved: ipv4.droppedUnresolved,
             icmpForwarded: icmp.forwarded,
             icmpTimedOut: icmp.timedOut,
+            icmpAnswered: icmp.answered,
+            icmpDeclined: icmp.declined,
             inboundFramesRejected: link.inboundDropped,
             outboundFramesRejected: link.outboundDropped,
             outboundFramesBackedUp: link.outboundBackedUp,
             captureBytesLost: (link as? CapturingLink)?.capture.bytesLost ?? 0,
             tcpEstablished: tcp.establishedCount,
             tcpRefusedByLimit: tcp.refusedForLimit,
+            tcpLocalConnections: tcp.localConnections,
             tcpDialFailed: tcp.refusedForDial,
             tcpRefusedLinkLocal: tcp.refusedForLinkLocal,
             udpFlows: udp.flowCount,
@@ -154,6 +185,7 @@ extension Gateway {
             dnsRefusedByLimit: dns.refusedForLimit,
             dnsRefusedNoUpstream: dns.refusedForNoUpstream,
             dnsUnmatchedReplies: dns.unmatchedReplies,
+            dnsTruncated: dns.truncated,
             dhcpLeases: dhcp.leaseCount,
             dhcpPoolExhausted: dhcp.exhausted,
             forwardedPorts: forwardedPorts.count,
@@ -184,14 +216,19 @@ extension Gateway.Statistics {
             ("ipv4_awaiting_fragments", ipv4AwaitingFragments),
             ("ipv4_delivered", ipv4Delivered),
             ("ipv4_unknown_protocol", ipv4UnknownProtocol),
+            ("ipv4_deferred_for_resolution", ipv4DeferredForResolution),
+            ("ipv4_dropped_unresolved", ipv4DroppedUnresolved),
             ("icmp_forwarded", icmpForwarded),
             ("icmp_timed_out", icmpTimedOut),
+            ("icmp_answered", icmpAnswered),
+            ("icmp_declined", icmpDeclined),
             ("inbound_frames_rejected", inboundFramesRejected),
             ("outbound_frames_rejected", outboundFramesRejected),
             ("outbound_frames_backed_up", outboundFramesBackedUp),
             ("capture_bytes_lost", captureBytesLost),
             ("tcp_established", tcpEstablished),
             ("tcp_refused_by_limit", tcpRefusedByLimit),
+            ("tcp_local_connections", tcpLocalConnections),
             ("tcp_dial_failed", tcpDialFailed),
             ("tcp_refused_link_local", tcpRefusedLinkLocal),
             ("udp_flows", udpFlows),
@@ -203,6 +240,7 @@ extension Gateway.Statistics {
             ("dns_refused_by_limit", dnsRefusedByLimit),
             ("dns_refused_no_upstream", dnsRefusedNoUpstream),
             ("dns_unmatched_replies", dnsUnmatchedReplies),
+            ("dns_truncated", dnsTruncated),
             ("dhcp_leases", dhcpLeases),
             ("dhcp_pool_exhausted", dhcpPoolExhausted),
             ("forwarded_ports", forwardedPorts),

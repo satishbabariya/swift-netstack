@@ -782,3 +782,136 @@ private func zoneAsk(_ fd: Int32, _ name: String, id: UInt16) async -> (address:
     guard let reply = await awaitReply(fd) else { return nil }
     return (answeredAddress(reply), responseCode(reply))
 }
+
+// MARK: - The resolver over TCP
+
+/// One length-prefixed message, as RFC 1035 §4.2.2 frames them.
+private func framed(_ message: ByteBuffer) -> ByteBuffer {
+    var out = ByteBufferAllocator().buffer(capacity: message.readableBytes + 2)
+    out.writeInteger(UInt16(message.readableBytes), endianness: .big)
+    var body = message
+    out.writeBuffer(&body)
+    return out
+}
+
+/// Every complete framed reply an embedded channel has written.
+private func replies(from channel: EmbeddedChannel) throws -> [ByteBuffer] {
+    var out: [ByteBuffer] = []
+    while var written = try channel.readOutbound(as: ByteBuffer.self) {
+        while let length = written.getInteger(at: written.readerIndex, as: UInt16.self),
+            written.readableBytes >= Int(length) + 2
+        {
+            written.moveReaderIndex(forwardBy: 2)
+            guard let message = written.readSlice(length: Int(length)) else { break }
+            out.append(message)
+        }
+    }
+    return out
+}
+
+@Test func theResolverAnswersOverTCPAsWellAsUDP() throws {
+    // Upstream serves DNS on both, and a resolver needs both: an answer that
+    // will not fit a datagram comes back truncated, and the asker's next move
+    // is the same question over TCP. Measured against a real guest before this
+    // existed, `nc -z 192.168.127.1 53` could not even connect.
+    let fixture = try DNSFixture(records: [
+        .init(name: "gateway.containers.internal", address: dnsGateway)
+    ])
+    let channel = EmbeddedChannel(loop: fixture.loop)
+    try channel.connect(to: SocketAddress(ipAddress: "192.168.127.2", port: 40000)).wait()
+    // Driven, not waited on: `serve` submits its pipeline setup to the loop,
+    // and an `EmbeddedEventLoop` runs what is submitted only when it is run --
+    // so waiting here without running it waits for ever.
+    let ready = fixture.server.serve(channel)
+    fixture.loop.run()
+    try ready.wait()
+
+    try channel.writeInbound(framed(dnsQuery("gateway.containers.internal")))
+    let answers = try replies(from: channel)
+    #expect(answers.count == 1, "\(answers.count) replies to one question")
+    let reply = try #require(answers.first)
+    #expect(answeredAddress(reply) == dnsGateway)
+    _ = try? channel.finish()
+}
+
+@Test func aQueryArrivingInPiecesIsAnsweredWhenItIsWhole() throws {
+    // TCP is a stream: the length prefix and the message it describes can
+    // arrive in any number of reads, and a resolver that assumed one read per
+    // message would answer some questions and silently drop others.
+    let fixture = try DNSFixture(records: [
+        .init(name: "gateway.containers.internal", address: dnsGateway)
+    ])
+    let channel = EmbeddedChannel(loop: fixture.loop)
+    try channel.connect(to: SocketAddress(ipAddress: "192.168.127.2", port: 40000)).wait()
+    // Driven, not waited on: `serve` submits its pipeline setup to the loop,
+    // and an `EmbeddedEventLoop` runs what is submitted only when it is run --
+    // so waiting here without running it waits for ever.
+    let ready = fixture.server.serve(channel)
+    fixture.loop.run()
+    try ready.wait()
+
+    var whole = framed(dnsQuery("gateway.containers.internal"))
+    guard let head = whole.readSlice(length: 3) else {
+        Issue.record("the framed query was shorter than its own prefix")
+        return
+    }
+    try channel.writeInbound(head)
+    #expect(try replies(from: channel).isEmpty, "positive control: answered half a question")
+    try channel.writeInbound(whole)
+    #expect(try replies(from: channel).count == 1, "the rest of the question was never answered")
+    _ = try? channel.finish()
+}
+
+@Test func twoQueriesInOneReadAreBothAnswered() throws {
+    // RFC 7766 §6.2.1.1 lets a client pipeline, and a resolver that answered
+    // only the first would leave the second to time out.
+    let fixture = try DNSFixture(records: [
+        .init(name: "gateway.containers.internal", address: dnsGateway)
+    ])
+    let channel = EmbeddedChannel(loop: fixture.loop)
+    try channel.connect(to: SocketAddress(ipAddress: "192.168.127.2", port: 40000)).wait()
+    // Driven, not waited on: `serve` submits its pipeline setup to the loop,
+    // and an `EmbeddedEventLoop` runs what is submitted only when it is run --
+    // so waiting here without running it waits for ever.
+    let ready = fixture.server.serve(channel)
+    fixture.loop.run()
+    try ready.wait()
+
+    var both = framed(dnsQuery("gateway.containers.internal"))
+    var second = framed(dnsQuery("gateway.containers.internal"))
+    both.writeBuffer(&second)
+    try channel.writeInbound(both)
+    #expect(try replies(from: channel).count == 2, "only one of two pipelined questions was answered")
+    _ = try? channel.finish()
+}
+
+@Test func aTCPConnectionIsGivenSomethingToCloseItWhenItAsksNothing() throws {
+    // A connection costs a descriptor and a slot in the forwarder's limit. A
+    // guest that opens one and says nothing is spending both, and RFC 7766
+    // §6.2.3 puts the responsibility for that on the server.
+    //
+    // This asserts that the bound is INSTALLED, not that it fires, and the
+    // difference belongs in the name rather than hidden behind one. NIO's
+    // `IdleStateHandler` measures elapsed time with `NIODeadline.now()` -- the
+    // real clock -- so no amount of advancing this fixture's clock will make it
+    // fire, and the version of this test that tried spent an hour of virtual
+    // time proving only that. Watching it genuinely time out would mean waiting
+    // ten real seconds, which is not a trade this suite makes.
+    //
+    // What this does catch is the bound being deleted, which is the failure
+    // that would actually happen.
+    let fixture = try DNSFixture(records: [])
+    let channel = EmbeddedChannel(loop: fixture.loop)
+    try channel.connect(to: SocketAddress(ipAddress: "192.168.127.2", port: 40000)).wait()
+    // Driven, not waited on: `serve` submits its pipeline setup to the loop,
+    // and an `EmbeddedEventLoop` runs what is submitted only when it is run --
+    // so waiting here without running it waits for ever.
+    let ready = fixture.server.serve(channel)
+    fixture.loop.run()
+    try ready.wait()
+
+    #expect(throws: Never.self) {
+        try channel.pipeline.syncOperations.handler(type: IdleStateHandler.self)
+    }
+    _ = try? channel.finish()
+}

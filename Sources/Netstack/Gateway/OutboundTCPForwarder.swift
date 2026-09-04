@@ -132,10 +132,37 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     /// displace a protocol handler silently, and this forwarder is that handler.
     /// So the interception belongs here, where the destination is already known
     /// and the decision is already being made.
-    public var locallyServed: (address: IPv4Address, port: UInt16)?
+    /// More than one, because there is more than one: the control plane on port
+    /// 80, and the resolver on port 53 over TCP, which a guest reaches for when
+    /// a datagram answer comes back truncated.
+    public private(set) var locallyServed: [LocalService] = []
 
-    /// What to put on a connection that `locallyServed` matched.
-    public var serveLocally: (@Sendable (Channel) -> EventLoopFuture<Void>)?
+    /// One destination this gateway answers itself, and what it puts on the
+    /// connection when a guest opens it.
+    public struct LocalService {
+        public let address: IPv4Address
+        public let port: UInt16
+        public let serve: @Sendable (Channel) -> EventLoopFuture<Void>
+
+        public init(
+            address: IPv4Address, port: UInt16,
+            serve: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+        ) {
+            self.address = address
+            self.port = port
+            self.serve = serve
+        }
+    }
+
+    /// Answer this destination here rather than dialling it.
+    ///
+    /// Replaces any service already registered for the same address and port,
+    /// so registering twice is a correction rather than a second listener the
+    /// first would shadow.
+    public func serveLocally(_ service: LocalService) {
+        locallyServed.removeAll { $0.address == service.address && $0.port == service.port }
+        locallyServed.append(service)
+    }
 
     /// Connections the guest opened to `locallyServed`, still being served.
     public private(set) var localConnections = 0
@@ -176,9 +203,10 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         // before it: this makes no host connection, but it does make a guest one
         // and the guest is assumed hostile. A destination that answers without
         // bounding what it hands out is the same hazard by another route.
-        if let served = locallyServed, let serve = serveLocally,
-            request.destination == served.address, request.destinationPort == served.port
-        {
+        if let served = locallyServed.first(where: {
+            $0.address == request.destination && $0.port == request.destinationPort
+        }) {
+            let serve = served.serve
             live += 1
             let slot = ConnectionSlot(forwarder: self)
             guard let endpoint = (try? request.complete()) ?? nil else {

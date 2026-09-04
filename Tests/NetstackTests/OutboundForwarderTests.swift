@@ -393,11 +393,13 @@ private final class GreetingOnConnect: ChannelInboundHandler, @unchecked Sendabl
     let served = Holder()
 
     try await holder.stack!.eventLoop.submit {
-        holder.forwarder!.locallyServed = (IPv4Address("192.168.127.1")!, 80)
-        holder.forwarder!.serveLocally = { channel in
-            served.served = channel
-            return channel.eventLoop.makeSucceededVoidFuture()
-        }
+        holder.forwarder!.serveLocally(
+            OutboundTCPForwarder.LocalService(
+                address: IPv4Address("192.168.127.1")!, port: 80
+            ) { channel in
+                served.served = channel
+                return channel.eventLoop.makeSucceededVoidFuture()
+            })
     }.get()
 
     send(

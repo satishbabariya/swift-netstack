@@ -462,6 +462,7 @@ public final class Gateway: @unchecked Sendable {
         self.tcp = tcp
         self.udp = udp
         self.icmp = icmp
+
     }
 
     /// Start on an already-connected datagram socket -- the descriptor
@@ -679,6 +680,36 @@ public final class Gateway: @unchecked Sendable {
             let icmp = ICMPForwarder(
                 stack: stack, nat: configuration.nat,
                 allowsLinkLocal: configuration.allowsLinkLocal)
+
+            // The resolver over TCP, which upstream serves and a resolver
+            // needs: an answer that will not fit a datagram comes back
+            // truncated, and the asker's next move is the same question over
+            // TCP. Wired here rather than left to a caller, because a gateway
+            // that answers DNS on one transport and refuses it on the other is
+            // not a resolver a stub can rely on.
+            //
+            // Every address this gateway answers for, not only the primary,
+            // because that is what the UDP side already does: its socket binds
+            // `.any`, so a query to the host alias is answered here rather than
+            // forwarded. Matching it matters more than the alternative -- a
+            // resolver that got a truncated answer from one address and then
+            // reached a DIFFERENT server when it retried over TCP would be
+            // worse than either behaviour on its own.
+            //
+            // Worth knowing, and not decided here: upstream binds both
+            // transports to the gateway address alone, so under gvproxy a
+            // query to `192.168.127.254:53` reaches the HOST's resolver. This
+            // package's UDP socket has always claimed that port on every
+            // address, which is the divergence; this only declines to make the
+            // two transports disagree with each other as well.
+            for address in [configuration.gatewayAddress] + configuration.gatewayVirtualAddresses {
+                tcp.serveLocally(
+                    OutboundTCPForwarder.LocalService(address: address, port: DNSServer.port) {
+                        [weak dns] channel in
+                        guard let dns else { return channel.close() }
+                        return dns.serve(channel)
+                    })
+            }
 
             // One limiter shared by every part, not one each. Nine components
             // with a window apiece would let a guest that can drive several

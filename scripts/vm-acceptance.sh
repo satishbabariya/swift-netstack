@@ -168,6 +168,30 @@ grep -q "^ABSENT_NAME=$" "$work/basics.out" \
     && pass "a name that does not exist resolves to nothing" \
     || fail "an absent name resolved to $(grep '^ABSENT_NAME=' "$work/basics.out" | cut -d= -f2-)"
 
+# --- The resolver over TCP ---------------------------------------------------
+#
+# Upstream serves DNS on both transports and a resolver needs both: an answer
+# that will not fit a datagram comes back truncated, and the asker's next move
+# is the same question over TCP. Before this the guest could not even connect --
+# `nc -z 192.168.127.1 53` returned 1.
+#
+# The query is built here rather than by a tool, because Alpine has neither
+# `dig` nor a `nslookup` that will use TCP. It is `gateway.containers.internal`
+# A IN, framed with RFC 1035 §4.2.2's two-byte length prefix.
+
+# Labelled and on one line of its own. The first version collapsed the whole
+# transcript with `tr -d`, which swept sandbox's own banner into the answer and
+# made the match fail for a reason that had nothing to do with DNS.
+guest 'echo "TCPANSWER=$(printf "\\x00\\x2d\\x2b\\x2b\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07\\x67\\x61\\x74\\x65\\x77\\x61\\x79\\x0a\\x63\\x6f\\x6e\\x74\\x61\\x69\\x6e\\x65\\x72\\x73\\x08\\x69\\x6e\\x74\\x65\\x72\\x6e\\x61\\x6c\\x00\\x00\\x01\\x00\\x01" | nc -w 6 192.168.127.1 53 | od -An -tx1 | tr -d " \\n")"' \
+    "$work/dnstcp.out"
+
+# The answer's last four bytes are the address: c0 a8 7f 01 is 192.168.127.1.
+# Matched rather than "did anything come back", so a truncated or refused reply
+# cannot pass.
+grep -q "^TCPANSWER=.*c0a87f01$" "$work/dnstcp.out" \
+    && pass "the resolver answers over TCP" \
+    || fail "the TCP query answered [$(grep '^TCPANSWER=' "$work/dnstcp.out" | cut -d= -f2- | tail -c 40)]"
+
 # --- The half-close, which is what a real guest found ------------------------
 
 port=24682

@@ -73,3 +73,4 @@ Sources/Netstack/Gateway/DNSServer.swift	aTCPConnectionIsGivenSomethingToCloseIt
 Sources/Netstack/Gateway/DNSServer.swift	aReplyTooLargeForADatagramComesBackTruncated	        guard reply.readableBytes > limit else { return reply }	        guard false else { return reply }
 Sources/Netstack/Gateway/DNSServer.swift	aReplyThatFitsIsNotTruncated	        guard reply.readableBytes > limit else { return reply }	        guard reply.readableBytes > 0 else { return reply }
 Sources/Netstack/Gateway/DNS.swift	theAskersOwnDatagramSizeIsHonoured	                return max(floor, Int(klass))	                return floor
+Sources/Netstack/Gateway/DNSServer.swift	aQuestionOfAnyTypeIsForwardedAndItsAnswerComesBack	        forward(query, payload: payload, respond: respond)	        if query.question.type == DNSQuestion.typeA { forward(query, payload: payload, respond: respond) }

@@ -461,6 +461,38 @@ PY
     [[ "$answer" == "GUEST-LISTENER" ]] \
         && pass "a port published into the guest carries a connection" \
         || fail "the published port answered '$answer'"
+
+    # The daemon's tunnel, in the same boot rather than another: `POST /tunnel`
+    # turns the control-plane connection itself into a byte pipe to an address
+    # inside the guest network. Upstream tests it ("reach a http server in the
+    # VM using the tunneling of the daemon") and nothing here did.
+    #
+    # `OK` first, not an HTTP response: the connection stopped being HTTP when
+    # the request was hijacked, and a client waits for that byte pair before it
+    # sends anything.
+    cat > "$work/tunnel.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(12)
+s.connect(sys.argv[1])
+s.sendall(b"POST /tunnel?ip=192.168.127.2&port=9999 HTTP/1.1\r\nHost: x\r\n\r\n")
+got = b""
+try:
+    while len(got) < 64:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        got += chunk
+except Exception:
+    pass
+print(got.decode(errors="replace").strip())
+s.close()
+PY
+    tunnelled="$(python3 "$work/tunnel.py" "$api")"
+    case "$tunnelled" in
+        OKGUEST-LISTENER) pass "the daemon's tunnel reaches into the guest" ;;
+        *) fail "the tunnel carried '$tunnelled'" ;;
+    esac
 else
     fail "the control plane never appeared at $api, so nothing was published"
 fi

@@ -648,10 +648,30 @@ addresses its guest itself, so nothing asks for a lease on its own and the
 first version of this script said so as a gap. But busybox's `udhcpc` is in the
 image, and a guest can be told to ask: it broadcasts a discover, selects the
 offer, and reports `lease of 192.168.127.2 obtained from 192.168.127.1, lease
-time 3600` -- the first time a real DHCP client has spoken to this server,
-whose other tests are all frames this repository wrote. The lease it gets is
-then read back from `/services/dhcp/leases`, which is where upstream's own
-client looks for it.
+time 3600` -- the first time a real DHCP client had spoken to this server,
+whose other tests are all frames this repository wrote. `udhcpc` hands the
+options it was given to a script as environment variables, so the check asks
+for one that prints them and reads options 3, 6, 1, 26 and 51 straight off the
+client. The lease is then read back from `/services/dhcp/leases`, which is
+where upstream's own client looks for it.
+
+Twenty-six checks across seven boots, and the rest of them came from reading
+upstream's own acceptance suite as a specification rather than guessing: the
+daemon's tunnel, unix-to-TCP forwarding, and the resolver over TCP -- which
+turned out not to exist here at all, and is now two of the checks and a feature.
+What remains uncovered is what needs egress from the guest, which `sandbox`
+correctly refuses, and SSH forwarding, which this package deliberately does not
+have.
+
+The checks are audited the way the guards are, by breaking the product and
+seeing which of them notice. Removing the ARP neighbour queue fails exactly one
+and leaves twenty-one passing; emptying the resolver's records fails exactly
+three; offering the wrong MTU fails exactly one, by name. That audit is also
+what retired two checks: "the default route is the gateway" and "the resolver is
+the gateway" read the guest's own configuration back, and `sandbox` writes that
+configuration -- so nothing this gateway did could have made them fail. What
+they claimed is now checked where it is this gateway's to get right, in the
+lease.
 
 The Swift examples on this page are **compiled**. They sit in a function nothing
 calls in `Tests/NetstackTests/READMEExample.swift`, so the test build type-checks

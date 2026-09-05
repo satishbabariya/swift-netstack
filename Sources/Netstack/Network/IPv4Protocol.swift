@@ -328,10 +328,21 @@ public final class IPv4Protocol {
         // that only refused would let a peer pin the whole budget permanently
         // and shut the queue for everybody else.
         //
-        // Guest-reachable, and that is why it matters here: a guest that sends
-        // SYNs with spoofed on-link sources makes this gateway answer addresses
-        // only that guest could ARP for, and it simply does not answer. Eleven
-        // of those would have taken every slot for good.
+        // What fills it is an address this gateway sends to and has never heard
+        // from: a host-to-guest forward to a guest that has not spoken yet, or
+        // one whose entry has aged out of the sixty-second cache. Those do not
+        // answer while they are absent, and nothing else releases the datagrams
+        // waiting on them.
+        //
+        // This comment used to name a different cause -- a guest spoofing
+        // on-link sources so that this gateway would ARP for addresses only
+        // that guest could answer for. That does not happen, and
+        // `aSourceTheGuestInventsIsLearnedRatherThanAskedAbout` is the test
+        // written to demonstrate it that demonstrated the opposite:
+        // `handleInbound` records the sender's link address from ANY packet
+        // that arrives, so an invented source is in the cache before anything
+        // is sent back to it. The bound is still right; the story attached to
+        // it was not.
         while deferredCount >= Self.maximumDeferredDatagrams
             || deferredBytes + payload.readableBytes > Self.maximumDeferredBytes
         {

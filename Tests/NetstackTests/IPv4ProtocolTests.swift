@@ -39,10 +39,13 @@ private func makeFixture(promiscuous: Bool = true, spoofing: Bool = true, resolv
     return Fixture(nic: nic, link: link, ip: ip, clock: clock, cache: cache)
 }
 
-private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UInt8], ttl: UInt8 = 64) -> ByteBuffer {
+private func ipFrame(
+    to destination: String, protocolNumber: UInt8, payload: [UInt8], ttl: UInt8 = 64,
+    source: IPv4Address = IPv4Address("192.168.127.2")!
+) -> ByteBuffer {
     var ipPacket = PacketBuffer(allocator: ByteBufferAllocator(), payload: ByteBuffer(bytes: payload))
     var header = IPv4Header(
-        source: IPv4Address("192.168.127.2")!,
+        source: source,
         destination: IPv4Address(destination)!,
         protocolNumber: IPProtocol(rawValue: protocolNumber),
         payloadLength: payload.count
@@ -424,4 +427,48 @@ private func ipFrame(to destination: String, protocolNumber: UInt8, payload: [UI
     #expect(
         delivered.count == 1,
         "the real datagram had no place left, so it was never delivered")
+}
+
+@Test func aSourceTheGuestInventsIsLearnedRatherThanAskedAbout() throws {
+    // Written to demonstrate an attack named in `hold`'s own comment, and it
+    // demonstrates the opposite.
+    //
+    // The claim was that a guest sending frames with spoofed on-link sources
+    // would make this gateway ARP for addresses only that guest could answer
+    // for, filling the queue of datagrams waiting on resolution. It cannot:
+    // `handleInbound` records the sender's link address from ANY packet that
+    // arrives, so the invented source is in the cache before anything is sent
+    // back to it, and no ARP request is ever made.
+    //
+    // The bound is still right -- what fills that queue is an address this
+    // gateway sends to and has never heard from, which is a host-to-guest
+    // forward to a guest that has not spoken yet, or one whose entry has aged
+    // out of the cache. It is just not the guest's to fill on demand, and the
+    // comment said it was.
+    let fixture = makeFixture(resolving: false)
+    let invented = IPv4Address("192.168.127.77")!
+
+    // A datagram from an address the guest has no claim to, in a frame carrying
+    // the guest's own MAC.
+    fixture.link.inject(
+        ipFrame(to: "192.168.127.1", protocolNumber: 17, payload: [0x00], source: invented))
+    _ = fixture.link.drainTransmitted()
+
+    var payload = ByteBufferAllocator().buffer(capacity: 4)
+    payload.writeString("back")
+    #expect(throws: Never.self) {
+        try fixture.ip.send(payload: payload, to: invented, from: nil, protocolNumber: .udp)
+    }
+
+    let sent = fixture.link.drainTransmitted()
+    #expect(sent.count == 1, "\(sent.count) frames went out where one datagram was expected")
+    var packet = PacketBuffer(received: try #require(sent.first))
+    let ethernet = try #require(EthernetHeader.parse(&packet))
+    #expect(
+        ethernet.etherType == .ipv4,
+        "the gateway asked ARP for an address the guest had already told it about")
+    #expect(
+        fixture.ip.deferredCount == 0,
+        "the datagram was held for resolution although the address was known")
+    #expect(fixture.ip.counters.deferredForResolution == 0)
 }

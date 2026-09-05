@@ -430,6 +430,47 @@ for counter in $counters; do
     fi
 done
 
+# 17. The tree is not sitting in a mutation.
+#
+# `falsify.sh` edits a source file, runs one test, and restores it from a trap.
+# A trap is not a guarantee: kill the process group at the wrong instant and the
+# edit stays, and `git add -A` will then commit somebody's deliberate bug.
+#
+# That is not hypothetical. It happened, and what it committed was
+# `NetworkSwitch` flooding unknown unicast -- the guest-chosen amplification the
+# drop rule exists to prevent -- into an open pull request. Two CI jobs caught
+# it twenty minutes later, which is the system working and is far too slow to be
+# the first thing that notices.
+#
+# Every guard row names the exact text it expects to find. If a row's anchor is
+# missing, either the tree is mid-mutation or the code moved out from under the
+# row -- and both are worth stopping for, because a row that cannot find its
+# anchor is a check that is no longer checking anything. This is the same
+# NO-ANCHOR the falsify job reports, moved to where it costs milliseconds
+# instead of twenty minutes.
+#
+# Presence, not uniqueness, because that is `falsify.sh`'s own contract: it
+# replaces the FIRST occurrence and asks only that there be one. Two rows here
+# do have anchors that appear twice, and both are reported CAUGHT, so the first
+# occurrence is the one their test is about. Requiring uniqueness would fail
+# them for a property the runner has never asked of them.
+while IFS=$'\t' read -r file filter anchor replacement extra; do
+    [[ -z "${file:-}" || "$file" == \#* ]] && continue
+    if [[ ! -f "$file" ]]; then
+        fail "$filter guards a file that does not exist" "guards.tsv names $file"
+        continue
+    fi
+    expanded=$(printf '%b' "$anchor")
+    if ! python3 - "$file" "$expanded" <<'ANCHOR'
+import sys
+sys.exit(0 if sys.argv[2] in open(sys.argv[1]).read() else 1)
+ANCHOR
+    then
+        fail "$filter's anchor is not in $file" \
+            "either the tree is mid-mutation, or the code moved and the guard stopped guarding"
+    fi
+done < scripts/guards.tsv
+
 
 if [[ $status -eq 0 ]]; then
     echo "✔ conventions hold"

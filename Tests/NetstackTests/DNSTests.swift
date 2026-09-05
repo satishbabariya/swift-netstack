@@ -1191,3 +1191,70 @@ private func mutateFramedQuery(_ input: [UInt8], _ rng: inout DNSRandom) -> [UIn
     #expect(try ask(valid) == 1, "a fresh connection stopped being answered")
     fixture.drain()
 }
+
+@Test func aMalformedAdditionalSectionAnswersTheFloor() throws {
+    // The comment on `advertisedUDPSize` says "anything malformed answers 512",
+    // and nothing checked it. It reads the GUEST's query, so every byte it
+    // walks is chosen by the guest: an ARCOUNT that lies, a name that never
+    // ends, a compression pointer, an rdlength that runs past the buffer. What
+    // it must not do is read past what it has, loop, or return a size the asker
+    // never offered.
+    //
+    // Written because the last commit found a claim of mine that was wrong. The
+    // difference between a comment and a check is whether anyone has tried.
+    func query(_ trailer: [UInt8], additional: UInt16) -> ByteBuffer {
+        var out = ByteBufferAllocator().buffer(capacity: 64)
+        out.writeInteger(UInt16(0x4242), endianness: .big)
+        out.writeInteger(UInt16(0x0100), endianness: .big)
+        out.writeInteger(UInt16(1), endianness: .big)
+        out.writeInteger(UInt16(0), endianness: .big)
+        out.writeInteger(UInt16(0), endianness: .big)
+        out.writeInteger(additional, endianness: .big)
+        out.writeInteger(UInt8(7))
+        out.writeString("example")
+        out.writeInteger(UInt8(3))
+        out.writeString("com")
+        out.writeInteger(UInt8(0))
+        out.writeInteger(UInt16(1), endianness: .big)
+        out.writeInteger(UInt16(1), endianness: .big)
+        out.writeBytes(trailer)
+        return out
+    }
+
+    let cases: [(String, ByteBuffer)] = [
+        ("an ARCOUNT with nothing behind it", query([], additional: 1)),
+        ("an ARCOUNT of sixty-five thousand", query([], additional: 0xFFFF)),
+        ("a name that never ends", query([UInt8](repeating: 0x3F, count: 40), additional: 1)),
+        ("a compression pointer where a record should be", query([0xC0, 0x0C], additional: 1)),
+        ("a record cut off mid-type", query([0x00, 0x00], additional: 1)),
+    ]
+
+    for (description, malformed) in cases {
+        let parsed = try #require(DNSCodec.parseQuery(malformed), "could not parse \(description)")
+        let size = DNSCodec.advertisedUDPSize(in: malformed, after: parsed)
+        #expect(size == 512, "\(description) advertised \(size) rather than the floor")
+    }
+
+    // The positive control beside them: a well-formed OPT record is still read,
+    // so the cases above are answering the floor because they are malformed
+    // rather than because nothing is ever read.
+    let good = queryAdvertising(4096, id: 9)
+    let parsedGood = try #require(DNSCodec.parseQuery(good))
+    #expect(DNSCodec.advertisedUDPSize(in: good, after: parsedGood) == 4096)
+
+    // And one that looks malformed and is not, which is why it sits here rather
+    // than in the list above -- where it was, until it failed.
+    //
+    // The record's rdlength claims sixty-five thousand bytes that are not
+    // there, but the size an asker offers is the CLASS field, and that is
+    // present and readable. Nothing reads the rdata, and the walk returns
+    // before rdlength is used for anything, so the lie changes nothing this
+    // code does. Answering the floor here would truncate replies the asker had
+    // said it would take, on the strength of a field nobody looks at.
+    let lyingLength = query(
+        [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF], additional: 1)
+    let parsedLying = try #require(DNSCodec.parseQuery(lyingLength))
+    #expect(
+        DNSCodec.advertisedUDPSize(in: lyingLength, after: parsedLying) == 4096,
+        "a readable OPT header was ignored because a field nothing reads was wrong")
+}

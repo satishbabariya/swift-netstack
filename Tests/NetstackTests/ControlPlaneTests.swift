@@ -1,5 +1,6 @@
 import Foundation
 import NIOCore
+import NIOEmbedded
 import NIOHTTP1
 import NIOPosix
 import Testing
@@ -1114,4 +1115,175 @@ private func rawProbe(_ bytes: [UInt8], to address: SocketAddress) -> RawOutcome
     _ = try? await holder.gateway?.close().get()
     close(guestSide)
     try? await group.shutdownGracefully()
+}
+
+// MARK: - The parser a hostile guest can reach
+
+/// SplitMix64, written out here rather than shared with `FuzzTests`: one
+/// generator's worth of arithmetic is cheaper than a dependency between two
+/// test files that otherwise have nothing to do with each other.
+private struct PlaneRandom {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+/// The request asked after each mutated one, to see whether the plane is still
+/// there. `Connection: close` on purpose: `rawRequest` reads until the server
+/// hangs up, so a kept-alive connection costs its full read deadline every
+/// time. With it the check is immediate when the plane behaves and slow only
+/// when it does not, which is the way round that matters -- the first version
+/// of this test took a hundred and fifty seconds to say nothing was wrong.
+private let planeProbe = "GET /stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+
+/// Requests that are meant to work, before anything is done to them.
+private let planeSeeds = [
+    "GET /stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    "GET /leases HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    "GET /services/forwarder/all HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    "POST /services/forwarder/expose HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 48\r\n\r\n"
+        + "{\"local\":\"127.0.0.1:0\",\"remote\":\"192.168.127.2:80\"}",
+    "POST /services/dns/add HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 30\r\n\r\n"
+        + "{\"name\":\"z.\",\"records\":[]}",
+]
+
+/// One mutation. Each is a shape that breaks a hand-written framer rather than
+/// random noise -- a length that disagrees with the body, a header that ends
+/// where the parser did not expect, a NUL in the middle of a token.
+private func mutatePlaneRequest(_ text: String, _ rng: inout PlaneRandom) -> String {
+    var bytes = Array(text.utf8)
+    guard !bytes.isEmpty else { return text }
+    switch rng.next() % 8 {
+    case 0:
+        bytes[Int(rng.next() % UInt64(bytes.count))] ^= UInt8(1 << (rng.next() % 8))
+    case 1:
+        bytes = Array(bytes.prefix(Int(rng.next() % UInt64(bytes.count))))
+    case 2:
+        return text.replacingOccurrences(of: "Content-Length:", with: "Content-Length: 99999 ;")
+    case 3:
+        return text + text
+    case 4:
+        bytes.insert(0, at: Int(rng.next() % UInt64(bytes.count)))
+    case 5:
+        return text.replacingOccurrences(of: "\r\n\r\n", with: "\r\n")
+    case 6:
+        return String(repeating: "X", count: 1 + Int(rng.next() % 4096)) + text
+    default:
+        return text.replacingOccurrences(of: "HTTP/1.1", with: "HTTP/9.9")
+    }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
+/// Send and hang up, without waiting for an answer.
+///
+/// The mutated requests do not need one: what is being checked is the probe
+/// after them, and most of them should be refused or left incomplete anyway. A
+/// truncated request legitimately leaves the server waiting for the rest, so
+/// reading its reply means waiting out the read deadline every time -- which is
+/// what made the first version of this test take a hundred and fifty seconds.
+///
+/// Hanging up mid-request is also the more realistic shape. A guest that sends
+/// half a body and disappears is exactly the case a hand-written framer gets
+/// wrong.
+private func sendAndHangUp(_ text: String, to address: SocketAddress) {
+    let fd = makeSocket(AF_INET, .stream)
+    guard fd >= 0 else { return }
+    defer { close(fd) }
+    _ = connectTo(fd, loopbackAddress(port: UInt16(address.port!)))
+    let out = Array(text.utf8)
+    _ = out.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+}
+
+@Test func theControlPlaneKeepsServingWhateverAGuestSendsIt() async throws {
+    // The frame fuzzer covers every parser a guest can reach with a datagram --
+    // ARP, DHCP, DNS, ICMP, TCP options, fragments. It does not reach this one,
+    // and a guest can: the forwarding routes are served to it at the gateway's
+    // own address on port 80, so its HTTP framer and JSON parsing are as
+    // exposed as anything under `Network/`.
+    //
+    // What is checked is not that a mutated request is answered sensibly --
+    // most should be refused -- but that the NEXT well-formed one still is. A
+    // framer that holds a body nobody will complete, or that forwards bytes the
+    // decoder reads as a second request, wedges the connection after it rather
+    // than the one that did it. That is why the check is a good request after
+    // each bad one rather than an assertion about the bad one's answer.
+    let iterations = Int(ProcessInfo.processInfo.environment["NETSTACK_PLANE_FUZZ_ITERATIONS"] ?? "") ?? 120
+    let seed = UInt64(ProcessInfo.processInfo.environment["NETSTACK_PLANE_FUZZ_SEED"] ?? "") ?? 0x5EED
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let api = holder.plane!.listeningAddress!
+
+    // The floor, so a failure below is the fuzzing rather than a fixture that
+    // never worked.
+    #expect(
+        try rawRequest(planeProbe, to: api).contains("200"),
+        "the plane did not answer before any of this began")
+
+    var rng = PlaneRandom(seed: seed)
+    for iteration in 0..<iterations {
+        var request = planeSeeds[Int(rng.next() % UInt64(planeSeeds.count))]
+        for _ in 0...(rng.next() % 3) {
+            request = mutatePlaneRequest(request, &rng)
+        }
+        sendAndHangUp(request, to: api)
+
+        let answer = try rawRequest(planeProbe, to: api)
+        guard answer.contains("200") else {
+            Issue.record("the plane stopped answering after iteration \(iteration)")
+            break
+        }
+    }
+
+    holder.plane?.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.gateway
+}
+
+@Test func mutatedRequestsActuallyReachTheFramer() throws {
+    // The floor under the test above, and what makes it worth running. Sending
+    // bytes at a socket and finding the plane still alive proves nothing if the
+    // bytes were rejected at the first character -- the fuzzer would pass while
+    // exercising the front door rather than the framer behind it.
+    //
+    // `FuzzTests` has the same companion for the same reason, and the reason it
+    // exists is that the socket-level check could not be falsified on its own:
+    // poisoning the plane's error path left the fuzz test green, because
+    // nothing established that its corpus got that far.
+    //
+    // So this drives the framer directly and counts. What it wants is not that
+    // every mutation parses -- most should not -- but that enough do to be
+    // reaching the code under test.
+    var rng = PlaneRandom(seed: 0xBEEF)
+    var complete = 0
+    let attempts = 400
+
+    for _ in 0..<attempts {
+        var request = planeSeeds[Int(rng.next() % UInt64(planeSeeds.count))]
+        for _ in 0...(rng.next() % 3) {
+            request = mutatePlaneRequest(request, &rng)
+        }
+        let channel = EmbeddedChannel()
+        try channel.pipeline.syncOperations.addHandler(HTTPMessageFramer())
+        _ = try? channel.writeInbound(ByteBuffer(string: request))
+        while let framed = ((try? channel.readInbound(as: ByteBuffer.self)) ?? nil) {
+            _ = framed
+            complete += 1
+        }
+        _ = try? channel.finish()
+    }
+
+    // One expression, because `#expect`'s message is a `Comment` and a `+`
+    // between two strings is not one.
+    #expect(
+        complete > attempts / 10,
+        "\(complete) of \(attempts) mutated requests reached the framer as a message, which is too few to be exercising it")
 }

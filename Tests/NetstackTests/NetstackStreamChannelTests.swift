@@ -787,3 +787,138 @@ private final class HalfCloseWatcher: ChannelInboundHandler, @unchecked Sendable
     }
     fixture.drain()
 }
+
+@Test func aGuestThatIgnoresAClosedWindowCannotPushDataThroughIt() throws {
+    // RFC 9293 §3.10.7.4's first case: with RCV.WND == 0 the only acceptable
+    // segment is one of zero length sitting exactly at RCV.NXT. Everything
+    // about this stack's memory bounds downstream of that rests on it --
+    // `TCPReassembler`'s doc comment says in as many words that a segment
+    // reaching it through a live connection "is already in the window and
+    // already trimmed", and this is what makes that true.
+    //
+    // Nothing checked it. Removing `segLen == 0` from that case leaves 844
+    // tests passing, and what it buys a guest is the right to keep sending
+    // after being told to stop: the window is the only thing that says stop,
+    // and a receiver that accepts data through a closed one has no flow control
+    // in that direction at all.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture)
+        try withExtendedLifetime(server) {
+            let iss = handshakeThroughForwarder(fixture)
+            _ = fixture.drainSegments()
+            let child = try #require(collector.children.first)
+            try child.setOption(ChannelOptions.autoRead, value: false).wait()
+
+            // Fill until the guest is told to stop. Not a fixed count: the
+            // window closes when the buffer is full, and asserting on a
+            // connection whose window merely SHRANK would be asserting about a
+            // different case of §3.10.7.4 than the one under test.
+            var offset = UInt32(1)
+            var window = UInt16(TCPEndpoint.receiveWindowBytes)
+            var acknowledged = SequenceNumber(guestISS + 1)
+            for _ in 0..<400 where window > 0 {
+                fixture.inject(
+                    guestSegment(sequence: guestISS + offset, ack: iss &+ 1, flags: [.ack, .psh]),
+                    payload: tcpPayload(1000))
+                offset += 1000
+                fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+                if let header = fixture.drainSegments().last?.header {
+                    window = header.window
+                    acknowledged = header.acknowledgement
+                }
+            }
+            #expect(window == 0, "fixture: the window never closed, so nothing below is about a closed one")
+
+            // At RCV.NXT exactly, and that is the whole point of reading it off
+            // the acknowledgement rather than off the loop's own counter.
+            //
+            // The two are not the same number: the last segment the window had
+            // room for was TRIMMED at the right edge, so `offset` is a thousand
+            // bytes further on than the connection actually got. A segment sent
+            // there is out of order as well as outside a closed window, and
+            // would be refused for the wrong reason -- this test would pass with
+            // the case it exists for deleted. RCV.NXT is where a real sender
+            // that has lost the window update sends, and it is the one position
+            // where nothing but the closed window can refuse it.
+            let refused = acknowledged
+            fixture.inject(
+                guestSegment(sequence: refused.value, ack: iss &+ 1, flags: [.ack, .psh]),
+                payload: tcpPayload(1000))
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            let answer = fixture.drainSegments().last?.header
+
+            #expect(answer?.acknowledgement == acknowledged, "the closed window took the bytes anyway: RCV.NXT moved")
+            #expect(answer?.window == 0, "the window reopened without the application having read anything")
+
+            // The control. Every assertion above is equally true of a
+            // connection that has stopped accepting data for some reason of its
+            // own, so let the application read, which is the only thing that
+            // legitimately reopens the window, and send the same segment again.
+            child.read()
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            _ = fixture.drainSegments()
+            fixture.inject(
+                guestSegment(sequence: refused.value, ack: iss &+ 1, flags: [.ack, .psh]),
+                payload: tcpPayload(1000))
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            let afterReading = fixture.drainSegments().last?.header
+            #expect(
+                afterReading?.acknowledgement == acknowledged + 1000,
+                "control: once the window reopened the same segment had to be accepted")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func readingFromAClosedWindowAnnouncesAWindowThatIsActuallyOpen() throws {
+    // `TCPEndpoint.read` has always known that a window which CLOSED must be
+    // announced at once rather than ride the next acknowledgement -- its comment
+    // says so, and gives the reason: there is no next acknowledgement, because
+    // the peer has stopped sending and is waiting on a probe.
+    //
+    // It emitted that acknowledgement, and the acknowledgement advertised zero.
+    // `tcb.rcvWnd` is a stored value that was written only when a segment
+    // arrived, and no segment arrives on a stalled connection -- so the frame
+    // sent to lift the closure announced the closure. The peer learned nothing
+    // and waited for its persist timer anyway, which is the entire interval that
+    // emission exists to save.
+    //
+    // Asserted on the window in the frame, not on `read` having emitted one.
+    // "A segment came back" was true the whole time this was broken.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture)
+        try withExtendedLifetime(server) {
+            let iss = handshakeThroughForwarder(fixture)
+            _ = fixture.drainSegments()
+            let child = try #require(collector.children.first)
+            try child.setOption(ChannelOptions.autoRead, value: false).wait()
+
+            var offset = UInt32(1)
+            var window = UInt16(TCPEndpoint.receiveWindowBytes)
+            for _ in 0..<400 where window > 0 {
+                fixture.inject(
+                    guestSegment(sequence: guestISS + offset, ack: iss &+ 1, flags: [.ack, .psh]),
+                    payload: tcpPayload(1000))
+                offset += 1000
+                fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+                if let header = fixture.drainSegments().last?.header { window = header.window }
+            }
+            #expect(window == 0, "fixture: the window never closed")
+
+            // Nothing arrives from here on. A stalled peer sends nothing, and
+            // that is the condition under test -- an injected segment would
+            // itself trigger the recompute and the assertion would say nothing.
+            child.read()
+            let announcements = fixture.drainSegments()
+
+            let announced = try #require(
+                announcements.last?.header, "reading from a closed window told the peer nothing at all")
+            #expect(announced.window > 0, "the frame announcing the reopened window advertised zero")
+            #expect(announced.flags.contains(.ack))
+            #expect(!announced.flags.contains(.rst))
+        }
+    }
+    fixture.drain()
+}

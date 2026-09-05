@@ -1034,3 +1034,73 @@ private final class HalfCloseWatcher: ChannelInboundHandler, @unchecked Sendable
     }
     fixture.drain()
 }
+
+@Test func aFinIsAcknowledgedAtOnceRatherThanOnTheDelayedAckTimer() throws {
+    // `Receiver` may delay an acknowledgement, and names three segments it must
+    // not delay: one that arrived out of order, one that filled a gap, and one
+    // carrying a FIN. A sweep of those three found the first two guarded and
+    // this one not.
+    //
+    // ## No `guards.tsv` row, and the measurement that says why
+    //
+    // The FIN case is decided twice, in two files: `Receiver`'s `!finReached`
+    // in `ackMayBeDelayed`, and `TCPStateMachine`'s own `outcome?.finReached
+    // != true` where it turns that into `.sendAck` or `.sendAckMayDelay`.
+    //
+    // Removing either one alone leaves this test passing, because the other
+    // still refuses to delay -- both were measured, both SURVIVED. Removing
+    // BOTH fails it, on all three assertions. A row can only mutate one anchor
+    // in one file, so no row here could report anything but a survival it did
+    // not earn.
+    //
+    // The test stays, because it is what would catch the second deletion, and
+    // because the pair being redundant is exactly the thing a future editor
+    // needs told: whichever of the two you are looking at, the tests will not
+    // stop you removing it, and the other one is why.
+    //
+    // A delayed FIN acknowledgement is not wrong, it is slow, and it is slow on
+    // the one exchange every connection performs: the peer has stopped sending
+    // and is waiting to be told its FIN arrived, so nothing else is coming to
+    // carry the acknowledgement and the whole delay is spent. That is the
+    // delayed-ACK interval added to every close, which is invisible in any test
+    // that advances the clock before looking -- and every other test here
+    // advances the clock before looking.
+    //
+    // So this one does not advance it at all.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture)
+        withExtendedLifetime(server) {
+            let iss = handshakeThroughForwarder(fixture)
+            _ = fixture.drainSegments()
+
+            // The control, first and deliberately: ordinary in-order data may
+            // be delayed, and is. Without this the assertion below is equally
+            // true of a stack that acknowledges everything immediately and has
+            // no delayed acknowledgement at all.
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack, .psh]),
+                payload: tcpPayload(100))
+            #expect(
+                fixture.drainSegments().isEmpty,
+                "control: an ordinary data segment was acknowledged immediately, so nothing below is about a delay")
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            _ = fixture.drainSegments()
+
+            // The same segment shape with a FIN on it. Still no clock advance.
+            fixture.inject(
+                guestSegment(sequence: guestISS + 101, ack: iss &+ 1, flags: [.ack, .psh, .fin]),
+                payload: tcpPayload(100))
+            let immediate = fixture.drainSegments()
+
+            #expect(immediate.count == 1, "the FIN's acknowledgement waited for the delayed-ACK timer")
+            let ack = immediate.first?.header
+            #expect(ack?.flags.contains(.ack) == true)
+            #expect(
+                ack?.acknowledgement == SequenceNumber(guestISS + 202),
+                "past the FIN, which occupies the sequence number after the data")
+        }
+        _ = collector.children
+    }
+    fixture.drain()
+}

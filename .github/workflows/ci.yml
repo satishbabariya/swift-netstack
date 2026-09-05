@@ -12,6 +12,8 @@ concurrency:
 jobs:
   test:
     name: Build and test
+    # A ceiling over the whole job, above the Test step's own. See that step.
+    timeout-minutes: 40
     # `Package.swift` declares swift-tools-version 6.2, so the runner needs a
     # toolchain at least that new. macos-14 ships Swift 5.10 and fails before it
     # compiles a line.
@@ -52,7 +54,28 @@ jobs:
         run: go build -o harness .
         working-directory: differential/harness
 
+      # Bounded, because an unbounded hang is worse than a failure.
+      #
+      # This suite normally finishes in half a minute. On 2026-09-05 it did not
+      # finish at all: fifteen tests started and none of them ever returned --
+      # every one of them from the family that opens real sockets and runs a
+      # real gateway, wedged together, which is the shape of the runner losing
+      # something underneath them rather than of one test looping. A re-run of
+      # the same commit passed in four minutes.
+      #
+      # Nothing bounded it. GitHub's default job timeout is six hours, so the
+      # job sat there holding a runner and saying nothing, and the only way to
+      # learn which tests were stuck was to pull the log and diff the ones that
+      # printed "started" against the ones that printed "passed":
+      #
+      #   grep 'Test .*() started'     -> 850
+      #   grep 'Test .*() passed after' -> 835
+      #
+      # Ten minutes is roughly twenty times the normal run and still a fifth of
+      # what was wasted. The point is not the number, it is that the job now
+      # ends, red, with the log available while it is still worth reading.
       - name: Test
+        timeout-minutes: 10
         # `set -o pipefail`, because piping into `tee` otherwise hands the
         # step `tee`'s exit status and a failing suite would go green. GitHub's
         # default shell is `bash -e`, which does not set it.
@@ -107,6 +130,7 @@ jobs:
 
   harness:
     name: Build the differential harness
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -142,6 +166,7 @@ jobs:
 
   linux:
     name: Build on Linux
+    timeout-minutes: 30
     # Not a claimed platform: `Package.swift` names macOS and the README says
     # macOS 14+. This job exists to find out how far off Linux is, and to stop
     # it drifting further -- upstream runs on Linux, so anyone who wants this
@@ -183,6 +208,7 @@ jobs:
 
   lint:
     name: Formatting, conventions and interop
+    timeout-minutes: 25
     # Split out of `test` so the cheap checks answer in a minute rather than
     # waiting behind the suite and the differential gate.
     runs-on: macos-26
@@ -223,6 +249,11 @@ jobs:
 
   guards:
     name: Falsify the guards
+    # Runs one build and one filtered test per row and takes about half an hour
+    # at 78 of them, so this is roughly double rather than the twentyfold the
+    # Test step gets. It grows with the row count: if this starts firing, the
+    # question is whether every row is still earning its place.
+    timeout-minutes: 60
     # Its own job because it is the long pole: seventeen mutations, each with a
     # build and a filtered test run. Nothing else needs to wait for it, and it
     # needs nothing from anything else.

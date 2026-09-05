@@ -1,3 +1,4 @@
+import Foundation
 import NIOCore
 import NIOEmbedded
 import NIOPosix
@@ -1077,4 +1078,116 @@ private func queryAdvertising(_ size: UInt16, id: UInt16) -> ByteBuffer {
     close(guestSide)
     try? await group.shutdownGracefully()
     _ = holder.stack
+}
+
+// MARK: - The TCP framing, as a hostile guest would send it
+
+/// SplitMix64. Local for the same reason `ControlPlaneTests` keeps its own: a
+/// generator is cheaper than a dependency between test files.
+private struct DNSRandom {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
+/// One mutation of a framed query. Each is a shape that breaks a
+/// length-prefixed reader rather than random noise: a prefix that disagrees
+/// with the body, a message split where a reader might assume it is not, two
+/// messages run together with the seam moved.
+private func mutateFramedQuery(_ input: [UInt8], _ rng: inout DNSRandom) -> [UInt8] {
+    guard input.count > 2 else { return input }
+    var out = input
+    switch rng.next() % 7 {
+    case 0:
+        out[Int(rng.next() % UInt64(out.count))] ^= UInt8(1 << (rng.next() % 8))
+    case 1:
+        // A prefix claiming far more than follows: the reader must wait rather
+        // than read past the end of what it has.
+        out[0] = 0xFF
+        out[1] = 0xFF
+    case 2:
+        // A prefix of nothing at all.
+        out[0] = 0
+        out[1] = 0
+    case 3:
+        out = Array(out.prefix(2 + Int(rng.next() % UInt64(out.count - 2))))
+    case 4:
+        // The same message twice.
+        out += out
+    case 5:
+        // A runt message between the two.
+        out.insert(contentsOf: [0x00, 0x01, 0x41], at: 2)
+    default:
+        // A prefix one shorter than the body, so the tail of one message is
+        // read as the head of the next.
+        let claimed = UInt16(out.count - 2)
+        out[0] = UInt8(truncatingIfNeeded: (claimed &- 1) >> 8)
+        out[1] = UInt8(truncatingIfNeeded: claimed &- 1)
+    }
+    return out
+}
+
+@Test func theResolverOverTCPSurvivesWhateverAGuestFrames() throws {
+    // A guest opens this connection and chooses every byte on it, so the
+    // length-prefixed reader in front of the resolver is as exposed as the
+    // datagram parsers `FuzzTests` covers -- and it is newer than they are.
+    //
+    // The invariant is server-wide rather than per-connection. Garbage on one
+    // connection may legitimately leave that one mid-message: a prefix claiming
+    // more than was sent is a promise the reader has to keep waiting on, and a
+    // valid query appended after it is the body of the message the guest said
+    // was coming. What must not happen is that connection taking the resolver
+    // down with it, so what is checked is a FRESH connection afterwards.
+    let iterations = Int(ProcessInfo.processInfo.environment["NETSTACK_DNSTCP_FUZZ_ITERATIONS"] ?? "") ?? 300
+    let seed = UInt64(ProcessInfo.processInfo.environment["NETSTACK_DNSTCP_FUZZ_SEED"] ?? "") ?? 0xD15EA5E
+    let fixture = try DNSFixture(records: [
+        .init(name: "gateway.containers.internal", address: dnsGateway)
+    ])
+
+    func ask(_ bytes: [UInt8]) throws -> Int {
+        let channel = EmbeddedChannel(loop: fixture.loop)
+        try channel.connect(to: SocketAddress(ipAddress: "192.168.127.2", port: 40000)).wait()
+        let ready = fixture.server.serve(channel)
+        fixture.loop.run()
+        try ready.wait()
+        _ = try? channel.writeInbound(ByteBuffer(bytes: bytes))
+        var replies = 0
+        while let written = ((try? channel.readOutbound(as: ByteBuffer.self)) ?? nil) {
+            _ = written
+            replies += 1
+        }
+        _ = try? channel.finish()
+        return replies
+    }
+
+    let valid = Array(framed(dnsQuery("gateway.containers.internal")).readableBytesView)
+    #expect(try ask(valid) == 1, "the fixture could not answer before any of this began")
+
+    var rng = DNSRandom(seed: seed)
+    var answered = 0
+    for _ in 0..<iterations {
+        var bytes = valid
+        for _ in 0...(rng.next() % 3) {
+            bytes = mutateFramedQuery(bytes, &rng)
+        }
+        answered += (try? ask(bytes)) ?? 0
+    }
+
+    // The companion, inline rather than beside: a corpus the reader rejects at
+    // the prefix would leave this test green while exercising nothing, which is
+    // the hole `FuzzTests` names in its own and the one the control-plane
+    // fuzzer had to have closed for it separately.
+    #expect(
+        answered > iterations / 10,
+        "\(answered) of \(iterations) mutated frames were answered, too few to be reaching the reader")
+
+    // And the resolver is still there for somebody else.
+    #expect(try ask(valid) == 1, "a fresh connection stopped being answered")
+    fixture.drain()
 }

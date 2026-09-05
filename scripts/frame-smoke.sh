@@ -2186,6 +2186,70 @@ mtu_smoke() {
 #
 # Driven through the executable because the parser lives in it and a test target
 # cannot import it.
+# The one flag this suite never passed.
+#
+# Found by asking which flags the program takes that nothing here exercises --
+# the same question that turned up a gate running with no upstream resolver at
+# all. Nineteen of twenty were used somewhere; `--log-level` was the twentieth.
+#
+# Both halves, because only one of them can fail quietly. A level it does not
+# know has to be refused: silently keeping `notice` would leave an operator who
+# asked for `trace` reading a log that says nothing is wrong because nothing is
+# being written. And a level it does know has to start, or the refusal is just a
+# broken flag.
+log_level_smoke() {
+    local directory="${TMPDIR:-/tmp}/netstack-smoke-log-$$"
+    rm -rf "$directory"
+    mkdir -p "$directory" || { echo "FAIL: could not make $directory"; return 1; }
+    local failures=0
+
+    # Started in the background and waited for, not read through a command
+    # substitution: the failure being looked for is a gateway that does NOT
+    # refuse, and reading its output to the end would wait for a process that
+    # runs forever. `config_value_smoke` above says the same thing at more
+    # length, having been written the other way first.
+    "$binary" --listen-vpnkit "$directory/wire.sock" --log-level shout \
+        >"$directory/refused.txt" 2>&1 &
+    local pid=$!
+    local exited=0
+    for _ in $(seq 1 120); do
+        if ! kill -0 "$pid" 2>/dev/null; then exited=1; break; fi
+        [[ -S "$directory/wire.sock" ]] && break
+        sleep 0.25
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    if [[ $exited -eq 0 ]]; then
+        echo "FAIL: --log-level shout started a gateway instead of being refused"
+        failures=1
+    elif ! grep -q "is not a level" "$directory/refused.txt"; then
+        echo "FAIL: --log-level shout was refused without saying why:" \
+            "$(head -1 "$directory/refused.txt")"
+        failures=1
+    fi
+
+    rm -f "$directory/wire.sock"
+    "$binary" --listen-vpnkit "$directory/wire.sock" --log-level debug \
+        >"$directory/started.txt" 2>&1 &
+    pid=$!
+    local started=0
+    for _ in $(seq 1 120); do
+        kill -0 "$pid" 2>/dev/null || break
+        if [[ -S "$directory/wire.sock" ]]; then started=1; break; fi
+        sleep 0.25
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    if [[ $started -eq 0 ]]; then
+        echo "FAIL: --log-level debug did not start: $(head -1 "$directory/started.txt")"
+        failures=1
+    fi
+
+    rm -rf "$directory"
+    [[ $failures -eq 0 ]] || return 1
+    echo "ok: --log-level takes a level it knows and refuses one it does not"
+}
+
 config_value_smoke() {
     local directory="${TMPDIR:-/tmp}/netstack-smoke-cfg-$$"
     rm -rf "$directory"
@@ -3228,6 +3292,7 @@ boot_smoke "--gatewayIP 10.7.0.1 --subnet 10.7.0.0/24 --hostIP 10.7.0.254" \
 mtu_smoke || status=1
 
 config_value_smoke || status=1
+log_level_smoke || status=1
 
 metadata_smoke 192.168.127.1 192.168.127.2 "" no || status=1
 metadata_smoke 192.168.127.1 192.168.127.2 "--ec2-metadata-access" yes || status=1

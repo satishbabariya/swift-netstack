@@ -100,3 +100,29 @@ private func frame(to destination: String, etherType: UInt16, payload: [UInt8]) 
     #expect(!nic.hasAddress(IPv4Address("192.168.127.2")!))
     #expect(nic.primaryAddress == IPv4Address("192.168.127.1"))
 }
+
+@Test func aNICNamesTheSubnetAnAddressOfItsBelongsTo() {
+    // The one public function in this package that nothing called and nothing
+    // tested, found by sweeping the public surface for symbols with no
+    // reference in `Sources` or `Tests`. Six others came up and all six are
+    // NIO protocol requirements -- `getOption`, `localAddress`,
+    // `triggerUserOutboundEvent` and the rest -- which NIO calls rather than
+    // this package, so they are reached even though nothing here names them.
+    //
+    // Untested public API on a library is a commitment nobody has checked.
+    // This one turned out to be right, which is worth knowing rather than
+    // assuming: the answer is the NETWORK, not the address that was asked
+    // about, and it is `IPv4Subnet`'s initialiser that masks it rather than
+    // anything here. A version that kept the host bits would have been wrong in
+    // a way no caller existed to notice.
+    let link = RecordingEndpoint(eventLoop: EmbeddedEventLoop(), linkAddress: MACAddress("5a:94:ef:e4:0c:ee")!)
+    let nic = NIC(id: 1, link: link)
+    nic.addAddress(IPv4Address("192.168.127.1")!, prefixLength: 24)
+    nic.addAddress(IPv4Address("10.1.2.3")!, prefixLength: 8)
+
+    #expect(nic.subnet(for: IPv4Address("192.168.127.1")!) == IPv4Subnet(cidr: "192.168.127.0/24"))
+    #expect(nic.subnet(for: IPv4Address("10.1.2.3")!) == IPv4Subnet(cidr: "10.0.0.0/8"))
+    #expect(
+        nic.subnet(for: IPv4Address("192.168.127.2")!) == nil,
+        "an address this NIC does not hold has no subnet here to name")
+}

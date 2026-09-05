@@ -85,3 +85,4 @@ Sources/Netstack/Transport/TCP/TCPStateMachine.swift	aRetransmissionThatStartsBe
 Sources/Netstack/Transport/TCP/InitialSequenceNumbers.swift	theInitialSendSequenceIsAKeyedFunctionOfTheFourTupleAndNotACounter	        var message: [UInt8] = secret	        var message: [UInt8] = []
 Sources/Netstack/Transport/TCP/InitialSequenceNumbers.swift	theInitialSendSequenceAdvancesWithRfc6528sFourMicrosecondTimer	        return SequenceNumber(m &+ f)	        return SequenceNumber(f)
 Sources/Netstack/Link/ARPCache.swift	cacheIsBoundedUnderAFloodOfSpoofedSources	            evictLeastRecentlyUsed()	            if false { evictLeastRecentlyUsed() }
+Sources/Netstack/Transport/TCP/TCPOptions.swift	aSackOptionCarryingPartOfABlockIsRefusedRatherThanReadAsFarAsItGoes	                guard valueLength > 0, valueLength % 8 == 0 else { return nil }	                guard valueLength > 0 else { return nil }

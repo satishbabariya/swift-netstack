@@ -55,3 +55,34 @@ private func parseOptions(_ literal: [UInt8]) -> [TCPOption]? {
     #expect(parseOptions([3, 2]) == nil)  // length 2: no value byte at all
     #expect(parseOptions([3, 3]) == nil)  // length 3 declared, value byte missing from the buffer
 }
+
+@Test func aSackOptionCarryingPartOfABlockIsRefusedRatherThanReadAsFarAsItGoes() {
+    // Two 32-bit edges per block, so a SACK option's value must be a whole
+    // number of eights. Reading the whole blocks and leaving the remainder is
+    // not a smaller version of the same answer: the leftover bytes stay in the
+    // options area and are parsed as the NEXT option, so a peer that names a
+    // length of fourteen decides how the four bytes after its blocks are read.
+    //
+    // The trailing bytes here are chosen so the misparse SUCCEEDS -- three NOPs
+    // and an end-of-list, which is a clean options area. That is what makes the
+    // case observable at all: with almost any other trailing bytes the second
+    // parse fails on its own and the whole thing returns nil regardless, which
+    // is the same answer for the wrong reason and would pass with the rule
+    // deleted.
+    let block: [UInt8] = [0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x20, 0x00]
+    let trailing: [UInt8] = [1, 1, 1, 0]
+    #expect(parseOptions([5, 14] + block + trailing) == nil)
+
+    // The control: the same block, in an option whose length says exactly one
+    // block, is read as exactly one block. Without it the assertion above is
+    // equally true of a parser that rejects every SACK option it sees.
+    let wellFormed = parseOptions([5, 10] + block)
+    #expect(wellFormed?.count == 1)
+    guard case .selectiveAcknowledgement(let blocks) = wellFormed?.first else {
+        Issue.record("a well-formed SACK option did not parse as one: \(String(describing: wellFormed))")
+        return
+    }
+    #expect(blocks.count == 1)
+    #expect(blocks.first?.left == SequenceNumber(0x0000_1000))
+    #expect(blocks.first?.right == SequenceNumber(0x0000_2000))
+}

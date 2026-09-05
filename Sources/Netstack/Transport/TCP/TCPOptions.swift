@@ -99,6 +99,24 @@ enum TCPOptionCodec {
             if kind == endOfOptionList { break }
             if kind == noOperation { continue }  // no length byte follows a NOP
 
+            // Both of these guards were removed, one at a time, and the whole
+            // suite run against each: both SURVIVED. Neither is dead, and
+            // neither should be deleted on the strength of that -- what they
+            // are is redundant with the per-kind reads below, which is worth
+            // knowing before someone reads a green run as permission.
+            //
+            // Without `length >= 2` a length of zero or one makes `valueLength`
+            // negative. Every known kind then fails its own exact-length test,
+            // and the unknown-kind path hands the negative straight to
+            // `readSlice`, whose bounds check answers nil for a negative length
+            // rather than trapping. So the parse still refuses -- one layer
+            // further down, and resting on NIO's contract rather than on this
+            // file's own arithmetic.
+            //
+            // `valueLength <= bytes.readableBytes` is the same shape: an option
+            // claiming more than the area holds fails whichever read tries to
+            // take it. It states the bound where the length is read, instead of
+            // leaving it implied by five separate reads further on.
             guard let length = bytes.readInteger(as: UInt8.self), length >= 2 else { return nil }
             let valueLength = Int(length) - 2
             guard valueLength <= bytes.readableBytes else { return nil }

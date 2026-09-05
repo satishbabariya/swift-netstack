@@ -381,6 +381,33 @@ struct Receiver {
     /// handshake could actually have put on the wire, which is the edge the
     /// peer was really given. Rounding it up instead would let the first
     /// advertisement exceed `rcvWndMax` and defeat that cap.
+    /// Recompute the advertised window after the application has read, and
+    /// store it — the same rule `accept` applies, applied at the only other
+    /// moment the answer can change.
+    ///
+    /// `tcb.rcvWnd` is a stored value, written here and nowhere else, and until
+    /// this existed it was written *only* on a segment's arrival. Reading is the
+    /// other event that moves it, and on a connection whose window has closed it
+    /// is the only one: the peer has stopped sending, so no segment is coming to
+    /// trigger the recompute.
+    ///
+    /// `TCPEndpoint.read` already decided a closed window must be announced at
+    /// once rather than ride the next acknowledgement, and it emitted one — an
+    /// acknowledgement carrying `tcb.rcvWnd`, which was still zero. It announced
+    /// the closure it was sent to lift. The peer learned nothing and waited for
+    /// its persist timer, which is exactly the probe interval that emission
+    /// exists to save.
+    ///
+    /// `consumed: 0`, so the floor term is the window already advertised: this
+    /// can only ever open the window, never move the right edge left, which is
+    /// the same guarantee `accept` gives.
+    mutating func reopenWindow(tcb: inout TCB) {
+        let window = advertisedWindow(
+            offered: tcb.rcvWnd, consumed: 0, maximum: tcb.rcvWndMax, scale: tcb.rcvWindScale,
+            held: tcb.heldBytes)
+        tcb.rcvWnd = Int(window) << Int(tcb.rcvWindScale)
+    }
+
     private func advertisedWindow(offered: Int, consumed: Int, maximum: Int, scale: UInt8, held: Int) -> UInt16 {
         let shift = Int(scale)
         // What the reassembler can take, less what the application has not yet

@@ -486,7 +486,14 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         guard count > 0 else { return ByteBuffer() }
         let taken = connection.receiveBuffer.readSlice(length: count) ?? ByteBuffer()
         connection.receiveBuffer.discardReadBytes()
+        // Before the recompute below, which is what reopens it.
+        let wasClosed = connection.tcb.rcvWnd == 0
         connection.tcb.setHeldBytes(connection.receiveBuffer.readableBytes)
+        // `setHeldBytes` records what is still held; it does not touch the
+        // window. `tcb.rcvWnd` used to be written only when a segment arrived,
+        // so the acknowledgement this method emits to announce a reopened window
+        // carried the closed one -- see `Receiver.reopenWindow`.
+        connection.receiver.reopenWindow(tcb: &connection.tcb)
         // Taking bytes reopens the window, and the peer has to be told — but not
         // on every read.
         //
@@ -515,7 +522,6 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         // frame each time — the syndrome this rule exists to prevent, caused by
         // the rule meant to prevent it.
         let threshold = min(2 * connection.mss, connection.tcb.rcvWndMax / 2)
-        let wasClosed = connection.tcb.rcvWnd == 0
         let worthAnnouncing = wasClosed ? count > 0 : count >= threshold
         let canAnnounce =
             connection.tcb.state == .established || connection.tcb.state == .finWait1

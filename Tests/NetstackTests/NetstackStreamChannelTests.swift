@@ -922,3 +922,115 @@ private final class HalfCloseWatcher: ChannelInboundHandler, @unchecked Sendable
     }
     fixture.drain()
 }
+
+@Test func aPureAckAtTheWrongPlaceIsNotAcceptableJustBecauseTheWindowIsShut() throws {
+    // RFC 9293 §3.10.7.4's first case has two halves, and the sweep that found
+    // the data half unguarded found this one unguarded too. With RCV.WND == 0 a
+    // segment is acceptable only if it is zero length AND sits at RCV.NXT.
+    //
+    // Dropping the position check makes every pure acknowledgement acceptable
+    // for as long as the window stays shut -- from any sequence at all. That is
+    // the state a stalled connection spends its time in, and the check is what
+    // keeps the RFC 5961 §7 challenge running through it: an off-window segment
+    // that is quietly accepted is one the peer is never corrected about, and one
+    // this stack has agreed to reason about as though it belonged here.
+    //
+    // The two branches are told apart by what comes back, which is the only
+    // thing that differs. An acceptable zero-length segment occupies no sequence
+    // space and is not acknowledged; an unacceptable one draws step 1's ACK.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture)
+        try withExtendedLifetime(server) {
+            let iss = handshakeThroughForwarder(fixture)
+            _ = fixture.drainSegments()
+            let child = try #require(collector.children.first)
+            try child.setOption(ChannelOptions.autoRead, value: false).wait()
+
+            var offset = UInt32(1)
+            var window = UInt16(TCPEndpoint.receiveWindowBytes)
+            var acknowledged = SequenceNumber(guestISS + 1)
+            for _ in 0..<400 where window > 0 {
+                fixture.inject(
+                    guestSegment(sequence: guestISS + offset, ack: iss &+ 1, flags: [.ack, .psh]),
+                    payload: tcpPayload(1000))
+                offset += 1000
+                fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+                if let header = fixture.drainSegments().last?.header {
+                    window = header.window
+                    acknowledged = header.acknowledgement
+                }
+            }
+            #expect(window == 0, "fixture: the window never closed")
+
+            // The control first, because it is the half that would go quietly
+            // wrong: a pure ACK exactly at RCV.NXT IS acceptable under a shut
+            // window, and must draw nothing.
+            fixture.inject(guestSegment(sequence: acknowledged.value, ack: iss &+ 1, flags: [.ack]))
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            #expect(
+                fixture.drainSegments().isEmpty,
+                "control: an acceptable zero-length segment occupies no sequence space and is not acknowledged")
+
+            // The same segment, 50,000 bytes away from where the connection is.
+            fixture.inject(guestSegment(sequence: acknowledged.value &+ 50_000, ack: iss &+ 1, flags: [.ack]))
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            let answer = fixture.drainSegments()
+            #expect(answer.count == 1, "an off-window acknowledgement was accepted rather than challenged")
+            #expect(
+                answer.first?.header.acknowledgement == acknowledged,
+                "the challenge has to say where the connection actually is, which is the point of sending it")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aRetransmissionThatStartsBehindRcvNxtStillDeliversTheNewBytesOnIt() throws {
+    // The third case of §3.10.7.4, and the third the sweep found unguarded:
+    // a segment carrying data is acceptable if EITHER end sits in the window.
+    // Drop the second half and a segment whose start is behind RCV.NXT is
+    // refused whole, however much new data rides on it.
+    //
+    // That is not an exotic shape, it is what a retransmission looks like after
+    // a partial acknowledgement was lost: the peer resends from where it thinks
+    // this side is, which is behind where it actually is, and the tail is bytes
+    // nobody has seen. Refusing it costs a round trip every time, and both sides
+    // are behaving correctly while it happens -- which is what makes the missing
+    // half so quiet.
+    let fixture = TCPFixture()
+    do {
+        let (server, collector) = try servingFixture(fixture)
+        withExtendedLifetime(server) {
+            let iss = handshakeThroughForwarder(fixture)
+            _ = fixture.drainSegments()
+
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: iss &+ 1, flags: [.ack, .psh]),
+                payload: tcpPayload(1000, fill: 0xaa))
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            _ = fixture.drainSegments()
+            #expect(collector.recorder.received.count == 1000, "fixture: the first thousand bytes arrived")
+
+            // Starts five hundred bytes behind RCV.NXT and ends five hundred
+            // past it. Filled differently, so the assertion below can say which
+            // half of the stream each delivered byte came from.
+            fixture.inject(
+                guestSegment(sequence: guestISS + 501, ack: iss &+ 1, flags: [.ack, .psh]),
+                payload: tcpPayload(1000, fill: 0xbb))
+            fixture.advance(by: TCPEndpoint.delayedAckTimeout)
+            let answer = fixture.drainSegments().last?.header
+
+            #expect(collector.recorder.received.count == 1500, "the new bytes on an overlapping retransmission were refused with it")
+            #expect(
+                answer?.acknowledgement == SequenceNumber(guestISS + 1501),
+                "the acknowledgement did not cover the bytes that arrived")
+            // Where the seam falls, not just how much arrived. A stack that
+            // delivered the overlapping segment whole would also have 1500
+            // bytes, with 500 of them written over data the application had
+            // already been given.
+            #expect(collector.recorder.received.prefix(1000).allSatisfy { $0 == 0xaa })
+            #expect(collector.recorder.received.suffix(500).allSatisfy { $0 == 0xbb })
+        }
+    }
+    fixture.drain()
+}

@@ -63,6 +63,63 @@ api="/tmp/netstack-acceptance-$$.sock"
 trap 'rm -rf "$work" "$api"; jobs -p | xargs -r kill 2>/dev/null' EXIT
 rm -f "$api"
 
+# An upstream resolver of this script's own, because otherwise there is none.
+#
+# `netstack-gateway` takes its upstream from `--dns` and nowhere else, so every
+# run of this gate until now started a gateway with no resolver behind it: a
+# guest asking for any name outside the served zones got REFUSED, and the
+# forwarding path -- the larger half of `DNSServer`, with its pending table,
+# its transaction ids and its timeouts -- was never once exercised against a
+# real guest.
+#
+# Small and fixed rather than a real resolver: the sandbox has no egress and
+# should not, so the answers are made up on purpose. What is being checked is
+# that a question reaches an upstream and its answer comes back, not what the
+# answer says.
+resolver_port=24800
+cat > "$work/resolver.py" <<'PY'
+import socket, struct, sys
+
+
+def skip_name(data, i):
+    while True:
+        n = data[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += n + 1
+
+
+def answer(query):
+    ident = query[:2]
+    end = skip_name(query, 12)
+    qtype, qclass = struct.unpack("!HH", query[end:end + 4])
+    question = query[12:end + 4]
+    if qtype == 16:
+        text = b"forwarded-txt-answer"
+        rdata = bytes([len(text)]) + text
+    else:
+        rdata = bytes([203, 0, 113, 7])
+    body = b"\xc0\x0c" + struct.pack("!HHIH", qtype, qclass, 60, len(rdata)) + rdata
+    return ident + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question + body
+
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    data, peer = s.recvfrom(2048)
+    try:
+        s.sendto(answer(data), peer)
+    except Exception:
+        pass
+PY
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$work/resolver.py" "$resolver_port" &
+    sleep 1
+fi
+
 echo "building the gateway"
 if ! swift build -c release --product netstack-gateway >"$work/build.log" 2>&1; then
     tail -20 "$work/build.log"
@@ -99,9 +156,10 @@ done
 # ships an empty array is an unbound variable under `set -u`, and so is
 # `${#args[@]}` on one, so counting first does not help. The array can be
 # empty, because sandbox may pass nothing but the config this drops.
-exec "@GATEWAY@" --pcap "@PCAP@" --listen "unix://@API@" ${args[@]+"${args[@]}"}
+exec "@GATEWAY@" --pcap "@PCAP@" --listen "unix://@API@" --dns "127.0.0.1:@RESOLVER@" ${args[@]+"${args[@]}"}
 SHIM
-sed -i '' -e "s|@GATEWAY@|$gateway|" -e "s|@PCAP@|$pcap|" -e "s|@API@|$api|" "$work/shim"
+sed -i '' -e "s|@GATEWAY@|$gateway|" -e "s|@PCAP@|$pcap|" -e "s|@API@|$api|" \
+    -e "s|@RESOLVER@|$resolver_port|" "$work/shim"
 chmod +x "$work/shim"
 
 # One boot per check would be honest and unusably slow -- a guest takes several
@@ -130,7 +188,9 @@ resolve() {
 }
 echo "GATEWAY_NAME=$(resolve gateway.containers.internal)"
 echo "HOST_NAME=$(resolve host.containers.internal)"
-echo "ABSENT_NAME=$(resolve nothing.containers.internal)"' "$work/basics.out"
+echo "ABSENT_NAME=$(resolve nothing.containers.internal)"
+echo "FORWARDED_NAME=$(resolve example.com)"
+echo "FORWARDED_TXT=$(printf "\\x33\\x33\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07\\x65\\x78\\x61\\x6d\\x70\\x6c\\x65\\x03\\x63\\x6f\\x6d\\x00\\x00\\x10\\x00\\x01" | nc -u -w 4 192.168.127.1 53 | od -An -tx1 | tr -d " \\n")"' "$work/basics.out"
 
 # NOT "by DHCP", which is what this said first and is not true: the capture
 # holds no DHCP exchange at all, because `sandbox` addresses its guest itself.
@@ -159,6 +219,26 @@ grep -q "^HOST_NAME=192.168.127.254$" "$work/basics.out" \
 grep -q "^ABSENT_NAME=$" "$work/basics.out" \
     && pass "a name that does not exist resolves to nothing" \
     || fail "an absent name resolved to $(grep '^ABSENT_NAME=' "$work/basics.out" | cut -d= -f2-)"
+
+# A name in no zone this gateway serves, which is the whole forwarding path:
+# the pending table, a transaction id of the gateway's own choosing rather than
+# the guest's, and the reply matched back against the question that asked it.
+# Answered 203.0.113.7 because this script's own resolver says so.
+grep -q "^FORWARDED_NAME=203.0.113.7$" "$work/basics.out" \
+    && pass "a name outside the served zones is forwarded and answered" \
+    || fail "the forwarded name resolved to $(grep '^FORWARDED_NAME=' "$work/basics.out" | cut -d= -f2-)"
+
+# And a record type this gateway neither serves nor understands, which is what
+# upstream's suite resolves through here -- CNAME, MX, NS, SRV, TXT. The reply
+# is relayed rather than rebuilt, and the pending table matches on the whole
+# question including its TYPE, so a type mishandled on this side is a guest that
+# hears nothing rather than one that hears something wrong.
+# The answer as hex, not as text. `tr -dc "[:print:]"` was the first attempt and
+# busybox's `tr` read the class as the literal set of characters in it, so the
+# check compared a handful of letters that happen to appear in any reply.
+grep -q "666f727761726465642d7478742d616e73776572" "$work/basics.out" \
+    && pass "a TXT question is forwarded and its answer relayed" \
+    || fail "the TXT question came back as $(grep '^FORWARDED_TXT=' "$work/basics.out" | cut -d= -f2- | tail -c 60)"
 
 # --- The resolver over TCP ---------------------------------------------------
 #

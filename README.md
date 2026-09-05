@@ -655,13 +655,26 @@ for one that prints them and reads options 3, 6, 1, 26 and 51 straight off the
 client. The lease is then read back from `/services/dhcp/leases`, which is
 where upstream's own client looks for it.
 
-Twenty-six checks across seven boots, and the rest of them came from reading
+Twenty-eight checks across seven boots, and the rest of them came from reading
 upstream's own acceptance suite as a specification rather than guessing: the
 daemon's tunnel, unix-to-TCP forwarding, and the resolver over TCP -- which
 turned out not to exist here at all, and is now two of the checks and a feature.
-What remains uncovered is what needs egress from the guest, which `sandbox`
-correctly refuses, and SSH forwarding, which this package deliberately does not
-have.
+
+Two more came from noticing what the script was not passing. `netstack-gateway`
+takes its upstream resolver from `--dns` and nowhere else, and this script gave
+it none -- so every run started a gateway with nothing behind it, a guest asking
+for any name outside the served zones got REFUSED, and the forwarding half of
+`DNSServer` (its pending table, its own transaction ids, its timeouts) had never
+met a real guest at all. The script now starts a small resolver of its own and
+points the gateway at it: one check resolves a name outside the served zones,
+and one asks for a TXT record, which is the type this gateway neither serves nor
+understands and relays rather than rebuilds. The answers are invented on
+purpose -- the sandbox has no egress and should not -- because what is being
+checked is that a question reaches an upstream and its answer comes back, not
+what the answer says.
+
+What remains uncovered is what needs real egress from the guest, and SSH
+forwarding, which this package deliberately does not have.
 
 The checks are audited the way the guards are, by breaking the product and
 seeing which of them notice. Removing the ARP neighbour queue fails exactly one

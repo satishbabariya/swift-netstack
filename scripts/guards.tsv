@@ -86,3 +86,4 @@ Sources/Netstack/Transport/TCP/InitialSequenceNumbers.swift	theInitialSendSequen
 Sources/Netstack/Transport/TCP/InitialSequenceNumbers.swift	theInitialSendSequenceAdvancesWithRfc6528sFourMicrosecondTimer	        return SequenceNumber(m &+ f)	        return SequenceNumber(f)
 Sources/Netstack/Link/ARPCache.swift	cacheIsBoundedUnderAFloodOfSpoofedSources	            evictLeastRecentlyUsed()	            if false { evictLeastRecentlyUsed() }
 Sources/Netstack/Transport/TCP/TCPOptions.swift	aSackOptionCarryingPartOfABlockIsRefusedRatherThanReadAsFarAsItGoes	                guard valueLength > 0, valueLength % 8 == 0 else { return nil }	                guard valueLength > 0 else { return nil }
+Sources/Netstack/Transport/TCP/RTTEstimator.swift	backingOffDoublesTheTimeoutAndSaturatesAtSixtySeconds	    static let maximumTimeout = TimeAmount.seconds(60)	    static let maximumTimeout = TimeAmount.hours(24)

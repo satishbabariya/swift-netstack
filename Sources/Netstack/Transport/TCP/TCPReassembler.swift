@@ -128,6 +128,35 @@ import NIOCore
 /// above could be provoked. That redundancy is deliberate; none of the four
 /// should be deleted as "already covered".
 ///
+/// The cost of that redundancy is that the tests cannot see three of the four
+/// go. Each was removed on its own and the whole suite run against it, and the
+/// results are here because "none should be deleted" is a rule a future editor
+/// will weigh against a green test run:
+///
+/// - **The admission guard: SURVIVED.** A segment past the domain is queued
+///   without it — and removed again by `pruneOutsideDomain` at the top of the
+///   very next `insert`, before anything can observe it. Even
+///   `tcpReassemblyRejectsASegmentAbsurdlyFarPastRcvNxt`, which exists for
+///   exactly this, still passes: it reads `pendingSegments` after a later
+///   insert has already swept the entry away.
+/// - **The staleness guard: SURVIVED.** For a segment wholly behind RCV.NXT
+///   `novelRanges` clamps its cursor to zero and finds `dataEnd` at or below
+///   it, so it yields no ranges and there is nothing to queue. The guard saves
+///   the walk, not the correctness.
+/// - **`pruneOutsideDomain`: SURVIVED.** It is defensive against an RCV.NXT
+///   that did not move the way this class's own returns moved it, and the real
+///   caller never supplies one. Nothing in the suite plays that caller.
+/// - **`novelRanges`' clamp at RCV.NXT: CAUGHT**, by
+///   `tcpReassemblyTrimsTheAlreadyDeliveredPrefixOfARetransmission`, and it
+///   carries the `guards.tsv` row. It is the one deletion here the tests stop.
+///
+/// One further note for whoever reads the admission guard and wonders: its
+/// first conjunct is dead. `segmentEnd` is `segmentStart + segment.length` and
+/// a length is never negative, so `segmentEnd <= maximumOffset` already implies
+/// `segmentStart <= maximumOffset`. It is left in place because it states the
+/// bound the way the bound is meant, and deleting it would be the fourth
+/// deletion above with no test to notice — but it is not a second check.
+///
 /// Offsets are stable under RCV.NXT advancing: two entries' offsets both
 /// shift by the same amount, so their relative order never changes and the
 /// queue never needs re-sorting.

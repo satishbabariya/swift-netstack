@@ -1543,3 +1543,57 @@ private func persistingSender(
     #expect(still.isEmpty)
     #expect(sender.persistDeadline == senderStart + .seconds(1), "the write is what starts the episode")
 }
+
+@Test func bareDuplicateAcknowledgementsOnAnIdleConnectionDoNotCollapseTheWindow() {
+    // RFC 5681 §3.2's condition (a): an acknowledgement counts as a duplicate
+    // only when "the receiver of the ACK has outstanding data". With nothing
+    // outstanding there is nothing a duplicate could be evidence of having
+    // lost, and the whole point of counting them is to infer a loss.
+    //
+    // This was the one conjunct of the six in that condition that the suite did
+    // not notice the removal of. It matters, and cheaply: SND.UNA == SND.NXT on
+    // an idle connection, so an acknowledgement naming SND.UNA is inside RFC
+    // 9293 §3.10.7.4's acceptable window and advances nothing. Three identical
+    // pure ACKs -- which cost a guest three 54-byte frames and require it to
+    // guess nothing -- would then take a connection with no data in flight
+    // through `lossDetected`, halving `ssthresh` and collapsing `cwnd` on a
+    // path that has carried nothing to lose.
+    //
+    // Nothing on the wire would show it. The damage is only visible the next
+    // time the gateway has something to send, as a connection that starts in
+    // congestion avoidance from a window it never earned, and a guest can
+    // repeat it whenever the connection goes quiet.
+    var tcb = senderTCB()
+    var sender = Sender(
+        congestionControl: Reno(maximumSegmentSize: 1000), clock: ManualClock(start: senderStart),
+        maximumBufferedBytes: 1 << 20)
+    #expect(sender.flightSize == 0, "fixture: an idle connection, with nothing outstanding")
+    let idleWindow = sender.congestionControl.congestionWindow
+    let idleThreshold = sender.congestionControl.slowStartThreshold
+
+    for _ in 0..<3 {
+        let accepted = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
+        #expect(accepted, "an ACK naming SND.UNA is acceptable; it just says nothing")
+    }
+
+    #expect(sender.duplicateAcknowledgements == 0, "an ACK with nothing outstanding is not a duplicate acknowledgement")
+    #expect(sender.congestionControl.congestionWindow == idleWindow, "three bare ACKs moved the congestion window of an idle connection")
+    #expect(sender.congestionControl.slowStartThreshold == idleThreshold, "three bare ACKs moved the slow-start threshold of an idle connection")
+
+    // The control, and it is the half that makes the assertions above mean
+    // something: all three of them are equally true of a sender that has
+    // stopped counting duplicates altogether. Give the same sender something to
+    // lose and the same three acknowledgements have to do what §3.2 says.
+    let accepted = sender.write(senderPayload(3000))
+    #expect(accepted)
+    _ = sender.segmentsToTransmit(tcb: &tcb, mss: 1000)
+    #expect(sender.flightSize == 3000, "control: now there is outstanding data")
+
+    for _ in 0..<3 {
+        let acknowledged = sender.acknowledged(upTo: SequenceNumber(100), tcb: &tcb, advertisedWindow: 65535)
+        #expect(acknowledged)
+    }
+
+    #expect(sender.duplicateAcknowledgements == 3, "control: with data outstanding these are duplicates")
+    #expect(sender.congestionControl.slowStartThreshold < idleThreshold, "control: the third duplicate is a loss signal and must reduce the threshold")
+}

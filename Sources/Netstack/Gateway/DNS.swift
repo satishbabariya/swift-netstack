@@ -215,7 +215,17 @@ enum DNSCodec {
     /// retried over TCP, including the ones the asker was perfectly willing to
     /// receive whole.
     ///
-    /// Anything malformed answers 512, which is the floor every asker accepts.
+    /// Anything this cannot READ answers 512, which is the floor every asker
+    /// accepts: a section that ends early, a name that never does, a count with
+    /// nothing behind it.
+    ///
+    /// Not "anything malformed", which is what this used to say and is a
+    /// stronger claim than the code makes. An OPT record whose rdlength claims
+    /// bytes that are not there still has a readable CLASS field, and that
+    /// field is the size the asker offered; nothing here reads the rdata, and
+    /// the walk returns before rdlength is used for anything. Answering the
+    /// floor there would truncate replies the asker had said it would take, on
+    /// the strength of a field nobody looks at.
     static func advertisedUDPSize(in original: ByteBuffer, after query: DNSQuery) -> Int {
         let floor = 512
         guard
@@ -262,8 +272,20 @@ enum DNSCodec {
     /// only a reader of the name has.
     private static func skipName(in buffer: ByteBuffer, from start: Int) -> Int? {
         var index = start
-        // A name is at most 255 bytes, so a well-formed one cannot need more
-        // steps than that. The bound is what stops a crafted buffer looping.
+        // Belt and braces, and the braces are the bounds check below rather
+        // than this count.
+        //
+        // The comment here used to say the count was "what stops a crafted
+        // buffer looping". It is not, and a falsification said so: replacing it
+        // with `while true` changes nothing any input can reach. Every branch
+        // either returns or advances -- a length of zero ends the name, the top
+        // two bits set is a pointer and ends it, anything else is 1...63 and
+        // moves on by at least two -- so the index only grows, and `getInteger`
+        // answers nil the moment it leaves the buffer.
+        //
+        // The count stays because a bound that costs nothing is worth having on
+        // a walk over bytes a guest chose. It is not in `guards.tsv`, because
+        // no input reaches it and a row there would claim otherwise.
         for _ in 0..<256 {
             guard let length = buffer.getInteger(at: index, as: UInt8.self) else { return nil }
             if length == 0 { return index + 1 }

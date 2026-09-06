@@ -228,6 +228,12 @@ jobs:
       - name: Check the conventions
         run: ./scripts/conventions.sh
 
+      # Reads gvproxy's own command line out of the module cache the interop
+      # driver already pins, and compares it with this one. Cheap, and it runs
+      # in this job because this is the job that has Go.
+      - name: gvproxy's flags are all accounted for
+        run: ./scripts/flag-parity.sh
+
       # Drives this gateway with gvisor-tap-vsock's own client library. Every
       # other comparison against upstream here depends on my having read
       # upstream correctly, and reading is what got `--listen` backwards and

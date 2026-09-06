@@ -1287,3 +1287,54 @@ private func sendAndHangUp(_ text: String, to address: SocketAddress) {
         complete > attempts / 10,
         "\(complete) of \(attempts) mutated requests reached the framer as a message, which is too few to be exercising it")
 }
+
+@Test func aServicesEndpointRefusesToAttachAGuest() async throws {
+    // `--services` is upstream's second endpoint: "the same HTTP API as the
+    // --listen flag, without the /connect endpoint". The difference is who is
+    // meant to be holding it. A guest can be given the services endpoint so it
+    // can publish its own ports; a guest that could also reach `/connect` could
+    // put ANOTHER machine on the network, which is a different privilege
+    // entirely -- and the one thing this endpoint exists to withhold.
+    //
+    // `ControlPlane.allowsGuestAttach` is what carries that, and until now it
+    // appeared nowhere in this suite. The whole point of the flag was resting on
+    // its own doc comment.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await controlPlaneFixture(group: group, guestSide: &guestSide)
+    let plane = holder.plane!
+    let api = plane.listeningAddress!
+
+    // The control that matters, and it runs FIRST so it cannot be written to
+    // suit the result. On a plane that does attach guests, `/connect` gets
+    // past the route and is refused for a reason of its own -- this gateway is
+    // on a single wire and has no switch to attach anything to.
+    //
+    // Without this, "404" below is equally true of a gateway that has no
+    // `/connect` at all, which is exactly what this test would be asserting if
+    // the route were deleted tomorrow.
+    let attaching = try request("POST", "/connect", body: "{}", to: api)
+    #expect(
+        attaching.status != 404,
+        "control: /connect answered 404 on a plane that attaches guests, so 404 below proves nothing")
+
+    plane.allowsGuestAttach = false
+
+    let refused = try request("POST", "/connect", body: "{}", to: api)
+    #expect(refused.status == 404, "a services endpoint attached a guest")
+
+    // And it is still the same API otherwise. A plane that answered 404 to
+    // everything would satisfy the assertion above and be useless as a services
+    // endpoint -- which is the failure that would actually ship, because the
+    // flag's whole purpose is to hand this endpoint to something less trusted
+    // and have it still work.
+    let stats = try request("GET", "/stats", body: nil, to: api)
+    #expect(stats.status == 200, "the services endpoint lost /stats along with /connect")
+    let forwards = try request("GET", "/services/forwarder/all", body: nil, to: api)
+    #expect(forwards.status == 200, "the services endpoint lost the routes it exists to serve")
+
+    plane.close()
+    _ = try? await holder.gateway?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+}

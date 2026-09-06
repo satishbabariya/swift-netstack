@@ -57,6 +57,7 @@ step "the README's test count" ./scripts/check-test-count.sh "$log"
 
 step "formatting" ./scripts/format.sh
 step "conventions" ./scripts/conventions.sh
+step "gvproxy's flags are all accounted for" ./scripts/flag-parity.sh
 step "interop with upstream's client" ./scripts/interop.sh
 step "frames through the built executable" ./scripts/frame-smoke.sh
 # Says "skipped" and passes where the platform has no seqpacket, which is every

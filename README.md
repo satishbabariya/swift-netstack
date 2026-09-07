@@ -1,5 +1,10 @@
 # swift-netstack
 
+[![CI](https://github.com/satishbabariya/swift-netstack/actions/workflows/ci.yml/badge.svg)](https://github.com/satishbabariya/swift-netstack/actions/workflows/ci.yml)
+[![Swift 6.2](https://img.shields.io/badge/Swift-6.2-orange.svg)](https://swift.org)
+[![Platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey.svg)](https://www.apple.com/macos/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 A userspace TCP/IP stack and VM gateway in pure Swift, built on SwiftNIO.
 
 This is a port of [gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock),
@@ -13,7 +18,7 @@ than spawned as a separate Go binary.
 ## Adding it
 
 ```swift
-.package(url: "https://github.com/satishbabariya/swift-netstack.git", from: "0.1.0")
+.package(url: "https://github.com/satishbabariya/swift-netstack.git", from: "0.2.0")
 ```
 
 ```swift
@@ -256,7 +261,25 @@ time and without limit, removing the victim's entries as it went.
 ### As a program
 
 For hosts that cannot link a Swift library, `netstack-gateway` is upstream's
-`gvproxy` in the same shape:
+`gvproxy` in the same shape. Either build it:
+
+```
+swift build -c release --product netstack-gateway
+```
+
+or take the universal macOS binary from the
+[latest release](https://github.com/satishbabariya/swift-netstack/releases/latest):
+
+```
+tar -xzf netstack-gateway-v0.2.0-macos-universal.tar.gz
+./netstack-gateway --help
+```
+
+Each release ships a `.sha256` beside the archive. The binary is unsigned and
+unnotarised, so Gatekeeper will want `xattr -d com.apple.quarantine` on it, or
+build from source.
+
+Either way it takes the same command line:
 
 ```
 netstack-gateway --listen-vfkit /tmp/net.sock --dns 1.1.1.1:53 \
@@ -819,6 +842,39 @@ One thing is Linux-only rather than macOS-only: `--listen-bess` needs
 `SOCK_SEQPACKET` on `AF_UNIX`, which Darwin does not have. It is implemented,
 and CI's Linux job is the only place it can be exercised — on a Mac the flag
 parses and the bind fails with the reason.
+
+## Contributing
+
+Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) is worth reading
+first — not for the usual reasons, but because this repository has one rule that
+shapes everything else in it:
+
+> A check that cannot fail is worse than no check, because it reports confidence
+> it has not earned.
+
+In practice that means tests here carry **controls** (a positive assertion that
+the thing does happen under other conditions, so "it didn't happen" is not also
+true of a component that never ran), and that 80 source lines are named in
+`scripts/guards.tsv`, where CI mutates each one on every pull request and
+requires the test that names it to fail. A pull request that adds a test will be
+asked what was broken to prove the test notices.
+
+Negative results are welcome too. Several comments in this codebase record a
+mutation that *survived* falsification, and what that means for whoever reads
+the guard next.
+
+## Security
+
+The guest is assumed hostile: it writes every byte of every frame this parses.
+If you have found something a guest gets that it should not, please report it
+privately rather than in an issue — [SECURITY.md](SECURITY.md) has the details
+and the scope.
+
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md). Releases are on the
+[releases page](https://github.com/satishbabariya/swift-netstack/releases), with
+a universal macOS build of `netstack-gateway` attached to each.
 
 ## License
 

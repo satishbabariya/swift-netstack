@@ -1,0 +1,26 @@
+# The raw route registrations in gvisor-tap-vsock v0.8.9, as grepped.
+#
+# Not the assembled paths -- `upstream-routes.txt` is those, and assembling
+# them means composing three nested muxes by hand. This is the input to that
+# assembly, stored so a change to it can be NOTICED. If upstream registers a
+# route, moves one, or renames a mount point, this file stops matching and
+# someone re-does the assembly; without it `upstream-routes.txt` can go on
+# being checked against a version it no longer describes.
+#
+# `/connect` is not here: upstream registers it from types.ConnectPath rather
+# than a literal, so the constant is checked separately.
+#
+# Regenerate with scripts/upstream-snapshots.sh --write.
+mux.Handle("/dhcp/"
+mux.Handle("/dns/"
+mux.Handle("/forwarder/"
+mux.Handle("/services/"
+mux.HandleFunc("."
+mux.HandleFunc("/add"
+mux.HandleFunc("/all"
+mux.HandleFunc("/cam"
+mux.HandleFunc("/expose"
+mux.HandleFunc("/leases"
+mux.HandleFunc("/stats"
+mux.HandleFunc("/tunnel"
+mux.HandleFunc("/unexpose"

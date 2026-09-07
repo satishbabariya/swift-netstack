@@ -228,11 +228,12 @@ jobs:
       - name: Check the conventions
         run: ./scripts/conventions.sh
 
-      # Reads gvproxy's own command line out of the module cache the interop
-      # driver already pins, and compares it with this one. Cheap, and it runs
-      # in this job because this is the job that has Go.
-      - name: gvproxy's flags are all accounted for
-        run: ./scripts/flag-parity.sh
+      # Conventions rules 14 and 15 compare this program with checked-in copies
+      # of gvproxy's flags and routes. This checks those copies still describe
+      # the version `differential/interop/go.mod` pins -- it runs here because
+      # this is the job with Go and the module cache.
+      - name: The upstream snapshots are current
+        run: ./scripts/upstream-snapshots.sh
 
       # Drives this gateway with gvisor-tap-vsock's own client library. Every
       # other comparison against upstream here depends on my having read

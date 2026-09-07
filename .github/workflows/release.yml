@@ -1,0 +1,83 @@
+# Build the gateway for a tag and attach it to the release.
+#
+# The library is consumed through SwiftPM and needs nothing built here. The
+# BINARY is the reason this exists: `netstack-gateway` is a drop-in for
+# `gvproxy`, and someone replacing gvproxy in a script wants a file to run, not
+# a toolchain to install.
+#
+# Universal, because a Mac in 2026 might be either architecture and a binary
+# that runs on one of them is a support question waiting to happen.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # So the build can be exercised without cutting a release first. A release
+  # workflow that has only ever run on the release is one nobody has tested.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  binary:
+    name: Build the gateway
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      # The gates run on every push and on every pull request. Running them
+      # again here is not ceremony: a tag can point at a commit that never went
+      # through a pull request, and shipping a binary is the wrong moment to
+      # find that out.
+      - name: Build with warnings as errors
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        timeout-minutes: 10
+        run: swift test
+
+      - name: Build the universal binary
+        run: |
+          swift build -c release --product netstack-gateway \
+            --arch arm64 --arch x86_64
+          mkdir -p dist
+          cp "$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/netstack-gateway" dist/
+
+      # Proves the thing being shipped runs, on the machine that built it, and
+      # is the architecture it claims. `--help` exits zero and touches no
+      # sockets, so it works on a runner with no network of its own.
+      - name: Check the binary runs and is universal
+        run: |
+          ./dist/netstack-gateway --help > /dev/null
+          file dist/netstack-gateway
+          lipo -archs dist/netstack-gateway | tee /tmp/archs
+          grep -q arm64 /tmp/archs
+          grep -q x86_64 /tmp/archs
+
+      - name: Package
+        run: |
+          cd dist
+          version="${GITHUB_REF_NAME:-untagged}"
+          tar -czf "netstack-gateway-${version}-macos-universal.tar.gz" netstack-gateway
+          shasum -a 256 *.tar.gz > "netstack-gateway-${version}-macos-universal.tar.gz.sha256"
+          ls -l
+
+      - name: Upload to the workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: netstack-gateway-macos-universal
+          path: dist/*.tar.gz*
+
+      # Only on a tag. A manual run builds and checks and stops there, which is
+      # what makes it safe to use for exercising this file.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.sha256 --clobber

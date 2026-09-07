@@ -277,17 +277,20 @@ done
 # names flags this program does not take, and a rule fighting its own
 # documentation gets answered by weakening the documentation. Naming them
 # answers that objection -- each entry below is itself a claim a reader can
-# check, and there are eight.
+# check, and there are nine.
 #
 #   --ssh-port, --forward-*    SSH forwarding, named in the section that says it
 #                              is deliberately absent
 #   --quick, --all, --filter   flags of check.sh, falsify.sh and swift test
+#   --product                  `swift build --product netstack-gateway`, in the
+#                              instructions for building the program
 #
 # What it catches: a flag the README offers and the program refuses. The reader
 # copies the line and gets an unknown-flag error, which is worse than an
 # undocumented flag because it was documented wrongly.
 documented_elsewhere="--ssh-port --forward-sock --forward-dest --forward-user"
 documented_elsewhere="$documented_elsewhere --forward-identity --quick --all --filter"
+documented_elsewhere="$documented_elsewhere --product"
 for flag in $(grep -oE '\-\-[a-zA-Z][a-zA-Z0-9-]*' README.md | sort -u); do
     case " $documented_elsewhere " in *" $flag "*) continue ;; esac
     if ! echo "$flags" | grep -qx -- "$flag"; then

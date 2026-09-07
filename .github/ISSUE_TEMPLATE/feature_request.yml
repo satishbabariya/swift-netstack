@@ -1,0 +1,44 @@
+name: Feature request
+description: Something this should do and does not
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things are documented as deliberately absent rather than missing:
+        **IPv6** and **SSH forwarding** (`--forward-sock` and friends). Both are
+        scope decisions with reasons in the README's "What is not here". You are
+        welcome to make the case for reopening either — that is a different
+        conversation from reporting them as gaps.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: >
+        The situation, rather than the feature. What are you building, and where
+        does this stack stop you?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you think should happen
+    validations:
+      required: true
+
+  - type: input
+    id: upstream
+    attributes:
+      label: Does gvproxy do this?
+      description: >
+        If upstream has it, a link to where. Parity with gvisor-tap-vsock is
+        this project's main design constraint, so "upstream does X" carries
+        weight here.
+      placeholder: "pkg/services/..., or: no, this would be new"
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you have tried or considered instead

@@ -38,6 +38,23 @@ jobs:
       - name: Build with warnings as errors
         run: swift build -Xswiftc -warnings-as-errors
 
+      # The differential tests FAIL rather than skip when this binary is absent
+      # -- a deliberate choice made in the CI workflow, because a silent skip
+      # made them indistinguishable from a pass. So a release build has to
+      # produce it too, and the first dispatch of this file found that out:
+      # `bothStacksAgreeOnARPAndICMP` and `theDifferentialDetectsADeliberateDivergence`
+      # failed here while passing in CI, on the same commit.
+      #
+      # That is the reason this workflow has `workflow_dispatch`.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: differential/harness/go.mod
+          cache-dependency-path: differential/harness/go.sum
+
+      - name: Build the differential harness
+        run: go build -o harness .
+        working-directory: differential/harness
+
       - name: Test
         timeout-minutes: 10
         run: swift test

@@ -370,8 +370,30 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
         statusOf(tcpPort: port, path: "/connect") == 404,
         "--services offered /connect, which is the one thing it is defined not to")
 
+    // Waited for by polling, not `waitUntilExit`, and bounded.
+    //
+    // `waitUntilExit` blocks the thread it is called on, and here that thread is
+    // one of Swift Testing's. When the gateway lost this SIGTERM -- see
+    // `terminationSignals` in main.swift -- it never exited, the call never
+    // returned, and the whole run stopped with it: seventeen tests that open
+    // sockets started and never finished, on main and on #200, until CI's
+    // ten-minute timeout. Reproduced here by withholding the signal, it hung
+    // the same way on an eighteen-core machine, with the one cooperative thread
+    // parked in `-[NSConcreteTask waitUntilExit]`.
+    //
+    // A gateway that ignores SIGTERM is a failure of this test, so it is
+    // reported as one, and killed so it does not outlive the run.
     process.terminate()
-    process.waitUntilExit()
+    var exited = false
+    for _ in 0..<400 where !exited {
+        exited = !process.isRunning
+        if !exited { try await Task.sleep(nanoseconds: 25_000_000) }
+    }
+    if !exited {
+        kill(process.processIdentifier, SIGKILL)
+        process.waitUntilExit()
+    }
+    try #require(exited, "the gateway was sent SIGTERM and was still running ten seconds later")
 
     // Removed on a clean stop, and only then: one left behind by a crash is how
     // a supervisor finds out there was one.

@@ -251,6 +251,41 @@ let usage = """
     different wires, and a socket is one or the other.
     """
 
+// SIGINT and SIGTERM are blocked before anything else runs, and collected with
+// `sigwait` once the gateway is up. A signal sent in between waits for it.
+//
+// They used to be ignored and handed to Dispatch signal sources, set up as the
+// very last step -- after the pid file and `ready` had told a supervisor to go
+// ahead. A SIGTERM sent on that word could land in either of two gaps. Before
+// the sources existed, it killed the process where it stood, leaving the pid
+// file behind as though it had crashed. Between `SIG_IGN` and the source
+// reaching the kernel, which `resume()` does not wait for, it was ignored and
+// never seen again: the gateway kept running, and whoever sent it waited
+// forever. Measured by sending SIGTERM the moment the pid file appeared, a
+// hundred times at each delay:
+//
+//     delay   clean   killed by default   still running 5s later
+//     0us       7          91                    2
+//     100us    41          55                    4
+//     150us    86          11                    3
+//
+// `theOperatorsFlagsDoWhatTheirNamesSay` is that supervisor, and on a loaded CI
+// runner the gap is wide: its `waitUntilExit` never returned, and the test run
+// hung until the job's timeout.
+//
+// A blocked signal is kept pending rather than acted on or dropped, and every
+// thread this process starts inherits the mask -- which is why this has to be
+// done before the first of them.
+let terminationSignals: sigset_t = {
+    var set = sigset_t()
+    sigemptyset(&set)
+    sigaddset(&set, SIGINT)
+    sigaddset(&set, SIGTERM)
+    return set
+}()
+var blockedSignals = terminationSignals
+pthread_sigmask(SIG_BLOCK, &blockedSignals, nil)
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 var options: Options
 do {
@@ -427,23 +462,13 @@ func reportHypervisorError(toSocketAt path: String?, group: EventLoopGroup) {
     try? channel.close().wait()
 }
 
+/// The first SIGINT or SIGTERM, including one sent before this was called --
+/// see `terminationSignals`.
 func awaitTerminationSignal() -> Int32 {
-    let received = NIOLockedValueBox<Int32>(SIGTERM)
-    let arrived = DispatchSemaphore(value: 0)
-    var sources: [DispatchSourceSignal] = []
-    for number in [SIGINT, SIGTERM] {
-        signal(number, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
-        source.setEventHandler {
-            received.withLockedValue { $0 = number }
-            arrived.signal()
-        }
-        source.resume()
-        sources.append(source)
-    }
-    arrived.wait()
-    for source in sources { source.cancel() }
-    return received.withLockedValue { $0 }
+    var waitingFor = terminationSignals
+    var received: Int32 = 0
+    while sigwait(&waitingFor, &received) != 0 {}
+    return received
 }
 
 /// Where a control endpoint listens.

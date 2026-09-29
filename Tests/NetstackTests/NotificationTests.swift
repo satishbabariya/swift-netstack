@@ -23,30 +23,61 @@ private func notificationPath(_ tag: String) -> String {
 
 /// A unix socket that accepts connections and collects one JSON object from
 /// each, the way a supervisor would.
-private final class NotificationListener: @unchecked Sendable {
-    private let fd: Int32
-    private let queue = DispatchQueue(label: "netstack.test.notifications")
+///
+/// The accept loop owns the descriptor: it is the only thing that touches it,
+/// and it closes it itself on the way out. `stop` asks, and wakes it.
+///
+/// It used to be closed by `stop`, from the test's thread, with a plain flag
+/// set just before. Nothing ordered the two: a loop that had read the flag
+/// before it changed called `accept` again on a number that had been closed --
+/// and a closed number is the next one handed out, so by then it was quite
+/// possibly another test's listener. The loop took that test's connection, got
+/// EAGAIN from a `recv` on the non-blocking socket it inherited, and closed it,
+/// and the guest on the other end saw EPIPE:
+///
+///     aStreamWireServesTheFirstGuestAndClosesTheSecond()
+///       write(first, ...) -> -1, expected 58
+///       received.first?.count -> nil
+///       a second guest was left connected to a wire that carries one
+///
+/// which is #198's failure down to the last line: the gateway never saw the
+/// first guest, so it served the second. That sequence -- a stale `accept` on a
+/// reused number, EAGAIN, close, EPIPE -- is what a C probe of the kernel does,
+/// step for step.
+///
+/// Waking a thread in `accept` is the awkward part. `shutdown` on a listening
+/// socket does nothing on Darwin (ENOTCONN), and closing it is the bug. So
+/// `stop` dials the listener once, which is the one wake-up both platforms
+/// agree on.
+private final class NotificationListener: Sendable {
+    private let path: String
     private let box = NIOLockedValueBox<[String]>([])
-    private var running = true
+    private let stopping = NIOLockedValueBox(false)
 
     init(path: String) {
-        fd = makeSocket(AF_UNIX, .stream)
+        self.path = path
+        let fd = makeSocket(AF_UNIX, .stream)
         _ = bindTo(fd, unixAddress(path: path))
         listen(fd, 32)
-        queue.async { [weak self] in self?.accept() }
-    }
-
-    private func accept() {
-        while running {
-            let client = acceptConnection(fd)
-            guard client >= 0 else { break }
-            var buffer = [UInt8](repeating: 0, count: 4096)
-            let read = buffer.withUnsafeMutableBytes { recv(client, $0.baseAddress, $0.count, 0) }
-            if read > 0 {
-                let text = String(decoding: buffer[0..<read], as: UTF8.self)
-                box.withLockedValue { $0.append(text.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let box = self.box
+        let stopping = self.stopping
+        DispatchQueue(label: "netstack.test.notifications").async {
+            while true {
+                let client = acceptConnection(fd)
+                if stopping.withLockedValue({ $0 }) {
+                    if client >= 0 { close(client) }
+                    break
+                }
+                guard client >= 0 else { break }
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                let read = buffer.withUnsafeMutableBytes { recv(client, $0.baseAddress, $0.count, 0) }
+                if read > 0 {
+                    let text = String(decoding: buffer[0..<read], as: UTF8.self)
+                    box.withLockedValue { $0.append(text.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                }
+                close(client)
             }
-            close(client)
+            close(fd)
         }
     }
 
@@ -62,9 +93,13 @@ private final class NotificationListener: @unchecked Sendable {
         return received
     }
 
+    /// Before the path is removed, which the tests' `defer` order arranges:
+    /// the wake-up is a dial, and it needs the name.
     func stop() {
-        running = false
-        close(fd)
+        stopping.withLockedValue { $0 = true }
+        let wake = makeSocket(AF_UNIX, .stream)
+        _ = connectTo(wake, unixAddress(path: path))
+        close(wake)
     }
 }
 

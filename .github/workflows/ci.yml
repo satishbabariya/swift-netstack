@@ -231,7 +231,8 @@ jobs:
       # Conventions rules 14 and 15 compare this program with checked-in copies
       # of gvproxy's flags and routes. This checks those copies still describe
       # the version `differential/interop/go.mod` pins -- it runs here because
-      # this is the job with Go and the module cache.
+      # this is the job with Go. It fetches that version itself: setup-go's
+      # cache is gone after a week unused, and this used to assume it was not.
       - name: The upstream snapshots are current
         run: ./scripts/upstream-snapshots.sh
 

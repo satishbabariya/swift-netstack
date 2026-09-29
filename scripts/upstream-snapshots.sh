@@ -17,7 +17,7 @@
 # snapshots, and a difference is a failure that says what to run.
 #
 # It is a separate script rather than another rule in `conventions.sh` because
-# it needs Go and a populated module cache, and `conventions.sh` is the gate
+# it needs Go and a network or a populated module cache, and `conventions.sh` is the gate
 # that answers in a second on any machine. This one runs beside the interop
 # driver, which pins the module it reads.
 #
@@ -32,6 +32,13 @@ write=0
 [[ "${1:-}" == "--write" ]] && write=1
 
 module="github.com/containers/gvisor-tap-vsock"
+# `go list -m` reports where a module is and never fetches it, so on an empty
+# cache it answered nothing and this failed before reading a line. CI's cache
+# is only as good as setup-go's last restore, and GitHub evicts a cache unused
+# for a week: the first push after a quiet week failed here whatever it
+# changed. Fetching the pinned version is a no-op on a warm cache. If the fetch
+# itself fails, the FAIL below still says so rather than comparing nothing.
+(cd differential/interop && go mod download "$module")
 upstream="$(cd differential/interop && go list -m -f '{{.Dir}}' "$module" 2>/dev/null)"
 if [[ -z "$upstream" || ! -d "$upstream" ]]; then
     echo "FAIL: could not locate $module in the module cache."

@@ -612,6 +612,77 @@ private func gwAwaitEchoReply(_ fd: Int32) async -> (source: IPv4Address, identi
     try? await group.shutdownGracefully()
 }
 
+@Test func aPingToTheInstanceMetadataServiceGoesUnansweredByDefault() async throws {
+    // TCP and UDP to 169.254.0.0/16 are refused. ICMP declined instead, and a
+    // declined echo is answered locally -- so `ping 169.254.169.254` came back
+    // from this process, and the one address a guest must not reach looked
+    // reachable. Needs no ICMP socket: the refusal comes before one is opened.
+    var pair: [Int32] = [0, 0]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let configuration = Gateway.Configuration()
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: configuration
+    ).get()
+
+    // The control: this wire carries an echo both ways, so the silence below is
+    // the gateway's choice and not a guest nobody is listening to.
+    _ = gwEchoRequest(
+        from: IPv4Address("192.168.127.2")!, to: configuration.gatewayAddress, identifier: 0x4444,
+        sequence: 1
+    ).withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    #expect(await gwAwaitEchoReply(pair[1]) != nil, "the gateway did not answer a ping to itself")
+
+    let metadata = IPv4Address("169.254.169.254")!
+    _ = gwEchoRequest(
+        from: IPv4Address("192.168.127.2")!, to: metadata, identifier: 0x5555, sequence: 2
+    ).withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    let reply = await gwAwaitEchoReply(pair[1])
+    #expect(reply == nil, "169.254.169.254 answered a ping, from \(reply.map { "\($0.source)" } ?? "")")
+
+    let stats = try await gateway.statistics().get()
+    #expect(stats.icmpRefusedLinkLocal == 1, "the ping was not refused by policy")
+    #expect(stats.icmpForwarded == 0, "the ping was sent to the host")
+    // One, the control. A second would be the metadata ping answered locally.
+    #expect(stats.icmpDeclined == 1, "the ping was declined, which answers it locally")
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}
+
+@Test func aPingToLinkLocalIsSentWhenLinkLocalIsDeliberatelyAllowed() async throws {
+    // The floor under the test above: a forwarder that dropped every ping
+    // would pass it. With the switch on, the request goes where any other
+    // does. Translated to loopback so a real reply can come back.
+    var pair: [Int32] = [0, 0]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let metadata = IPv4Address("169.254.169.254")!
+    var configuration = Gateway.Configuration()
+    configuration.allowsLinkLocal = true
+    configuration.nat[metadata] = IPv4Address("127.0.0.1")!
+    let gateway = try await Gateway.start(
+        adoptingDatagramSocket: pair[0], group: group, configuration: configuration
+    ).get()
+
+    _ = gwEchoRequest(
+        from: IPv4Address("192.168.127.2")!, to: metadata, identifier: 0x6666, sequence: 1
+    ).withUnsafeBytes { send(pair[1], $0.baseAddress, $0.count, 0) }
+    let reply = await gwAwaitEchoReply(pair[1])
+    #expect(reply?.source == metadata, "a permitted link-local ping went unanswered")
+
+    let stats = try await gateway.statistics().get()
+    #expect(stats.icmpRefusedLinkLocal == 0, "link-local was refused despite being allowed")
+    if unprivilegedICMPIsAvailable() {
+        #expect(stats.icmpForwarded == 1, "the permitted ping was answered locally rather than sent")
+    }
+
+    _ = try? await gateway.close().get()
+    close(pair[1])
+    try? await group.shutdownGracefully()
+}
+
 @Test func theStatisticsAccountForWhatArrivedRatherThanOnlyWhatSucceeded() async throws {
     // Every counter here names a place a packet is dropped and nothing is said,
     // which is the state an operator cannot debug: the guest insists it sent

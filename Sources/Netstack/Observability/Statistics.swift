@@ -54,6 +54,11 @@ extension Gateway {
         /// host will not open an unprivileged ICMP socket. A large value here
         /// with `icmpForwarded` at zero is that last case, and worth seeing.
         public var icmpDeclined: Int
+        /// Echo requests to a link-local address, dropped by policy. The ICMP
+        /// half of `tcpRefusedLinkLocal`, and read the same way: a ping to
+        /// 169.254.169.254 that went unanswered because of this is policy, not
+        /// an absent service.
+        public var icmpRefusedLinkLocal: Int
 
         /// Frames from the guest that this wire would not carry.
         public var inboundFramesRejected: Int
@@ -167,6 +172,7 @@ extension Gateway {
             icmpTimedOut: icmp.timedOut,
             icmpAnswered: icmp.answered,
             icmpDeclined: icmp.declined,
+            icmpRefusedLinkLocal: icmp.refusedForLinkLocal,
             inboundFramesRejected: link.inboundDropped,
             outboundFramesRejected: link.outboundDropped,
             outboundFramesBackedUp: link.outboundBackedUp,
@@ -222,6 +228,7 @@ extension Gateway.Statistics {
             ("icmp_timed_out", icmpTimedOut),
             ("icmp_answered", icmpAnswered),
             ("icmp_declined", icmpDeclined),
+            ("icmp_refused_link_local", icmpRefusedLinkLocal),
             ("inbound_frames_rejected", inboundFramesRejected),
             ("outbound_frames_rejected", outboundFramesRejected),
             ("outbound_frames_backed_up", outboundFramesBackedUp),

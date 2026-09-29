@@ -36,6 +36,8 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case udpRefusedLinkLocal
     /// An echo request dropped because too many were already in flight.
     case icmpRefusedByLimit
+    /// An echo request to a link-local address, dropped.
+    case icmpRefusedLinkLocal
     /// A query this gateway does not own, with nowhere configured to send it.
     case dnsRefusedNoUpstream
     /// A query dropped because too many were already outstanding.
@@ -67,7 +69,7 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
         case .dnsRefusedNoUpstream: return .warning
         // A guest reaching for the instance metadata service is worth an
         // operator's attention whether it meant to or not.
-        case .tcpRefusedLinkLocal, .udpRefusedLinkLocal: return .warning
+        case .tcpRefusedLinkLocal, .udpRefusedLinkLocal, .icmpRefusedLinkLocal: return .warning
         // Either a guest came back on a new port or one is claiming another's
         // address, and nothing here can tell which. An operator should see it.
         case .switchAddressMoved: return .warning

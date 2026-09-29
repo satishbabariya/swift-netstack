@@ -1513,6 +1513,37 @@ try:
               after, "for", described)
         sys.exit(1)
     print("ok: icmp  the gateway forwarded it rather than answering for", described)
+
+    # The metadata service, which must look as unreachable to ping as it does to
+    # TCP and UDP. Run after the ping above, which is its control: that one
+    # proved this wire carries an echo both ways, so silence here is the
+    # gateway's choice. Silence alone is not enough, though -- it is also what a
+    # forwarded ping to nowhere looks like -- so the count says which it was.
+    metadata = address("169.254.169.254")
+    counters = statistics()
+    forwarded_before = counters.get("icmp_forwarded", 0)
+    refused_before = counters.get("icmp_refused_link_local", 0)
+    s.send(echo_frame(metadata, identifier + 1, body))
+    s.settimeout(3)
+    while True:
+        try:
+            reply = s.recv(2048)
+        except socket.timeout:
+            break
+        if len(reply) < 42 or reply[12:14] != b"\x08\x00" or reply[23] != 1:
+            continue
+        if reply[26:30] == metadata and reply[34] == 0:
+            print("FAIL: 169.254.169.254 answered a ping for", described)
+            sys.exit(1)
+    counters = statistics()
+    if counters.get("icmp_refused_link_local", 0) <= refused_before:
+        print("FAIL: the link-local ping was not refused by policy --",
+              "icmp_refused_link_local stayed at", refused_before, "for", described)
+        sys.exit(1)
+    if counters.get("icmp_forwarded", 0) != forwarded_before:
+        print("FAIL: the link-local ping was forwarded for", described)
+        sys.exit(1)
+    print("ok: icmp  169.254.169.254 went unanswered, refused by policy, for", described)
 finally:
     s.close()
     os.unlink(client_path)

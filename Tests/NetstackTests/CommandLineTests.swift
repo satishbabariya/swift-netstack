@@ -84,6 +84,80 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     return (process.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 
+#if !canImport(Darwin)
+    /// `--listen-bess` where the socket type exists: the gateway binds and waits,
+    /// so what is checked is the listener rather than an exit.
+    ///
+    /// Not the "waiting for a guest" line. That is `print`, and stdout into a pipe
+    /// is block-buffered here, so the line arrives when the process exits and not
+    /// when it is written -- a check on it waits for exactly the exit this
+    /// replaces.
+    ///
+    /// Instead a seqpacket connect to the path, which is the observation a guest
+    /// makes and has three ways to fail: an unknown flag exits before any socket
+    /// exists, a failed bind leaves none, and the flag misrouted to another wire
+    /// leaves a stream or datagram socket there, which refuses a seqpacket peer
+    /// with EPROTOTYPE.
+    private func bessListenerAppears() {
+        let binary = gatewayBinary()
+        guard !binary.isEmpty else { return }
+        let path = "/tmp/netstack-bess-check-\(getpid()).sock"
+        unlink(path)
+        defer { unlink(path) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = ["--listen-bess", path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        guard (try? process.run()) != nil else {
+            Issue.record("netstack-gateway could not be started")
+            return
+        }
+
+        // Ten seconds, the same as `run` gives a process to exit.
+        var connected = false
+        var lastError: Int32 = 0
+        let deadline = Date().addingTimeInterval(10)
+        while !connected, process.isRunning, Date() < deadline {
+            let peer = socket(AF_UNIX, Int32(SOCK_SEQPACKET.rawValue), 0)
+            guard peer >= 0 else {
+                Issue.record("SOCK_SEQPACKET on AF_UNIX: errno \(errno)")
+                break
+            }
+            var remote = sockaddr_un()
+            remote.sun_family = sa_family_t(AF_UNIX)
+            withUnsafeMutableBytes(of: &remote.sun_path) { $0.copyBytes(from: path.utf8) }
+            let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+            let outcome = withUnsafePointer(to: &remote) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(peer, $0, size) }
+            }
+            lastError = outcome == 0 ? 0 : errno
+            close(peer)
+            if outcome == 0 {
+                connected = true
+            } else {
+                usleep(100_000)
+            }
+        }
+
+        let stillRunning = process.isRunning
+        if stillRunning { process.terminate() }
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+
+        #expect(
+            !output.contains("unknown option"), "--listen-bess is a wire this program has: \(output)")
+        #expect(
+            connected,
+            """
+            no seqpacket listener at \(path) (last errno \(lastError), \
+            \(stillRunning ? "still running" : "exited \(process.terminationStatus)")): \(output)
+            """)
+    }
+#endif
+
 @Test func theProgramSpellsItsFlagsTheWayGvproxyDoes() throws {
     guard let help = run(["--help"]) else { return }
     #expect(help.status == 0)
@@ -137,16 +211,24 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     // is a different thing from an option the program does not know, and this
     // checks the difference by requiring the failure to name the socket type
     // rather than the flag.
-    if let bess = run(["--listen-bess", "/tmp/netstack-bess-check.sock"]) {
-        #expect(
-            !bess.output.contains("unknown option"),
-            "--listen-bess is a wire this program has: \(bess.output)")
-        #if canImport(Darwin)
+    //
+    // Linux has the socket type, so there the bind succeeds and the gateway does
+    // what it is for: waits for a guest. This used to run the same `run` on both
+    // and wait for an exit that Linux never gives, so the watchdog reported the
+    // flag as hung on the one platform where it works. There the check is the
+    // listener itself -- see `bessListenerAppears`.
+    #if canImport(Darwin)
+        if let bess = run(["--listen-bess", "/tmp/netstack-bess-check.sock"]) {
+            #expect(
+                !bess.output.contains("unknown option"),
+                "--listen-bess is a wire this program has: \(bess.output)")
             #expect(
                 bess.output.contains("SOCK_SEQPACKET"),
                 "on a platform without seqpacket the failure should name it: \(bess.output)")
-        #endif
-    }
+        }
+    #else
+        bessListenerAppears()
+    #endif
 
     // A forward's transport, which is a prefix on the host side in the config
     // file and now on the command line too. An operator who can ask for a

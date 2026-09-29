@@ -686,7 +686,6 @@ do {
     let guestPlane = ControlPlane(gateway: gateway)
     try guestPlane.listenForGuests().wait()
     planes.append(guestPlane)
-    _ = planes
 
     // Logged first of the three, because the two below are what something else
     // waits on and this is what a person reads afterwards.
@@ -753,7 +752,21 @@ do {
     // `close()` walks the same path as any other shutdown and flushes the
     // capture on the way through, so this needs no knowledge of what is being
     // closed.
-    let received = awaitTerminationSignal()
+    //
+    // The planes are held across the wait explicitly, because nothing else holds
+    // them: each listener captures its plane `[weak self]` and closes any
+    // connection that arrives after the plane is gone. This used to be `_ =
+    // planes` above, which is a use, not a lifetime -- Swift keeps a local alive
+    // to its last use rather than to the end of its scope, and `-O` on Linux
+    // released every plane right there. Each control socket then accepted and
+    // closed with the request unread, so every client saw a reset:
+    //
+    //     curl: (56) Recv failure: Connection reset by peer
+    //
+    // The debug build keeps locals to the end of scope, which is why a gateway
+    // started by hand answered and the release build `frame-smoke.sh` runs did
+    // not.
+    let received = withExtendedLifetime(planes) { awaitTerminationSignal() }
     announce("netstack-gateway: stopping on \(received == SIGINT ? "SIGINT" : "SIGTERM")", toStandardError: options.listenStdio)
     try? gateway.close().wait()
     try? group.syncShutdownGracefully()

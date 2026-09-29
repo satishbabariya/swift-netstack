@@ -1,4 +1,6 @@
-# The HTTP routes gvproxy's API serves, from gvisor-tap-vsock v0.8.9.
+# The HTTP routes gvproxy's API serves, from gvisor-tap-vsock
+# fca6da3418e8e6bd3b0f4f1a8c8bc1a2e84e2208 -- the commit sandbox enforces egress
+# with, not v0.8.9. Unchanged from v0.8.9's route set; see upstream-routes.raw.
 #
 # Assembled from three files, because upstream's mux is nested: pkg/virtualnetwork/mux.go
 # has the top-level routes and mounts the services mux, pkg/virtualnetwork/services.go

@@ -1,4 +1,5 @@
-# The flags gvproxy takes, from gvisor-tap-vsock v0.8.9.
+# The flags gvproxy takes, from gvisor-tap-vsock fca6da3418e8e6bd3b0f4f1a8c8bc1a2e84e2208
+# -- the commit sandbox enforces egress with, not v0.8.9.
 #
 # Read out of cmd/gvproxy/config.go rather than from its README, because the
 # README is prose and this is the flagSet. Regenerate against a newer upstream
@@ -32,3 +33,4 @@ pcap
 pid-file
 services
 ssh-port
+subnet

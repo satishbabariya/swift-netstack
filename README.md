@@ -796,7 +796,8 @@ all until that was written — a forward is two halves and only the TCP half of
 each had ever been driven.
 
 `scripts/interop.sh` starts a gateway and drives it with **gvisor-tap-vsock's own
-client library**, pinned at v0.8.9. Every other comparison with upstream here
+client library**, pinned at `fca6da3418e8e6bd3b0f4f1a8c8bc1a2e84e2208` — the
+commit sandbox actually enforces egress with, not v0.8.9. Every other comparison with upstream here
 rests on having read upstream correctly — and reading is what put `--listen` on
 the wrong socket, missed `/services/dhcp/leases`, and did not notice that Go's
 JSON decoder matches field names case-insensitively where this one did not, so

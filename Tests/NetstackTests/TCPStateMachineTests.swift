@@ -1311,3 +1311,74 @@ private func pawsTCB(tsRecent: UInt32) -> TCB {
         segment: stale, on: &tcb, receiver: &receiver, sender: &sender, challengeACKs: &budget)
     #expect(tcb.rcvNxt == SequenceNumber(1010), "no negotiation, no PAWS, and the data is accepted")
 }
+
+// MARK: - ABORT (RFC 9293 §3.10.5)
+
+/// The reset an abort asked for, if it asked for one.
+private func abortReset(_ actions: [TCPAction]) -> (sequence: SequenceNumber, ack: SequenceNumber?)? {
+    for action in actions {
+        if case .sendRst(let sequence, let ack) = action { return (sequence, ack) }
+    }
+    return nil
+}
+
+@Test func anAbortResetsAtSndNxtFromEveryStateWhoseSynHasGone() {
+    // SND.NXT, not SND.UNA: the peer has received everything up to SND.NXT, and
+    // RFC 5961 §3.2 has it act on a reset only when the sequence number is
+    // exactly its RCV.NXT. A reset at the oldest unacknowledged byte is
+    // in-window and is answered with a challenge ACK instead -- the connection
+    // the abort was meant to end stays open at the other side.
+    //
+    // Forty bytes in flight in each state, so SND.UNA and SND.NXT differ and a
+    // reset at the wrong one cannot pass.
+    let builders: [(name: String, tcb: TCB)] = [
+        ("SYN-RECEIVED", synReceivedTCB(iss: 3000)),
+        ("ESTABLISHED", establishedTCB(sndUna: 100, sndNxt: 100)),
+        ("FIN-WAIT-1", finWait1TCB(sndUna: 100)),
+        ("FIN-WAIT-2", finWait2TCB(sndUna: 100)),
+        ("CLOSE-WAIT", closeWaitTCB(sndUna: 100)),
+    ]
+    for (name, original) in builders {
+        var tcb = original
+        tcb.sndNxt = tcb.sndUna + 40
+        let actions = TCPStateMachine.abort(on: &tcb)
+        let reset = abortReset(actions)
+        #expect(reset?.sequence == original.sndUna + 40, "\(name): the reset is not at SND.NXT")
+        #expect(reset?.ack == nil, "\(name): RFC 9293 §3.10.5's reset is <SEQ=SND.NXT><CTL=RST>, no ACK bit")
+        #expect(containsDeleteTCB(actions), "\(name): the block is not deleted")
+        #expect(!containsSendFin(actions), "\(name): an abort is not a close")
+        #expect(tcb.state == .closed, "\(name): left in \(tcb.state)")
+        #expect(actions.count == 2, "\(name): \(actions)")
+    }
+}
+
+@Test func anAbortSendsNothingWhereThePeerHasAlreadyBeenToldOrNeverKnew() {
+    // RFC 9293 §3.10.5 gives CLOSING, LAST-ACK and TIME-WAIT an "ok" and a
+    // deleted block: the FIN already told the peer this side is finished, and a
+    // reset on top of it cuts short a close the peer is completing. LISTEN and
+    // SYN-SENT have no peer that knows of a connection.
+    var closing = establishedTCB()
+    closing.state = .closing
+    let states: [(name: String, tcb: TCB)] = [
+        ("LISTEN", listenTCB()),
+        ("SYN-SENT", synSentTCB()),
+        ("CLOSING", closing),
+        ("LAST-ACK", lastAckTCB()),
+        ("TIME-WAIT", timeWaitTCB()),
+    ]
+    for (name, original) in states {
+        var tcb = original
+        let actions = TCPStateMachine.abort(on: &tcb)
+        #expect(actions == [.deleteTCB], "\(name): \(actions)")
+        #expect(tcb.state == .closed, "\(name): left in \(tcb.state)")
+    }
+}
+
+@Test func aSecondAbortSendsNothing() {
+    // The first abort must have done something, or "the second does nothing" is
+    // also true of an abort that never does anything.
+    var tcb = establishedTCB(sndUna: 100, sndNxt: 140)
+    #expect(abortReset(TCPStateMachine.abort(on: &tcb)) != nil)
+    #expect(TCPStateMachine.abort(on: &tcb).isEmpty)
+    #expect(tcb.state == .closed)
+}

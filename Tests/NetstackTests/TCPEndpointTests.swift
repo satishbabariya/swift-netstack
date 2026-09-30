@@ -126,8 +126,14 @@ final class TCPFixture {
     /// the tests below assert about TCP, and a stray ARP request would
     /// otherwise turn a clear failure into a confusing one.
     func drainSegments() -> [(header: TCPHeader, payload: ByteBuffer)] {
+        segments(in: link.drainTransmitted())
+    }
+
+    /// The TCP segments among `frames`, parsed, for a caller that has already
+    /// taken the frames off the link to carry them somewhere.
+    func segments(in frames: [ByteBuffer]) -> [(header: TCPHeader, payload: ByteBuffer)] {
         var out: [(header: TCPHeader, payload: ByteBuffer)] = []
-        for frame in link.drainTransmitted() {
+        for frame in frames {
             var packet = PacketBuffer(received: frame)
             guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4 else { continue }
             guard let ip = IPv4Header.parse(&packet), ip.protocolNumber == .tcp else { continue }
@@ -2386,6 +2392,292 @@ private func flood(_ fixture: TCPFixture, _ header: TCPHeader, times: Int) {
             #expect(
                 endpoint.smoothedRoundTripForTesting == afterHandshake,
                 "the acknowledgement that emptied the flight moved the estimate")
+        }
+    }
+    fixture.drain()
+}
+
+// MARK: - ABORT
+
+/// An established connection caught in the middle of a transfer in both
+/// directions: 20 bytes from the guest that nothing has read, and 10 of the
+/// gateway's 100 on the wire behind a 10-byte window with 90 still queued.
+/// Returns SND.NXT, the sequence number a reset has to carry.
+private func establishMidTransfer(_ fixture: TCPFixture, _ endpoint: TCPEndpoint) throws -> UInt32 {
+    fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+    _ = fixture.drainSegments()
+    fixture.inject(guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 10))
+    _ = fixture.drainSegments()
+    fixture.inject(
+        guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack], window: 10), payload: tcpPayload(20))
+    _ = fixture.drainSegments()
+    try endpoint.send(tcpPayload(100))
+    let sent = fixture.drainSegments().reduce(0) { $0 + $1.payload.readableBytes }
+    #expect(sent == 10, "the window let \(sent) bytes out, not 10, so this is not the state the test means")
+    return gatewayISS &+ 1 &+ 10
+}
+
+@Test func abortingAnEstablishedConnectionMidTransferSendsOneResetAndNoFin() throws {
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let closed = Counter()
+        endpoint.onClosed = { closed.increment() }
+        try withExtendedLifetime(endpoint) {
+            let sndNxt = try establishMidTransfer(fixture, endpoint)
+            // Controls: there is something to discard in each direction, and the
+            // demuxer holds the listening key that the abort has to release.
+            #expect(endpoint.heldBytesForTesting == 20)
+            #expect((endpoint.flightForTesting ?? 0) == 10)
+            #expect(fixture.stack.transportDemuxer.registrationCountForTesting == 1)
+
+            endpoint.abort()
+
+            let wire = fixture.drainSegments()
+            #expect(wire.count == 1, "an abort put \(wire.count) segments on the wire: \(wire.map(\.header.flags))")
+            let reset = try #require(wire.first)
+            #expect(reset.header.flags.contains(.rst))
+            #expect(!reset.header.flags.contains(.fin), "a FIN reads as an orderly end of stream")
+            #expect(!reset.header.flags.contains(.syn))
+            #expect(reset.payload.readableBytes == 0)
+            #expect(
+                reset.header.sequence.value == sndNxt,
+                "the reset is at \(reset.header.sequence.value); the peer has everything up to \(sndNxt)")
+            #expect(reset.header.sourcePort == tcpLocalPort)
+            #expect(reset.header.destinationPort == tcpPeerPort)
+
+            #expect(endpoint.connectionCountForTesting == 0)
+            #expect(endpoint.timeWaitCountForTesting == 0, "an abort holds nothing for 2*MSL")
+            #expect(fixture.stack.transportDemuxer.registrationCountForTesting == 0)
+            #expect(endpoint.read().readableBytes == 0, "the unread bytes were discarded")
+            #expect(throws: StackError.self) { try endpoint.send(tcpPayload(1)) }
+            #expect(closed.value == 1)
+
+            // The 90 bytes queued and the 10 in flight are gone: nothing is
+            // retransmitted, probed or finished with a FIN, however long we wait.
+            fixture.advance(by: .hours(1))
+            #expect(fixture.drainSegments().isEmpty)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func theSameConnectionLeftAloneKeepsRetransmitting() throws {
+    // The control for the test above: its closing silence only means something
+    // if this connection would have spoken.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            _ = try establishMidTransfer(fixture, endpoint)
+            fixture.advance(by: .seconds(5))
+            let wire = fixture.drainSegments()
+            #expect(wire.contains { $0.payload.readableBytes > 0 }, "no retransmission in 5 s: \(wire.map(\.header.flags))")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aSecondAbortAndAnAbortAfterCloseSendNothing() throws {
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let closed = Counter()
+        endpoint.onClosed = { closed.increment() }
+        try withExtendedLifetime(endpoint) {
+            _ = try establishMidTransfer(fixture, endpoint)
+            endpoint.abort()
+            #expect(fixture.drainSegments().count == 1)
+            endpoint.abort()
+            endpoint.close()
+            endpoint.shutdownWrite()
+            #expect(fixture.drainSegments().isEmpty, "a reset was followed by more")
+            #expect(closed.value == 1, "onClosed fires once per connection")
+        }
+    }
+    fixture.drain()
+}
+
+@Test func anAbortFromSynReceivedResetsAndFromTimeWaitSaysNothing() throws {
+    let fixture = TCPFixture()
+    do {
+        let half = try listeningEndpoint(fixture)
+        try withExtendedLifetime(half) {
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            let synAck = try #require(fixture.drainSegments().first)
+            #expect(synAck.header.flags.contains(.syn))
+            half.abort()
+            let wire = fixture.drainSegments()
+            #expect(wire.count == 1 && wire[0].header.flags.contains(.rst), "SYN-RECEIVED: \(wire.map(\.header.flags))")
+            #expect(wire.first?.header.sequence.value == gatewayISS &+ 1)
+        }
+    }
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+            endpoint.close()
+            _ = fixture.drainSegments()
+            driveToTimeWait(fixture)
+            _ = fixture.drainSegments()
+            #expect(endpoint.timeWaitCountForTesting == 1, "the control: there is a TIME-WAIT block to abort")
+
+            endpoint.abort()
+            #expect(fixture.drainSegments().isEmpty, "TIME-WAIT has nothing to reset")
+            #expect(endpoint.timeWaitCountForTesting == 0)
+            #expect(fixture.stack.transportDemuxer.registrationCountForTesting == 0)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func anAbortedListenerFreesItsPortAndRefusesWhatArrivesAfter() throws {
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let successor = TCPEndpoint(stack: fixture.stack, initialSequenceNumbers: FixedInitialSequenceNumbers(9000))
+        try withExtendedLifetime((endpoint, successor)) {
+            #expect(throws: StackError.portInUse) { try successor.bind(address: tcpGateway, port: tcpLocalPort) }
+
+            endpoint.abort()
+            try successor.bind(address: tcpGateway, port: tcpLocalPort)
+            successor.abort()
+
+            fixture.inject(guestSegment(sequence: guestISS, flags: [.syn]))
+            let refusal = try #require(fixture.drainSegments().first)
+            #expect(refusal.header.flags.contains(.rst), "a SYN to an aborted listener is answered as a closed port")
+            #expect(!refusal.header.flags.contains(.syn))
+        }
+    }
+    do {
+        // Nothing bound, nothing connected.
+        let bare = TCPEndpoint(stack: fixture.stack, initialSequenceNumbers: FixedInitialSequenceNumbers(9000))
+        bare.abort()
+        bare.abort()
+        #expect(fixture.drainSegments().isEmpty)
+    }
+    fixture.drain()
+}
+
+@Test func anAbortFromInsideOnDataSendsTheResetAndNotTheAcknowledgement() throws {
+    // The shape the gateway will use: the application looks at the first bytes
+    // a guest sent, decides, and aborts from the callback that delivered them.
+    // The segment that delivered them would ordinarily be acknowledged when the
+    // callback returns; an acknowledgement after the reset is a segment for a
+    // connection that no longer exists.
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        let looked = Counter()
+        endpoint.onData = { [weak endpoint] in
+            looked.increment()
+            endpoint?.abort()
+        }
+        withExtendedLifetime(endpoint) {
+            completeHandshake(fixture)
+            _ = fixture.drainSegments()
+
+            fixture.inject(
+                guestSegment(sequence: guestISS + 1, ack: gatewayISS &+ 1, flags: [.ack]), payload: tcpPayload(50))
+            let wire = fixture.drainSegments()
+            #expect(looked.value == 1)
+            #expect(wire.count == 1 && wire[0].header.flags.contains(.rst), "saw \(wire.map(\.header.flags))")
+            #expect(wire.first?.header.sequence.value == gatewayISS &+ 1)
+            #expect(endpoint.connectionCountForTesting == 0)
+            fixture.advance(by: .hours(1))
+            #expect(fixture.drainSegments().isEmpty)
+        }
+    }
+    fixture.drain()
+}
+
+@Test func aSegmentArrivingAfterAnAbortIsRefusedAsAClosedPortWould() throws {
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            let sndNxt = try establishMidTransfer(fixture, endpoint)
+            endpoint.abort()
+            _ = fixture.drainSegments()
+
+            // The guest had already acknowledged the 10 bytes when the reset
+            // crossed it. Nothing holds the tuple any more, so the stack's
+            // closed-port rule answers; it does not absorb it the way a dying
+            // TIME-WAIT block would.
+            fixture.inject(guestSegment(sequence: guestISS + 21, ack: sndNxt, flags: [.ack], window: 10))
+            let wire = fixture.drainSegments()
+            #expect(wire.count == 1 && wire[0].header.flags.contains(.rst), "saw \(wire.map(\.header.flags))")
+        }
+    }
+    fixture.drain()
+}
+
+// MARK: - ABORT, against a peer nobody here wrote
+
+/// Delivers `frames` from the peer to the stack, then carries whatever each side
+/// answers to the other until both are quiet. Returns every frame the stack
+/// emitted along the way.
+@discardableResult
+private func converge(_ fixture: TCPFixture, _ peer: GVisorPeer, peerFrames: [ByteBuffer] = []) throws -> [ByteBuffer] {
+    var emitted: [ByteBuffer] = []
+    var toStack = peerFrames
+    for _ in 0..<200 {
+        for frame in toStack { fixture.link.inject(frame) }
+        let fromStack = fixture.link.drainTransmitted()
+        emitted += fromStack
+        toStack = try fromStack.flatMap { try peer.inject($0) }
+        if toStack.isEmpty { return emitted }
+    }
+    Issue.record("the two stacks were still answering each other after 200 rounds")
+    return emitted
+}
+
+@Test func aRealPeerSeesAnAbortedConnectionAsAResetByPeer() throws {
+    // The frames above are frames this repository wrote, read by a test this
+    // repository wrote. What a reset does to the program at the far end is gVisor's
+    // to say: it accepts a reset only at exactly its RCV.NXT (RFC 5961 §3.2),
+    // which is why the reset is at SND.NXT, and it reports one to its
+    // application as ECONNRESET.
+    guard let harness = requireDifferentialHarness() else { return }
+    let fixture = TCPFixture()
+    do {
+        let endpoint = try listeningEndpoint(fixture)
+        try withExtendedLifetime(endpoint) {
+            let peer = try GVisorPeer(harness: harness)
+            try converge(fixture, peer, peerFrames: try peer.connect())
+            #expect(try peer.state().uppercased().contains("ESTABLISHED"), "the handshake did not complete")
+
+            // Bytes the gateway never reads, then a large write it cannot finish.
+            try converge(fixture, peer, peerFrames: try peer.write(bytes: 2000))
+            #expect(endpoint.heldBytesForTesting == 2000)
+            try endpoint.send(tcpPayload(40_000))
+
+            // The gateway's first flight reaches the peer; the peer's
+            // acknowledgements are still on the wire when the abort happens.
+            let flight = fixture.link.drainTransmitted()
+            let delivered = fixture.segments(in: flight).reduce(0) { $0 + $1.payload.readableBytes }
+            #expect(delivered > 0, "nothing was in flight, so this is not mid-transfer")
+            let acknowledgements = try flight.flatMap { try peer.inject($0) }
+            #expect(!acknowledgements.isEmpty)
+            #expect((endpoint.flightForTesting ?? 0) > 0)
+
+            endpoint.abort()
+            let frames = fixture.link.drainTransmitted()
+            let wire = fixture.segments(in: frames)
+            #expect(wire.count == 1 && wire[0].header.flags.contains(.rst), "saw \(wire.map(\.header.flags))")
+            #expect(wire.allSatisfy { !$0.header.flags.contains(.fin) })
+
+            let answers = try frames.flatMap { try peer.inject($0) }
+            #expect(answers.isEmpty, "the peer answered a reset")
+            let read = try peer.read()
+            #expect(read.errno == GVisorPeer.connectionReset, "the application saw errno \(read.errno) (\(read.error ?? "no error"))")
+
+            // The acknowledgements that were already on the wire reach a stack
+            // with no connection, and are refused.
+            for acknowledgement in acknowledgements { fixture.link.inject(acknowledgement) }
+            let late = fixture.drainSegments()
+            #expect(!late.isEmpty && late.allSatisfy { $0.header.flags.contains(.rst) })
         }
     }
     fixture.drain()

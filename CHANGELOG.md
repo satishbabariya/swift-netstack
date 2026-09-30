@@ -24,6 +24,14 @@ log, where each change says what was measured as well as what moved.
   be read. Both are new requirements with no default, so an existing conformer
   stops compiling until it writes a verdict. Counted as
   `dns_refused_by_policy`. The TLS decision is not in this release.
+- **`TCPEndpoint.abort()`**, the reset primitive. It sends one `RST` at SND.NXT
+  (RFC 9293 §3.10.5) from SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2 and
+  CLOSE-WAIT, discards both buffers, and leaves the connection CLOSED with no
+  FIN and no TIME-WAIT. From LISTEN, CLOSING, LAST-ACK and TIME-WAIT it sends
+  nothing, and it is safe to call in any state and more than once. The
+  sequence number matters: a peer acts on a reset only at exactly its
+  RCV.NXT (RFC 5961 §3.2) and answers anything else in the window with a
+  challenge ACK. Nothing in the library calls it yet.
 
 ### Fixed
 

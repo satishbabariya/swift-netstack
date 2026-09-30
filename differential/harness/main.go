@@ -108,6 +108,12 @@ type response struct {
 }
 
 func main() {
+	// `harness peer` is the live mode in peer.go; with no argument this is the
+	// batch differential it has always been.
+	if len(os.Args) > 1 && os.Args[1] == "peer" {
+		peerMain()
+		return
+	}
 	if err := execute(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "harness:", err)
 		os.Exit(1)

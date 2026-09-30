@@ -574,6 +574,56 @@ else
     fail "the control plane was gone, so the lease table could not be read"
 fi
 
+# --- A ping to the instance metadata service ---------------------------------
+#
+# TCP and UDP to 169.254.0.0/16 were refused and ICMP was not: the forwarder
+# declined it, a declined echo is answered locally, and `ping 169.254.169.254`
+# came back from the gateway. The one address a guest must not reach looked
+# reachable to ping and to nothing else.
+#
+# Silence alone proves nothing -- a guest whose network never came up is silent
+# too, and so is a ping forwarded to an address with nobody there. So the guest
+# also pings the host, which is forwarded for real (NAT turns it into 127.0.0.1
+# after the loopback check), and the gateway's own counters say which path each
+# one took. Read while the guest is still up, for the reason the lease table is.
+
+ping_out="$work/ping-link-local.out"
+rm -f "$api"
+SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c \
+    'sleep 8
+     ping -c 1 -W 3 169.254.169.254 2>&1 | grep -E "packets transmitted"
+     ping -c 1 -W 3 192.168.127.254 2>&1 | grep -E "packets transmitted" | sed "s/^/CONTROL /"
+     echo PINGSDONE
+     sleep 30' \
+    >"$ping_out" 2>&1 &
+for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
+for _ in $(seq 1 30); do grep -q PINGSDONE "$ping_out" && break; sleep 2; done
+
+counter() { grep -oE "\"$1\":[0-9]+" <<<"$2" | cut -d: -f2; }
+if [[ -S "$api" ]] && command -v curl >/dev/null 2>&1; then
+    stats="$(curl -s --unix-socket "$api" http://x/stats)"
+    refused="$(counter icmp_refused_link_local "$stats")"
+    forwarded="$(counter icmp_forwarded "$stats")"
+    declined="$(counter icmp_declined "$stats")"
+
+    grep -q "^CONTROL .*1 packets received" "$ping_out" && [[ "${forwarded:-0}" -ge 1 ]] \
+        && pass "a ping to the host is answered, and was forwarded (icmp_forwarded=$forwarded)" \
+        || fail "the control ping failed, so the silence below means nothing" \
+            "$(grep '^CONTROL' "$ping_out") icmp_forwarded=${forwarded:-?}"
+
+    grep -qE "^1 packets transmitted, 0 packets received, 100% packet loss" "$ping_out" \
+        && pass "169.254.169.254 does not answer a ping" \
+        || fail "169.254.169.254 answered a ping" "$(grep -v '^sandbox:' "$ping_out" | head -3)"
+
+    # Declined would mean answered locally; forwarded above is the control's one.
+    [[ "${refused:-0}" -ge 1 && "${declined:-0}" -eq 0 && "${forwarded:-0}" -eq 1 ]] \
+        && pass "it was refused by policy (icmp_refused_link_local=$refused), not declined or sent" \
+        || fail "the link-local ping was not refused by policy" \
+            "icmp_refused_link_local=${refused:-?} icmp_declined=${declined:-?} icmp_forwarded=${forwarded:-?}"
+else
+    fail "the control plane was gone, so the ping counters could not be read"
+fi
+
 # --- A port published into the guest -----------------------------------------
 #
 # The reason this check exists: it did not work at all, and nothing here noticed

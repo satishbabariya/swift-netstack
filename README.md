@@ -65,7 +65,8 @@ any address the guest could route to.
 instance metadata service, which hands credentials to whatever asks from the
 host, and a gateway that dials on a guest's behalf is a way for the guest to
 ask. Set `allowsLinkLocal` if you need it; upstream spells the same switch
-`Ec2MetadataAccess` and also defaults it off. To publish one of its ports on the host:
+`Ec2MetadataAccess` and also defaults it off. A ping to that range goes
+unanswered too, which is a divergence from upstream — see below. To publish one of its ports on the host:
 
 ```swift
 let leased = gateway.leasedAddress(for: guestMAC)!
@@ -428,6 +429,15 @@ broadcast are never forwarded, matching upstream. If the host will not open an
 unprivileged ICMP socket, the gateway answers locally as it did before, because
 a ping that works badly beats a network that fails to start.
 
+**A ping to link-local goes unanswered**, unless `allowsLinkLocal` is set, and
+here this deliberately differs from upstream in both of its versions. gvproxy
+v0.8.9 has no ICMP forwarder: gVisor answers every echo itself, 169.254.169.254
+included. Upstream's main branch forwards echo to the host without consulting
+`Ec2MetadataAccess`. The first says a guest can reach the metadata service when
+TCP and UDP say it cannot; the second sends the guest's packets there when the
+flag says it may not. This one takes the request and drops it, counted as
+`icmp_refused_link_local`.
+
 ### What is not here
 
 **SSH forwarding.** gvproxy's `--forward-sock`, `--forward-dest`,
@@ -773,7 +783,7 @@ failed there after the push. `scripts/conventions.sh` checks that every script
 `ci.yml` invokes is invoked by `check.sh` too, so a gate cannot be added to CI
 and quietly stay unrunnable locally.
 
-851 tests, plus a differential harness in `differential/` that drives gVisor's
+853 tests, plus a differential harness in `differential/` that drives gVisor's
 real TCP stack from the same generated sequences and compares every frame. **CI
 runs the full ten thousand**, not the three hundred `swift test` does by
 default — the claim below was checked by hand until it wasn't. The

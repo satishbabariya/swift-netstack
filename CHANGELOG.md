@@ -3,6 +3,17 @@
 Notable changes. Dates are the release date; the full history is in the commit
 log, where each change says what was measured as well as what moved.
 
+## Unreleased
+
+### Fixed
+
+- **A ping to link-local was answered by the gateway.** With `allowsLinkLocal`
+  off, `ICMPForwarder` declined 169.254.0.0/16, and a declined echo is answered
+  locally — so `ping 169.254.169.254` got a reply while TCP and UDP to the same
+  address were refused. It is now taken and dropped, and counted as
+  `icmp_refused_link_local`. This differs from gvproxy v0.8.9, which answers
+  every ping locally; the README says why.
+
 ## 0.2.0 — 2026-09-07
 
 Feature parity with `gvproxy` v0.8.9 is complete and enforced by CI rather than

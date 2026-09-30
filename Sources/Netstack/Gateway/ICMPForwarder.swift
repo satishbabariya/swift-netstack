@@ -41,6 +41,8 @@ import NIOPosix
 /// - **Loopback and broadcast are never forwarded**, matching upstream: those
 ///   are the host's own addresses, and a guest that pings them is asking this
 ///   process about itself rather than about the network.
+/// - **Link-local is dropped, not answered**, unless `allowsLinkLocal` is set.
+///   See `handle` for why this departs from upstream in both of its versions.
 public final class ICMPForwarder: @unchecked Sendable {
     private let stack: Stack
     private let eventLoop: EventLoop
@@ -64,6 +66,10 @@ public final class ICMPForwarder: @unchecked Sendable {
     /// addresses, loopback, broadcast, and -- if the host will not open an
     /// unprivileged ICMP socket -- everything.
     public private(set) var declined = 0
+    /// Requests to a link-local address, taken and dropped. Neither sent nor
+    /// answered, so the guest sees the loss it would see from any address it
+    /// may not reach.
+    public private(set) var refusedForLinkLocal = 0
 
     public var log: RateLimitedLogger?
 
@@ -105,7 +111,23 @@ public final class ICMPForwarder: @unchecked Sendable {
         // again, which is the exact fiction this type was written to end.
         if header.destination == stack.configuration.gatewayAddress { return decline() }
         if header.destination == .broadcast || header.destination.bytes[0] == 127 { return decline() }
-        if !allowsLinkLocal, header.destination.isLinkLocal { return decline() }
+
+        // Taken and dropped, like TCP and UDP to the same range. Declining it,
+        // which this did first, handed it to the local answer: `ping
+        // 169.254.169.254` came back from this process, and the one address a
+        // guest must not reach looked reachable to ping and to nothing else.
+        //
+        // Upstream differs, and in two directions. v0.8.9 has no ICMP forwarder
+        // at all and gVisor answers every echo locally, this range included.
+        // Its main branch forwards echo to the host without consulting
+        // `Ec2MetadataAccess`. Neither is followed: the first is the fiction
+        // this type exists to end, and the second sends a guest's packets to
+        // the metadata service when the flag says it may not.
+        if !allowsLinkLocal, header.destination.isLinkLocal {
+            refusedForLinkLocal += 1
+            log?.record(.icmpRefusedLinkLocal, ["destination": .string(header.destination.description)])
+            return true
+        }
 
         guard outstanding < maximumOutstanding else {
             refusedForLimit += 1

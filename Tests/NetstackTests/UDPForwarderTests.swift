@@ -258,3 +258,61 @@ private final class UppercasingUDPEcho: ChannelInboundHandler, @unchecked Sendab
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+@Test func aDatagramToALinkLocalAddressIsRefusedNotForwarded() async throws {
+    // Upstream's `1834ed6b` ("apply ec2MetadataAccess bypass to UDP
+    // forwarder"): 169.254.169.254 is the cloud metadata service, and it
+    // hands out credentials to anything that asks from the host. A UDP
+    // forwarder that treats it like any other destination is a way for the
+    // guest to ask. `refusedForLinkLocal` and `openedSockets` are
+    // `UDPForwarder`'s own record of a datagram taken-and-dropped versus one
+    // that opened a real socket toward the metadata service.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await udpGatewayFixture(group: group, guestSide: &guestSide)
+
+    let bytes = guestDatagram(
+        to: IPv4Address("169.254.169.254")!, port: 80, payload: Array("hello".utf8))
+    _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+    // A refusal is silent from the guest's side -- there is no reply to
+    // await, only the forwarder's own counters.
+    _ = await awaitDatagrams(guestSide)
+
+    let refused = try await holder.link!.eventLoop.submit { holder.forwarder?.refusedForLinkLocal ?? 0 }.get()
+    let opened = try await holder.link!.eventLoop.submit { holder.forwarder?.openedSockets ?? 0 }.get()
+    #expect(refused == 1, "the link-local datagram was not refused")
+    #expect(opened == 0, "a socket was opened toward the metadata service")
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func aDatagramToBroadcastIsLeftForTheStackNotForwarded() async throws {
+    // Upstream's `21d9036e` ("ensure IPV4Broadcast check remains for UDP"):
+    // a forwarder that treats 255.255.255.255 like any other destination
+    // opens a host socket on the guest's behalf toward the host's own
+    // broadcast domain, which is not a NAT flow. `flowCount` and
+    // `openedSockets` are what `UDPForwarder.handle`'s broadcast guard keeps
+    // at zero.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await udpGatewayFixture(group: group, guestSide: &guestSide)
+
+    let bytes = guestDatagram(to: .broadcast, port: 67, payload: Array("hello".utf8))
+    _ = bytes.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+    _ = await awaitDatagrams(guestSide)
+
+    let count = try await holder.link!.eventLoop.submit { holder.forwarder?.flowCount ?? 0 }.get()
+    let opened = try await holder.link!.eventLoop.submit { holder.forwarder?.openedSockets ?? 0 }.get()
+    #expect(count == 0, "a flow was opened for a broadcast datagram")
+    #expect(opened == 0, "a socket was opened toward the broadcast address")
+
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

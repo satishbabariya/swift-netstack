@@ -193,19 +193,33 @@ public final class WireLinkEndpoint: GatewayLink, @unchecked Sendable {
                 log?.record(.outboundFrameRejected, ["bytes": .stringConvertible(frame.readableBytes), "limit": .stringConvertible(maximumFrame)])
                 continue
             }
-            if let descriptor = rawDescriptor {
-                if writeDirectly(frame, to: descriptor) {
-                    bytesSent += frame.readableBytes
-                }
-                continue
-            }
-            guard let channel else {
+            // The direct write needs a live channel as well as a descriptor: the
+            // descriptor is NIO's, and NIO closes it with the channel. After
+            // that the number belongs to whichever socket the process opens
+            // next, and a stack still writing to its link -- a retransmit timer,
+            // a DHCP answer -- was writing into a stranger. In the suite the
+            // stranger was another test's socket, and a frame from a gateway
+            // that had already gone arrived there as garbage. NIO closes the
+            // descriptor and clears `isActive` on this loop, so the check cannot
+            // go stale between here and the `send`.
+            //
+            // Only the direct write asks `isActive`. A write through the channel
+            // to a closed one fails inside NIO and touches no descriptor, and an
+            // `EmbeddedChannel` -- what the framing tests drive -- is never
+            // active at all.
+            guard let channel, rawDescriptor == nil || channel.isActive else {
                 // No guest on the wire. Dropped and counted, which is what a
                 // real link does while the cable is out -- and the alternative,
                 // holding frames for a guest that may never return, is a queue
                 // with no bound and no reader.
                 outboundDropped += 1
                 log?.record(.outboundFrameDropped, ["reason": .string("no guest is on the wire")])
+                continue
+            }
+            if let descriptor = rawDescriptor {
+                if writeDirectly(frame, to: descriptor) {
+                    bytesSent += frame.readableBytes
+                }
                 continue
             }
             // A link drops when its queue is full, and this is that queue.

@@ -362,6 +362,59 @@ private func ethernetFrame(payload: Int) -> ByteBuffer {
     try? await group.shutdownGracefully()
 }
 
+@Test func aClosedWireDoesNotWriteIntoWhateverSocketTookItsDescriptor() async throws {
+    // An adopted wire writes to its descriptor directly -- see `rawDescriptor` --
+    // and NIO owns that descriptor and closes it with the channel. The kernel
+    // hands the number to the next socket anyone in the process opens. A stack
+    // still writing to its link after that (a retransmit timer, a DHCP answer)
+    // was writing into a stranger.
+    //
+    // In the suite, the stranger is another test's socket, and what arrives
+    // there is a frame from a gateway that has already gone.
+    //
+    // Another test running in parallel can take the freed number first, so this
+    // retries with a fresh wire until the stranger lands on it; alone, it lands
+    // on the first try.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var landed = false
+    for _ in 0..<50 where !landed {
+        var pair: [Int32] = [0, 0]
+        #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+        let link = try await WireBootstrap.adoptingDatagramSocket(
+            pair[0], group: group, linkAddress: wireMAC, mtu: 1500
+        ).get()
+        let freed = pair[0]
+        _ = try? await link.close().get()
+        close(pair[1])
+
+        // A new descriptor gets the lowest free number, so the stranger usually
+        // lands on the freed one by itself -- which is exactly how it happened
+        // in the suite.
+        var strangers: [Int32] = [0, 0]
+        #expect(makeSocketPair(AF_UNIX, .datagram, &strangers) == 0)
+        defer {
+            close(strangers[0])
+            close(strangers[1])
+        }
+        guard let landedAt = strangers.firstIndex(of: freed) else { continue }
+        let reader = strangers[1 - landedAt]
+        landed = true
+
+        // `write` is synchronous on the loop: once this returns, anything it sent
+        // is already in the stranger's queue.
+        let drops = try await link.eventLoop.submit { () -> Int in
+            link.write([PacketBuffer(received: ethernetFrame(payload: 60))])
+            return link.outboundDropped
+        }.get()
+        var probe = [UInt8](repeating: 0, count: 4096)
+        let leaked = probe.withUnsafeMutableBytes { recv(reader, $0.baseAddress, $0.count, dontWait) }
+        #expect(leaked < 0, "a closed wire wrote \(leaked) bytes into the socket that took its descriptor")
+        #expect(drops == 1, "a frame written to a closed wire was not counted as dropped")
+    }
+    #expect(landed, "no socket landed on the freed descriptor in fifty tries")
+    try? await group.shutdownGracefully()
+}
+
 @Test func theHyperkitFramingIsTwoBytesLittleEndian() throws {
     // Upstream's second stream framing, and the default its own `/connect`
     // endpoint uses. qemu writes four bytes big-endian; hyperkit and vpnkit

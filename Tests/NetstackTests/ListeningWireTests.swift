@@ -145,15 +145,19 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     // answers.
     let path = temporaryPath("stream")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    let pending = WireBootstrap.listeningStreamSocket(
-        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500)
-
-    // Wait for the socket to exist before dialling it.
-    for _ in 0..<400 where !FileManager.default.fileExists(atPath: path) {
-        try await Task.sleep(nanoseconds: 5_000_000)
-    }
+    // Awaited before dialling, and that is the whole of what makes the dial
+    // safe. This used to poll for the socket FILE, which appears at `bind(2)`;
+    // NIO calls `listen(2)` a moment later on the loop, and a dial in between
+    // is refused. A loaded runner is exactly where a moment gets long enough:
+    //
+    //     could not dial .../netstack-stream-2035895180.sock: Connection refused
+    //
+    // on main, 2026-09-05. The future completes once the socket is listening,
+    // which `aListeningStreamWireIsBoundBeforeAnyGuestConnects` pins.
+    let link = try await WireBootstrap.listeningStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
     let first = dial(path, type: .stream)
-    let link = try await pending.get()
     let collector = Collector()
     try await link.eventLoop.submit { link.attach(collector) }.get()
 
@@ -163,7 +167,12 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
     wire.writeInteger(UInt32(frame.count), endianness: .big)
     wire.writeBytes(frame)
     let bytes = Array(wire.readableBytesView)
-    #expect(bytes.withUnsafeBytes { write(first, $0.baseAddress, $0.count) } == bytes.count)
+    // The errno, because "-1 instead of 58" is all CI said the one time this
+    // failed, and EPIPE and EBADF point at entirely different culprits.
+    let written = bytes.withUnsafeBytes { write(first, $0.baseAddress, $0.count) }
+    #expect(
+        written == bytes.count,
+        "the first guest's write returned \(written): \(written < 0 ? String(cString: strerror(errno)) : "short")")
 
     var received: [[UInt8]] = []
     for _ in 0..<400 where received.isEmpty {
@@ -200,14 +209,12 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
 @Test func aGuestThatGoesAwayReleasesTheWireForTheNextOne() async throws {
     let path = temporaryPath("stream")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    let pending = WireBootstrap.listeningStreamSocket(
-        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500)
-    for _ in 0..<400 where !FileManager.default.fileExists(atPath: path) {
-        try await Task.sleep(nanoseconds: 5_000_000)
-    }
+    // Listening before the dial, not merely bound -- see the test above.
+    let link = try await WireBootstrap.listeningStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
 
     let first = dial(path, type: .stream)
-    let link = try await pending.get()
     let collector = Collector()
     try await link.eventLoop.submit { link.attach(collector) }.get()
 
@@ -580,35 +587,23 @@ private func dial(_ path: String, type: SocketKind) -> Int32 {
 @Test func closingAListeningStreamWireStopsItsListener() async throws {
     let path = temporaryPath("qemu-close")
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    // The future this returns is the LINK, and a link exists only once a guest
-    // has connected -- so awaiting it before dialling waits for a guest that the
-    // test has not sent yet. Written that way first, it hung.
-    let pending = WireBootstrap.listeningStreamSocket(
-        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500)
-
-    // `try #require` rather than `#expect`, for both of these, because the await
-    // below cannot finish without a guest: an expectation that only records an
-    // issue leaves this test HANGING rather than failing.
-    //
-    // It did. Written with `#expect`, and with a one-second wait for the bind,
-    // it passed here and hung a CI job for thirty-five minutes against a six
-    // minute normal -- the socket had not appeared yet on a loaded runner, the
-    // dial failed, the issue was recorded, and the await sat there for a guest
-    // that was never going to arrive. A check that hangs instead of failing is
-    // the thing this whole test exists to remove, so it should not be one.
-    var bound = false
-    for _ in 0..<600 where !bound {
-        bound = FileManager.default.fileExists(atPath: path)
-        if !bound { try await Task.sleep(nanoseconds: 5_000_000) }
-    }
-    try #require(bound, "the listening wire never bound \(path)")
+    // Awaited before anything dials it. This used to say the future waited for
+    // a guest, and so dialled first and polled for the socket file to know when
+    // -- but the future completes once the socket is listening, and has since
+    // `aListeningStreamWireIsBoundBeforeAnyGuestConnects`. The file appears at
+    // `bind(2)`, before `listen(2)`, so the poll could let a dial through to a
+    // socket that refused it.
+    let link = try await WireBootstrap.listeningStreamSocket(
+        atPath: path, group: group, linkAddress: listenMAC, mtu: 1500
+    ).get()
 
     // Open first, so this is about closing rather than about binding.
+    // `try #require`, so a refused dial ends the test rather than leaving the
+    // rest to assert about a connection that never existed.
     let before = makeSocket(AF_UNIX, .stream)
     try #require(
         connectTo(before, unixAddress(path: path)) == 0,
         "could not dial \(path): \(String(cString: strerror(errno)))")
-    let link = try await pending.get()
     close(before)
 
     _ = try? await link.close().get()

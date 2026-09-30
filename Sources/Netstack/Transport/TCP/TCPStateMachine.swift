@@ -1133,4 +1133,33 @@ extension TCPStateMachine {
             return []  // already closing or closed; a second CLOSE has no effect.
         }
     }
+
+    /// RFC 9293 §3.10.5's "ABORT Call": the application discards the
+    /// connection rather than closing it. No FIN, no FIN-WAIT, no TIME-WAIT.
+    ///
+    /// A reset goes out only where the peer can be holding state for us: the
+    /// states that have sent or accepted a SYN and not yet begun the closing
+    /// exchange. The RFC gives CLOSING, LAST-ACK and TIME-WAIT an "ok" and a
+    /// deleted block with nothing on the wire -- the FIN has already told the
+    /// peer the stream is over, and a reset on top of it would cut short a
+    /// close the peer is completing. SYN-SENT and LISTEN have no peer that
+    /// knows of a connection yet.
+    ///
+    /// The reset is `<SEQ=SND.NXT><CTL=RST>`, the ACK bit clear: SND.NXT is the
+    /// one sequence number the peer is certain to accept, and there is nothing
+    /// to acknowledge that a reset needs to name.
+    ///
+    /// Safe to call in any state and a no-op in CLOSED, which is what makes a
+    /// second abort send nothing.
+    static func abort(on tcb: inout TCB) -> [TCPAction] {
+        let state = tcb.state
+        guard state != .closed else { return [] }
+        tcb.state = .closed
+        switch state {
+        case .synReceived, .established, .finWait1, .finWait2, .closeWait:
+            return [.sendRst(sequence: tcb.sndNxt, ack: nil), .deleteTCB]
+        case .listen, .synSent, .closing, .lastAck, .timeWait, .closed:
+            return [.deleteTCB]
+        }
+    }
 }

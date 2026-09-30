@@ -843,6 +843,57 @@ public final class TCPEndpoint: TransportEndpointDelegate {
         onWritable = nil
     }
 
+    /// Discard every connection at once: a reset to each peer that could be
+    /// holding state for us, the queues dropped, the four-tuples released. No
+    /// FIN, no FIN-WAIT, no TIME-WAIT. RFC 9293 §3.10.5's ABORT.
+    ///
+    /// `close()` and `shutdownWrite()` are the orderly exits and both put a FIN
+    /// on the wire, which a peer reads as "the stream ended normally" -- a TLS
+    /// client sees a server that answered and hung up. A reset says the
+    /// connection was refused, and this side keeps nothing for it: the demuxer
+    /// registrations go with the connections, so a late segment from the peer
+    /// is answered as a segment to a closed port, with one more reset.
+    ///
+    /// Safe in any state, including with no connection at all, and idempotent:
+    /// the second call finds nothing to reset. Which states reset and which only
+    /// delete is `TCPStateMachine.abort`'s decision (TIME-WAIT, for one, sends
+    /// nothing).
+    ///
+    /// `onData`, `onEstablished`, `onWritable` and `onPeerFinished` are dropped,
+    /// as `close()` drops them. `onClosed` is kept and fires once per
+    /// connection, before this returns, so the caller that aborts can learn
+    /// that the endpoint is done in the same way as from any other ending.
+    public func abort() {
+        sendSideClosed = true
+        onData = nil
+        onEstablished = nil
+        onWritable = nil
+        onPeerFinished = nil
+        sendRefused = false
+
+        for connection in Array(connections.values) {
+            for action in TCPStateMachine.abort(on: &connection.tcb) {
+                switch action {
+                case .sendRst(let sequence, _):
+                    emit([.rst], sequence: sequence, on: connection, acknowledgement: SequenceNumber(0), window: 0)
+                case .deleteTCB:
+                    connection.receiveBuffer = ByteBuffer()
+                    connection.tcb.setHeldBytes(0)
+                    remove(connection)
+                    reportClosed(connection)
+                default:
+                    break
+                }
+            }
+        }
+
+        if let boundID {
+            stack.transportDemuxer.unregister(boundID, protocolNumber: .tcp)
+        }
+        boundID = nil
+        isListening = false
+    }
+
     /// Schedule work against this endpoint's clock and event loop.
     ///
     /// Exposed because a caller above this type sometimes has to bound a wait,

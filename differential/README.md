@@ -34,6 +34,15 @@ per run and one list of frames **per step**:
 {"runs": [ [ ["<base64 ethernet frame>", ...], [], ... ], ... ]}
 ```
 
+`harness peer` is the other way round: gVisor plays the **guest**, dialling the
+gateway from 192.168.127.2:50000, and the conversation is live -- one JSON
+command per line on stdin (`connect`, `inject`, `advance`, `write`, `read`,
+`state`), one reply per line carrying the frames gVisor emitted since the last
+command. It exists for questions about what the receiving side's application
+is told, which a scripted exchange cannot answer: `read` reports the errno a
+Linux program would see, so a reset shows as 104 (ECONNRESET). It uses a local
+errno table because `pkg/syserr` cannot be imported on Darwin.
+
 At step `i` the harness injects `frames[i]` (empty string for "nothing
 arrives"), advances its manual clock by `advanceMs[i]` milliseconds, reads
 and discards whatever the connection has received, performs `actions[i]`

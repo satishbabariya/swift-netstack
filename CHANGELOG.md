@@ -5,6 +5,17 @@ log, where each change says what was measured as well as what moved.
 
 ## Unreleased
 
+### Added
+
+- **`Gateway.Configuration.egressPolicy`**, the `dial` half of ADR 0001. An
+  `EgressPolicy` is asked once per new TCP connection, UDP flow and ICMP echo,
+  with the destination as the guest dialled it and after `nat`. A refused SYN
+  gets `RST|ACK` and no SYN-ACK; a refused datagram or ping is dropped with no
+  reply of any kind. Link-local refusals and the gateway's own services come
+  first and are not the policy's to decide. `nil`, the default, changes
+  nothing. Counted as `tcp_refused_by_policy`, `udp_refused_by_policy` and
+  `icmp_refused_by_policy`. The DNS and TLS decisions are not in this release.
+
 ### Fixed
 
 - **A ping to link-local was answered by the gateway.** With `allowsLinkLocal`

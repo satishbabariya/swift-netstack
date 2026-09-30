@@ -55,6 +55,13 @@ public final class Gateway: @unchecked Sendable {
         /// which hands credentials to whatever asks from the host. Upstream
         /// spells the same switch `Ec2MetadataAccess` and also defaults it off.
         public var allowsLinkLocal: Bool
+        /// What decides whether a guest's TCP connection, UDP flow or ping may
+        /// leave. `nil` forwards everything, exactly as before there was one.
+        ///
+        /// Consulted after the refusals that are not a preference -- link-local
+        /// above all -- so a policy cannot re-open them, and never for the
+        /// gateway's own services, which are not egress. See `EgressPolicy`.
+        public var egressPolicy: (any EgressPolicy)? = nil
         /// Write every frame in and out to a pcap file at this path. Upstream's
         /// `CaptureFile`. Bounded -- see `PacketCapture`.
         /// The address to hand a vpnkit guest, by the UUID hyperkit sends.
@@ -673,13 +680,13 @@ public final class Gateway: @unchecked Sendable {
                 maximumConnections: configuration.maximumTCPConnections,
                 keepAlive: configuration.keepAlive,
                 dialTimeout: configuration.tcpDialTimeout, nat: configuration.nat,
-                allowsLinkLocal: configuration.allowsLinkLocal)
+                allowsLinkLocal: configuration.allowsLinkLocal, policy: configuration.egressPolicy)
             let udp = UDPForwarder(
                 stack: stack, maximumFlows: configuration.maximumUDPFlows, nat: configuration.nat,
-                allowsLinkLocal: configuration.allowsLinkLocal)
+                allowsLinkLocal: configuration.allowsLinkLocal, policy: configuration.egressPolicy)
             let icmp = ICMPForwarder(
                 stack: stack, nat: configuration.nat,
-                allowsLinkLocal: configuration.allowsLinkLocal)
+                allowsLinkLocal: configuration.allowsLinkLocal, policy: configuration.egressPolicy)
 
             // The resolver over TCP, which upstream serves and a resolver
             // needs: an answer that will not fit a datagram comes back

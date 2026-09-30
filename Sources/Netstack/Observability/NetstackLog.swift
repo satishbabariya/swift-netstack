@@ -38,6 +38,12 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case icmpRefusedByLimit
     /// An echo request to a link-local address, dropped.
     case icmpRefusedLinkLocal
+    /// A guest connection refused by the `EgressPolicy`.
+    case tcpRefusedByPolicy
+    /// A guest datagram dropped because the `EgressPolicy` refused its flow.
+    case udpRefusedByPolicy
+    /// An echo request dropped because the `EgressPolicy` refused it.
+    case icmpRefusedByPolicy
     /// A query this gateway does not own, with nowhere configured to send it.
     case dnsRefusedNoUpstream
     /// A query dropped because too many were already outstanding.

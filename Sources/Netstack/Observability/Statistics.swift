@@ -59,6 +59,8 @@ extension Gateway {
         /// 169.254.169.254 that went unanswered because of this is policy, not
         /// an absent service.
         public var icmpRefusedLinkLocal: Int
+        /// Echo requests the `EgressPolicy` refused, dropped unanswered.
+        public var icmpRefusedByPolicy: Int
 
         /// Frames from the guest that this wire would not carry.
         public var inboundFramesRejected: Int
@@ -98,6 +100,8 @@ extension Gateway {
         /// look identical from outside: a refusal and a failed dial both end as
         /// a reset on the guest's connection.
         public var tcpRefusedLinkLocal: Int
+        /// Guest connections the `EgressPolicy` refused.
+        public var tcpRefusedByPolicy: Int
 
         /// Guest UDP flows currently holding a host socket. A **gauge**.
         public var udpFlows: Int
@@ -108,6 +112,9 @@ extension Gateway {
         public var udpRefusedByLimit: Int
         /// Flows closed early to make room for a new one.
         public var udpReclaimed: Int
+        /// Datagrams dropped because the `EgressPolicy` refused their flow. One
+        /// per datagram, not per flow: a refused flow is remembered nowhere.
+        public var udpRefusedByPolicy: Int
 
         /// Queries answered from this gateway's own records.
         public var dnsAnsweredLocally: Int
@@ -173,6 +180,7 @@ extension Gateway {
             icmpAnswered: icmp.answered,
             icmpDeclined: icmp.declined,
             icmpRefusedLinkLocal: icmp.refusedForLinkLocal,
+            icmpRefusedByPolicy: icmp.refusedByPolicy,
             inboundFramesRejected: link.inboundDropped,
             outboundFramesRejected: link.outboundDropped,
             outboundFramesBackedUp: link.outboundBackedUp,
@@ -182,10 +190,12 @@ extension Gateway {
             tcpLocalConnections: tcp.localConnections,
             tcpDialFailed: tcp.refusedForDial,
             tcpRefusedLinkLocal: tcp.refusedForLinkLocal,
+            tcpRefusedByPolicy: tcp.refusedByPolicy,
             udpFlows: udp.flowCount,
             udpSocketsOpened: udp.openedSockets,
             udpRefusedByLimit: udp.refusedForLimit,
             udpReclaimed: udp.reclaimed,
+            udpRefusedByPolicy: udp.refusedByPolicy,
             dnsAnsweredLocally: dns.answeredLocally,
             dnsForwarded: dns.forwarded,
             dnsRefusedByLimit: dns.refusedForLimit,
@@ -229,6 +239,7 @@ extension Gateway.Statistics {
             ("icmp_answered", icmpAnswered),
             ("icmp_declined", icmpDeclined),
             ("icmp_refused_link_local", icmpRefusedLinkLocal),
+            ("icmp_refused_by_policy", icmpRefusedByPolicy),
             ("inbound_frames_rejected", inboundFramesRejected),
             ("outbound_frames_rejected", outboundFramesRejected),
             ("outbound_frames_backed_up", outboundFramesBackedUp),
@@ -238,10 +249,12 @@ extension Gateway.Statistics {
             ("tcp_local_connections", tcpLocalConnections),
             ("tcp_dial_failed", tcpDialFailed),
             ("tcp_refused_link_local", tcpRefusedLinkLocal),
+            ("tcp_refused_by_policy", tcpRefusedByPolicy),
             ("udp_flows", udpFlows),
             ("udp_sockets_opened", udpSocketsOpened),
             ("udp_refused_by_limit", udpRefusedByLimit),
             ("udp_reclaimed", udpReclaimed),
+            ("udp_refused_by_policy", udpRefusedByPolicy),
             ("dns_answered_locally", dnsAnsweredLocally),
             ("dns_forwarded", dnsForwarded),
             ("dns_refused_by_limit", dnsRefusedByLimit),

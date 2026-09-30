@@ -1,7 +1,13 @@
 # Interoperating with upstream's client
 
 `scripts/interop.sh` starts `netstack-gateway` and drives it with
-[gvisor-tap-vsock][]'s own `pkg/client`, pinned at v0.8.9.
+[gvisor-tap-vsock][]'s own `pkg/client`, pinned at
+`fca6da3418e8e6bd3b0f4f1a8c8bc1a2e84e2208` -- the commit sandbox actually
+enforces egress with, not v0.8.9. The two diverged: v0.8.9 is 146 commits
+behind fca6da3 and 24 commits sideways of it on its own backport branch. A
+parity claim against v0.8.9 said nothing about the sixteen wire-affecting
+commits in that gap, eight of them still uncovered by anything in this
+repository -- see issue RED-21's `wire-diff` document.
 
 Everything else that compares this port with upstream does so by *reading*
 upstream. That is how three things went wrong:
@@ -20,10 +26,11 @@ not need me to.
 
 ## What it does not cover
 
-`Protected` on `types.Zone` is on upstream's main branch and not in v0.8.9, the
-newest release, so the driver does not read it. This port implements it because
-it was ported from main; an older client ignores the field, which is what a JSON
-decoder does with one it has no home for.
+`Protected` on `types.Zone` landed on upstream's main branch after fca6da3
+(commit `901a96a5`, DNS `/add` input validation) and is in neither v0.8.9 nor
+the commit now pinned here, so the driver does not read it. This port
+implements it because it was ported from main; an older client ignores the
+field, which is what a JSON decoder does with one it has no home for.
 
 The wire protocols are not exercised here — this drives the HTTP control API. The
 frame-level comparison against gVisor's TCP is `differential/`.

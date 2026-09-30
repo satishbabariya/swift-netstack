@@ -66,10 +66,11 @@ func main() {
 	if err != nil {
 		fail("ListDNS", err)
 	}
-	// `Protected` is on upstream's main branch and not in v0.8.9, which is the
-	// newest release. This port implements it because it was read from main;
-	// the field is simply ignored by an older client, which is what a JSON
-	// decoder does with a field it has no home for.
+	// `Protected` landed on upstream's main branch after fca6da3 (the commit
+	// pinned above) and is in neither v0.8.9 nor fca6da3. This port implements
+	// it because it was read from main; the field is simply ignored by an
+	// older client, which is what a JSON decoder does with a field it has no
+	// home for.
 	fmt.Printf("OK   ListDNS -> %d zone(s), first %q\n", len(zones), zones[0].Name)
 
 	if err := c.AddDNS(&types.Zone{

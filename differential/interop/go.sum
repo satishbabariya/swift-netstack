@@ -1,2 +1,2 @@
-github.com/containers/gvisor-tap-vsock v0.8.9 h1:6b7pqxFcKJ0EycBt1V4zPo3FQtgLLgs50AYkbFIb9eU=
-github.com/containers/gvisor-tap-vsock v0.8.9/go.mod h1:OfqLraPkar5xMQcGbl9czDDSM6/xelt0HJpyB3es6v0=
+github.com/containers/gvisor-tap-vsock v0.8.9-0.20260821162340-fca6da3418e8 h1:SCVtT8UtvFJlQzFlK3pZVGoW5k82nbVsTTd2RnkJIpg=
+github.com/containers/gvisor-tap-vsock v0.8.9-0.20260821162340-fca6da3418e8/go.mod h1:P8YrSiTi5bBeT0pOjMqJ1/PvNEy/D2vjKbW0ggcjtWM=

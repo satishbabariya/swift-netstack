@@ -67,6 +67,10 @@ public final class UDPForwarder: @unchecked Sendable {
     /// Datagrams dropped for naming a link-local address.
     public private(set) var refusedForLinkLocal = 0
 
+    /// Datagrams dropped because the `EgressPolicy` refused their flow.
+    public private(set) var refusedByPolicy = 0
+    private let policy: (any EgressPolicy)?
+
     /// Host sockets opened over this forwarder's life, which is not the same as
     /// `flowCount` and is the figure that shows a flow being reused.
     ///
@@ -86,8 +90,10 @@ public final class UDPForwarder: @unchecked Sendable {
 
     public init(
         stack: Stack, maximumFlows: Int = 512, idleTimeout: TimeAmount = .seconds(60),
-        nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false
+        nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false,
+        policy: (any EgressPolicy)? = nil
     ) {
+        self.policy = policy
         self.nat = nat
         self.allowsLinkLocal = allowsLinkLocal
         self.stack = stack
@@ -146,6 +152,20 @@ public final class UDPForwarder: @unchecked Sendable {
         // Consumed either way from here: the guest addressed something past this
         // gateway, and no endpoint on this stack is going to answer it.
         guard !opening.contains(key) else { return true }
+        // Once per new four-tuple, before the limit, so a refused destination
+        // takes no flow slot. Dropped with no ICMP, as sandbox's Go patch does:
+        // a scan of refused ports gets nothing back to count.
+        if let policy,
+            policy.dial(
+                EgressFlow(
+                    transport: .udp, source: key.source, sourcePort: key.sourcePort,
+                    destination: key.destination, translatedDestination: nat[key.destination] ?? key.destination,
+                    port: key.destinationPort)) == .refuse
+        {
+            refusedByPolicy += 1
+            log?.record(.udpRefusedByPolicy, ["destination": .string("\(key.destination):\(key.destinationPort)")])
+            return true
+        }
         reclaimIdle()
         guard flows.count + opening.count < maximumFlows else {
             refusedForLimit += 1

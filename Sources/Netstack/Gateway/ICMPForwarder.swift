@@ -70,6 +70,9 @@ public final class ICMPForwarder: @unchecked Sendable {
     /// answered, so the guest sees the loss it would see from any address it
     /// may not reach.
     public private(set) var refusedForLinkLocal = 0
+    /// Requests the `EgressPolicy` refused, taken and dropped.
+    public private(set) var refusedByPolicy = 0
+    private let policy: (any EgressPolicy)?
 
     public var log: RateLimitedLogger?
 
@@ -78,8 +81,10 @@ public final class ICMPForwarder: @unchecked Sendable {
 
     public init(
         stack: Stack, maximumOutstanding: Int = 64, timeout: TimeAmount = .seconds(5),
-        nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false
+        nat: [IPv4Address: IPv4Address] = [:], allowsLinkLocal: Bool = false,
+        policy: (any EgressPolicy)? = nil
     ) {
+        self.policy = policy
         self.stack = stack
         self.eventLoop = stack.eventLoop
         self.maximumOutstanding = max(1, maximumOutstanding)
@@ -126,6 +131,22 @@ public final class ICMPForwarder: @unchecked Sendable {
         if !allowsLinkLocal, header.destination.isLinkLocal {
             refusedForLinkLocal += 1
             log?.record(.icmpRefusedLinkLocal, ["destination": .string(header.destination.description)])
+            return true
+        }
+
+        // `return true`, taken and dropped: 100% loss, as sandbox's patch 0006
+        // does. NOT `decline()`. A declined echo is answered by
+        // `IPv4Protocol.handleICMP` from the address that was pinged, so a
+        // refused destination would appear to answer -- worse than the hole
+        // 0006 closed, because it tells the guest policy's answer is "reachable".
+        if let policy,
+            policy.dial(
+                EgressFlow(
+                    transport: .icmpEcho, source: header.source, sourcePort: nil, destination: header.destination,
+                    translatedDestination: nat[header.destination] ?? header.destination, port: nil)) == .refuse
+        {
+            refusedByPolicy += 1
+            log?.record(.icmpRefusedByPolicy, ["destination": .string(header.destination.description)])
             return true
         }
 

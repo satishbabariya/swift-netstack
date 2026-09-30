@@ -61,6 +61,10 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     /// reaching for something it was deliberately not given.
     public private(set) var refusedForLinkLocal = 0
 
+    /// Connections the `EgressPolicy` refused.
+    public private(set) var refusedByPolicy = 0
+    private let policy: (any EgressPolicy)?
+
     /// Where refusals are reported, if anywhere. `Gateway` sets this; a
     /// hand-assembled arrangement opts in by setting it too.
     public var log: RateLimitedLogger?
@@ -80,8 +84,9 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         stack: Stack, maximumInFlight: Int = 512, maximumConnections: Int = 1024,
         keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
         dialTimeout: TimeAmount = .seconds(5), nat: [IPv4Address: IPv4Address] = [:],
-        allowsLinkLocal: Bool = false
+        allowsLinkLocal: Bool = false, policy: (any EgressPolicy)? = nil
     ) {
+        self.policy = policy
         self.nat = nat
         self.allowsLinkLocal = allowsLinkLocal
         self.stack = stack
@@ -238,6 +243,30 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             return
         }
 
+        // Address translation: a guest reaching the gateway's host address is
+        // reaching the host, and the host's own services are on its loopback --
+        // not on an address in the guest's subnet, where a dial would find
+        // nothing. Upstream's `NAT`, and its default maps exactly this one.
+        // Worked out before the policy, which is given both addresses.
+        let translated = nat[request.destination] ?? request.destination
+
+        // After link-local, the limit and the gateway's own services, which are
+        // not egress. Refused with the same reset as a failed dial, before a
+        // slot is taken or anything is dialled: the guest's `connect()` fails
+        // with ECONNREFUSED at once, which is sandbox's `r.Complete(true)`.
+        if let policy,
+            policy.dial(
+                EgressFlow(
+                    transport: .tcp, source: request.source, sourcePort: request.sourcePort,
+                    destination: request.destination, translatedDestination: translated,
+                    port: request.destinationPort)) == .refuse
+        {
+            refusedByPolicy += 1
+            log?.record(.tcpRefusedByPolicy, ["destination": .string("\(request.destination):\(request.destinationPort)")])
+            request.refuse()
+            return
+        }
+
         // The slot is taken HERE, where the decision is made, not when the
         // splice succeeds.
         //
@@ -249,11 +278,6 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         // fast the test's dials completed rather than of anything in the code.
         live += 1
         let slot = ConnectionSlot(forwarder: self)
-        // Address translation: a guest reaching the gateway's host address is
-        // reaching the host, and the host's own services are on its loopback --
-        // not on an address in the guest's subnet, where a dial would find
-        // nothing. Upstream's `NAT`, and its default maps exactly this one.
-        let translated = nat[request.destination] ?? request.destination
         guard
             let destination = try? SocketAddress(
                 ipAddress: translated.description, port: Int(request.destinationPort))

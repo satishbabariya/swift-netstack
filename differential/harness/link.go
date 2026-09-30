@@ -41,6 +41,10 @@ type harnessLink struct {
 	linkAddr   tcpip.LinkAddress
 	mtu        uint32
 	emitted    [][]byte
+	// onEmit, when set, is handed each frame instead of it being captured.
+	// The live TLS mode in tls.go puts frames on a real socket with it; the
+	// batch and peer modes leave it nil and read TakeEmitted.
+	onEmit func([]byte)
 }
 
 func newHarnessLink(linkAddr tcpip.LinkAddress, mtu uint32) *harnessLink {
@@ -143,8 +147,14 @@ func (e *harnessLink) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Erro
 		buf.Release()
 
 		e.mu.Lock()
-		e.emitted = append(e.emitted, frame)
+		onEmit := e.onEmit
+		if onEmit == nil {
+			e.emitted = append(e.emitted, frame)
+		}
 		e.mu.Unlock()
+		if onEmit != nil {
+			onEmit(frame)
+		}
 		n++
 	}
 	return n, nil

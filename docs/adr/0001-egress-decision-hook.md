@@ -289,13 +289,56 @@ patch that needs it.
   ("the plain connection is not its to use"). The guest channel keeps its
   `maximumTCPConnections` slot until it closes.
 
+#### `clientHello` as built
+
+Built after the rest, and it differs from the shape above in four places. Each
+difference is on purpose:
+
+- **Only a name is asked about.** `EgressClientHello` is the flow and a
+  `serverName`, not the four-case enum. A stream that is not TLS and a complete
+  hello with no SNI are passed on without a call, because `dial` has already
+  allowed the address and sandbox splices both. A hello that cannot be read is
+  refused **without** a call and counted in `tlsRefusedUnreadable`. That is the
+  precedent `resolved` set, where a reply whose answer section cannot be read is
+  refused without a call. It is also patch 0013's rule: a hello that is
+  truncated, too slow, too large or malformed has not said which name it wants,
+  and the server may still read one from it. A policy that could answer
+  `.unreadable` with `.allow` would reopen the hole 0013 closed.
+- **Two bounds, not one.** 16 KiB for the handshake message and 32 KiB for the
+  records carrying it, as in patch 0013. Each record costs a five-byte header, so
+  without the second bound a guest that sends one-byte records would make the
+  gateway hold six bytes for each byte of hello.
+- **Not TLS is decided on the first byte.** Go reads five bytes first, so a
+  protocol that sends one byte and waits would stall until the deadline. A
+  stream that ends before sending anything is also passed on, FIN and all:
+  there are no bytes to leak. Go refuses that stream.
+- **`.divert` is not built.** `EgressTLSVerdict` has `allow` and `refuse`. The
+  broker that needs a divert is out of scope, and the case goes into
+  `EgressTLSVerdict` when a patch needs it.
+
+A server name that is not printable ASCII (a NUL, a space, anything over 0x7E)
+is refused as unreadable. RFC 6066 makes a `host_name` an ASCII DNS name, and a
+policy that matches suffixes should not be asked to judge
+`"evil\0.allowed.example"`. Go passes those bytes through to its matcher.
+
+The guest-observed check is `ClientHelloTests`. The guest there is the
+differential harness in `tls` mode: gVisor's TCP stack running Go's crypto/tls
+client, whose hello is re-framed into two records the way patch 0013's test
+does it. The upstream is a crypto/tls server on loopback. A refused name gets a
+reset, and the upstream reads zero bytes before EOF. An allowed name, and the
+same refused name under an allow-all policy, complete their handshakes.
+
 ### What the netstack adds around the hooks
 
 - **Counters** (rule 16): `refusedByPolicy` on `OutboundTCPForwarder`,
   `UDPForwarder`, `ICMPForwarder` and `DNSServer`, plus `refusedForServerName`
-  and `diverted` on the TCP forwarder, all in `Gateway.Statistics`.
+  and `diverted` on the TCP forwarder, all in `Gateway.Statistics`. As built:
+  `refusedForServerName` and `refusedUnreadableClientHello`, reported as
+  `tlsRefusedByPolicy` and `tlsRefusedUnreadable`. There is no `diverted`,
+  because nothing diverts yet.
 - **Events** (rule 9): `tcpRefusedByPolicy`, `udpRefusedByPolicy`,
-  `icmpRefusedByPolicy`, `dnsRefusedByPolicy`, `tlsRefusedByPolicy`, all
+  `icmpRefusedByPolicy`, `dnsRefusedByPolicy`, `tlsRefusedByPolicy`, and
+  `tlsRefusedUnreadable` as built, all
   through the shared `RateLimitedLogger`. The guest decides how many
   refusals there are, and this is the rule patch 0011 had to add to Go by hand.
 - **Nothing else.** No matcher, no ledger, no audit file.
@@ -382,6 +425,31 @@ server would also have waited for. The only added time is the parse.
   local reply from the gateway. Nothing leaves, so it is not a leak. It is the
   same false reachability `ICMPForwarder` exists to stop, though, and it is
   tracked separately.
+
+## Limits
+
+What the hooks, as built, do not see:
+
+- **`resolved` reports IPv4 only.** `EgressAnswer.addresses` holds class IN
+  `A` records and nothing else. An `AAAA` answer is still passed to `resolved`,
+  since every matched reply is, but its addresses are not in it: `addresses`
+  is empty. This gateway carries no IPv6, so a guest cannot dial an address it
+  learned that way through this gateway. A policy checking answers for DNS
+  rebinding still sees nothing of a v6 answer.
+- **`resolved` reports `A` records only, and only from the answer section.**
+  Addresses carried in any other form are not reported: the `ipv4hint` and
+  `ipv6hint` of an `HTTPS` or `SVCB` record, and `A` records in the additional
+  section. For a policy that allows a dial only to addresses it was shown,
+  that fails closed: a guest dialling an `ipv4hint` address is refused as
+  unresolved. For a rebinding check it is a gap: a private address in an
+  `ipv4hint` reaches the guest, because the policy is never shown it.
+  `A` records owned by a name the question does not reach through its CNAME
+  chain are left out on purpose: an upstream can put anything in a reply.
+- **`clientHello` runs after a TCP handshake with the upstream.** See "Why
+  here and not earlier" above. The upstream sees a connection open and close
+  with no bytes, even for a refused name.
+- **`clientHello` sees the outer name only** under Encrypted ClientHello. See
+  below.
 
 ## Out of scope
 

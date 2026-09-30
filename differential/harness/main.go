@@ -114,6 +114,10 @@ func main() {
 		peerMain()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "tls" {
+		tlsMain(os.Args[2:])
+		return
+	}
 	if err := execute(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "harness:", err)
 		os.Exit(1)

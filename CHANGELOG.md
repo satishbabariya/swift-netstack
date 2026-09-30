@@ -23,7 +23,19 @@ log, where each change says what was measured as well as what moved.
   replaces it with `REFUSED`, and so does a reply whose answer section cannot
   be read. Both are new requirements with no default, so an existing conformer
   stops compiling until it writes a verdict. Counted as
-  `dns_refused_by_policy`. The TLS decision is not in this release.
+  `dns_refused_by_policy`.
+- **`EgressPolicy.clientHello` and `inspectedTLSPorts`**, the TLS half of ADR
+  0001. On a port the policy names, a guest's first bytes are held until its
+  ClientHello is complete, reassembled across as many records as the client
+  split it into (at most 16 KiB of message in 32 KiB of records, within
+  `Gateway.Configuration.clientHelloTimeout`, 15 s by default). The server name
+  goes to `clientHello`. A refusal resets the guest's connection with
+  `TCPEndpoint.abort()` and closes the upstream with none of the guest's bytes
+  sent. A stream that is not TLS, and a hello with no server name, pass
+  unchanged and unasked. A hello that cannot be read (malformed, too large,
+  cut short or too slow) is refused unasked. New requirements with no
+  default, as before. Counted as `tls_refused_by_policy` and
+  `tls_refused_unreadable`.
 - **`TCPEndpoint.abort()`**, the reset primitive. It sends one `RST` at SND.NXT
   (RFC 9293 §3.10.5) from SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2 and
   CLOSE-WAIT, discards both buffers, and leaves the connection CLOSED with no
@@ -31,7 +43,7 @@ log, where each change says what was measured as well as what moved.
   nothing, and it is safe to call in any state and more than once. The
   sequence number matters: a peer acts on a reset only at exactly its
   RCV.NXT (RFC 5961 §3.2) and answers anything else in the window with a
-  challenge ACK. Nothing in the library calls it yet.
+  challenge ACK. A refused server name is its first caller.
 
 ### Fixed
 

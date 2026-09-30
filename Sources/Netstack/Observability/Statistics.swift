@@ -102,6 +102,13 @@ extension Gateway {
         public var tcpRefusedLinkLocal: Int
         /// Guest connections the `EgressPolicy` refused.
         public var tcpRefusedByPolicy: Int
+        /// Guest connections reset because the `EgressPolicy` refused the
+        /// server name in their ClientHello.
+        public var tlsRefusedByPolicy: Int
+        /// Guest connections on an inspected TLS port reset because no server
+        /// name could be read from them: malformed, too large, cut short, or
+        /// too slow. Not a policy decision, so counted apart from the one above.
+        public var tlsRefusedUnreadable: Int
 
         /// Guest UDP flows currently holding a host socket. A **gauge**.
         public var udpFlows: Int
@@ -194,6 +201,8 @@ extension Gateway {
             tcpDialFailed: tcp.refusedForDial,
             tcpRefusedLinkLocal: tcp.refusedForLinkLocal,
             tcpRefusedByPolicy: tcp.refusedByPolicy,
+            tlsRefusedByPolicy: tcp.refusedForServerName,
+            tlsRefusedUnreadable: tcp.refusedUnreadableClientHello,
             udpFlows: udp.flowCount,
             udpSocketsOpened: udp.openedSockets,
             udpRefusedByLimit: udp.refusedForLimit,
@@ -254,6 +263,8 @@ extension Gateway.Statistics {
             ("tcp_dial_failed", tcpDialFailed),
             ("tcp_refused_link_local", tcpRefusedLinkLocal),
             ("tcp_refused_by_policy", tcpRefusedByPolicy),
+            ("tls_refused_by_policy", tlsRefusedByPolicy),
+            ("tls_refused_unreadable", tlsRefusedUnreadable),
             ("udp_flows", udpFlows),
             ("udp_sockets_opened", udpSocketsOpened),
             ("udp_refused_by_limit", udpRefusedByLimit),

@@ -2,9 +2,9 @@
 ///
 /// See `docs/adr/0001-egress-decision-hook.md` for where each decision sits and
 /// what the guest sees when it is refused. `dial` covers TCP, UDP and ICMP
-/// echo; `resolve` and `resolved` cover DNS. The TLS decision comes later, as a
-/// new requirement with no default, so a conformer's build breaks and it has to
-/// write down a verdict. That is on purpose. A default of
+/// echo; `resolve` and `resolved` cover DNS; `clientHello` covers the server
+/// name a TLS connection asks for. None of them has a default, so a conformer
+/// has to write down a verdict for each. That is on purpose. A default of
 /// `.allow` is how sandbox came to report "reaches nothing" while `ping
 /// 1.1.1.1` was answered: nobody had written the ICMP gate.
 ///
@@ -43,6 +43,28 @@ public protocol EgressPolicy: Sendable {
     /// refused UDP destination is remembered nowhere, so each datagram to it
     /// asks again.
     func dial(_ flow: EgressFlow) -> EgressVerdict
+
+    /// The destination ports whose connections are read for a ClientHello
+    /// before anything is sent upstream. Read once, when the gateway is
+    /// assembled. A connection to any other port is spliced unread.
+    var inspectedTLSPorts: Set<UInt16> { get }
+
+    /// The server name a TLS connection on an inspected port asks for, after
+    /// `dial` allowed it and the upstream has been dialled. A refusal resets
+    /// the guest's connection, and the upstream is closed with none of the
+    /// guest's bytes sent to it. The upstream has still seen a TCP handshake:
+    /// the name arrives after the only point where the dial could have been
+    /// refused.
+    ///
+    /// Asked only when there is a name. A stream that is not TLS, and a
+    /// complete ClientHello with no `server_name`, are passed on without a
+    /// call, because `dial` already allowed the address and there is no name
+    /// to judge. A hello that cannot be read is refused without a call: it
+    /// has not said which name it wants, and the server may still read one
+    /// from it. That covers a hello that is malformed, over 16 KiB (or 32 KiB
+    /// of records), cut short by the guest, or not complete within
+    /// `clientHelloTimeout`.
+    func clientHello(_ hello: EgressClientHello) -> EgressTLSVerdict
 }
 
 public enum EgressVerdict: Sendable, Hashable {
@@ -133,4 +155,28 @@ public struct EgressAnswer: Sendable, Hashable {
         self.addresses = addresses
         self.canonicalNames = canonicalNames
     }
+}
+
+/// A TLS connection's server name, read from its ClientHello.
+public struct EgressClientHello: Sendable, Hashable {
+    /// The connection `dial` allowed.
+    public let flow: EgressFlow
+    /// From the `server_name` extension. Lowercased, with no trailing dot, and
+    /// printable ASCII only: a hello whose name is not is refused as
+    /// unreadable before this is built. With Encrypted ClientHello this is the
+    /// outer name, the client-facing server's, and only that.
+    public let serverName: String
+
+    public init(flow: EgressFlow, serverName: String) {
+        self.flow = flow
+        self.serverName = serverName
+    }
+}
+
+/// What `clientHello` decides. Separate from `EgressVerdict` because ADR 0001
+/// gives TLS a third answer, handing the connection to the embedder, and that
+/// case belongs here when it is built.
+public enum EgressTLSVerdict: Sendable, Hashable {
+    case allow
+    case refuse
 }

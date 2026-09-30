@@ -157,6 +157,8 @@ public final class DNSServer: @unchecked Sendable {
         let respond: Responder
         let originalID: UInt16
         let question: DNSQuestion
+        /// What `resolve` was asked, so `resolved` is told the same thing.
+        let asked: EgressQuestion
         let deadline: NIODeadline
     }
 
@@ -182,6 +184,7 @@ public final class DNSServer: @unchecked Sendable {
     /// builds one. The cost is a query per lookup, answered from a table in this
     /// process without touching the network.
     private let ttl: UInt32
+    private let policy: (any EgressPolicy)?
 
     private var upstreamChannel: Channel?
     private var pending: [UInt16: Pending] = [:]
@@ -198,6 +201,8 @@ public final class DNSServer: @unchecked Sendable {
     /// can answer.
     public private(set) var refusedForNoUpstream = 0
     public private(set) var unmatchedReplies = 0
+    /// Questions and answers the `EgressPolicy` refused, each answered `REFUSED`.
+    public private(set) var refusedByPolicy = 0
 
     /// Where refusals are reported, if anywhere. `Gateway` sets this; a
     /// hand-assembled arrangement opts in by setting it too.
@@ -215,8 +220,10 @@ public final class DNSServer: @unchecked Sendable {
 
     public init(
         stack: Stack, records: [StaticRecord], upstream: [SocketAddress] = [],
-        maximumPending: Int = 256, timeout: TimeAmount = .seconds(5), ttl: UInt32 = 0
+        maximumPending: Int = 256, timeout: TimeAmount = .seconds(5), ttl: UInt32 = 0,
+        policy: (any EgressPolicy)? = nil
     ) throws {
+        self.policy = policy
         self.stack = stack
         self.records = Dictionary(records.map { ($0.name, $0.address) }, uniquingKeysWith: { first, _ in first })
         // Every configured record's parent zone, owned and protected. This is
@@ -239,7 +246,7 @@ public final class DNSServer: @unchecked Sendable {
         try endpoint.bind(address: .any, port: Self.port)
         endpoint.onDatagram = { [weak self] payload, source, port in
             guard let self else { return }
-            self.handle(payload) { [weak self] reply in
+            self.handle(payload, source: source, transport: .udp) { [weak self] reply in
                 guard let self else { return }
                 try? self.endpoint.send(
                     self.fittedToDatagram(reply, answering: payload), to: source, port: port)
@@ -316,11 +323,17 @@ public final class DNSServer: @unchecked Sendable {
 
     /// Answer one query, however it arrived. The TCP framing calls this; the
     /// UDP socket calls it with a responder that sends a datagram back.
-    func answer(_ payload: ByteBuffer, respond: @escaping Responder) {
-        handle(payload, respond: respond)
+    func answer(
+        _ payload: ByteBuffer, source: IPv4Address, transport: EgressQuestion.Transport,
+        respond: @escaping Responder
+    ) {
+        handle(payload, source: source, transport: transport, respond: respond)
     }
 
-    private func handle(_ payload: ByteBuffer, respond: @escaping Responder) {
+    private func handle(
+        _ payload: ByteBuffer, source: IPv4Address, transport: EgressQuestion.Transport,
+        respond: @escaping Responder
+    ) {
         guard let query = DNSCodec.parseQuery(payload) else { return }
 
         if query.question.klass == DNSQuestion.classIN, query.question.type == DNSQuestion.typeA,
@@ -381,7 +394,18 @@ public final class DNSServer: @unchecked Sendable {
             return
         }
 
-        forward(query, payload: payload, respond: respond)
+        // After the gateway's own names, which are not egress, and before
+        // anything leaves. ADR 0001: every qtype, both transports.
+        let asked = EgressQuestion(
+            source: source, name: query.question.name, type: query.question.type,
+            klass: query.question.klass, transport: transport)
+        if let policy, policy.resolve(asked) == .refuse {
+            refusedByPolicy += 1
+            log?.record(.dnsRefusedByPolicy, ["name": .string(sanitizedForLog(query.question.name))])
+            refuse(query, payload: payload, respond: respond)
+            return
+        }
+        forward(query, asked: asked, payload: payload, respond: respond)
     }
 
     /// The zone that owns `name`, most specific first.
@@ -444,7 +468,9 @@ public final class DNSServer: @unchecked Sendable {
         return true
     }
 
-    private func forward(_ query: DNSQuery, payload: ByteBuffer, respond: @escaping Responder) {
+    private func forward(
+        _ query: DNSQuery, asked: EgressQuestion, payload: ByteBuffer, respond: @escaping Responder
+    ) {
         guard let channel = upstreamChannel, let server = upstream.first else {
             // Logged at a higher level than the rest, and named so it reads
             // as what it nearly always is: nobody configured an upstream, and
@@ -469,7 +495,7 @@ public final class DNSServer: @unchecked Sendable {
         // of what an on-path guest needs to answer its own neighbours' queries.
         let upstreamID = allocateID()
         pending[upstreamID] = Pending(
-            respond: respond, originalID: query.id, question: query.question,
+            respond: respond, originalID: query.id, question: query.question, asked: asked,
             deadline: stack.clock.now() + timeout)
 
         var outgoing = payload
@@ -526,6 +552,26 @@ public final class DNSServer: @unchecked Sendable {
 
         var outgoing = payload
         outgoing.setInteger(entry.originalID, at: outgoing.readerIndex, endianness: .big)
+        if let policy {
+            // An answer section that cannot be read is refused, not relayed:
+            // the policy would be letting through addresses it never saw.
+            let parsed = DNSCodec.parseAnswers(payload, of: reply)
+            let verdict = parsed.map {
+                policy.resolved(
+                    EgressAnswer(
+                        question: entry.asked,
+                        addresses: $0.addresses.map { EgressAnswer.Address(address: $0.0, ttl: $0.1) },
+                        canonicalNames: $0.canonicalNames))
+            }
+            if verdict != .allow {
+                refusedByPolicy += 1
+                log?.record(.dnsRefusedByPolicy, ["name": .string(sanitizedForLog(reply.question.name))])
+                var original = reply
+                original.id = entry.originalID
+                refuse(original, payload: outgoing, respond: entry.respond)
+                return
+            }
+        }
         entry.respond(outgoing)
     }
 
@@ -674,7 +720,8 @@ private final class DNSOverTCP: ChannelInboundHandler {
             guard let message = buffered.readSlice(length: Int(length)) else { break }
             accumulated = buffered.readableBytes > 0 ? buffered : nil
             let channel = context.channel
-            server.answer(message) { reply in
+            let source = channel.remoteAddress?.ipAddress.flatMap(IPv4Address.init) ?? .any
+            server.answer(message, source: source, transport: .tcp) { reply in
                 var framed = channel.allocator.buffer(capacity: reply.readableBytes + 2)
                 framed.writeInteger(UInt16(truncatingIfNeeded: reply.readableBytes), endianness: .big)
                 var body = reply

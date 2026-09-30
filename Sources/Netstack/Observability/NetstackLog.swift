@@ -44,6 +44,8 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case udpRefusedByPolicy
     /// An echo request dropped because the `EgressPolicy` refused it.
     case icmpRefusedByPolicy
+    /// A DNS question or answer refused by the `EgressPolicy`.
+    case dnsRefusedByPolicy
     /// A query this gateway does not own, with nowhere configured to send it.
     case dnsRefusedNoUpstream
     /// A query dropped because too many were already outstanding.

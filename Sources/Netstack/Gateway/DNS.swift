@@ -3,10 +3,10 @@ import NIOCore
 /// A DNS question, which is as much of a message as this gateway has to
 /// understand.
 ///
-/// Answers, authorities and additionals are never parsed: a query this gateway
-/// cannot answer itself is forwarded as the bytes that arrived, and the reply is
-/// returned as the bytes that came back. Parsing records in order to re-encode
-/// them identically would be work with a defect budget and no benefit.
+/// Answers, authorities and additionals are never re-encoded: a query this
+/// gateway cannot answer itself is forwarded as the bytes that arrived, and the
+/// reply is returned as the bytes that came back. The answer section is read
+/// only to show an `EgressPolicy` what it says (`parseAnswers`).
 struct DNSQuestion: Equatable {
     /// Lowercased and without a trailing dot, so a lookup is a dictionary hit
     /// rather than a comparison rule. DNS names are case-insensitive
@@ -17,6 +17,7 @@ struct DNSQuestion: Equatable {
     var klass: UInt16
 
     static let typeA: UInt16 = 1
+    static let typeCNAME: UInt16 = 5
     static let classIN: UInt16 = 1
 }
 
@@ -108,6 +109,96 @@ enum DNSCodec {
             labels.append(String(decoding: bytes, as: UTF8.self).lowercased())
         }
         return labels.joined(separator: ".")
+    }
+
+    /// Read a name that may be compressed, advancing `cursor` past it.
+    ///
+    /// For a reply's answer section, where RFC 1035 §4.1.4 compression is
+    /// normal, unlike the question of a query (`parseName`). A pointer is
+    /// followed only if it lands strictly before where the last one did, or
+    /// before the name itself for the first. That is what ends the walk: the
+    /// place a pointer may go only moves back, so a pointer to itself, or two
+    /// pointing at each other, is refused rather than followed.
+    static func readName(_ buffer: ByteBuffer, at cursor: inout Int) -> String? {
+        var labels: [String] = []
+        var total = 0
+        var index = cursor
+        var limit = cursor
+        var end: Int?
+        while true {
+            guard let length = buffer.getInteger(at: index, as: UInt8.self) else { return nil }
+            if length & 0xC0 == 0xC0 {
+                guard let pointer = buffer.getInteger(at: index, endianness: .big, as: UInt16.self) else { return nil }
+                let target = buffer.readerIndex + Int(pointer & 0x3FFF)
+                guard target < limit else { return nil }
+                if end == nil { end = index + 2 }
+                limit = target
+                index = target
+                continue
+            }
+            guard length & 0xC0 == 0 else { return nil }
+            index += 1
+            if length == 0 { break }
+            total += Int(length) + 1
+            guard total <= maximumNameLength,
+                let bytes = buffer.getBytes(at: index, length: Int(length))
+            else { return nil }
+            index += Int(length)
+            labels.append(String(decoding: bytes, as: UTF8.self).lowercased())
+        }
+        cursor = end ?? index
+        return labels.joined(separator: ".")
+    }
+
+    /// The class IN A records in a reply's answer section that are reachable
+    /// from its question, and the CNAME chain that reaches them.
+    ///
+    /// Nil if the section cannot be read. The reply comes from upstream, which
+    /// is not the guest but is not trusted either, so this is held to
+    /// `parseQuery`'s standard: every length checked, and nil rather than a
+    /// partial answer. `reply` is the parse of the same bytes.
+    static func parseAnswers(_ payload: ByteBuffer, of reply: DNSQuery)
+        -> (addresses: [(IPv4Address, UInt32)], canonicalNames: [String])?
+    {
+        guard let count = payload.getInteger(at: payload.readerIndex + 6, endianness: .big, as: UInt16.self)
+        else { return nil }
+        let end = payload.writerIndex
+        var cursor = payload.readerIndex + reply.questionRange.upperBound
+        var records: [(owner: String, type: UInt16, ttl: UInt32, data: Int, length: Int)] = []
+        for _ in 0..<count {
+            guard let owner = readName(payload, at: &cursor),
+                let type = payload.getInteger(at: cursor, endianness: .big, as: UInt16.self),
+                let klass = payload.getInteger(at: cursor + 2, endianness: .big, as: UInt16.self),
+                let ttl = payload.getInteger(at: cursor + 4, endianness: .big, as: UInt32.self),
+                let length = payload.getInteger(at: cursor + 8, endianness: .big, as: UInt16.self),
+                cursor + 10 + Int(length) <= end
+            else { return nil }
+            if klass == DNSQuestion.classIN {
+                records.append((owner, type, ttl, cursor + 10, Int(length)))
+            }
+            cursor += 10 + Int(length)
+        }
+
+        // At most one hop per record, so a chain that loops back on itself
+        // ends when the records do.
+        var chain: [String] = []
+        var current = reply.question.name
+        for _ in records {
+            guard let next = records.first(where: { $0.owner == current && $0.type == DNSQuestion.typeCNAME })
+            else { break }
+            var at = next.data
+            guard let target = readName(payload, at: &at), at == next.data + next.length else { return nil }
+            chain.append(target)
+            current = target
+        }
+
+        let reachable = Set([reply.question.name] + chain)
+        var addresses: [(IPv4Address, UInt32)] = []
+        for record in records where record.type == DNSQuestion.typeA && reachable.contains(record.owner) {
+            guard record.length == 4, let bytes = payload.getBytes(at: record.data, length: 4) else { return nil }
+            addresses.append((IPv4Address(bytes[0], bytes[1], bytes[2], bytes[3]), record.ttl))
+        }
+        return (addresses, chain)
     }
 
     /// An answer carrying one A record, built by copying the query's own header

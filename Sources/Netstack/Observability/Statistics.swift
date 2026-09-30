@@ -133,6 +133,9 @@ extension Gateway {
         /// against `dnsForwarded`: a high one is a resolver being sent to TCP
         /// often, which is worth knowing before someone reports it as slowness.
         public var dnsTruncated: Int
+        /// Questions and upstream answers the `EgressPolicy` refused, each
+        /// answered `REFUSED`.
+        public var dnsRefusedByPolicy: Int
 
         /// Addresses currently leased. A **gauge**.
         public var dhcpLeases: Int
@@ -202,6 +205,7 @@ extension Gateway {
             dnsRefusedNoUpstream: dns.refusedForNoUpstream,
             dnsUnmatchedReplies: dns.unmatchedReplies,
             dnsTruncated: dns.truncated,
+            dnsRefusedByPolicy: dns.refusedByPolicy,
             dhcpLeases: dhcp.leaseCount,
             dhcpPoolExhausted: dhcp.exhausted,
             forwardedPorts: forwardedPorts.count,
@@ -261,6 +265,7 @@ extension Gateway.Statistics {
             ("dns_refused_no_upstream", dnsRefusedNoUpstream),
             ("dns_unmatched_replies", dnsUnmatchedReplies),
             ("dns_truncated", dnsTruncated),
+            ("dns_refused_by_policy", dnsRefusedByPolicy),
             ("dhcp_leases", dhcpLeases),
             ("dhcp_pool_exhausted", dhcpPoolExhausted),
             ("forwarded_ports", forwardedPorts),

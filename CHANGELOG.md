@@ -14,7 +14,16 @@ log, where each change says what was measured as well as what moved.
   reply of any kind. Link-local refusals and the gateway's own services come
   first and are not the policy's to decide. `nil`, the default, changes
   nothing. Counted as `tcp_refused_by_policy`, `udp_refused_by_policy` and
-  `icmp_refused_by_policy`. The DNS and TLS decisions are not in this release.
+  `icmp_refused_by_policy`.
+- **`EgressPolicy.resolve` and `resolved`**, the DNS half of ADR 0001. A
+  question of any type for a name the gateway does not own is put to
+  `resolve` before it goes upstream; a refusal is `REFUSED` and nothing is
+  sent. An upstream reply is put to `resolved`, with its A records and CNAME
+  chain reachable from the question, before the guest sees it; a refusal
+  replaces it with `REFUSED`, and so does a reply whose answer section cannot
+  be read. Both are new requirements with no default, so an existing conformer
+  stops compiling until it writes a verdict. Counted as
+  `dns_refused_by_policy`. The TLS decision is not in this release.
 
 ### Fixed
 

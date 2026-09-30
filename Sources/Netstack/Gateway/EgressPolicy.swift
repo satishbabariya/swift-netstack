@@ -1,10 +1,10 @@
 /// What an embedder decides about traffic leaving the gateway.
 ///
 /// See `docs/adr/0001-egress-decision-hook.md` for where each decision sits and
-/// what the guest sees when it is refused. This is the first slice of it:
-/// `dial`, for TCP, UDP and ICMP echo. The DNS and TLS decisions come later,
-/// and each will be a new requirement with no default, so a conformer's build
-/// breaks and it has to write down a verdict. That is on purpose. A default of
+/// what the guest sees when it is refused. `dial` covers TCP, UDP and ICMP
+/// echo; `resolve` and `resolved` cover DNS. The TLS decision comes later, as a
+/// new requirement with no default, so a conformer's build breaks and it has to
+/// write down a verdict. That is on purpose. A default of
 /// `.allow` is how sandbox came to report "reaches nothing" while `ping
 /// 1.1.1.1` was answered: nobody had written the ICMP gate.
 ///
@@ -18,6 +18,24 @@
 /// A policy shared by gateways on different loops is called from several
 /// threads at once, so its `Sendable` has to be real.
 public protocol EgressPolicy: Sendable {
+    /// A DNS question the gateway would forward upstream, of any type.
+    ///
+    /// The gateway's own names (its static records and the zones it owns) are
+    /// answered before this and never asked about: they are not egress. A
+    /// refusal is `REFUSED` (rcode 5) to the guest, and nothing is sent
+    /// upstream. Not NXDOMAIN, which a resolver would cache as the name not
+    /// existing.
+    func resolve(_ question: EgressQuestion) -> EgressVerdict
+
+    /// An upstream reply to a question `resolve` allowed, before the guest
+    /// sees it. A refusal replaces the reply with `REFUSED`.
+    ///
+    /// Every matched reply is passed, including ones with no addresses in
+    /// them. A reply whose answer section cannot be read is refused without a
+    /// call: a policy that keeps a record of what it handed out cannot record
+    /// what it was never shown.
+    func resolved(_ answer: EgressAnswer) -> EgressVerdict
+
     /// A new TCP connection, a new UDP flow, or an ICMP echo request.
     ///
     /// Called once per new flow, never per packet: a segment on an established
@@ -64,5 +82,55 @@ public struct EgressFlow: Sendable, Hashable {
         self.destination = destination
         self.translatedDestination = translatedDestination
         self.port = port
+    }
+}
+
+/// One question the guest asked, before it leaves the gateway.
+public struct EgressQuestion: Sendable, Hashable {
+    public enum Transport: Sendable, Hashable {
+        case udp
+        case tcp
+    }
+
+    public let source: IPv4Address
+    /// Lowercased, with no trailing dot.
+    public let name: String
+    public let type: UInt16
+    public let klass: UInt16
+    public let transport: Transport
+
+    public init(source: IPv4Address, name: String, type: UInt16, klass: UInt16, transport: Transport) {
+        self.source = source
+        self.name = name
+        self.type = type
+        self.klass = klass
+        self.transport = transport
+    }
+}
+
+/// What upstream answered, as far as a policy about addresses needs it.
+public struct EgressAnswer: Sendable, Hashable {
+    public struct Address: Sendable, Hashable {
+        public let address: IPv4Address
+        public let ttl: UInt32
+
+        public init(address: IPv4Address, ttl: UInt32) {
+            self.address = address
+            self.ttl = ttl
+        }
+    }
+
+    public let question: EgressQuestion
+    /// The class IN A records owned by the question name or a name in
+    /// `canonicalNames`. A record for any other name is not reachable from the
+    /// question and is left out: an upstream can put anything in a reply.
+    public let addresses: [Address]
+    /// The CNAME targets followed from the question name, in order, lowercased.
+    public let canonicalNames: [String]
+
+    public init(question: EgressQuestion, addresses: [Address], canonicalNames: [String]) {
+        self.question = question
+        self.addresses = addresses
+        self.canonicalNames = canonicalNames
     }
 }

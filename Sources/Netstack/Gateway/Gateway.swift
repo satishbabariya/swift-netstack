@@ -666,7 +666,7 @@ public final class Gateway: @unchecked Sendable {
                 reserved: [configuration.hostAddress] + configuration.gatewayVirtualAddresses)
             let dns = try DNSServer(
                 stack: stack, records: configuration.dnsRecords,
-                upstream: configuration.upstreamResolvers)
+                upstream: configuration.upstreamResolvers, policy: configuration.egressPolicy)
             // Every virtual address the gateway answers for, added to the NIC
             // before anything can ask: ARP is answered from `NIC.hasAddress`,
             // so an address that is not here is one no guest can send to,

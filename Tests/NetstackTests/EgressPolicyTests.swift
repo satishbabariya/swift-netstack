@@ -24,6 +24,8 @@ private final class Verdicts: EgressPolicy {
     let verdict: EgressVerdict
     let asked = NIOLockedValueBox<[EgressFlow]>([])
     init(_ verdict: EgressVerdict) { self.verdict = verdict }
+    func resolve(_ question: EgressQuestion) -> EgressVerdict { verdict }
+    func resolved(_ answer: EgressAnswer) -> EgressVerdict { .allow }
     func dial(_ flow: EgressFlow) -> EgressVerdict {
         asked.withLockedValue { $0.append(flow) }
         return verdict
@@ -145,6 +147,17 @@ private func probe(_ policy: (any EgressPolicy)?) async throws -> Probed {
     sendFrame(fd, ethernetFrame(echoRequest(identifier: 0x0202), to: host, .icmp, gatewayMAC: mac))
     result.echoReplyFrom = echoReply(await collect(fd, for: 1000, until: { echoReply($0) != nil }))
 
+    // A question for a name the gateway does not own, so `Gateway` has to have
+    // handed the policy to its resolver for it to be asked.
+    var query = ByteBuffer(bytes: [0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7])
+    query.writeString("example")
+    query.writeBytes([3] + Array("com".utf8) + [0, 0, 1, 0, 1])
+    let question = UDPHeader.serialize(
+        payload: query, source: egressGuest, destination: configuration.gatewayAddress, sourcePort: 40200,
+        destinationPort: DNSServer.port, allocator: ByteBufferAllocator())!
+    sendFrame(fd, ethernetFrame(question, to: configuration.gatewayAddress, .udp, gatewayMAC: mac))
+    _ = await collect(fd, for: 1000, until: { $0.contains { $0.0.protocolNumber == .udp } })
+
     result.statistics = try await gateway.statistics().get()
     try? await listener.close()
     try? await echo.close()
@@ -183,6 +196,7 @@ private final class UDPEcho: ChannelInboundHandler, Sendable {
     #expect(stats.icmpForwarded == 0, "a refused ping was sent")
     // One, the control. A second would be the refused ping answered locally.
     #expect(stats.icmpDeclined == 1, "a refused ping was declined, which answers it")
+    #expect(stats.dnsRefusedByPolicy == 1, "the resolver was not given the policy")
 }
 
 @Test func anAllowAllPolicyLeavesTheSameProbesAnswered() async throws {
@@ -195,6 +209,9 @@ private final class UDPEcho: ChannelInboundHandler, Sendable {
     #expect(probed.datagramReply == Array("hello".utf8), "an allowed datagram got no answer")
     #expect(probed.echoReplyFrom == host, "an allowed ping went unanswered")
     #expect(probed.statistics.tcpRefusedByPolicy + probed.statistics.udpRefusedByPolicy + probed.statistics.icmpRefusedByPolicy == 0)
+    // No upstream is configured, so an allowed question is refused for that.
+    #expect(probed.statistics.dnsRefusedByPolicy == 0)
+    #expect(probed.statistics.dnsRefusedNoUpstream == 1)
 
     // Asked once per flow, with the address the guest dialled and the one
     // `nat` turned it into. The gateway's own address is not egress and is

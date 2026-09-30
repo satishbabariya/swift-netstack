@@ -763,3 +763,49 @@ private final class FuzzChildCollector: ChannelInboundHandler, @unchecked Sendab
     server.close(promise: nil)
     fixture.drain()
 }
+
+// MARK: - The answer section, which upstream writes and `resolved` reads
+
+@Test func theAnswerParserSurvivesMutatedRepliesAndStillReadsAGoodOne() throws {
+    var query = ByteBuffer()
+    query.writeBytes([0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0])
+    for label in ["www", "allowed", "test"] {
+        query.writeInteger(UInt8(label.utf8.count))
+        query.writeBytes(Array(label.utf8))
+    }
+    query.writeBytes([0, 0, 1, 0, 1])
+    let good = egressChainReply(to: query)
+
+    // The oracle that makes this more than "it did not crash": the unmutated
+    // reply still reads as the chain it is, before and after the garbage.
+    func readsTheChain(_ reply: ByteBuffer) -> Bool {
+        guard let parsed = DNSCodec.parseQuery(replyAsQuery: reply),
+            let answers = DNSCodec.parseAnswers(reply, of: parsed)
+        else { return false }
+        return answers.canonicalNames == ["edge.cdn.test"] && answers.addresses.map(\.0) == [IPv4Address(203, 0, 113, 7)]
+    }
+    #expect(readsTheChain(good))
+
+    var rng = FuzzRandom(seed: 0xD45)
+    var read = 0
+    for _ in 0..<20_000 {
+        let mutated = ByteBuffer(bytes: fuzzMutate(Array(good.readableBytesView), &rng))
+        guard let parsed = DNSCodec.parseQuery(replyAsQuery: mutated) else { continue }
+        if DNSCodec.parseAnswers(mutated, of: parsed) != nil { read += 1 }
+    }
+    // Most mutations leave something readable; a parser that refused
+    // everything would pass the loop above and fail here.
+    #expect(read > 1_000)
+    #expect(readsTheChain(good))
+}
+
+@Test func aCompressionPointerThatDoesNotPointBackIsRefused() throws {
+    // A pointer to itself, and one pointing forward: followed, either would
+    // walk forever or read a name that was never written.
+    for pointer: UInt16 in [0xC00C, 0xC0FF] {
+        var buffer = ByteBuffer(bytes: [UInt8](repeating: 0, count: 12))
+        buffer.writeInteger(pointer, endianness: .big)
+        var cursor = 12
+        #expect(DNSCodec.readName(buffer, at: &cursor) == nil)
+    }
+}

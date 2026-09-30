@@ -69,10 +69,13 @@ private func run(_ arguments: [String]) -> (status: Int32, output: String)? {
     // closed stdout but may not have been reaped yet, so it reads as running and
     // every invocation looked hung.
     let fired = NIOLockedValueBox(false)
+    // SIGKILL, not `terminate()`: the gateway holds SIGTERM until it is up --
+    // see `terminationSignals` in main.swift -- so a gateway stuck on the way
+    // up would never see one.
     let watchdog = DispatchWorkItem {
         guard process.isRunning else { return }
         fired.withLockedValue { $0 = true }
-        process.terminate()
+        kill(process.processIdentifier, SIGKILL)
     }
     DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(10), execute: watchdog)
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -484,8 +487,14 @@ private func statusOf(tcpPort port: Int, path: String) -> Int? {
     // It refused with "endpoint is not connected" at first, because
     // PacketCapture threw StackError.notConnected: an unrelated error reused
     // because it was to hand, invisible while the only caller swallowed it.
+    //
+    // The socket path is unique because this call gets as far as `bind`, and two
+    // runs of the suite at once each found the other's socket there and failed
+    // on that instead of the capture.
+    let socketPath = "/tmp/netstack-err-check-\(UInt32.random(in: 0...UInt32.max)).sock"
+    defer { unlink(socketPath) }
     if let refused = run([
-        "--listen-vfkit", "/tmp/netstack-err-check.sock", "--pcap", "/no/such/dir/x.pcap",
+        "--listen-vfkit", socketPath, "--pcap", "/no/such/dir/x.pcap",
     ]) {
         #expect(refused.status != 0, "a gateway started with a capture it could not write")
         #expect(

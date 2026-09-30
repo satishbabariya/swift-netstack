@@ -1,4 +1,5 @@
 import Foundation
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
 import NIOPosix
@@ -459,7 +460,8 @@ private final class FakeResolver: ChannelInboundHandler, @unchecked Sendable {
 
 /// A gateway on a real socketpair, with a real upstream resolver on loopback.
 private func forwardingGateway(
-    group: EventLoopGroup, guestSide: inout Int32, upstream: SocketAddress, maximumPending: Int = 256
+    group: EventLoopGroup, guestSide: inout Int32, upstream: SocketAddress, maximumPending: Int = 256,
+    policy: (any EgressPolicy)? = nil
 ) async throws -> DNSHolder {
     var pair: [Int32] = [0, 0]
     #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
@@ -479,7 +481,7 @@ private func forwardingGateway(
         holder.stack = stack
         holder.server = try DNSServer(
             stack: stack, records: [.init(name: "gateway.containers.internal", address: dnsGateway)],
-            upstream: [upstream], maximumPending: maximumPending)
+            upstream: [upstream], maximumPending: maximumPending, policy: policy)
     }.get()
     try await holder.server!.startForwarding(group: group).get()
     return holder
@@ -1257,4 +1259,164 @@ private func mutateFramedQuery(_ input: [UInt8], _ rng: inout DNSRandom) -> [UIn
     #expect(
         DNSCodec.advertisedUDPSize(in: lyingLength, after: parsedLying) == 4096,
         "a readable OPT header was ignored because a field nothing reads was wrong")
+}
+
+// MARK: - ADR 0001's `resolve` and `resolved`, observed by the guest
+
+/// A reply to `query` whose answer is a CNAME chain, compressed the way real
+/// resolvers write it: `<question> CNAME edge.cdn.test`, `edge.cdn.test A
+/// 203.0.113.7`, and a stray `other.test A 6.6.6.6` that the question does not
+/// reach.
+func egressChainReply(to query: ByteBuffer) -> ByteBuffer {
+    var reply = query
+    let flags = reply.getInteger(at: reply.readerIndex + 2, endianness: .big, as: UInt16.self)!
+    reply.setInteger(flags | 0x8080, at: reply.readerIndex + 2, endianness: .big)
+    reply.setInteger(UInt16(3), at: reply.readerIndex + 6, endianness: .big)
+    func record(_ type: UInt16, _ rdata: [UInt8]) {
+        reply.writeInteger(type, endianness: .big)
+        reply.writeInteger(UInt16(1), endianness: .big)
+        reply.writeInteger(UInt32(60), endianness: .big)
+        reply.writeInteger(UInt16(rdata.count), endianness: .big)
+        reply.writeBytes(rdata)
+    }
+    func name(_ text: String) -> [UInt8] {
+        text.split(separator: ".").flatMap { [UInt8($0.utf8.count)] + Array($0.utf8) } + [0]
+    }
+    reply.writeInteger(UInt16(0xC00C), endianness: .big)
+    let target = reply.writerIndex - reply.readerIndex + 10
+    record(DNSQuestion.typeCNAME, name("edge.cdn.test"))
+    reply.writeInteger(UInt16(0xC000 | target), endianness: .big)
+    record(DNSQuestion.typeA, [203, 0, 113, 7])
+    reply.writeBytes(name("other.test"))
+    record(DNSQuestion.typeA, [6, 6, 6, 6])
+    return reply
+}
+
+private final class ChainResolver: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = AddressedEnvelope<ByteBuffer>
+    typealias OutboundOut = AddressedEnvelope<ByteBuffer>
+    var asked = 0
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let envelope = unwrapInboundIn(data)
+        asked += 1
+        context.writeAndFlush(
+            wrapOutboundOut(AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: egressChainReply(to: envelope.data))),
+            promise: nil)
+    }
+}
+
+/// One verdict for questions and one for answers, and a record of each call.
+private final class DNSVerdicts: EgressPolicy {
+    let question: EgressVerdict
+    let answer: EgressVerdict
+    let questions = NIOLockedValueBox<[EgressQuestion]>([])
+    let answers = NIOLockedValueBox<[EgressAnswer]>([])
+    init(question: EgressVerdict, answer: EgressVerdict) {
+        self.question = question
+        self.answer = answer
+    }
+    func resolve(_ question: EgressQuestion) -> EgressVerdict {
+        questions.withLockedValue { $0.append(question) }
+        return self.question
+    }
+    func resolved(_ answer: EgressAnswer) -> EgressVerdict {
+        answers.withLockedValue { $0.append(answer) }
+        return self.answer
+    }
+    func dial(_ flow: EgressFlow) -> EgressVerdict { .allow }
+}
+
+private struct Resolved {
+    var code: UInt16?
+    var answers: UInt16?
+    var bytes: [UInt8] = []
+    var upstreamAsked = 0
+    var refusedByPolicy = 0
+    var localAnswer: IPv4Address?
+}
+
+/// Ask `www.allowed.test` and the gateway's own name, under `policy`.
+private func resolveUnder(_ policy: DNSVerdicts) async throws -> Resolved {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let resolver = ChainResolver()
+    let upstream = try await DatagramBootstrap(group: group)
+        .channelInitializer { $0.pipeline.addHandler(resolver) }
+        .bind(host: "127.0.0.1", port: 0).get()
+    var guestSide: Int32 = -1
+    let holder = try await forwardingGateway(
+        group: group, guestSide: &guestSide, upstream: upstream.localAddress!, policy: policy)
+
+    var result = Resolved()
+    // The control for a refusal: the gateway's own names are not egress and
+    // are answered under any policy, so the wire is carrying replies.
+    askOverWire(guestSide, dnsQuery("gateway.containers.internal", id: 0x0001))
+    result.localAnswer = await awaitReply(guestSide).flatMap(answeredAddress)
+
+    askOverWire(guestSide, dnsQuery("WWW.Allowed.test", id: 0xBEEF))
+    if let reply = await awaitReply(guestSide) {
+        result.code = reply.getInteger(at: reply.readerIndex + 2, endianness: .big, as: UInt16.self).map { $0 & 0x000F }
+        result.answers = reply.getInteger(at: reply.readerIndex + 6, endianness: .big, as: UInt16.self)
+        result.bytes = Array(reply.readableBytesView)
+    }
+    result.upstreamAsked = try await upstream.eventLoop.submit { resolver.asked }.get()
+    result.refusedByPolicy = try await holder.link!.eventLoop.submit { holder.server?.refusedByPolicy ?? 0 }.get()
+
+    try? await upstream.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    return result
+}
+
+private func contains(_ bytes: [UInt8], _ needle: [UInt8]) -> Bool {
+    bytes.count >= needle.count && (0...(bytes.count - needle.count)).contains { Array(bytes[$0..<$0 + needle.count]) == needle }
+}
+
+@Test func aQuestionThePolicyRefusesIsAnsweredRefusedAndNeverLeaves() async throws {
+    let policy = DNSVerdicts(question: .refuse, answer: .allow)
+    let resolved = try await resolveUnder(policy)
+
+    #expect(resolved.localAnswer == dnsGateway, "the gateway's own name was gated")
+    #expect(resolved.code == DNSCodec.responseCodeRefused, "a refused name was not answered REFUSED")
+    #expect(resolved.answers == 0)
+    #expect(resolved.upstreamAsked == 0, "a refused name was sent upstream")
+    #expect(resolved.refusedByPolicy == 1)
+    #expect(policy.answers.withLockedValue { $0 }.isEmpty)
+}
+
+@Test func anAnswerThePolicyRefusesNeverReachesTheGuest() async throws {
+    let policy = DNSVerdicts(question: .allow, answer: .refuse)
+    let resolved = try await resolveUnder(policy)
+
+    #expect(resolved.localAnswer == dnsGateway)
+    #expect(resolved.upstreamAsked == 1, "the question never reached upstream, so no answer was refused")
+    #expect(resolved.code == DNSCodec.responseCodeRefused, "a refused answer was not replaced with REFUSED")
+    #expect(resolved.answers == 0)
+    #expect(!contains(resolved.bytes, [203, 0, 113, 7]), "the refused address reached the guest")
+    // Refused on the verdict, not because the answer could not be read.
+    #expect(policy.answers.withLockedValue { $0.map { $0.addresses.map(\.address) } } == [[IPv4Address(203, 0, 113, 7)]])
+    #expect(resolved.refusedByPolicy == 1)
+}
+
+@Test func anAllowAllPolicyLeavesTheSameQuestionAnswered() async throws {
+    let policy = DNSVerdicts(question: .allow, answer: .allow)
+    let resolved = try await resolveUnder(policy)
+
+    #expect(resolved.code == DNSCodec.responseCodeNoError)
+    #expect(resolved.answers == 3)
+    #expect(contains(resolved.bytes, [203, 0, 113, 7]), "an allowed answer did not reach the guest")
+    #expect(resolved.refusedByPolicy == 0)
+
+    // Asked once each way, about what the guest asked and what came back.
+    // The gateway's own name is not asked about.
+    let question = EgressQuestion(source: dnsGuest, name: "www.allowed.test", type: 1, klass: 1, transport: .udp)
+    #expect(policy.questions.withLockedValue { $0 } == [question])
+    #expect(
+        policy.answers.withLockedValue { $0 } == [
+            EgressAnswer(
+                question: question, addresses: [.init(address: IPv4Address(203, 0, 113, 7), ttl: 60)],
+                canonicalNames: ["edge.cdn.test"])
+        ], "the stray record was passed, or the chain was not followed")
 }

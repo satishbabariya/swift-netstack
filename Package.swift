@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "Netstack", targets: ["Netstack"]),
         .executable(name: "netstack-gateway", targets: ["netstack-gateway"]),
+        .executable(name: "netstack-egress-bench", targets: ["netstack-egress-bench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -30,6 +31,13 @@ let package = Package(
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+        .executableTarget(
+            name: "netstack-egress-bench",
+            dependencies: [
+                "Netstack",
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
             ]
         ),
         .testTarget(

@@ -53,6 +53,12 @@ log, where each change says what was measured as well as what moved.
   address were refused. It is now taken and dropped, and counted as
   `icmp_refused_link_local`. This differs from gvproxy v0.8.9, which answers
   every ping locally; the README says why.
+- **A guest behind a published port saw every client as the gateway.** TCP and
+  UDP port forwards now bind the guest-side end to the client's own address
+  and port, as upstream's `f9306b96` does, so the guest sees who dialled.
+  Loopback, unspecified and non-IPv4 clients still come from the gateway,
+  because a guest drops an answer to 127.0.0.1 as a martian. A guest's UDP reply
+  to a propagated client is matched to its flow, not opened as new egress.
 
 ## 0.2.0 — 2026-09-07
 

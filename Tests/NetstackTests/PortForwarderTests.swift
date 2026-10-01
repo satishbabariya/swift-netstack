@@ -485,3 +485,373 @@ private func udpGuestDatagram(sourcePort: UInt16, destinationPort: UInt16, paylo
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+// MARK: - Source-address propagation (upstream f9306b96)
+//
+// The guest should see who dialled a published port, not the gateway. Loopback
+// is the exception that has to hold: the guest answers the source address
+// through the gateway, and an answer to 127.0.0.1 on a real guest's link is a
+// martian it drops. A loopback socket cannot present any other address, so the
+// non-loopback cases hand the forwarder one through its seam and watch what the
+// guest is sent; the loopback cases use the real socket's own address.
+
+private let pfClient = IPv4Address("10.1.2.3")!
+// Not 40000: that is where `UDPPortForwarder` starts stepping its own ports, and
+// a client there could not tell propagation from the fallback.
+private let pfClientPort: UInt16 = 51234
+
+/// Segments the gateway put on the wire, with the IP addresses they carried.
+private func pfAwaitAddressed(
+    _ fd: Int32, where predicate: ([(ip: IPv4Header, tcp: TCPHeader, payload: ByteBuffer)]) -> Bool
+) async -> [(ip: IPv4Header, tcp: TCPHeader, payload: ByteBuffer)] {
+    var collected: [(ip: IPv4Header, tcp: TCPHeader, payload: ByteBuffer)] = []
+    for _ in 0..<400 {
+        for _ in 0..<64 {
+            var back = [UInt8](repeating: 0, count: 4096)
+            let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
+            guard read > 0 else { break }
+            var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
+            guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,
+                let ip = IPv4Header.parse(&packet), ip.protocolNumber == .tcp,
+                let tcp = TCPHeader.parse(&packet, header: ip)
+            else { continue }
+            collected.append((ip, tcp, packet.payload))
+        }
+        if predicate(collected) { return collected }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return collected
+}
+
+/// A segment from the guest to any address, which is what answering a
+/// propagated source takes: it is addressed past the gateway, and reaches it
+/// only because the gateway is the guest's default route.
+private func pfGuestSegment(
+    to destination: IPv4Address, sourcePort: UInt16, destinationPort: UInt16, sequence: UInt32,
+    acknowledgement: UInt32, flags: TCPFlags, payload: [UInt8] = []
+) -> [UInt8] {
+    let allocator = ByteBufferAllocator()
+    let header = TCPHeader(
+        sourcePort: sourcePort, destinationPort: destinationPort,
+        sequence: SequenceNumber(sequence), acknowledgement: SequenceNumber(acknowledgement),
+        dataOffset: 5, flags: flags, window: 65535, checksum: 0, urgentPointer: 0, options: [])
+    let segment = header.serialize(
+        payload: ByteBuffer(bytes: payload), source: pfGuest, destination: destination, allocator: allocator)
+    var packet = PacketBuffer(allocator: allocator, payload: segment)
+    IPv4Header(source: pfGuest, destination: destination, protocolNumber: .tcp, payloadLength: segment.readableBytes)
+        .prepend(to: &packet)
+    EthernetHeader(destination: pfGatewayMAC, source: pfGuestMAC, etherType: .ipv4).prepend(to: &packet)
+    return Array(packet.frame.readableBytesView)
+}
+
+/// Collects what a host-side channel reads.
+private final class PFCollector: ChannelInboundHandler, @unchecked Sendable {
+    // `@unchecked`: `received` is written only on the channel's loop and read
+    // by the test through `channel.eventLoop.submit`, so every access is on
+    // that one loop.
+    typealias InboundIn = ByteBuffer
+    var received = ""
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buffer = unwrapInboundIn(data)
+        received += buffer.readString(length: buffer.readableBytes) ?? ""
+    }
+}
+
+@Test func aForwardedConnectionReachesTheGuestFromTheClientsAddressAndStillCarriesBothWays() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await portForwardingGateway(group: group, guestSide: &guestSide, guestPort: 8080)
+    // The guest's egress forwarder, as `Gateway` installs it, so the guest's
+    // answer to an address past the gateway has to get past it before it
+    // reaches the connection that is waiting for it.
+    let egress = try await holder.stack!.eventLoop.submit { () -> OutboundTCPForwarder in
+        let stack = holder.stack!
+        holder.forwarder!.clientAddress = { _ in
+            try? SocketAddress(ipAddress: pfClient.description, port: Int(pfClientPort))
+        }
+        return OutboundTCPForwarder(stack: stack)
+    }.get()
+    let hostPort = holder.forwarder!.listeningAddress!.port!
+
+    let collector = PFCollector()
+    let dialler = try await ClientBootstrap(group: group)
+        .channelInitializer { $0.pipeline.addHandler(collector) }
+        .connect(host: "127.0.0.1", port: hostPort).get()
+
+    let syn = await pfAwaitAddressed(guestSide) { $0.contains { $0.tcp.flags.contains(.syn) } }
+    let opening = try #require(syn.first { $0.tcp.flags.contains(.syn) }, "the gateway never dialled the guest")
+    #expect(
+        opening.ip.source == pfClient,
+        "the guest saw the connection come from \(opening.ip.source), not the client at \(pfClient)")
+    #expect(opening.tcp.sourcePort == pfClientPort, "the guest saw source port \(opening.tcp.sourcePort)")
+
+    // The guest answers the client's address. It reaches the gateway only as
+    // its default route; if nothing here is waiting for it, the handshake
+    // never completes and the guest sees the right address on a dead
+    // connection.
+    let accept = pfGuestSegment(
+        to: pfClient, sourcePort: 8080, destinationPort: opening.tcp.sourcePort, sequence: 5000,
+        acknowledgement: opening.tcp.sequence.value &+ 1, flags: [.syn, .ack])
+    _ = accept.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+
+    var out = dialler.allocator.buffer(capacity: 5)
+    out.writeString("hello")
+    try await dialler.writeAndFlush(out)
+    let data = await pfAwaitAddressed(guestSide) { $0.contains { $0.payload.readableBytes > 0 } }
+    let carried = try #require(data.first { $0.payload.readableBytes > 0 }, "the host's bytes never reached the guest")
+    #expect(String(decoding: carried.payload.readableBytesView, as: UTF8.self) == "hello")
+    #expect(carried.ip.source == pfClient)
+
+    // And back: the guest's bytes, addressed to the client, reach the dialler.
+    let answer = pfGuestSegment(
+        to: pfClient, sourcePort: 8080, destinationPort: opening.tcp.sourcePort, sequence: 5001,
+        acknowledgement: opening.tcp.sequence.value &+ 6, flags: [.ack, .psh], payload: Array("world".utf8))
+    _ = answer.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+    var received = ""
+    for _ in 0..<400 where received != "world" {
+        received = try await dialler.eventLoop.submit { collector.received }.get()
+        if received != "world" { try? await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(received == "world", "the guest's answer never reached the host client")
+
+    try? await dialler.close()
+    holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+    _ = egress
+}
+
+@Test func aLoopbackClientStillReachesTheGuestFromTheGateway() async throws {
+    // The control. 127.0.0.1 propagated would be a martian to a real guest,
+    // and the forward everyone uses -- 127.0.0.1:2222 to the guest's 22 --
+    // would stop working.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await portForwardingGateway(group: group, guestSide: &guestSide, guestPort: 8080)
+    let hostPort = holder.forwarder!.listeningAddress!.port!
+
+    let dialler = try await ClientBootstrap(group: group).connect(host: "127.0.0.1", port: hostPort).get()
+    let syn = await pfAwaitAddressed(guestSide) { $0.contains { $0.tcp.flags.contains(.syn) } }
+    let opening = try #require(syn.first { $0.tcp.flags.contains(.syn) }, "the gateway never dialled the guest")
+    #expect(opening.ip.source == pfGateway, "a loopback client reached the guest from \(opening.ip.source)")
+
+    try? await dialler.close()
+    holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func onlyRoutableIPv4ClientsArePropagated() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await portForwardingGateway(group: group, guestSide: &guestSide, guestPort: 8080)
+    let results = try await holder.stack!.eventLoop.submit { () -> [String: String] in
+        let stack = holder.stack!
+        func bound(_ ip: String, _ port: Int) -> String {
+            let address = try? SocketAddress(ipAddress: ip, port: port)
+            return ForwardedSource.binding(for: address, on: stack).map { "\($0.address):\($0.port)" } ?? "gateway"
+        }
+        return [
+            "10.0.2.50": bound("10.0.2.50", 1234),
+            "::ffff:10.0.2.50": bound("::ffff:10.0.2.50", 1234),
+            "127.0.0.1": bound("127.0.0.1", 2222),
+            "127.1.2.3": bound("127.1.2.3", 2222),
+            "::ffff:127.0.0.1": bound("::ffff:127.0.0.1", 2222),
+            "0.0.0.0": bound("0.0.0.0", 0),
+            "::1": bound("::1", 2222),
+            "2001:db8::1": bound("2001:db8::1", 2222),
+        ]
+    }.get()
+    #expect(results["10.0.2.50"] == "10.0.2.50:1234")
+    #expect(results["::ffff:10.0.2.50"] == "10.0.2.50:1234")
+    for kept in ["127.0.0.1", "127.1.2.3", "::ffff:127.0.0.1", "0.0.0.0", "::1", "2001:db8::1"] {
+        #expect(results[kept] == "gateway", "\(kept) was propagated as \(results[kept] ?? "nil")")
+    }
+    // A unix-socket forward has no address to propagate at all.
+    let unix = try SocketAddress(unixDomainSocketPath: "/tmp/x.sock")
+    let unixResult = try await holder.stack!.eventLoop.submit {
+        ForwardedSource.binding(for: unix, on: holder.stack!) == nil
+    }.get()
+    #expect(unixResult)
+
+    holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+/// A UDP datagram from the guest to any address. See the TCP version above.
+private func udpGuestDatagram(
+    to destination: IPv4Address, sourcePort: UInt16, destinationPort: UInt16, payload: [UInt8]
+) -> [UInt8] {
+    let allocator = ByteBufferAllocator()
+    let datagram = UDPHeader.serialize(
+        payload: ByteBuffer(bytes: payload), source: pfGuest, destination: destination,
+        sourcePort: sourcePort, destinationPort: destinationPort, allocator: allocator)!
+    var packet = PacketBuffer(allocator: allocator, payload: datagram)
+    IPv4Header(
+        source: pfGuest, destination: destination, protocolNumber: .udp, payloadLength: datagram.readableBytes
+    ).prepend(to: &packet)
+    EthernetHeader(destination: pfGatewayMAC, source: pfGuestMAC, etherType: .ipv4).prepend(to: &packet)
+    return Array(packet.frame.readableBytesView)
+}
+
+/// The first UDP datagram for `port` the gateway put on the wire.
+private func pfAwaitDatagram(_ fd: Int32, toPort port: UInt16) async -> (ip: IPv4Header, udp: UDPHeader, payload: [UInt8])? {
+    for _ in 0..<400 {
+        var back = [UInt8](repeating: 0, count: 4096)
+        let read = back.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, dontWait) }
+        if read > 0 {
+            var packet = PacketBuffer(received: ByteBuffer(bytes: back[0..<read]))
+            guard let ethernet = EthernetHeader.parse(&packet), ethernet.etherType == .ipv4,
+                let ip = IPv4Header.parse(&packet), ip.protocolNumber == .udp,
+                let udp = UDPHeader.parse(&packet, header: ip), udp.destinationPort == port
+            else { continue }
+            return (ip, udp, Array(packet.payload.readableBytesView))
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return nil
+}
+
+@Test func aForwardedDatagramReachesTheGuestFromTheSendersAddressAndTheReplyIsNotTakenForEgress() async throws {
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [0, 0]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let guestSide = pair[1]
+    defer { close(guestSide) }
+    let link = try await WireBootstrap.adoptingDatagramSocket(
+        pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
+    ).get()
+    let holder = PFHolder()
+    holder.link = link
+    let (forwarder, egress) = try await link.eventLoop.submit { () -> (UDPPortForwarder, UDPForwarder) in
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: pfGateway, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!))
+        stack.start()
+        stack.arpCache.record(pfGuest, pfGuestMAC)
+        holder.stack = stack
+        // The guest's egress forwarder, as `Gateway` installs it. It sees every
+        // datagram first, and the reply below is addressed past the gateway.
+        return (UDPPortForwarder(stack: stack, guestAddress: pfGuest, guestPort: 9999), UDPForwarder(stack: stack))
+    }.get()
+    try await forwarder.listen(port: 0).get()
+
+    let sender = try SocketAddress(ipAddress: pfClient.description, port: Int(pfClientPort))
+    try await link.eventLoop.submit {
+        forwarder.receive(ByteBuffer(string: "ping"), from: sender)
+    }.get()
+
+    let request = try #require(await pfAwaitDatagram(guestSide, toPort: 9999), "the datagram never reached the guest")
+    #expect(
+        request.ip.source == pfClient,
+        "the guest saw the datagram come from \(request.ip.source), not the sender at \(pfClient)")
+    #expect(request.udp.sourcePort == pfClientPort, "the guest saw source port \(request.udp.sourcePort)")
+    #expect(String(decoding: request.payload, as: UTF8.self) == "ping")
+
+    // The guest answers the address it was shown.
+    let reply = udpGuestDatagram(
+        to: request.ip.source, sourcePort: 9999, destinationPort: request.udp.sourcePort,
+        payload: Array("pong".utf8))
+    _ = reply.withUnsafeBytes { send(guestSide, $0.baseAddress, $0.count, 0) }
+
+    var replies = 0
+    for _ in 0..<400 where replies == 0 {
+        replies = try await link.eventLoop.submit { forwarder.repliesForwarded }.get()
+        if replies == 0 { try? await Task.sleep(nanoseconds: 5_000_000) }
+    }
+    #expect(replies == 1, "the guest's reply never reached the flow waiting for it")
+    let leaked = try await link.eventLoop.submit { egress.openedSockets + egress.flowCount }.get()
+    #expect(leaked == 0, "the guest's reply was opened as egress to the real network")
+
+    _ = try? await forwarder.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+    _ = egress
+}
+
+@Test func aLoopbackDatagramStillReachesTheGuestFromTheGateway() async throws {
+    // The UDP control, through a real loopback socket.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var pair: [Int32] = [0, 0]
+    #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+    let guestSide = pair[1]
+    defer { close(guestSide) }
+    let link = try await WireBootstrap.adoptingDatagramSocket(
+        pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
+    ).get()
+    let holder = PFHolder()
+    holder.link = link
+    let forwarder = try await link.eventLoop.submit { () -> UDPPortForwarder in
+        let stack = Stack(
+            link: link,
+            configuration: Stack.Configuration(
+                gatewayAddress: pfGateway, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!))
+        stack.start()
+        stack.arpCache.record(pfGuest, pfGuestMAC)
+        holder.stack = stack
+        return UDPPortForwarder(stack: stack, guestAddress: pfGuest, guestPort: 9999)
+    }.get()
+    try await forwarder.listen(port: 0).get()
+    let hostPort = forwarder.listeningAddress!.port!
+
+    let sender = makeSocket(AF_INET, .datagram)
+    #expect(sender >= 0)
+    defer { close(sender) }
+    _ = sendTo(sender, Array("ping".utf8), loopbackAddress(port: UInt16(hostPort)))
+
+    let request = try #require(await pfAwaitDatagram(guestSide, toPort: 9999), "the datagram never reached the guest")
+    #expect(request.ip.source == pfGateway, "a loopback sender reached the guest from \(request.ip.source)")
+
+    _ = try? await forwarder.close().get()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}
+
+@Test func onlyAnEndpointOnTheExactAddressKeepsADatagramFromTheEgressForwarder() async throws {
+    // The egress forwarder steps aside for a datagram an endpoint here is bound
+    // to exactly -- a propagated forward's flow. A wildcard bind must not count:
+    // this stack's own service on 0.0.0.0:5353 is no claim on port 5353 at every
+    // address the guest might reach.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var guestSide: Int32 = -1
+    let holder = try await portForwardingGateway(group: group, guestSide: &guestSide, guestPort: 8080)
+    let (wildcard, exact) = try await holder.stack!.eventLoop.submit { () -> (Bool, Bool) in
+        let stack = holder.stack!
+        let toClient = IPv4Header(source: pfGuest, destination: pfClient, protocolNumber: .udp, payloadLength: 8)
+        let service = UDPEndpoint(stack: stack)
+        try service.bind(address: .any, port: 5353)
+        let wildcard = stack.transportDemuxer.hasEndpoint(
+            protocolNumber: .udp, header: toClient, localPort: 5353, remotePort: 9999)
+        let flow = UDPEndpoint(stack: stack)
+        try flow.bind(address: pfClient, port: 5353)
+        let exact = stack.transportDemuxer.hasEndpoint(
+            protocolNumber: .udp, header: toClient, localPort: 5353, remotePort: 9999)
+        _ = (service, flow)
+        return (wildcard, exact)
+    }.get()
+    #expect(!wildcard, "a wildcard bind kept a guest's datagram to \(pfClient) from the egress forwarder")
+    #expect(exact, "a flow bound to \(pfClient) was not seen")
+
+    holder.forwarder?.close()
+    _ = try? await holder.stack?.shutdown().get()
+    _ = try? await holder.link?.close().get()
+    close(guestSide)
+    try? await group.shutdownGracefully()
+    _ = holder.stack
+}

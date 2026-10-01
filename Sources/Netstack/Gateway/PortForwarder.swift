@@ -50,6 +50,12 @@ public final class PortForwarder: @unchecked Sendable {
     /// port when it asked for zero.
     public var listeningAddress: SocketAddress? { listener?.localAddress }
 
+    /// Who dialled, read from an accepted host connection. The kernel's answer
+    /// in production; replaceable so a test can present a non-loopback client
+    /// from a loopback socket, since loopback is the one case that must keep
+    /// the gateway's address. See `ForwardedSource`.
+    var clientAddress: (Channel) -> SocketAddress? = { $0.remoteAddress }
+
     /// `keepAlive` defaults on for the same reason it does on the outbound
     /// forwarder: see `OutboundTCPForwarder.init`.
     public init(
@@ -128,7 +134,8 @@ public final class PortForwarder: @unchecked Sendable {
 
         guard
             let guestChannel = GuestSplice.connect(
-                stack: stack, host: inbound, to: guestAddress, port: guestPort, keepAlive: keepAlive)
+                stack: stack, host: inbound, to: guestAddress, port: guestPort, keepAlive: keepAlive,
+                from: ForwardedSource.binding(for: clientAddress(inbound), on: stack))
         else {
             slot.release()
             inbound.close(promise: nil)

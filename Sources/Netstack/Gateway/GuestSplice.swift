@@ -17,9 +17,14 @@ enum GuestSplice {
     /// `host` must already be on `stack.eventLoop`. Both channels of a splice
     /// have to share a loop (see `GlueHandler`), and this is not the place that
     /// can arrange it.
+    ///
+    /// `source`, when given, is where the guest-side end is bound, so the guest
+    /// sees the connection come from there rather than from the gateway. See
+    /// `ForwardedSource`.
     static func connect(
         stack: Stack, host: Channel, to address: IPv4Address, port: UInt16,
-        keepAlive: TCPEndpoint.KeepAliveConfiguration?
+        keepAlive: TCPEndpoint.KeepAliveConfiguration?,
+        from source: (address: IPv4Address, port: UInt16)? = nil
     ) -> NetstackStreamChannel? {
         let eventLoop = stack.eventLoop
         eventLoop.preconditionInEventLoop()
@@ -58,6 +63,16 @@ enum GuestSplice {
         // completes, and a channel that becomes active before its pipeline is
         // registered delivers `channelActive` to nobody.
         guestChannel.register0(promise: nil)
+        // The client's own port first, as upstream binds it. It can already be
+        // taken here -- a client that reuses a port while this stack's earlier
+        // connection from it still lingers -- and then the connection takes an
+        // ephemeral port on the same address rather than failing: the guest
+        // still sees who dialled, which is the part that matters.
+        if let source {
+            if (try? endpoint.bind(address: source.address, port: source.port)) == nil {
+                try? endpoint.bind(address: source.address, port: 0)
+            }
+        }
         let connected = eventLoop.makePromise(of: Void.self)
         guestChannel.connect0(to: destination, promise: connected)
         connected.futureResult.whenFailure { _ in

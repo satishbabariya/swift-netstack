@@ -86,8 +86,15 @@ public final class UDPPortForwarder: @unchecked Sendable {
             }
     }
 
+    /// Replies from the guest handed back to a host sender. For tests and
+    /// diagnostics.
+    private(set) var repliesForwarded = 0
+
     /// A datagram from the host, on the forwarder's own loop.
-    fileprivate func receive(_ payload: ByteBuffer, from source: SocketAddress) {
+    ///
+    /// Internal rather than private so a test can present a non-loopback
+    /// sender, which a loopback socket cannot. See `ForwardedSource`.
+    func receive(_ payload: ByteBuffer, from source: SocketAddress) {
         eventLoop.preconditionInEventLoop()
         if let flow = flows[source] {
             flow.lastUsed = stack.clock.now()
@@ -102,15 +109,24 @@ public final class UDPPortForwarder: @unchecked Sendable {
         }
 
         let endpoint = UDPEndpoint(stack: stack)
-        // A port of this stack's choosing, stepped until one binds. The guest
-        // replies to it, and the reply is matched back to `source` by which
-        // endpoint received it -- which is why each host sender needs one of its
-        // own rather than all of them sharing.
+        // From the sender's own address and port when it may be propagated, so
+        // the guest sees who sent (see `ForwardedSource`); otherwise from the
+        // gateway. Either way the guest replies to that address and port, and
+        // the reply is matched back to `source` by which endpoint received it --
+        // which is why each host sender needs one of its own rather than all of
+        // them sharing.
         var bound = false
+        let client = ForwardedSource.binding(for: source, on: stack)
+        if let client {
+            bound = (try? endpoint.bind(address: client.address, port: client.port)) != nil
+        }
+        // A port of this stack's choosing, stepped until one binds, if the
+        // sender's own was not available or not wanted.
+        let address = client?.address ?? stack.configuration.gatewayAddress
         for _ in 0..<1024 where !bound {
             let port = nextSourcePort
             nextSourcePort = nextSourcePort == UInt16.max ? 40000 : nextSourcePort + 1
-            if (try? endpoint.bind(address: stack.configuration.gatewayAddress, port: port)) != nil {
+            if (try? endpoint.bind(address: address, port: port)) != nil {
                 bound = true
             }
         }
@@ -118,6 +134,7 @@ public final class UDPPortForwarder: @unchecked Sendable {
 
         endpoint.onDatagram = { [weak self] reply, _, _ in
             guard let self, let listener = self.listener else { return }
+            self.repliesForwarded += 1
             // Straight back to whoever sent, through the same socket they sent
             // to -- a reply from a different port is one their kernel will not
             // match to anything they have open.

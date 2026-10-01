@@ -126,16 +126,7 @@ public final class TransportDemuxer {
             return true
         }
 
-        // Most specific first. A connected endpoint beats a listener bound to
-        // the same port, and a listener on a specific address beats one on
-        // any address.
-        let candidates = [
-            TransportEndpointID(localAddress: header.destination, localPort: localPort, remoteAddress: header.source, remotePort: remotePort),
-            TransportEndpointID(localAddress: header.destination, localPort: localPort, remoteAddress: .any, remotePort: 0),
-            TransportEndpointID(localAddress: .any, localPort: localPort, remoteAddress: .any, remotePort: 0),
-        ]
-
-        for candidate in candidates {
+        for candidate in candidates(header: header, localPort: localPort, remotePort: remotePort) {
             let key = Key(protocolNumber: protocolNumber.rawValue, id: candidate)
             guard let registration = registrations[key] else { continue }
             guard let delegate = registration.delegate else {
@@ -146,6 +137,39 @@ public final class TransportDemuxer {
             return true
         }
         return false
+    }
+
+    /// Whether an endpoint bound to exactly this packet's destination address
+    /// would take it, were no protocol handler in the way.
+    ///
+    /// A protocol handler sees every packet first, and a forwarder's handler
+    /// claims anything addressed past the gateway. That is right for a guest's
+    /// egress and wrong for a reply to an address this stack is speaking from
+    /// on someone's behalf -- a port forward bound to its client's address, see
+    /// `ForwardedSource` -- which the forwarder would otherwise send out to the
+    /// real network as though the guest had started something new. A handler
+    /// asks this to tell the two apart.
+    ///
+    /// The wildcard-address candidate is left out on purpose. An endpoint bound
+    /// to `0.0.0.0:53` is this stack's own service, not a claim on port 53 at
+    /// every address the guest might reach; counting it would hand every
+    /// guest datagram to an outside resolver to that endpoint instead.
+    func hasEndpoint(protocolNumber: IPProtocol, header: IPv4Header, localPort: UInt16, remotePort: UInt16) -> Bool {
+        candidates(header: header, localPort: localPort, remotePort: remotePort).contains { candidate in
+            candidate.localAddress == header.destination
+                && registrations[Key(protocolNumber: protocolNumber.rawValue, id: candidate)]?.delegate != nil
+        }
+    }
+
+    /// Most specific first. A connected endpoint beats a listener bound to the
+    /// same port, and a listener on a specific address beats one on any
+    /// address.
+    private func candidates(header: IPv4Header, localPort: UInt16, remotePort: UInt16) -> [TransportEndpointID] {
+        [
+            TransportEndpointID(localAddress: header.destination, localPort: localPort, remoteAddress: header.source, remotePort: remotePort),
+            TransportEndpointID(localAddress: header.destination, localPort: localPort, remoteAddress: .any, remotePort: 0),
+            TransportEndpointID(localAddress: .any, localPort: localPort, remoteAddress: .any, remotePort: 0),
+        ]
     }
 
     /// An unused port in the ephemeral range, for an endpoint that did not

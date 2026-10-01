@@ -65,6 +65,18 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
     public private(set) var refusedByPolicy = 0
     private let policy: (any EgressPolicy)?
 
+    /// Connections reset because `EgressPolicy.clientHello` refused the server
+    /// name their ClientHello asked for.
+    public private(set) var refusedForServerName = 0
+
+    /// Connections reset on an inspected port because no server name could be
+    /// read from them. See `EgressPolicy.clientHello` for what counts.
+    public private(set) var refusedUnreadableClientHello = 0
+
+    /// `policy.inspectedTLSPorts`, read once here, as the protocol says.
+    private let inspectedTLSPorts: Set<UInt16>
+    private let clientHelloTimeout: TimeAmount
+
     /// Where refusals are reported, if anywhere. `Gateway` sets this; a
     /// hand-assembled arrangement opts in by setting it too.
     public var log: RateLimitedLogger?
@@ -84,9 +96,12 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         stack: Stack, maximumInFlight: Int = 512, maximumConnections: Int = 1024,
         keepAlive: TCPEndpoint.KeepAliveConfiguration? = TCPEndpoint.KeepAliveConfiguration(),
         dialTimeout: TimeAmount = .seconds(5), nat: [IPv4Address: IPv4Address] = [:],
-        allowsLinkLocal: Bool = false, policy: (any EgressPolicy)? = nil
+        allowsLinkLocal: Bool = false, policy: (any EgressPolicy)? = nil,
+        clientHelloTimeout: TimeAmount = .seconds(15)
     ) {
         self.policy = policy
+        self.inspectedTLSPorts = policy?.inspectedTLSPorts ?? []
+        self.clientHelloTimeout = clientHelloTimeout
         self.nat = nat
         self.allowsLinkLocal = allowsLinkLocal
         self.stack = stack
@@ -326,12 +341,14 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
                     slot.release()
                     request.refuse()
                 case .success(let outbound):
-                    self.splice(request, to: outbound, slot: slot)
+                    self.splice(request, to: outbound, slot: slot, translated: translated)
                 }
             }
     }
 
-    private func splice(_ request: ForwarderRequest, to outbound: Channel, slot: ConnectionSlot) {
+    private func splice(
+        _ request: ForwarderRequest, to outbound: Channel, slot: ConnectionSlot, translated: IPv4Address
+    ) {
         // `complete()` is what answers the SYN, and it is deliberately the last
         // thing that can fail: everything above this line is reversible with a
         // `refuse`, and nothing below it is.
@@ -366,6 +383,31 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
             // side -- `echo … | nc`, busybox `nc` with no stdin, every
             // HTTP/0.9-shaped protocol -- is still waiting for the answer.
             try outbound.syncOptions?.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+            // Ahead of the glue, so the glue is handed nothing until the hello
+            // has been judged. Added before `registerAlreadyConfigured0`, like
+            // the glue, because that is what lets the guest's bytes up.
+            if let policy, inspectedTLSPorts.contains(request.destinationPort) {
+                let flow = EgressFlow(
+                    transport: .tcp, source: request.source, sourcePort: request.sourcePort,
+                    destination: request.destination, translatedDestination: translated,
+                    port: request.destinationPort)
+                try guestChannel.pipeline.syncOperations.addHandler(
+                    ClientHelloInspector(
+                        timeout: clientHelloTimeout,
+                        schedule: { endpoint.schedule(after: $0, $1) },
+                        judge: { [weak self] outcome in
+                            self?.judge(outcome, on: flow, policy: policy) ?? false
+                        },
+                        refuse: {
+                            // A reset rather than a FIN: to a TLS client a FIN
+                            // mid-handshake reads as a server that answered
+                            // and hung up. `abort` reports the endpoint closed,
+                            // the guest channel goes inactive on that, and the
+                            // glue closes the upstream, which has been sent
+                            // nothing.
+                            endpoint.abort()
+                        }))
+            }
             try guestChannel.pipeline.syncOperations.addHandler(guestGlue)
             try outbound.pipeline.syncOperations.addHandler(hostGlue)
         } catch {
@@ -386,6 +428,34 @@ public final class OutboundTCPForwarder: @unchecked Sendable {
         outbound.closeFuture.whenComplete { _ in slot.release() }
 
         guestChannel.registerAlreadyConfigured0(promise: nil)
+    }
+
+    /// Whether a connection on an inspected port may go on, from what its first
+    /// bytes turned out to be.
+    private func judge(
+        _ outcome: ClientHelloReassembler.Outcome, on flow: EgressFlow, policy: any EgressPolicy
+    ) -> Bool {
+        let destination = "\(flow.destination):\(flow.port ?? 0)"
+        switch outcome {
+        case .notTLS, .noServerName:
+            return true
+        case .serverName(let name):
+            guard policy.clientHello(EgressClientHello(flow: flow, serverName: name)) == .refuse else {
+                return true
+            }
+            refusedForServerName += 1
+            log?.record(
+                .tlsRefusedByPolicy,
+                ["destination": .string(destination), "name": .string(sanitizedForLog(name))])
+            return false
+        case .unreadable(let why):
+            refusedUnreadableClientHello += 1
+            log?.record(
+                .tlsRefusedUnreadable, ["destination": .string(destination), "reason": .string("\(why)")])
+            return false
+        case .needMore:
+            return false
+        }
     }
 }
 

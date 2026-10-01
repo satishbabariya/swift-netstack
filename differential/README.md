@@ -43,6 +43,21 @@ is told, which a scripted exchange cannot answer: `read` reports the errno a
 Linux program would see, so a reset shows as 104 (ECONNRESET). It uses a local
 errno table because `pkg/syserr` cannot be imported on Darwin.
 
+`harness tls <name>...` is the one live mode on a real clock and a real wire.
+gVisor is the guest again, but on a unix datagram socket to a `Gateway`
+listening at a path, and the application on top of it is Go's crypto/tls
+client. It starts a crypto/tls server on loopback with a certificate for the
+names given, prints `{"port":n}`, and reads one case as a JSON line: the
+gateway's socket path, a path to bind, the destination, the server name to ask
+for (`""` sends no SNI), `split` (cut the first record after that many
+handshake bytes and send it as two records, as sandbox patch 0013's test does),
+or `plain` bytes to send instead of a handshake. It prints what the client was
+told and what the server saw (the SNI its handshake was asked for, its error,
+every byte it read), then waits for stdin to close so the guest stays on the
+wire while the test closes its gateway. `ClientHelloTests` drives it. What it
+answers is a TLS question, not a frame-level one: whether a server behind the
+gateway ever saw a hello the policy refused.
+
 At step `i` the harness injects `frames[i]` (empty string for "nothing
 arrives"), advances its manual clock by `advanceMs[i]` milliseconds, reads
 and discards whatever the connection has received, performs `actions[i]`

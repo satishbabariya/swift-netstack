@@ -1325,6 +1325,8 @@ private final class DNSVerdicts: EgressPolicy {
         return self.answer
     }
     func dial(_ flow: EgressFlow) -> EgressVerdict { .allow }
+    let inspectedTLSPorts: Set<UInt16> = []
+    func clientHello(_ hello: EgressClientHello) -> EgressTLSVerdict { .allow }
 }
 
 private struct Resolved {

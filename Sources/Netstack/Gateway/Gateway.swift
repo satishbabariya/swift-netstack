@@ -62,6 +62,11 @@ public final class Gateway: @unchecked Sendable {
         /// above all -- so a policy cannot re-open them, and never for the
         /// gateway's own services, which are not egress. See `EgressPolicy`.
         public var egressPolicy: (any EgressPolicy)? = nil
+        /// How long a connection on one of `egressPolicy`'s inspected TLS ports
+        /// has to send a complete ClientHello. One that has not is reset and
+        /// counted in `tlsRefusedUnreadable`. Fifteen seconds, sandbox's Go
+        /// `clientHelloTimeout`. Measured on the stack's clock.
+        public var clientHelloTimeout: TimeAmount = .seconds(15)
         /// Write every frame in and out to a pcap file at this path. Upstream's
         /// `CaptureFile`. Bounded -- see `PacketCapture`.
         /// The address to hand a vpnkit guest, by the UUID hyperkit sends.
@@ -680,7 +685,8 @@ public final class Gateway: @unchecked Sendable {
                 maximumConnections: configuration.maximumTCPConnections,
                 keepAlive: configuration.keepAlive,
                 dialTimeout: configuration.tcpDialTimeout, nat: configuration.nat,
-                allowsLinkLocal: configuration.allowsLinkLocal, policy: configuration.egressPolicy)
+                allowsLinkLocal: configuration.allowsLinkLocal, policy: configuration.egressPolicy,
+                clientHelloTimeout: configuration.clientHelloTimeout)
             let udp = UDPForwarder(
                 stack: stack, maximumFlows: configuration.maximumUDPFlows, nat: configuration.nat,
                 allowsLinkLocal: configuration.allowsLinkLocal, policy: configuration.egressPolicy)

@@ -30,6 +30,8 @@ private final class Verdicts: EgressPolicy {
         asked.withLockedValue { $0.append(flow) }
         return verdict
     }
+    let inspectedTLSPorts: Set<UInt16> = []
+    func clientHello(_ hello: EgressClientHello) -> EgressTLSVerdict { .allow }
 }
 
 private let egressGuest = IPv4Address("192.168.127.2")!

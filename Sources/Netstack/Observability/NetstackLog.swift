@@ -46,6 +46,12 @@ public enum NetstackEvent: String, Sendable, CaseIterable {
     case icmpRefusedByPolicy
     /// A DNS question or answer refused by the `EgressPolicy`.
     case dnsRefusedByPolicy
+    /// A TLS connection reset because the `EgressPolicy` refused its server
+    /// name.
+    case tlsRefusedByPolicy
+    /// A connection on an inspected TLS port reset because no server name
+    /// could be read from its first bytes.
+    case tlsRefusedUnreadable
     /// A query this gateway does not own, with nowhere configured to send it.
     case dnsRefusedNoUpstream
     /// A query dropped because too many were already outstanding.

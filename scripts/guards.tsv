@@ -117,3 +117,13 @@ Sources/Netstack/Gateway/ClientHello.swift	aHandshakeThatGoesWrongIsUnreadableNo
 Sources/Netstack/Gateway/ClientHello.swift	splittingAHelloFinelyIsStoppedAtTheRecordBound	    static let maximumRecordBytes = 32 * 1024	    static let maximumRecordBytes = 128 * 1024
 Sources/Netstack/Gateway/ClientHello.swift	aSecondServerNameExtensionIsRefusedNotJudgedByTheFirst	            guard serverNameExtension == nil else { return .unreadable(.malformed) }	            guard serverNameExtension == nil else { continue }
 Sources/Netstack/Gateway/ClientHello.swift	aSecondHostNameIsRefusedNotJudgedByTheFirst	            guard hostName == nil else { return .unreadable(.malformed) }	            guard hostName == nil else { continue }
+Sources/Netstack/Gateway/ForwardedSource.swift	onlyRoutableIPv4ClientsArePropagated	guard address != .any, address.bytes[0] != 127 else { return nil }	guard address != .any else { return nil }
+Sources/Netstack/Gateway/ForwardedSource.swift	onlyRoutableIPv4ClientsArePropagated	guard address != .any, address.bytes[0] != 127 else { return nil }	guard address.bytes[0] != 127 else { return nil }
+Sources/Netstack/Gateway/ForwardedSource.swift	onlyRoutableIPv4ClientsArePropagated	lowered.hasPrefix("::ffff:") ?	false ?
+Sources/Netstack/Gateway/ForwardedSource.swift	aClientIsNotPropagatedWhereTheStackCouldNotSpeakForIt	guard stack.configuration.allowsAnySource, 	guard 
+Sources/Netstack/Gateway/ForwardedSource.swift	aClientIsNotPropagatedWhereTheStackCouldNotSpeakForIt	stack.configuration.acceptsAnyDestination else { return nil }	true else { return nil }
+Sources/Netstack/Gateway/PortForwarder.swift	aForwardedConnectionReachesTheGuestFromTheClientsAddressAndStillCarriesBothWays	from: ForwardedSource.binding(for: clientAddress(inbound), on: stack))	from: nil)
+Sources/Netstack/Gateway/GuestSplice.swift	aForwardedConnectionReachesTheGuestFromTheClientsAddressAndStillCarriesBothWays	        if let source {	        if let source, false {
+Sources/Netstack/Gateway/UDPPortForwarder.swift	aForwardedDatagramReachesTheGuestFromTheSendersAddressAndTheReplyIsNotTakenForEgress	let client = ForwardedSource.binding(for: source, on: stack)	let client: (address: IPv4Address, port: UInt16)? = nil
+Sources/Netstack/Gateway/UDPForwarder.swift	aForwardedDatagramReachesTheGuestFromTheSendersAddressAndTheReplyIsNotTakenForEgress	            !stack.transportDemuxer.hasEndpoint(	            true || !stack.transportDemuxer.hasEndpoint(
+Sources/Netstack/Transport/TransportDemuxer.swift	onlyAnEndpointOnTheExactAddressKeepsADatagramFromTheEgressForwarder	            candidate.localAddress == header.destination\n                &&	            true\n                &&

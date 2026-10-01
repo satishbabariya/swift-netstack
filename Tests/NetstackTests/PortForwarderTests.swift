@@ -855,3 +855,33 @@ private func pfAwaitDatagram(_ fd: Int32, toPort port: UInt16) async -> (ip: IPv
     try? await group.shutdownGracefully()
     _ = holder.stack
 }
+
+@Test func aClientIsNotPropagatedWhereTheStackCouldNotSpeakForIt() async throws {
+    // A stack that may not send from an address it does not own, or will not
+    // take a packet addressed to one, would bind the connection to an address
+    // it can neither speak from nor hear on. Both keep the gateway's address.
+    let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    var outcomes: [String: Bool] = [:]
+    for (name, spoofs, promiscuous) in [("no spoofing", false, true), ("not promiscuous", true, false), ("both", true, true)] {
+        var pair: [Int32] = [0, 0]
+        #expect(makeSocketPair(AF_UNIX, .datagram, &pair) == 0)
+        let link = try await WireBootstrap.adoptingDatagramSocket(
+            pair[0], group: group, linkAddress: pfGatewayMAC, mtu: 1500
+        ).get()
+        outcomes[name] = try await link.eventLoop.submit { () -> Bool in
+            let stack = Stack(
+                link: link,
+                configuration: Stack.Configuration(
+                    gatewayAddress: pfGateway, subnet: IPv4Subnet(cidr: "192.168.127.0/24")!,
+                    acceptsAnyDestination: promiscuous, allowsAnySource: spoofs))
+            let client = try? SocketAddress(ipAddress: "10.0.2.50", port: 1234)
+            return ForwardedSource.binding(for: client, on: stack) != nil
+        }.get()
+        _ = try? await link.close().get()
+        close(pair[1])
+    }
+    #expect(outcomes["no spoofing"] == false, "propagated on a stack that may not send from the client's address")
+    #expect(outcomes["not promiscuous"] == false, "propagated on a stack that will not hear the guest's answer")
+    #expect(outcomes["both"] == true, "the ordinary gateway configuration did not propagate")
+    try? await group.shutdownGracefully()
+}

@@ -637,6 +637,7 @@ guest_out="$work/published.out"
 rm -f "$api"
 SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c \
     '(while true; do echo GUEST-LISTENER | nc -l -p 9999; done) & sleep 45' >"$guest_out" 2>&1 &
+published_guest=$!
 for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
 sleep 12
 
@@ -726,6 +727,89 @@ PY
 else
     fail "the control plane never appeared at $api, so nothing was published"
 fi
+
+# --- Who the guest sees on a published port ----------------------------------
+#
+# Upstream f9306b96: a forwarded connection reaches the guest from the client
+# that dialled, not from the gateway -- except from loopback, because a real
+# guest drops its own answer to 127.0.0.1 as a martian and the forward everyone
+# uses would stop working. The unit tests hand the forwarder a client address;
+# this is the one place a real kernel picks the source, a real guest stack
+# answers it, and the guest itself says who it thinks is on the other end.
+#
+# The non-loopback client needs an address of this machine's own that is not
+# loopback. With none there is nothing to observe, and that is a failure rather
+# than a pass: a gate that cannot run its check has not checked anything.
+
+# The published-port guest above sleeps on past its checks. Booted alongside
+# it, this guest's control plane came up too late and both dials were refused.
+wait "$published_guest" 2>/dev/null
+
+host_ip="$(ifconfig 2>/dev/null | awk '/inet / && $2 !~ /^(127\.|169\.254\.)/ { print $2; exit }')"
+peer_port=24692
+loop_port=24693
+rm -f "$api"
+SANDBOX_GATEWAY="$work/shim" sandbox run alpine -- sh -c '
+    (nc -l -p 9997 >/dev/null 2>&1) &
+    (nc -l -p 9996 >/dev/null 2>&1) &
+    # Any state, not only ESTABLISHED: nc has nothing on stdin, so the guest
+    # half-closes at once and its end sits in FIN_WAIT2 -- still the guest
+    # socket, still naming its peer. `-tn` lists no listeners. The listener is
+    # dual-stack, so the peer reads `::ffff:a.b.c.d` and the prefix comes off.
+    peer() {
+        for _ in $(seq 1 30); do
+            p=$(netstat -tn 2>/dev/null | awk -v l=":$1" "\$4 ~ l\"\$\" { sub(/:[0-9]+\$/, \"\", \$5); sub(/^::ffff:/, \"\", \$5); print \$5; exit }")
+            [ -n "$p" ] && { echo "$p"; return; }
+            sleep 1
+        done
+    }
+    sleep 14
+    echo "PEER_ROUTABLE=$(peer 9997)"
+    echo "PEER_LOOPBACK=$(peer 9996)"
+' >"$work/peers.out" 2>&1 &
+peers_guest=$!
+for _ in $(seq 1 20); do [[ -S "$api" ]] && break; sleep 2; done
+sleep 8
+
+if [[ -z "$host_ip" ]]; then
+    fail "this machine has no non-loopback IPv4 address, so who the guest sees was not checked"
+elif [[ -S "$api" ]] && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    curl -s -X POST --unix-socket "$api" http://x/services/forwarder/expose \
+        -d "{\"local\":\"$host_ip:$peer_port\",\"remote\":\"192.168.127.2:9997\"}" >/dev/null
+    curl -s -X POST --unix-socket "$api" http://x/services/forwarder/expose \
+        -d "{\"local\":\"127.0.0.1:$loop_port\",\"remote\":\"192.168.127.2:9996\"}" >/dev/null
+    sleep 1
+    # Held open while the guest looks: the guest reads its peer off an
+    # established connection, which is the guest's own account of it.
+    cat > "$work/hold.py" <<'PY'
+import socket, sys, time
+held = []
+for host, port in ((sys.argv[1], int(sys.argv[2])), ("127.0.0.1", int(sys.argv[3]))):
+    s = socket.socket()
+    s.settimeout(10)
+    try:
+        s.connect((host, port))
+        held.append(s)
+    except Exception as error:
+        print("error dialling %s:%d: %s" % (host, port, type(error).__name__))
+time.sleep(25)
+PY
+    python3 "$work/hold.py" "$host_ip" "$peer_port" "$loop_port"
+    for _ in $(seq 1 12); do grep -q "^PEER_LOOPBACK=" "$work/peers.out" && break; sleep 2; done
+    routable="$(grep '^PEER_ROUTABLE=' "$work/peers.out" | cut -d= -f2-)"
+    loopback="$(grep '^PEER_LOOPBACK=' "$work/peers.out" | cut -d= -f2-)"
+    [[ "$routable" == "$host_ip" ]] \
+        && pass "a guest sees a published port's client at its own address ($host_ip)" \
+        || fail "a client at $host_ip reached the guest as '${routable}'"
+    [[ "$loopback" == "192.168.127.1" ]] \
+        && pass "a loopback client still reaches the guest from the gateway" \
+        || fail "a loopback client reached the guest as '${loopback}'"
+else
+    fail "the control plane never appeared at $api, so who the guest sees was not checked"
+fi
+# This guest gone before the next boots, so the next check's control plane is
+# its own and not this one's.
+wait "$peers_guest" 2>/dev/null
 
 # --- A UDP port published into the guest, first datagram and all -------------
 #

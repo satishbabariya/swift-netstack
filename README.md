@@ -595,7 +595,11 @@ every run and does not fail on the threshold; that is a separate decision from
 having the number at all. `NETSTACK_BENCH_SLOW_ALLOW_ALL=1` makes `allow-all`
 sleep 50 µs per call instead, and CI's second run of the benchmark sets it and
 requires every hook's reported p99 to cross the 10 µs line — proof the
-benchmark can see a slow policy, not only report a fast one.
+benchmark can see a slow policy, not only report a fast one. The allow-all and
+nil rows sit close enough to the host clock's own resolution (`ContinuousClock`
+ticks in roughly 42 ns steps on Apple silicon) that their p50 and p99 often
+land on the same quantized value — that is the clock's granularity showing
+through, not a claim that the call costs exactly that much.
 
 `scripts/frame-smoke.sh` drives the **built executable** with real ethernet
 frames over its wire socket, because everything else that watches the program

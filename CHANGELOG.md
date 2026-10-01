@@ -33,7 +33,7 @@ log, where each change says what was measured as well as what moved.
   `TCPEndpoint.abort()` and closes the upstream with none of the guest's bytes
   sent. A stream that is not TLS, and a hello with no server name, pass
   unchanged and unasked. A hello that cannot be read (malformed, too large,
-  cut short or too slow) is refused unasked. New requirements with no
+  cut short or too slow, or naming a server twice) is refused unasked. New requirements with no
   default, as before. Counted as `tls_refused_by_policy` and
   `tls_refused_unreadable`.
 - **`TCPEndpoint.abort()`**, the reset primitive. It sends one `RST` at SND.NXT

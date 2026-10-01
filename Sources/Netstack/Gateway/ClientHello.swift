@@ -125,37 +125,50 @@ struct ClientHelloReassembler {
         // No extensions at all is legal before TLS 1.3, and it is nameless.
         guard let extensionsLength = hello.uint16() else { return .noServerName }
         guard var extensions = hello.take(Int(extensionsLength)) else { return .unreadable(.malformed) }
+        // Every extension is walked, not just up to the first `server_name`. A
+        // hello with two is forbidden (RFC 8446 §4.2), and judging the first
+        // while an upstream honours the second would let the guest pick the
+        // name the policy sees.
+        var serverNameExtension: Cursor?
         while extensions.remaining >= 4 {
             let type = extensions.uint16()!
             let length = extensions.uint16()!
-            guard var body = extensions.take(Int(length)) else { return .unreadable(.malformed) }
-            if type == 0 { return hostName(in: &body) }
+            guard let body = extensions.take(Int(length)) else { return .unreadable(.malformed) }
+            guard type == 0 else { continue }
+            guard serverNameExtension == nil else { return .unreadable(.malformed) }
+            serverNameExtension = body
         }
-        return .noServerName
+        guard var body = serverNameExtension else { return .noServerName }
+        return hostName(in: &body)
     }
 
-    /// The first `host_name` in a `server_name` extension (RFC 6066 §3).
+    /// The one `host_name` in a `server_name` extension (RFC 6066 §3). A second
+    /// is forbidden by the same section, and refused for the same reason as a
+    /// second extension.
     private static func hostName(in body: inout Cursor) -> Outcome {
         guard let listLength = body.uint16(), var list = body.take(Int(listLength)) else {
             return .unreadable(.malformed)
         }
+        var hostName: Cursor?
         while list.remaining >= 3 {
             let type = list.byte()!
             let length = list.uint16()!
             guard let name = list.take(Int(length)) else { return .unreadable(.malformed) }
             // 0 is host_name, and no other type has ever been defined.
             guard type == 0 else { continue }
-            var bytes = name.bytes
-            if bytes.last == UInt8(ascii: ".") { bytes = bytes.dropLast() }
-            // Empty is treated as absent, as the Go patch does.
-            guard !bytes.isEmpty else { return .noServerName }
-            // RFC 6066 makes a host_name an ASCII DNS name. A NUL, a space or a
-            // byte over 0x7E is not one, and a policy that matches suffixes
-            // should not be handed "evil\0.allowed.example" to judge.
-            guard bytes.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else { return .unreadable(.malformed) }
-            return .serverName(String(decoding: bytes, as: UTF8.self).lowercased())
+            guard hostName == nil else { return .unreadable(.malformed) }
+            hostName = name
         }
-        return .noServerName
+        guard let name = hostName else { return .noServerName }
+        var bytes = name.bytes
+        if bytes.last == UInt8(ascii: ".") { bytes = bytes.dropLast() }
+        // Empty is treated as absent, as the Go patch does.
+        guard !bytes.isEmpty else { return .noServerName }
+        // RFC 6066 makes a host_name an ASCII DNS name. A NUL, a space or a
+        // byte over 0x7E is not one, and a policy that matches suffixes
+        // should not be handed "evil\0.allowed.example" to judge.
+        guard bytes.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else { return .unreadable(.malformed) }
+        return .serverName(String(decoding: bytes, as: UTF8.self).lowercased())
     }
 
     private struct Cursor {

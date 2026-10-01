@@ -368,25 +368,70 @@ private final class Inspected {
 
 /// A ClientHello body with a `server_name` of `serverName`, or none if `nil`,
 /// among the extensions a real one carries around it.
+///
+/// Built from named, typed pieces with `append`, not one `+` chain of literals:
+/// the Linux compiler gives up type-checking the chain.
 private func clientHello(serverName: String?, extraExtensions: [UInt8] = []) -> [UInt8] {
-    var body: [UInt8] = [0x03, 0x03] + [UInt8](repeating: 0x11, count: 32)
-    body += [32] + [UInt8](repeating: 0x22, count: 32)
-    body += [0x00, 0x04, 0x13, 0x01, 0x13, 0x02]
-    body += [0x01, 0x00]
     var extensions: [UInt8] = []
     // supported_versions, TLS 1.3
-    extensions += [0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]
+    let supportedVersions: [UInt8] = [0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]
+    extensions.append(contentsOf: supportedVersions)
     if let serverName {
-        let name = Array(serverName.utf8)
-        let entry: [UInt8] = [0x00] + be16(name.count) + name
-        let list = be16(entry.count) + entry
-        extensions += [0x00, 0x00] + be16(list.count) + list
+        extensions.append(contentsOf: serverNameExtension(hostNames: [serverName]))
     }
-    // key_share with a dummy X25519 share
-    extensions += [0x00, 0x33] + be16(38) + be16(36) + [0x00, 0x1d] + be16(32) + [UInt8](repeating: 0x33, count: 32)
-    extensions += extraExtensions
-    body += be16(extensions.count) + extensions
-    return [0x01] + be24(body.count) + body
+    extensions.append(contentsOf: keyShare())
+    extensions.append(contentsOf: extraExtensions)
+    return clientHello(extensions: extensions)
+}
+
+/// A ClientHello body around exactly `extensions`.
+private func clientHello(extensions: [UInt8]) -> [UInt8] {
+    let random = [UInt8](repeating: 0x11, count: 32)
+    let sessionID = [UInt8](repeating: 0x22, count: 32)
+    let cipherSuites: [UInt8] = [0x00, 0x04, 0x13, 0x01, 0x13, 0x02]
+    let compressionMethods: [UInt8] = [0x01, 0x00]
+    var body: [UInt8] = [0x03, 0x03]
+    body.append(contentsOf: random)
+    body.append(UInt8(sessionID.count))
+    body.append(contentsOf: sessionID)
+    body.append(contentsOf: cipherSuites)
+    body.append(contentsOf: compressionMethods)
+    body.append(contentsOf: be16(extensions.count))
+    body.append(contentsOf: extensions)
+    var message: [UInt8] = [0x01]
+    message.append(contentsOf: be24(body.count))
+    message.append(contentsOf: body)
+    return message
+}
+
+/// A `server_name` extension whose list holds a `host_name` entry per name.
+private func serverNameExtension(hostNames: [String]) -> [UInt8] {
+    var list: [UInt8] = []
+    for hostName in hostNames {
+        let name: [UInt8] = Array(hostName.utf8)
+        list.append(0x00)
+        list.append(contentsOf: be16(name.count))
+        list.append(contentsOf: name)
+    }
+    var body: [UInt8] = be16(list.count)
+    body.append(contentsOf: list)
+    var out: [UInt8] = [0x00, 0x00]
+    out.append(contentsOf: be16(body.count))
+    out.append(contentsOf: body)
+    return out
+}
+
+/// key_share with a dummy X25519 share.
+private func keyShare() -> [UInt8] {
+    let share = [UInt8](repeating: 0x33, count: 32)
+    var entry: [UInt8] = [0x00, 0x1d]
+    entry.append(contentsOf: be16(share.count))
+    entry.append(contentsOf: share)
+    var out: [UInt8] = [0x00, 0x33]
+    out.append(contentsOf: be16(entry.count + 2))
+    out.append(contentsOf: be16(entry.count))
+    out.append(contentsOf: entry)
+    return out
 }
 
 /// `message` carried in handshake records of at most `size` bytes each.
@@ -394,15 +439,21 @@ private func records(_ message: [UInt8], size: Int) -> [UInt8] {
     var out: [UInt8] = []
     var rest = message[...]
     while !rest.isEmpty {
-        let part = rest.prefix(size)
-        out += [0x16, 0x03, 0x01] + be16(part.count) + part
+        let part: ArraySlice<UInt8> = rest.prefix(size)
+        let header: [UInt8] = [0x16, 0x03, 0x01]
+        out.append(contentsOf: header)
+        out.append(contentsOf: be16(part.count))
+        out.append(contentsOf: part)
         rest = rest.dropFirst(part.count)
     }
     return out
 }
 
 private func be16(_ value: Int) -> [UInt8] { [UInt8(value >> 8 & 0xff), UInt8(value & 0xff)] }
-private func be24(_ value: Int) -> [UInt8] { [UInt8(value >> 16 & 0xff)] + be16(value) }
+private func be24(_ value: Int) -> [UInt8] {
+    let high: UInt8 = UInt8(value >> 16 & 0xff)
+    return [high] + be16(value)
+}
 
 private func feedAll(_ bytes: [UInt8], chunk: Int = .max) -> ClientHelloReassembler.Outcome {
     var reassembler = ClientHelloReassembler()
@@ -447,6 +498,46 @@ private func feedAll(_ bytes: [UInt8], chunk: Int = .max) -> ClientHelloReassemb
     for (name, input) in cases {
         #expect(feedAll(input) == .unreadable(.malformed), "\(name)")
     }
+}
+
+/// Two `server_name` extensions, the first allowed and the second denied.
+/// RFC 8446 §4.2 forbids the pair, and an upstream that honoured the second
+/// would be reached under a name the policy never saw. Refused unread, not
+/// judged by the first.
+@Test func aSecondServerNameExtensionIsRefusedNotJudgedByTheFirst() throws {
+    var extensions: [UInt8] = serverNameExtension(hostNames: [allowedName])
+    extensions.append(contentsOf: keyShare())
+    extensions.append(contentsOf: serverNameExtension(hostNames: [deniedName]))
+    let hello = records(clientHello(extensions: extensions), size: 38)
+    #expect(feedAll(hello) == .unreadable(.malformed))
+
+    // And through the inspector: refused, and nothing passed on.
+    let inspected = try Inspected()
+    try inspected.send(hello)
+    #expect(inspected.judged == [.unreadable(.malformed)])
+    #expect(inspected.refused == 1)
+    #expect(inspected.downstream.bytes.isEmpty)
+}
+
+/// Two `host_name` entries in one `server_name` list, the first allowed and the
+/// second denied. RFC 6066 §3 forbids more than one name of a type.
+@Test func aSecondHostNameIsRefusedNotJudgedByTheFirst() throws {
+    var extensions: [UInt8] = serverNameExtension(hostNames: [allowedName, deniedName])
+    extensions.append(contentsOf: keyShare())
+    let hello = records(clientHello(extensions: extensions), size: 38)
+    #expect(feedAll(hello) == .unreadable(.malformed))
+
+    let inspected = try Inspected()
+    try inspected.send(hello)
+    #expect(inspected.judged == [.unreadable(.malformed)])
+    #expect(inspected.refused == 1)
+    #expect(inspected.downstream.bytes.isEmpty)
+
+    // The control: the same builder with one name is read, so it is the second
+    // name that is refused and not the way the hello was built.
+    var single: [UInt8] = serverNameExtension(hostNames: [allowedName])
+    single.append(contentsOf: keyShare())
+    #expect(feedAll(records(clientHello(extensions: single), size: 38)) == .serverName(allowedName))
 }
 
 /// A hello header claiming just under 16 KiB, then one byte per record for as

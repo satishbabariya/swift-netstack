@@ -321,6 +321,11 @@ is refused as unreadable. RFC 6066 makes a `host_name` an ASCII DNS name, and a
 policy that matches suffixes should not be asked to judge
 `"evil\0.allowed.example"`. Go passes those bytes through to its matcher.
 
+A hello with two `server_name` extensions, or two `host_name` entries in one, is
+refused as unreadable rather than judged by the first: an upstream that honoured
+the second would be reached under a name the policy never saw, and RFC 8446 §4.2
+and RFC 6066 §3 forbid both, so no real client sends them.
+
 The guest-observed check is `ClientHelloTests`. The guest there is the
 differential harness in `tls` mode: gVisor's TCP stack running Go's crypto/tls
 client, whose hello is re-framed into two records the way patch 0013's test

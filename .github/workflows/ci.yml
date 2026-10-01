@@ -255,6 +255,44 @@ jobs:
       - name: A gateway under sustained traffic
         run: ./scripts/soak.sh
 
+  egress-bench:
+    name: Benchmark the egress hooks
+    # ADR 0001 sets a 10 microsecond p99 budget for a hook and says plainly
+    # that no number here has ever been measured. This measures it: `dial`,
+    # `resolve` and `clientHello`, each with no policy, an allow-all policy,
+    # and a 1,000-rule policy. It only prints p50 and p99 per hook -- nothing
+    # here fails the build on the threshold yet, because that is a separate
+    # decision from having the number at all.
+    timeout-minutes: 15
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Benchmark the egress hooks
+        run: swift run -c release netstack-egress-bench
+
+      # A benchmark nobody has ever seen fail is a benchmark nobody should
+      # trust. This makes `AllowAllPolicy` sleep 50 microseconds per call and
+      # requires that every hook's reported p99 for it crossed the 10
+      # microsecond line above -- proof the measurement can see a slow policy,
+      # not just report a fast one. This step is allowed to fail the build:
+      # it is checking the benchmark, not the hooks.
+      - name: Self-test -- a slow allow-all policy must push p99 over 10 microseconds
+        run: |
+          set -o pipefail
+          NETSTACK_BENCH_SLOW_ALLOW_ALL=1 swift run -c release netstack-egress-bench 2>&1 | tee /tmp/egress-bench-slow.log
+          failed=0
+          for hook in dial resolve clientHello; do
+            if ! grep -E "^${hook}[[:space:]]+allow-all.*NO$" /tmp/egress-bench-slow.log > /dev/null; then
+              echo "a 50 microsecond sleep in allow-all did not push ${hook}'s reported p99 over the 10 microsecond line"
+              failed=1
+            fi
+          done
+          exit $failed
+
   guards:
     name: Falsify the guards
     # Runs one build and one filtered test per row and takes about half an hour

@@ -580,6 +580,23 @@ together take around forty times the samples that `TCPHeader.serialize` and
 as the stack. It asserts only that every byte arrived — a throughput number from
 a run that lost data is a number about something else.
 
+```
+swift run -c release netstack-egress-bench
+```
+
+ADR 0001 sets a 10 µs p99 budget for `dial`, `resolve` and `clientHello`,
+measured on the event loop from call to return, and said plainly that nobody
+had measured it. This times each hook with no policy installed, with an
+allow-all policy, and with a 1,000-rule policy that scans its whole table
+before falling through to the same `allow`. It measured every hook, against
+every policy, under 3 µs at p99 on 2026-10-01 on an Apple-silicon laptop — the
+1,000-rule policy was the slowest, at around 2.6 µs. CI prints this table on
+every run and does not fail on the threshold; that is a separate decision from
+having the number at all. `NETSTACK_BENCH_SLOW_ALLOW_ALL=1` makes `allow-all`
+sleep 50 µs per call instead, and CI's second run of the benchmark sets it and
+requires every hook's reported p99 to cross the 10 µs line — proof the
+benchmark can see a slow policy, not only report a fast one.
+
 `scripts/frame-smoke.sh` drives the **built executable** with real ethernet
 frames over its wire socket, because everything else that watches the program
 watches its control plane — and a gateway that has come up believing it is

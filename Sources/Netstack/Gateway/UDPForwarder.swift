@@ -122,6 +122,16 @@ public final class UDPForwarder: @unchecked Sendable {
         // working.
         guard header.destination != gateway, header.destination != .broadcast else { return false }
 
+        // A reply to a host sender behind a published port, whose flow this
+        // stack bound to the sender's own address (see `ForwardedSource`). It
+        // is addressed past the gateway like egress is, but an endpoint here is
+        // waiting for it; opening a flow instead would send the guest's reply
+        // out to the real network and leave the sender with nothing.
+        guard
+            !stack.transportDemuxer.hasEndpoint(
+                protocolNumber: .udp, header: header, localPort: localPort, remotePort: remotePort)
+        else { return false }
+
         // Consumed and dropped, not passed on. See
         // `OutboundTCPForwarder.handle` for why link-local is refused by
         // default; DNS over UDP to 169.254.169.254 reaches the same metadata
